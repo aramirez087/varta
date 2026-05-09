@@ -32,6 +32,13 @@ pub struct Config {
     /// Optional deadline after which the daemon shuts itself down. Used by
     /// integration tests to bound run time without relying on signals.
     pub shutdown_after: Option<Duration>,
+    /// Optional kill-after deadline for outstanding recovery children.
+    /// `None` (the default) preserves v0.1.0 semantics: children are
+    /// reaped on completion but never killed. The CLI parser for
+    /// `--recovery-timeout-ms` lands in Session 03 of the
+    /// recovery-async-spawn epic; in this red phase the field exists
+    /// but is always `None`.
+    pub recovery_timeout: Option<Duration>,
 }
 
 /// Failure modes for [`Config::from_args`].
@@ -181,6 +188,7 @@ OPTIONAL:
             file_export,
             prom_addr,
             shutdown_after: shutdown_after_secs.map(Duration::from_secs),
+            recovery_timeout: None,
         })
     }
 }
