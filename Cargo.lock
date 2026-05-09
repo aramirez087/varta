@@ -5,6 +5,10 @@ version = 4
 [[package]]
 name = "varta-bench"
 version = "0.1.0"
+dependencies = [
+ "varta-client",
+ "varta-vlp",
+]
 
 [[package]]
 name = "varta-client"
@@ -16,6 +20,11 @@ dependencies = [
 [[package]]
 name = "varta-tests"
 version = "0.1.0"
+dependencies = [
+ "varta-client",
+ "varta-vlp",
+ "varta-watch",
+]
 
 [[package]]
 name = "varta-vlp"
