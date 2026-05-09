@@ -6,3 +6,6 @@ license = "MIT OR Apache-2.0"
 description = "Varta agent API — emits VLP frames over a Unix Domain Socket."
 
 [dependencies]
+
+[dependencies.varta-vlp]
+path = "../varta-vlp"
