@@ -1,0 +1,14 @@
+# --- BEGIN openwolf merge drivers (managed by epic-toolkit) ---
+# Append-mostly markdown logs use git's built-in `union` driver
+# (concatenates both sides line-by-line, no local config required).
+.wolf/anatomy.md       merge=union
+.wolf/memory.md        merge=union
+.wolf/cerebrum.md      merge=union
+
+# JSON metadata files use the `wolf-json` custom driver, registered
+# automatically by .wolf/scripts/install-merge-driver.sh on every
+# epic run and Claude Code session start.
+.wolf/buglog.json              merge=wolf-json
+.wolf/token-ledger.json        merge=wolf-json
+.wolf/hooks/_session.json      merge=wolf-json
+# --- END openwolf merge drivers ---

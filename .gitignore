@@ -21,9 +21,6 @@ target
 #.idea/
 
 # Wolf/AI Agent state and logs
-.wolf/buglog.json
-.wolf/cron-state.json
-.wolf/token-ledger.json
-.wolf/designqc-report.json
-.wolf/suggestions.json
-.wolf/hooks/_session.json
+.wolf/
+docs/claude-sessions
+scripts/resolve-wolf.sh
