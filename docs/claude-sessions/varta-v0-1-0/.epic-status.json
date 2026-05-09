@@ -1,0 +1,93 @@
+{
+  "epic": "varta-v0-1-0",
+  "started_at": 1778348917.8697112,
+  "sessions": {
+    "1": {
+      "status": "done",
+      "slug": "charter-and-vlp",
+      "wave": 1,
+      "title": "Charter And Vlp",
+      "step": 0,
+      "tool": "",
+      "target": "",
+      "elapsed": 647.0,
+      "started_at": 1778348917.945778
+    },
+    "2": {
+      "status": "done",
+      "slug": "client-core",
+      "wave": 2,
+      "title": "Client Core",
+      "step": 0,
+      "tool": "",
+      "target": "",
+      "elapsed": 606.0,
+      "started_at": 1778349564.592343
+    },
+    "3": {
+      "status": "done",
+      "slug": "watch-core",
+      "wave": 2,
+      "title": "Watch Core",
+      "step": 0,
+      "tool": "",
+      "target": "",
+      "elapsed": 583.0,
+      "started_at": 1778349564.6497421
+    },
+    "4": {
+      "status": "done",
+      "slug": "panic-handler",
+      "wave": 3,
+      "title": "Panic Handler",
+      "step": 0,
+      "tool": "",
+      "target": "",
+      "elapsed": 449.0,
+      "started_at": 1778350170.375533
+    },
+    "5": {
+      "status": "done",
+      "slug": "recovery-and-exporter",
+      "wave": 3,
+      "title": "Recovery And Exporter",
+      "step": 0,
+      "tool": "",
+      "target": "",
+      "elapsed": 775.0,
+      "started_at": 1778350170.433905
+    },
+    "6": {
+      "status": "done",
+      "slug": "integration-and-bench",
+      "wave": 4,
+      "title": "Integration And Bench",
+      "step": 0,
+      "tool": "",
+      "target": "",
+      "elapsed": 1136.0,
+      "started_at": 1778350945.949455
+    },
+    "7": {
+      "status": "done",
+      "slug": "docs-and-examples",
+      "wave": 4,
+      "title": "Docs And Examples",
+      "step": 0,
+      "tool": "",
+      "target": "",
+      "elapsed": 475.0,
+      "started_at": 1778350946.012477
+    },
+    "8": {
+      "status": "pending",
+      "slug": "ci-gate",
+      "wave": 5,
+      "title": "Ci Gate",
+      "step": 0,
+      "tool": "",
+      "target": "",
+      "elapsed": 0.0
+    }
+  }
+}
