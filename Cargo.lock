@@ -9,6 +9,9 @@ version = "0.1.0"
 [[package]]
 name = "varta-client"
 version = "0.1.0"
+dependencies = [
+ "varta-vlp",
+]
 
 [[package]]
 name = "varta-tests"
