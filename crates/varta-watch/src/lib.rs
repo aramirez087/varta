@@ -8,8 +8,14 @@
 //! [`Event`] values to exporters and the recovery command. The protocol root
 //! is [`varta_vlp`]; nothing else is on the dependency surface.
 
+pub mod config;
+pub mod exporter;
 pub mod observer;
+pub mod recovery;
 pub mod tracker;
 
+pub use config::{Config, ConfigError};
+pub use exporter::{Exporter, FileExporter, PromExporter};
 pub use observer::{Event, Observer};
+pub use recovery::{Recovery, RecoveryOutcome};
 pub use tracker::{Slot, Tracker, Update};
