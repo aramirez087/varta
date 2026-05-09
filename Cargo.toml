@@ -1,0 +1,9 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/varta-vlp",
+    "crates/varta-client",
+    "crates/varta-watch",
+    "crates/varta-tests",
+    "crates/varta-bench",
+]

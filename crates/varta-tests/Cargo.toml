@@ -1,0 +1,10 @@
+[package]
+name = "varta-tests"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "Varta end-to-end test harness — owned by Session 06."
+
+[dependencies]
+
+[dev-dependencies]
