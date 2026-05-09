@@ -1,8 +1,15 @@
 #![deny(missing_docs, unsafe_op_in_unsafe_fn, rust_2018_idioms)]
 #![forbid(clippy::dbg_macro, clippy::print_stdout)]
 
-//! Varta observer library — Session 03 will land the decode/track loop here.
+//! Varta observer library — UDS receive loop, per-pid tracker, stall surface.
 //!
-//! This crate currently exposes no public items. Session 03 introduces the
-//! path dependency on `varta-vlp` together with the `Observer`, `Tracker`,
-//! and `Event` types.
+//! This crate is the in-process kernel of `varta-watch`. The binary
+//! (Session 05) drives [`Observer::poll`] in a single thread and routes
+//! [`Event`] values to exporters and the recovery command. The protocol root
+//! is [`varta_vlp`]; nothing else is on the dependency surface.
+
+pub mod observer;
+pub mod tracker;
+
+pub use observer::{Event, Observer};
+pub use tracker::{Slot, Tracker, Update};
