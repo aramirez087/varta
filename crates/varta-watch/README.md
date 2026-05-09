@@ -1,0 +1,106 @@
+# varta-watch
+
+← [Workspace root](../../README.md)
+
+Observer binary — decode VLP frames from agent sockets, surface stalls, and
+export metrics. A single-threaded poll loop; no background threads and no
+signal handler dependency.
+
+## Invocation
+
+```sh
+varta-watch \
+  --socket /tmp/varta.sock \
+  --threshold-ms 2000 \
+  --recovery-cmd "systemctl restart myapp-{pid}" \
+  --recovery-debounce-ms 5000 \
+  --export-file /var/log/varta/events.tsv \
+  --prom-addr 127.0.0.1:9100
+```
+
+## Flags
+
+| Flag | Type | Default | Description |
+|------|------|---------|-------------|
+| `--socket <PATH>` | path | **required** | Bind the observer's UDS at this path. |
+| `--threshold-ms <MS>` | u64 ms | **required** | Per-pid silence window before a stall is surfaced. |
+| `--recovery-cmd <TEMPLATE>` | string | — | Shell fragment run via `/bin/sh -c` on each unique stall. The literal `{pid}` is replaced with the stalled pid. |
+| `--recovery-debounce-ms <MS>` | u64 ms | `1000` | Per-pid debounce window for `recovery-cmd` invocations. |
+| `--export-file <PATH>` | path | — | Append one tab-separated event line per observer event to this file. |
+| `--prom-addr <IP:PORT>` | `SocketAddr` | — | Bind the Prometheus `/metrics` endpoint here. |
+| `--shutdown-after-secs <SECS>` | u64 secs | — | Exit cleanly after the given uptime (used by integration tests). |
+| `-h`, `--help` | flag | — | Print help to stdout and exit 0. |
+
+## `/metrics` schema
+
+`GET /metrics` returns Prometheus text exposition format (v0.0.4). All pids
+that have produced at least one beat or stall event appear in every metric
+family. Pids are sorted numerically ascending.
+
+```
+# HELP varta_beats_total Total accepted beats per agent pid.
+# TYPE varta_beats_total counter
+varta_beats_total{pid="1234"} 42
+
+# HELP varta_stalls_total Total observer-detected stalls per agent pid.
+# TYPE varta_stalls_total counter
+varta_stalls_total{pid="1234"} 1
+
+# HELP varta_status Last reported status code per agent pid (0=ok,1=degraded,2=critical,3=stall).
+# TYPE varta_status gauge
+varta_status{pid="1234"} 0
+```
+
+## File export schema
+
+Each line is tab-separated with a fixed column count:
+
+```
+<observer_ns>\t<kind>\t<pid>\t<nonce>\t<status>\t<payload>\n
+```
+
+- `observer_ns` — elapsed nanoseconds since the `FileExporter` was created.
+- `kind` ∈ `{beat, stall, decode, io}`.
+- For `decode` and `io` events the `pid`, `nonce`, `status`, and `payload`
+  columns are written as `-` so the line stays rectangular.
+- `status` is the lowercase name: `ok`, `degraded`, `critical`, or `stall`.
+
+Example:
+
+```
+1234567\tbeat\t5678\t1\tok\t0
+2345678\tstall\t5678\t1\tstall\t-
+3456789\tdecode\t-\t-\t-\tBadMagic
+```
+
+## `recovery_cmd` template syntax
+
+The `--recovery-cmd` value is a shell fragment. The literal string `{pid}` is
+replaced with the stalled pid's decimal representation before the fragment is
+passed to `/bin/sh -c`. No other substitution tokens exist.
+
+```sh
+# Restart a systemd unit whose name includes the pid:
+--recovery-cmd "systemctl restart myapp-{pid}"
+
+# Log the stall and attempt a graceful kill:
+--recovery-cmd "echo stall {pid} >> /var/log/varta.log && kill -TERM {pid}"
+```
+
+Recovery invocations are debounced per pid. A second stall for the same pid
+within the debounce window is silently skipped; distinct pids are independent.
+The debounce window resets after each successful or failed spawn.
+
+## Constraints
+
+- **Zero production registry dependencies.** Only `varta-vlp` (path dep) and
+  `std` are used.
+- **Single-threaded.** The poll loop runs entirely on the main thread; the
+  Prometheus listener is non-blocking and drained each tick.
+- **Non-blocking beat.** Agents are never blocked by the observer; the UDS
+  is a datagram socket and sends complete or fail immediately.
+
+## See also
+
+- Protocol crate: [`crates/varta-vlp/README.md`](../varta-vlp/README.md)
+- Architecture: [`docs/architecture/vlp-frame.md`](../../docs/architecture/vlp-frame.md)

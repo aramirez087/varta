@@ -13,3 +13,13 @@ panic-handler = []
 
 [dependencies.varta-vlp]
 path = "../varta-vlp"
+
+[[example]]
+name = "basic"
+
+[[example]]
+name = "with_payload"
+
+[[example]]
+name = "with_panic_handler"
+required-features = ["panic-handler"]
