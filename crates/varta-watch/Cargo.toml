@@ -6,7 +6,9 @@ license = "MIT OR Apache-2.0"
 description = "Varta observer — receives VLP frames and surfaces stalls."
 
 [dependencies]
-varta-vlp = { path = "../varta-vlp" }
+
+[dependencies.varta-vlp]
+path = "../varta-vlp"
 
 [lib]
 path = "src/lib.rs"
