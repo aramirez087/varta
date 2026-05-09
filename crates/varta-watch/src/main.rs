@@ -86,12 +86,27 @@ fn run(cfg: Config) -> std::io::Result<()> {
             if let Event::Stall { pid, .. } = &ev {
                 if let Some(rec) = recovery.as_mut() {
                     match rec.on_stall(*pid) {
-                        RecoveryOutcome::Spawned(status) if status.success() => {}
-                        RecoveryOutcome::Spawned(status) => {
-                            eprintln!("varta-watch: recovery for pid {pid} exited {status}");
+                        RecoveryOutcome::Spawned { child_pid } => {
+                            eprintln!(
+                                "varta-watch: recovery for pid {pid} spawned (child {child_pid})"
+                            );
+                        }
+                        RecoveryOutcome::Reaped { status, .. } if status.success() => {}
+                        RecoveryOutcome::Reaped { child_pid, status } => {
+                            eprintln!(
+                                "varta-watch: recovery for pid {pid} (child {child_pid}) exited {status}"
+                            );
+                        }
+                        RecoveryOutcome::Killed { child_pid } => {
+                            eprintln!(
+                                "varta-watch: recovery for pid {pid} (child {child_pid}) killed after timeout"
+                            );
                         }
                         RecoveryOutcome::SpawnFailed(e) => {
                             eprintln!("varta-watch: recovery for pid {pid} failed to spawn: {e}");
+                        }
+                        RecoveryOutcome::ReapFailed(e) => {
+                            eprintln!("varta-watch: recovery for pid {pid} reap failed: {e}");
                         }
                         RecoveryOutcome::Debounced => {}
                     }

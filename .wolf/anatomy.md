@@ -1,11 +1,12 @@
 # anatomy.md
 
-> Auto-maintained by OpenWolf. Last scanned: 2026-05-09T19:20:32.424Z
-> Files: 57 tracked | Anatomy hits: 0 | Misses: 0
+> Auto-maintained by OpenWolf. Last scanned: 2026-05-09T19:54:11.968Z
+> Files: 59 tracked | Anatomy hits: 0 | Misses: 0
 
 ## ./
 
 - `.gitignore` — Git ignore rules (~183 tok)
+- `.session-01-plan.md` — Session 01 — Implementation Plan (~5198 tok)
 - `Cargo.toml` — Rust package manifest (~49 tok)
 - `CLAUDE.md` — OpenWolf (~898 tok)
 - `LICENSE` — Project license (~290 tok)
@@ -104,20 +105,20 @@
 
 ## crates/varta-watch/src/
 
-- `config.rs` — Hand-rolled GNU-style argv parser for the `varta-watch` binary. (~3122 tok)
+- `config.rs` — Hand-rolled GNU-style argv parser for the `varta-watch` binary. (~3034 tok)
 - `exporter.rs` — Exporters for [`crate::observer::Event`] streams. (~3172 tok)
 - `lib.rs` — Varta observer library — UDS receive loop, per-pid tracker, stall surface. (~228 tok)
-- `main.rs` — Varta observer binary entry point. (~1137 tok)
+- `main.rs` — Varta observer binary entry point. (~1279 tok)
 - `observer.rs` — Single-threaded observer: bind a Unix datagram socket, decode incoming (~1790 tok)
-- `recovery.rs` — Per-pid debounced recovery command runner. (~1193 tok)
+- `recovery.rs` — Per-pid debounced recovery command runner. (~2372 tok)
 - `tracker.rs` — Per-pid liveness tracker backed by a fixed `[Slot; 64]` array. (~1695 tok)
 
 ## crates/varta-watch/tests/
 
 - `acceptance.rs` — Session 03 acceptance contract tests for `varta-watch`. (~1976 tok)
-- `cli_smoke.rs` — Session 05 acceptance contract test for the `varta-watch` binary surface. (~310 tok)
+- `cli_smoke.rs` — Session 05 acceptance contract test for the `varta-watch` binary surface. (~800 tok)
 - `exporter_endpoint.rs` — Session 05 acceptance contract tests for `varta-watch::exporter`. (~1383 tok)
-- `recovery_e2e.rs` — Session 05 acceptance contract tests for `varta-watch::Recovery`. (~754 tok)
+- `recovery_e2e.rs` — Session 05 acceptance contract tests for `varta-watch::Recovery`. (~1764 tok)
 
 ## docs/acceptance/
 
@@ -125,6 +126,7 @@
 
 ## docs/architecture/
 
+- `recovery-async-spawn.md` — Recovery — Non-Blocking Spawn / Async Reap (~2178 tok)
 - `vlp-frame.md` — VLP Frame — Wire Layout (v0.1.0) (~980 tok)
 
 ## docs/benchmarks/
