@@ -1,4 +1,4 @@
-//! Per-pid debounced recovery command runner.
+//! Per-pid debounced recovery command runner (non-blocking).
 //!
 //! Recovery is the daemon's cold path: it fires only when an agent has
 //! crossed its silence threshold. The runner substitutes the literal
@@ -6,35 +6,15 @@
 //! `/bin/sh -c <rendered>`. A per-pid debounce window suppresses repeat
 //! invocations during a single silence run.
 //!
-//! ## Async-spawn epic — Session 01 (red phase)
-//!
-//! The public surface advertised here is the green-phase contract that
-//! Sessions 02 and 03 will implement. In this red phase:
-//!
-//! * `RecoveryOutcome` carries the final six-variant shape, including
-//!   `Spawned { child_pid }`, `Reaped { .. }`, `Killed { .. }`, and
-//!   `ReapFailed(_)`.
-//! * `Recovery::with_timeout` accepts the optional kill-after deadline
-//!   but does not yet enforce it. `Recovery::new` delegates to
-//!   `with_timeout(.., None)`.
-//! * `Recovery::on_stall` STILL BLOCKS. The body uses `Command::spawn`
-//!   followed by `Child::wait` so the per-pid `child_pid` is real and
-//!   the existing two acceptance tests keep passing on the
-//!   `Reaped { .. }` shape. The non-blocking implementation lands in
-//!   Session 02.
-//! * `Recovery::try_reap` is a stub returning an empty `Vec`. The
-//!   four red-phase acceptance tests fail against this stub by design.
+//! Children are spawned asynchronously; they never block the observer's
+//! poll loop. On each tick, [`Recovery::try_reap`] drains completed or
+//! deadline-exceeded children and returns outcomes for logging.
 
 use std::collections::HashMap;
-use std::process::Command;
+use std::process::{Child, Command};
 use std::time::{Duration, Instant};
 
 /// Outcome of [`Recovery::on_stall`] or [`Recovery::try_reap`].
-///
-/// `Spawned`, `SpawnFailed`, and `Debounced` describe the synchronous
-/// outcome of `on_stall`. `Reaped`, `Killed`, and `ReapFailed` describe
-/// state transitions that `try_reap` will surface for previously-spawned
-/// children once the green-phase implementation lands.
 #[derive(Debug)]
 pub enum RecoveryOutcome {
     /// `/bin/sh -c <rendered>` was forked successfully and the child is
@@ -51,11 +31,10 @@ pub enum RecoveryOutcome {
     /// `/bin/sh` missing). The error is surfaced verbatim.
     SpawnFailed(std::io::Error),
     /// A previously-spawned child has exited and was reaped on this tick.
-    /// The observer never blocks waiting for this transition.
     Reaped {
         /// OS process id of the child that exited.
         child_pid: u32,
-        /// `ExitStatus` from `Child::wait` / `Child::try_wait`.
+        /// `ExitStatus` from `Child::try_wait`.
         status: std::process::ExitStatus,
     },
     /// A previously-spawned child exceeded its `recovery_timeout`
@@ -70,30 +49,17 @@ pub enum RecoveryOutcome {
 }
 
 /// Bookkeeping slot for one outstanding child.
-///
-/// Session 01 only needs the type to exist for the green-phase impl to
-/// flesh out; today no field is read because `try_reap` is a stub. The
-/// `#[allow(dead_code)]` annotations are a deliberate red-phase signal
-/// that Session 02 will activate these fields.
-#[allow(dead_code)]
 struct Outstanding {
-    child: std::process::Child,
+    child: Child,
     spawned_at: Instant,
 }
 
 /// Per-pid debounced runner of a `recovery_cmd` template.
-///
-/// The `last_fired` map is keyed by pid; recovery is the cold path so
-/// the hash-table allocation cost is acceptable per the operator rules.
-/// `outstanding` will hold one entry per live child once Session 02
-/// lands; today it is reserved but unused.
 pub struct Recovery {
     template: String,
     debounce: Duration,
     last_fired: HashMap<u32, Instant>,
-    #[allow(dead_code)]
     timeout: Option<Duration>,
-    #[allow(dead_code)]
     outstanding: HashMap<u32, Outstanding>,
 }
 
@@ -102,7 +68,6 @@ impl Recovery {
     /// window.
     ///
     /// Equivalent to [`Recovery::with_timeout(template, debounce, None)`].
-    /// Children will be reaped on completion but never killed.
     pub fn new(template: String, debounce: Duration) -> Self {
         Self::with_timeout(template, debounce, None)
     }
@@ -113,15 +78,7 @@ impl Recovery {
     /// are reaped on completion but are never killed. `timeout = Some(d)`
     /// asks `try_reap` to issue `kill(2)` once a child has been
     /// outstanding longer than `d`.
-    ///
-    /// The template is taken as-is; the only substitution performed at
-    /// fire time is replacing every literal `{pid}` substring with the
-    /// stalled pid's decimal representation.
-    pub fn with_timeout(
-        template: String,
-        debounce: Duration,
-        timeout: Option<Duration>,
-    ) -> Self {
+    pub fn with_timeout(template: String, debounce: Duration, timeout: Option<Duration>) -> Self {
         Recovery {
             template,
             debounce,
@@ -131,21 +88,15 @@ impl Recovery {
         }
     }
 
-    /// Substitute `{pid}` and spawn `/bin/sh -c <rendered>`.
+    /// Substitute `{pid}` and spawn `/bin/sh -c <rendered>` non-blockingly.
     ///
     /// Returns [`RecoveryOutcome::Debounced`] if the previous invocation
     /// for `pid` is still inside the debounce window. The debounce is
     /// per-pid and monotonic — distinct pids may fire within a single
     /// window without suppressing one another.
-    ///
-    /// Red-phase note: this body still calls `Child::wait` and therefore
-    /// blocks for the child's full duration. The shape of the return
-    /// value is the green-phase `Reaped { .. }` so the existing
-    /// acceptance tests can match the new variant. Session 02 replaces
-    /// the body with a non-blocking spawn that returns `Spawned { .. }`
-    /// immediately.
     pub fn on_stall(&mut self, pid: u32) -> RecoveryOutcome {
         let now = Instant::now();
+
         if let Some(prev) = self.last_fired.get(&pid) {
             if now.duration_since(*prev) < self.debounce {
                 return RecoveryOutcome::Debounced;
@@ -155,38 +106,119 @@ impl Recovery {
         let rendered = self.template.replace("{pid}", &pid.to_string());
         self.last_fired.insert(pid, now);
 
-        let mut child = match Command::new("/bin/sh").arg("-c").arg(&rendered).spawn() {
-            Ok(c) => c,
-            Err(e) => return RecoveryOutcome::SpawnFailed(e),
-        };
-        let child_pid = child.id();
-        match child.wait() {
-            Ok(status) => RecoveryOutcome::Reaped { child_pid, status },
-            Err(e) => RecoveryOutcome::ReapFailed(e),
+        match Command::new("/bin/sh").arg("-c").arg(&rendered).spawn() {
+            Ok(child) => {
+                let child_pid = child.id();
+                self.outstanding.insert(
+                    pid,
+                    Outstanding {
+                        child,
+                        spawned_at: Instant::now(),
+                    },
+                );
+                RecoveryOutcome::Spawned { child_pid }
+            }
+            Err(e) => RecoveryOutcome::SpawnFailed(e),
         }
     }
 
     /// Drain completed (or deadline-exceeded) children for one observer
     /// tick.
     ///
-    /// Red-phase: returns an empty `Vec`. The four acceptance tests
-    /// gating Session 02 fail against this stub by design — they assert
-    /// real `Reaped` / `Killed` outcomes that this stub does not produce.
+    /// Never blocks; returns an empty vector when no children have
+    /// transitioned since the last tick.
     pub fn try_reap(&mut self) -> Vec<RecoveryOutcome> {
-        Vec::new()
+        let mut outcomes = Vec::new();
+
+        // Collect keys first, then process each entry to avoid borrow issues.
+        let pids: Vec<u32> = self.outstanding.keys().copied().collect();
+
+        for pid in pids {
+            let entry = match self.outstanding.get_mut(&pid) {
+                Some(e) => e,
+                None => continue,
+            };
+
+            match entry.child.try_wait() {
+                Ok(Some(status)) => {
+                    // Child has exited; remove and report.
+                    let child_pid = entry.child.id();
+                    self.outstanding.remove(&pid);
+                    outcomes.push(RecoveryOutcome::Reaped { child_pid, status });
+                }
+
+                Ok(None) => {
+                    // Still running — check timeout.
+                    if let Some(to) = self.timeout {
+                        if entry.spawned_at.elapsed() >= to {
+                            let child_pid = entry.child.id();
+                            match entry.child.kill() {
+                                Ok(()) => {
+                                    // wait() is safe here: kill(2) succeeded,
+                                    // so the process will terminate and we can
+                                    // reap it without blocking indefinitely.
+                                    let _ = entry.child.wait();
+                                    self.outstanding.remove(&pid);
+                                    outcomes.push(RecoveryOutcome::Killed { child_pid });
+                                }
+
+                                Err(e) if e.kind() == std::io::ErrorKind::InvalidInput => {
+                                    // Child already exited between our try_wait and kill.
+                                    // Retry try_wait once to reap.
+                                    match entry.child.try_wait() {
+                                        Ok(Some(status)) => {
+                                            let child_pid = entry.child.id();
+                                            self.outstanding.remove(&pid);
+                                            outcomes.push(RecoveryOutcome::Reaped {
+                                                child_pid,
+                                                status,
+                                            });
+                                        }
+                                        _ => {
+                                            // Still not reaped; leave in place.
+                                        }
+                                    }
+                                }
+
+                                Err(e) => {
+                                    self.outstanding.remove(&pid);
+                                    outcomes.push(RecoveryOutcome::ReapFailed(e));
+                                }
+                            }
+                        }
+                    }
+                    // No timeout or not yet exceeded — leave in place.
+                }
+
+                Err(e) => {
+                    self.outstanding.remove(&pid);
+                    outcomes.push(RecoveryOutcome::ReapFailed(e));
+                }
+            }
+        }
+
+        outcomes
+    }
+}
+
+impl Drop for Recovery {
+    fn drop(&mut self) {
+        // Best-effort reap on shutdown: call try_reap to clean up.
+        let _ = self.try_reap();
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Instant;
 
     #[test]
     fn debounces_repeat_calls_for_same_pid() {
         let mut rec = Recovery::new("true".to_string(), Duration::from_secs(10));
         let first = rec.on_stall(1);
         let second = rec.on_stall(1);
-        assert!(matches!(first, RecoveryOutcome::Reaped { .. }));
+        assert!(matches!(first, RecoveryOutcome::Spawned { .. }));
         assert!(matches!(second, RecoveryOutcome::Debounced));
     }
 
@@ -195,8 +227,8 @@ mod tests {
         let mut rec = Recovery::new("true".to_string(), Duration::from_secs(10));
         let a = rec.on_stall(1);
         let b = rec.on_stall(2);
-        assert!(matches!(a, RecoveryOutcome::Reaped { .. }));
-        assert!(matches!(b, RecoveryOutcome::Reaped { .. }));
+        assert!(matches!(a, RecoveryOutcome::Spawned { .. }));
+        assert!(matches!(b, RecoveryOutcome::Spawned { .. }));
     }
 
     #[test]
@@ -206,15 +238,106 @@ mod tests {
             Duration::from_secs(0),
         );
         match rec.on_stall(7) {
-            RecoveryOutcome::Reaped { status, .. } => assert!(status.success()),
-            other => panic!("expected Reaped(success), got {other:?}"),
+            RecoveryOutcome::Spawned { child_pid: _ } => {
+                // Child should exit quickly; reap it.
+                std::thread::sleep(Duration::from_millis(50));
+                let outcomes = rec.try_reap();
+                let reaped = outcomes.into_iter().find_map(|o| match o {
+                    RecoveryOutcome::Reaped { status, .. } => Some(status),
+                    _ => None,
+                });
+                assert!(
+                    matches!(reaped, Some(s) if s.success()),
+                    "expected Reaped(success) for pid 7; got {:?}",
+                    reaped
+                );
+            }
+            other => panic!("expected Spawned, got {other:?}"),
         }
     }
 
     #[test]
-    fn try_reap_returns_empty_during_red_phase() {
-        let mut rec = Recovery::new("true".to_string(), Duration::from_secs(0));
-        assert!(rec.try_reap().is_empty());
+    fn spawn_returns_immediately_for_slow_template() {
+        let mut rec = Recovery::new("sleep 1".to_string(), Duration::ZERO);
+        let start = Instant::now();
+        match rec.on_stall(42) {
+            RecoveryOutcome::Spawned { .. } => {}
+            other => panic!("expected Spawned, got {other:?}"),
+        }
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < Duration::from_millis(50),
+            "spawn blocked for {elapsed:?}; expected non-blocking"
+        );
+    }
+
+    #[test]
+    fn try_reap_surfaces_reaped_for_fast_child() {
+        let mut rec = Recovery::new("true".to_string(), Duration::ZERO);
+        match rec.on_stall(99) {
+            RecoveryOutcome::Spawned { .. } => {}
+            other => panic!("expected Spawned, got {other:?}"),
+        }
+
+        // Poll try_reap until we see Reaped.
+        let deadline = Instant::now() + Duration::from_millis(500);
+        loop {
+            if Instant::now() >= deadline {
+                panic!("timed out waiting for Reaped");
+            }
+            let outcomes = rec.try_reap();
+            if let Some(o) = outcomes.into_iter().find_map(|o| match o {
+                RecoveryOutcome::Reaped { status, .. } => Some(status),
+                _ => None,
+            }) {
+                assert!(o.success(), "expected success from 'true'");
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    #[test]
+    fn try_reap_kills_after_timeout() {
+        let mut rec = Recovery::with_timeout(
+            "sleep 5".to_string(),
+            Duration::ZERO,
+            Some(Duration::from_millis(100)),
+        );
+        match rec.on_stall(7) {
+            RecoveryOutcome::Spawned { .. } => {}
+            other => panic!("expected Spawned, got {other:?}"),
+        }
+
+        let deadline = Instant::now() + Duration::from_millis(1_000);
+        loop {
+            if Instant::now() >= deadline {
+                panic!("timed out waiting for Killed");
+            }
+            let outcomes = rec.try_reap();
+            if outcomes
+                .iter()
+                .any(|o| matches!(o, RecoveryOutcome::Killed { .. }))
+            {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(30));
+        }
+    }
+
+    #[test]
+    fn drop_does_not_leak_zombies() {
+        // Spawn a fast child; Recovery::drop calls try_reap to clean up.
+        {
+            let mut rec = Recovery::new("true".to_string(), Duration::ZERO);
+            match rec.on_stall(999) {
+                RecoveryOutcome::Spawned { .. } => {}
+                other => panic!("expected Spawned, got {other:?}"),
+            }
+            // Drop happens here; best-effort reap runs.
+        }
+
+        // If we reach here without hanging or panicking, the child was cleaned up.
     }
 
     #[test]

@@ -55,11 +55,27 @@ fn recovery_cmd_fires_once_per_stall_within_debounce() {
     let second = rec.on_stall(42);
 
     match first {
-        RecoveryOutcome::Reaped { status, .. } => {
-            assert!(status.success(), "touch failed: {status:?}")
-        }
+        RecoveryOutcome::Spawned { .. } => {}
         other => panic!("first stall should have spawned, got {other:?}"),
     }
+
+    // Reap the child to confirm it succeeded.
+    let deadline = Instant::now() + Duration::from_millis(500);
+    loop {
+        if Instant::now() >= deadline {
+            panic!("timed out waiting for recovery child to be reaped");
+        }
+        let outcomes = rec.try_reap();
+        if let Some(o) = outcomes.into_iter().find_map(|o| match o {
+            RecoveryOutcome::Reaped { status, .. } => Some(status),
+            _ => None,
+        }) {
+            assert!(o.success(), "touch failed: {o:?}");
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
     assert!(
         matches!(second, RecoveryOutcome::Debounced),
         "second stall within debounce window should be debounced, got {second:?}"
@@ -78,10 +94,25 @@ fn recovery_cmd_template_substitutes_pid() {
 
     let outcome = rec.on_stall(12345);
     match outcome {
-        RecoveryOutcome::Reaped { status, .. } => {
-            assert!(status.success(), "echo failed: {status:?}")
+        RecoveryOutcome::Spawned { .. } => {}
+        other => panic!("expected Spawned, got {other:?}"),
+    }
+
+    // Reap the child to confirm it succeeded.
+    let deadline = Instant::now() + Duration::from_millis(500);
+    loop {
+        if Instant::now() >= deadline {
+            panic!("timed out waiting for recovery child to be reaped");
         }
-        other => panic!("expected Reaped, got {other:?}"),
+        let outcomes = rec.try_reap();
+        if let Some(o) = outcomes.into_iter().find_map(|o| match o {
+            RecoveryOutcome::Reaped { status, .. } => Some(status),
+            _ => None,
+        }) {
+            assert!(o.success(), "echo failed: {o:?}");
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
     }
 
     let body = std::fs::read_to_string(log.as_path()).expect("read log");
