@@ -1,0 +1,130 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  ci:
+    name: gate
+    runs-on: ubuntu-latest
+    steps:
+      - name: checkout
+        uses: actions/checkout@v4
+
+      - name: rust toolchain (stable + rustfmt + clippy)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: cargo fmt --check
+        run: cargo fmt --all -- --check
+
+      - name: clippy (all-features)
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+      - name: clippy (no-default-features)
+        run: cargo clippy --workspace --all-targets --no-default-features -- -D warnings
+
+      - name: tests (all-features, -D warnings)
+        run: cargo test --workspace --all-features
+        env:
+          RUSTFLAGS: -D warnings
+
+      - name: doc-tests (all-features)
+        run: cargo test --doc --workspace --all-features
+
+      - name: release build
+        run: cargo build --workspace --release
+
+      - name: examples build (all-features)
+        run: cargo build --workspace --examples --all-features
+
+      - name: zero-dep audit (varta-vlp)
+        run: |
+          awk '/^\[dependencies\]$/{f=1;next} /^\[/{f=0} f && NF{print "FAIL " FILENAME ": " $0; exit 1}' crates/varta-vlp/Cargo.toml
+
+      - name: zero-dep audit (varta-client)
+        run: |
+          awk '/^\[dependencies\]$/{f=1;next} /^\[/{f=0} f && NF{print "FAIL " FILENAME ": " $0; exit 1}' crates/varta-client/Cargo.toml
+
+      - name: zero-dep audit (varta-watch)
+        run: |
+          awk '/^\[dependencies\]$/{f=1;next} /^\[/{f=0} f && NF{print "FAIL " FILENAME ": " $0; exit 1}' crates/varta-watch/Cargo.toml
+
+      - name: TDD ledger audit
+        run: |
+          set -e
+          for n in 01 02 03 04 05 06; do
+            f=docs/roadmap/varta-v0-1-0/session-$n-handoff.md
+            grep -qE '^### RED( |$)'   "$f" || { echo "FAIL: $f missing RED block"; exit 1; }
+            grep -qE '^### GREEN( |$)' "$f" || { echo "FAIL: $f missing GREEN block"; exit 1; }
+            echo "OK ledger $f"
+          done
+          f=docs/roadmap/varta-v0-1-0/session-07-handoff.md
+          grep -q 'n/a — docs-only session' "$f" || { echo "FAIL: $f missing docs-only ledger note"; exit 1; }
+          echo "OK ledger $f (docs-only)"
+
+      - name: acceptance contract audit
+        run: |
+          set -e
+          contract='connect_succeeds_when_observer_socket_exists|crates/varta-client/tests/acceptance.rs|test
+          beat_emits_canonical_32_byte_frame|crates/varta-client/tests/acceptance.rs|test
+          beat_increments_nonce_monotonically|crates/varta-client/tests/acceptance.rs|test
+          beat_returns_dropped_when_observer_absent|crates/varta-client/tests/acceptance.rs|test
+          beat_makes_zero_heap_allocations_after_init|crates/varta-client/tests/zero_alloc.rs|test
+          observer_emits_beat_per_received_frame|crates/varta-watch/tests/acceptance.rs|test
+          observer_emits_stall_after_threshold_elapses|crates/varta-watch/tests/acceptance.rs|test
+          observer_reports_decode_error_for_bad_magic|crates/varta-watch/tests/acceptance.rs|test
+          tracker_capacity_bounded_to_64_pids|crates/varta-watch/tests/acceptance.rs|test
+          panic_handler_emits_critical_beat_before_unwind|crates/varta-client/tests/panic_feature.rs|test
+          panic_handler_preserves_original_panic_outcome|crates/varta-client/tests/panic_feature.rs|test
+          panic_module_excluded_without_feature|crates/varta-client/tests/panic_feature.rs|test
+          recovery_cmd_fires_once_per_stall_within_debounce|crates/varta-watch/tests/recovery_e2e.rs|test
+          recovery_cmd_template_substitutes_pid|crates/varta-watch/tests/recovery_e2e.rs|test
+          prom_exporter_reports_beats_total_per_pid|crates/varta-watch/tests/exporter_endpoint.rs|test
+          prom_exporter_reports_stalls_total_per_pid|crates/varta-watch/tests/exporter_endpoint.rs|test
+          file_exporter_appends_one_line_per_event|crates/varta-watch/tests/exporter_endpoint.rs|test
+          cli_help_lists_every_documented_flag|crates/varta-watch/tests/cli_smoke.rs|test
+          client_to_observer_to_recovery_full_loop|crates/varta-tests/tests/end_to_end.rs|no-harness
+          panic_handler_critical_beat_visible_in_metrics|crates/varta-tests/tests/end_to_end.rs|no-harness
+          bench_latency_p99_under_one_microsecond|crates/varta-bench/src/main.rs|bench-assertion
+          bench_observer_cpu_under_zero_point_one_percent|crates/varta-bench/src/main.rs|bench-assertion
+          bench_binary_size_delta_under_twenty_kilobytes|crates/varta-bench/src/main.rs|bench-assertion'
+          echo "$contract" | sed 's/^[[:space:]]*//' | while IFS='|' read -r name file kind; do
+            [ -z "$name" ] && continue
+            case "$kind" in
+              test|no-harness)
+                grep -qE "^[[:space:]]*fn[[:space:]]+${name}\b" "$file" \
+                  || { echo "FAIL [$kind] $name @ $file"; exit 1; }
+                ;;
+              bench-assertion)
+                grep -qF "$name" "$file" \
+                  || { echo "FAIL [bench] $name @ $file"; exit 1; }
+                ;;
+            esac
+            echo "OK [$kind] $name"
+          done
+
+      - name: ignore audit
+        run: |
+          set -e
+          # Find every #[ignore] in tests; each must have a // JUSTIFY: comment within ±2 lines.
+          matches=$(git grep -nE '^[[:space:]]*#\[ignore' -- 'crates/**/tests/*.rs' || true)
+          if [ -z "$matches" ]; then
+            echo "OK no #[ignore] tests in tree"
+            exit 0
+          fi
+          echo "$matches" | while IFS=: read -r f l _; do
+            start=$((l-2)); [ "$start" -lt 1 ] && start=1
+            end=$((l+2))
+            if sed -n "${start},${end}p" "$f" | grep -q 'JUSTIFY:'; then
+              echo "OK $f:$l #[ignore] (justified)"
+            else
+              echo "FAIL $f:$l #[ignore] without adjacent JUSTIFY"
+              exit 1
+            fi
+          done
+
+      - name: bench latency (record only — never fails CI)
+        run: cargo run -p varta-bench --release -- latency || true
