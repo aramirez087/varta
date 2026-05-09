@@ -1,0 +1,43 @@
+# Varta
+
+> Zero dependencies. Zero allocations. Agents that never go dark.
+
+A 32-byte heartbeat protocol for distributed local agents and networked clusters. Your processes talk; Varta listens.
+
+## Key Properties
+- **Zero dependencies:** Production crates (`varta-vlp`, `varta-client`, `varta-watch`) have an empty `[dependencies]` section.
+- **Zero steady-state allocation:** After `Varta::connect`, every `beat()` call operates on a stack buffer. 
+- **Sub-microsecond beat path:** One stack encode, one `send(2)`, no allocations.
+- **Non-blocking:** The agent socket is set to non-blocking at connect time. A missing observer surfaces as `BeatOutcome::Dropped`, preventing stalls.
+
+## Usage
+`varta-client` is the agent API. 
+```rust
+use varta_client::{BeatOutcome, Status, Varta};
+
+let mut agent = Varta::connect("/tmp/varta.sock").unwrap();
+// or connect_udp("192.168.1.100:9000")
+
+// In the hot path:
+match agent.beat(Status::Ok, 0) {
+    BeatOutcome::Sent => {},
+    BeatOutcome::Dropped => {}, // Observer absent, safe
+    BeatOutcome::Failed(e) => {}, 
+}
+```
+
+## Crates
+1. `varta-vlp`: 32-byte wire protocol defining `Frame`, `Status`, and stack-based encode/decode (with optional ChaCha20-Poly1305 AEAD crypto).
+2. `varta-client`: The agent API (features: `panic-handler`, `udp`, `crypto` for SecureUdpTransport).
+3. `varta-watch`: The observer binary. Detects stalls, runs recovery commands, exports Prometheus metrics (supports SecureUdpListener).
+## Official Clients
+In addition to the Rust reference client, official client libraries exist under `clients/` with independent semver, shared test vectors, and interop testing in CI:
+- **Python**: `pip install varta` -> [`clients/python/`](clients/python/)
+- **Go**: `go get github.com/aramirez087/Varta/clients/go` -> [`clients/go/`](clients/go/)
+- **Node.js**: `npm install @varta-health/client` -> [`clients/node/`](clients/node/)
+- **.NET**: `dotnet add package Varta.Client` -> [`clients/dotnet/`](clients/dotnet/)
+- **JVM (Java)**: `implementation("health.varta:varta-client:0.1.0")` -> [`clients/java/`](clients/java/)
+
+## Links
+- Website: https://varta.sh
+- Repository: https://github.com/aramirez087/varta

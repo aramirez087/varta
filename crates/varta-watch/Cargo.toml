@@ -1,0 +1,147 @@
+[package]
+name = "varta-watch"
+version = "0.2.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "Varta observer — receives VLP frames and surfaces stalls."
+authors = ["Alexander Ramirez"]
+repository = "https://github.com/aramirez087/Varta"
+documentation = "https://docs.rs/varta-watch"
+readme = "README.md"
+categories = ["command-line-utilities", "network-programming", "os"]
+keywords = ["monitoring", "watchdog", "healthcheck", "prometheus", "safety-critical"]
+rust-version = "1.70.0"
+# Std-only build script.  When `compile-time-config` is active it parses
+# $VARTA_CONFIG_FILE (KEY=VALUE) and emits constants into $OUT_DIR; when
+# the feature is absent it writes an empty stub so config.rs's `include!`
+# is always valid.  Uses only the standard library — does not violate the
+# zero-registry-dependency rule (build-deps would not violate it either,
+# but we keep things tight).
+build = "build.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+
+[features]
+default = ["json-log"]
+# Internal: shared UDP socket wiring (UdpSocket bind/recv) used by both
+# secure and plaintext UDP listeners.  Not user-facing on its own —
+# enable `secure-udp` or `unsafe-plaintext-udp` instead.
+udp-core = []
+# Enable the AEAD-authenticated UDP listener (ChaCha20-Poly1305).  This
+# is the recommended UDP transport — the only one with cryptographic
+# sender authentication.
+secure-udp = ["udp-core", "varta-vlp/crypto"]
+# UNSAFE: enable the unauthenticated plaintext UDP listener.  Any device
+# with network reach to the bound port can inject heartbeats, suppress
+# stall detection, or trigger false recovery commands.  Even with this
+# feature compiled in, the listener will refuse to bind at runtime
+# unless `--i-accept-plaintext-udp` is passed.  Do not enable in
+# production builds.
+unsafe-plaintext-udp = ["udp-core"]
+# Emit structured JSON lines to stderr instead of plain eprintln!.
+# Each line is a self-contained JSON object with ts_ns, level, msg,
+# and optional context fields (pid, child_pid, error).  Suitable for
+# SIEM / syslog ingestion in hospital IT environments.
+json-log = []
+# Enable tamper-evident SHA-256 hash chaining on the recovery audit log.
+# Required for IEC 62304 Class C (medical / safety-critical) deployments —
+# without it, audit records carry a literal '-' in the chain column and
+# the daemon emits a startup warning that the build is not Class-C-
+# conforming.  Propagates the existing optional crypto deps from
+# `varta-vlp/crypto`; varta-watch itself stays registry-dep-free.
+audit-chain = ["varta-vlp/crypto"]
+# Test-only instrumentation — zero effect on the production code path when
+# absent.  Adds `--inject-wedge-ms <MS>` to artificially stall the poll
+# loop for the self-watchdog integration test.  Never enabled in
+# production builds; not listed as unsafe-* because it adds no security
+# surface — it merely slows one iteration.
+test-hooks = []
+# Compile in the Prometheus HTTP text-format exporter (`PromExporter`),
+# the TCP accept loop, the bearer-token loader, the per-IP rate-limit
+# table, and the `--prom-*` argv flags.  When absent, the entire HTTP
+# surface is excluded from the binary (verified by the CI `strings`
+# audit): the only exporter linked is `FileExporter`.  Enable for SRE /
+# cloud deployments that scrape `/metrics`; leave off for safety-critical
+# builds where a network-reachable HTTP server in the observer's address
+# space is a liability.  Cannot be combined with `compile-time-config`
+# (enforced by `compile_error!` in lib.rs).
+prometheus-exporter = ["varta-vlp/crypto"]
+# Replace runtime argv parsing with a compile-time-baked Config produced
+# by `build.rs` from the file at $VARTA_CONFIG_FILE.  The 292-arm
+# `Config::from_args` and the multi-page `Config::HELP` flag listing are
+# excluded from the binary; the runtime accepts zero argv tokens (any
+# non-empty argv is a startup error).  Removes the GNU-style argv parser
+# CVE surface from safety-critical (Class-A) builds.  Cannot be combined
+# with `prometheus-exporter` (the HTTP exporter has no opt-in path
+# without argv).  See book/src/architecture/compile-time-config.md.
+compile-time-config = []
+# Test-only: expose normally-private bounded-collection modules (`probe_table`,
+# `outstanding_table`, `ip_state_table`) under a stable `__fuzz_internals`
+# path so the `fuzz/` crate can drive them directly. Not enabled in any
+# production build; the CI `zero-dep audit` is not affected because no new
+# registry dependencies are introduced.
+fuzzing = ["prometheus-exporter"]
+# Test-only: force `recv_authenticated` to use the `SocketModeOnly` plain-recv
+# fallback on any platform, including Linux/macOS where the kernel-attested
+# path would normally be selected. Allows the `socket_mode_only_fallback`
+# integration test to exercise the `BeatOrigin::SocketModeOnly` recovery-
+# refusal path on the CI host without requiring a platform that lacks
+# per-datagram credentials. Never enabled in production builds.
+force-socketmode-fallback = []
+# Excise the inline-asm `varta_signal_restorer` trampoline and the direct
+# `rt_sigaction(2)` syscall path from compilation entirely.  When enabled,
+# only the libc `sigaction(3)` wrapper is linked (zero registry deps — pure
+# `extern "C"`); the runtime default flips to `SignalHandlerMode::Libc`; and
+# `--signal-handler-mode=direct` is rejected at argv.  Cannot be combined
+# with `compile-time-config` (enforced by `compile_error!` in lib.rs) —
+# Class-A safety-critical builds retain end-to-end kernel-ABI ownership.
+# See book/src/architecture/signal-install.md.
+libc-signal-mode = []
+
+[dependencies.varta-vlp]
+path = "../varta-vlp"
+version = "0.2.0"
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "varta-watch"
+path = "src/main.rs"
+
+# cargo-binstall metadata — adopters with a Rust toolchain skip the
+# `curl | sh` path and run `cargo binstall varta-watch`. Same signed
+# tarball, same SBOM, same SLSA provenance as the GitHub Release
+# artifact; binstall just resolves the platform triple, downloads, and
+# verifies the sha256 sidecar. See book/src/operations/install.md.
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/varta-watch-v{ version }-{ target-family }-{ target-arch }{ archive-suffix }"
+bin-dir = "varta-watch-v{ version }-{ target-family }-{ target-arch }/{ bin }{ binary-ext }"
+pkg-fmt = "tgz"
+
+[package.metadata.binstall.overrides.x86_64-unknown-linux-musl]
+pkg-url = "{ repo }/releases/download/v{ version }/varta-watch-v{ version }-linux-amd64-musl.tar.gz"
+bin-dir = "varta-watch-v{ version }-linux-amd64-musl/{ bin }"
+
+[package.metadata.binstall.overrides.aarch64-unknown-linux-musl]
+pkg-url = "{ repo }/releases/download/v{ version }/varta-watch-v{ version }-linux-arm64-musl.tar.gz"
+bin-dir = "varta-watch-v{ version }-linux-arm64-musl/{ bin }"
+
+[package.metadata.binstall.overrides.x86_64-unknown-linux-gnu]
+pkg-url = "{ repo }/releases/download/v{ version }/varta-watch-v{ version }-linux-amd64.tar.gz"
+bin-dir = "varta-watch-v{ version }-linux-amd64/{ bin }"
+
+[package.metadata.binstall.overrides.aarch64-unknown-linux-gnu]
+pkg-url = "{ repo }/releases/download/v{ version }/varta-watch-v{ version }-linux-arm64.tar.gz"
+bin-dir = "varta-watch-v{ version }-linux-arm64/{ bin }"
+
+[package.metadata.binstall.overrides.x86_64-apple-darwin]
+pkg-url = "{ repo }/releases/download/v{ version }/varta-watch-v{ version }-darwin-amd64.tar.gz"
+bin-dir = "varta-watch-v{ version }-darwin-amd64/{ bin }"
+
+[package.metadata.binstall.overrides.aarch64-apple-darwin]
+pkg-url = "{ repo }/releases/download/v{ version }/varta-watch-v{ version }-darwin-arm64.tar.gz"
+bin-dir = "varta-watch-v{ version }-darwin-arm64/{ bin }"

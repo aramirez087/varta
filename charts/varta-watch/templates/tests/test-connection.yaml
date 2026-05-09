@@ -1,0 +1,70 @@
+{{- if .Values.prometheus.bindAddr -}}
+apiVersion: v1
+kind: Pod
+metadata:
+  name: "{{ include "varta-watch.fullname" . }}-test-connection"
+  namespace: {{ include "varta-watch.namespace" . }}
+  labels:
+    {{- include "varta-watch.labels" . | nindent 4 }}
+  annotations:
+    "helm.sh/hook": test
+    # NOTE: do NOT include hook-succeeded here. `helm test --logs` reads pod
+    # logs AFTER the pod terminates; if hook-succeeded deletes the pod on
+    # success, the subsequent log fetch races and fails with
+    # `unable to get pod logs ...: pods "..." not found`. before-hook-creation
+    # cleans up on the NEXT `helm test` run, which is sufficient.
+    "helm.sh/hook-delete-policy": before-hook-creation
+spec:
+  restartPolicy: Never
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 65532
+    runAsGroup: 65532
+    fsGroup: 65532
+    seccompProfile:
+      type: RuntimeDefault
+  initContainers:
+    {{- include "varta-watch.tokenInitContainer" . | nindent 4 }}
+  containers:
+    - name: curl
+      image: curlimages/curl:8.10.1
+      command: ["/bin/sh", "-c"]
+      args:
+        - |
+          set -eu
+          token=$(cat /etc/varta/prom.token)
+          url="http://{{ include "varta-watch.fullname" . }}.{{ include "varta-watch.namespace" . }}.svc:{{ .Values.service.port }}/metrics"
+          echo "GET $url" >&2
+          if ! body=$(curl -fsS -H "Authorization: Bearer $token" "$url" 2>&1); then
+            echo "curl failed: $body" >&2
+            exit 1
+          fi
+          if printf '%s\n' "$body" | grep -q '^varta_watch_uptime_seconds '; then
+            echo OK
+            exit 0
+          fi
+          echo "metric varta_watch_uptime_seconds missing from /metrics body; first 10 lines follow:" >&2
+          printf '%s\n' "$body" | head -10 >&2
+          exit 1
+      securityContext:
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        capabilities:
+          drop: ["ALL"]
+      volumeMounts:
+        - name: token
+          mountPath: /etc/varta
+          readOnly: true
+  volumes:
+    - name: token-source
+      secret:
+        secretName: {{ include "varta-watch.tokenSecretName" . }}
+        items:
+          - key: {{ include "varta-watch.tokenSecretKey" . }}
+            path: prom.token
+        defaultMode: 0400
+    - name: token
+      emptyDir:
+        medium: Memory
+        sizeLimit: 4Ki
+{{- end -}}

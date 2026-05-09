@@ -1,0 +1,31 @@
+Thanks for installing varta-watch {{ .Chart.AppVersion }}.
+
+Release name:  {{ .Release.Name }}
+Namespace:     {{ include "varta-watch.namespace" . }}
+Mode:          {{ .Values.mode }}
+Image:         {{ include "varta-watch.image" . }}
+
+==> Verify the observer is healthy:
+
+    kubectl -n {{ include "varta-watch.namespace" . }} get {{ if eq .Values.mode "daemonset" }}daemonset{{ else }}deployment{{ end }} {{ include "varta-watch.fullname" . }}
+
+==> Scrape /metrics from inside the cluster:
+
+    TOKEN=$(kubectl -n {{ include "varta-watch.namespace" . }} get secret {{ include "varta-watch.tokenSecretName" . }} -o jsonpath='{.data.{{ include "varta-watch.tokenSecretKey" . }}}' | base64 -d)
+    kubectl -n {{ include "varta-watch.namespace" . }} run curl-test --rm -it --image=curlimages/curl:8.10.1 --restart=Never -- \
+        curl -sS -H "Authorization: Bearer $TOKEN" \
+        http://{{ include "varta-watch.fullname" . }}.{{ include "varta-watch.namespace" . }}.svc:{{ .Values.service.port }}/metrics | head
+
+==> Run the Helm test pod (asserts the bearer token + endpoint work):
+
+    helm test {{ .Release.Name }} -n {{ .Release.Namespace }}
+
+{{ if .Values.dashboard.enabled -}}
+==> Grafana dashboard:
+
+    The dashboard is shipped as ConfigMap '{{ include "varta-watch.fullname" . }}-dashboard'
+    with label '{{ .Values.dashboard.label }}={{ .Values.dashboard.labelValue }}' — the Grafana sidecar will auto-import it.
+
+{{ end -}}
+==> Operator guide:    https://varta.sh/book/operations/helm.html
+==> Threat model:      https://varta.sh/book/architecture/threat-model.html

@@ -1,0 +1,45 @@
+---
+# Drop-in Prometheus scrape configuration for varta-watch.
+#
+# Paste the `scrape_configs:` block into your `prometheus.yml`. Adjust:
+#   - targets:           hostname(s) running varta-watch
+#   - credentials_file:  path to the bearer token (must match
+#                        --prom-token-file passed to varta-watch)
+#
+# Compatibility: Prometheus >= 2.40.
+#
+# Sizing notes:
+#   - scrape_interval >= 15s keeps comfortable headroom under the default
+#     scrape budget (--scrape-budget-ms 250). Tighter intervals are fine on
+#     well-provisioned hosts.
+#   - varta-watch's built-in per-IP rate limit defaults to 5 req/IP/s with
+#     burst 10 (--prom-rate-limit-per-sec / --prom-rate-limit-burst). A
+#     single Prometheus scraper at 15s interval is well within the limit.
+#     Multiple scrapers (HA Prometheus pair) at <2s combined interval will
+#     start tripping the limit -- raise the burst or split the scrape set.
+#   - scrape_timeout < scrape_interval (Prometheus enforces this).
+
+scrape_configs:
+  - job_name: varta-watch
+    metrics_path: /metrics
+    scheme: http
+    static_configs:
+      - targets:
+          - 'varta-host.internal:9100'
+        labels:
+          service: varta-watch
+    authorization:
+      type: Bearer
+      credentials_file: /etc/prometheus/varta-token
+    scrape_interval: 15s
+    scrape_timeout: 10s
+    # Optional: drop noisy debug metrics by uncommenting.
+    # metric_relabel_configs:
+    #   - source_labels: [__name__]
+    #     regex: 'varta_log_suppressed_total'
+    #     action: drop
+
+  # ----- Optional: kube-prometheus ServiceMonitor pattern -----
+  # If running under the prometheus-operator, prefer the ServiceMonitor CRD
+  # at observability/examples/kubernetes/varta-watch.servicemonitor.yaml
+  # over this static_configs block.

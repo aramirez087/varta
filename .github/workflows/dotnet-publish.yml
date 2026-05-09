@@ -1,0 +1,48 @@
+name: publish-dotnet-client
+
+# Publish Varta.Client to NuGet.org on tags `dotnet-vX.Y.Z`.
+#
+# Required GitHub secret (Actions scope):
+#   NUGET_API_KEY  — NuGet.org API key scoped to Varta.Client
+
+on:
+  push:
+    tags: ["dotnet-v*"]
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-publish:
+    name: build & publish to NuGet
+    runs-on: ubuntu-latest
+    environment:
+      name: nuget-publish
+      url: https://www.nuget.org/packages/Varta.Client
+    steps:
+      - name: checkout
+        uses: actions/checkout@v4
+
+      - name: setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: |
+            8.x
+            10.x
+
+      - name: restore
+        working-directory: clients/dotnet
+        run: dotnet restore src/Varta.Client/Varta.Client.csproj
+
+      - name: build
+        working-directory: clients/dotnet
+        run: dotnet build src/Varta.Client/Varta.Client.csproj --configuration Release --no-restore
+
+      - name: pack
+        working-directory: clients/dotnet
+        run: dotnet pack src/Varta.Client/Varta.Client.csproj --configuration Release --no-build --output nupkg
+
+      - name: publish to NuGet.org
+        working-directory: clients/dotnet
+        run: dotnet nuget push nupkg/*.nupkg --source https://api.nuget.org/v3/index.json --api-key ${{ secrets.NUGET_API_KEY }} --skip-duplicate

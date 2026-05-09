@@ -1,0 +1,12 @@
+# Kani Rust Verifier configuration for varta-vlp.
+#
+# Symbolic verification of Frame::decode and its supporting primitives.
+# See book/src/architecture/verification.md for the full strategy.
+#
+# default-unwind = 64 covers the 28-iteration CRC-32C loop in
+# crc32c::compute over a 28-byte payload with margin.  Decode harnesses
+# (frame.rs) only iterate over fixed-size 32-byte arrays so they are
+# unwind-insensitive.
+
+[flags]
+default-unwind = 64

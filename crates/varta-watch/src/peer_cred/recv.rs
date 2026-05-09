@@ -1,0 +1,409 @@
+//! Public receive path — `enable_credential_passing` and `recv_authenticated`.
+//!
+//! These are the two functions the observer calls every iteration of its
+//! poll loop: once at setup (`enable_credential_passing`) and once per
+//! datagram (`recv_authenticated`). The body is intentionally
+//! cfg-branched on `target_os` for the `Msghdr` field-order differences;
+//! everything else delegates to `super::plat` and `super::cmsg_*`.
+
+use std::io;
+
+use super::plat;
+use super::{observer_uid, BeatOrigin, RecvResult};
+
+/// Classify a kernel-attested UDS beat by the PID the kernel attributed to it.
+///
+/// A nonzero `peer_pid` means the kernel named a concrete sending process, so
+/// the observer can (and does) enforce the `frame.pid == peer_pid` binding the
+/// [`BeatOrigin::KernelAttested`] contract promises — recovery is eligible.
+///
+/// A zero `peer_pid` is the macOS sentinel returned by
+/// [`super::macos_fallback::pid_uid_from_results`] when every
+/// `getsockopt` credential mechanism fails: the kernel attributed the datagram
+/// to **no** recognisable peer. Tagging that `KernelAttested` would skip both
+/// the UID check and the `frame.pid == peer_pid` binding (both guarded by
+/// `peer_pid != 0`), letting any same-UID process forge `frame.pid` and drive
+/// recovery for a victim pid. Collapse to [`BeatOrigin::SocketModeOnly`]
+/// instead — trust derives from socket-file permissions only and the recovery
+/// gate refuses it. See CLAUDE.md hard constraint #8.
+// Unused on platforms that reach only the socket-mode fallback block (and
+// under `force-socketmode-fallback`); the kernel-attested path is its sole
+// caller.
+#[allow(dead_code)]
+fn origin_for_peer_pid(peer_pid: u32) -> BeatOrigin {
+    if peer_pid != 0 {
+        BeatOrigin::KernelAttested
+    } else {
+        BeatOrigin::SocketModeOnly
+    }
+}
+
+/// Enable the kernel to attach sender credentials to every received datagram.
+///
+/// Must be called once after the observer binds its socket and before the
+/// first call to [`recv_authenticated`].
+///
+/// On Linux this sets `SO_PASSCRED` so the kernel includes `SCM_CREDENTIALS`
+/// ancillary data on every datagram.  On FreeBSD / DragonFly / NetBSD this
+/// sets `LOCAL_CREDS` so the kernel includes `SCM_CREDS` ancillary data
+/// (struct cmsgcred).  On illumos / Solaris this sets `SO_RECVUCRED` so the
+/// kernel includes `SCM_UCRED` ancillary data (opaque `ucred_t`).  On macOS
+/// pathname UDS and all other platforms this is a no-op; they fall back to
+/// socket-mode-only defence.
+pub(crate) fn enable_credential_passing(fd: i32) -> io::Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        let (level, optname) = (plat::SOL_SOCKET, plat::SO_PASSCRED);
+        let one: i32 = 1;
+        // SAFETY: `setsockopt(2)` with `SO_PASSCRED` (see `socket(7)` and
+        // `unix(7)`) reads `optlen` bytes from `optval`.
+        // - `fd` is the observer's UDS receive socket (freshly bound by the
+        //   listener immediately before this call).
+        // - `addr_of!(one)` produces a valid pointer to a stack-local i32
+        //   that outlives the call.
+        // - `optlen == size_of::<i32>()` matches what the kernel reads.
+        // - The return value is checked; on error we surface the errno.
+        let ret = unsafe {
+            plat::setsockopt(
+                fd,
+                level,
+                optname,
+                core::ptr::addr_of!(one) as *const core::ffi::c_void,
+                core::mem::size_of::<i32>() as u32,
+            )
+        };
+        if ret != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    #[cfg(any(target_os = "freebsd", target_os = "dragonfly", target_os = "netbsd"))]
+    {
+        let (level, optname) = (plat::SOL_SOCKET, plat::LOCAL_CREDS);
+        let one: i32 = 1;
+        // SAFETY: `setsockopt(2)` with `LOCAL_CREDS` (see `unix(4)`) reads
+        // `optlen` bytes from `optval`. Same invariants as the Linux branch
+        // above: `fd` is the freshly bound UDS receive socket, `addr_of!`
+        // yields a valid pointer to a stack-local i32, `optlen` matches.
+        let ret = unsafe {
+            plat::setsockopt(
+                fd,
+                level,
+                optname,
+                core::ptr::addr_of!(one) as *const core::ffi::c_void,
+                core::mem::size_of::<i32>() as u32,
+            )
+        };
+        if ret != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    #[cfg(any(target_os = "illumos", target_os = "solaris"))]
+    {
+        let (level, optname) = (plat::SOL_SOCKET, plat::SO_RECVUCRED);
+        let one: i32 = 1;
+        // SAFETY: `setsockopt(2)` with `SO_RECVUCRED` (see `socket(3SOCKET)`
+        // on illumos/Solaris) reads `optlen` bytes from `optval`. Same
+        // invariants as the Linux branch above.
+        let ret = unsafe {
+            plat::setsockopt(
+                fd,
+                level,
+                optname,
+                core::ptr::addr_of!(one) as *const core::ffi::c_void,
+                core::mem::size_of::<i32>() as u32,
+            )
+        };
+        if ret != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    #[cfg(not(any(
+        target_os = "linux",
+        target_os = "freebsd",
+        target_os = "dragonfly",
+        target_os = "netbsd",
+        target_os = "illumos",
+        target_os = "solaris",
+    )))]
+    {
+        let _ = fd;
+        Ok(())
+    }
+}
+
+/// Receive one datagram from `fd` and extract its kernel-attested sender PID.
+///
+/// Returns [`RecvResult::Authenticated`] with the peer PID and the 32-byte
+/// frame payload. Timed-out reads yield [`RecvResult::WouldBlock`]; short
+/// reads yield [`RecvResult::ShortRead`]; fatal errors yield
+/// [`RecvResult::IoError`].
+///
+/// On platforms with per-datagram kernel credential passing (Linux, FreeBSD,
+/// DragonFly, NetBSD, illumos, Solaris) a beat the kernel attributed to a
+/// concrete peer (`peer_pid != 0`) carries `origin =
+/// BeatOrigin::KernelAttested`. macOS pathname datagram sockets do not expose
+/// per-datagram credentials to an unconnected observer socket, so they
+/// downgrade to `origin = BeatOrigin::SocketModeOnly` through the zero-PID
+/// sentinel path. On platforms with no kernel credential passing the beat
+/// likewise carries `origin = BeatOrigin::SocketModeOnly` with `peer_pid = 0`.
+/// Recovery commands are refused for every `SocketModeOnly` beat.
+pub(crate) fn recv_authenticated(fd: i32) -> RecvResult {
+    // --- recvmsg credential path (Linux / macOS / BSD / illumos / Solaris) -
+    //
+    // Suppressed when `force-socketmode-fallback` is active so that the
+    // generic fallback block below is reached on any host — enabling the
+    // integration test to exercise `BeatOrigin::SocketModeOnly` on Linux CI.
+    #[cfg(all(
+        not(feature = "force-socketmode-fallback"),
+        any(
+            target_os = "linux",
+            target_os = "macos",
+            target_os = "freebsd",
+            target_os = "dragonfly",
+            target_os = "netbsd",
+            target_os = "illumos",
+            target_os = "solaris",
+        )
+    ))]
+    {
+        let mut data = [0u8; 32];
+
+        #[repr(align(8))]
+        struct AncBuf([u8; plat::ANCILLARY_BUFFER_SIZE]);
+        let mut anc = AncBuf([0u8; plat::ANCILLARY_BUFFER_SIZE]);
+
+        let mut iov = plat::Iovec {
+            iov_base: data.as_mut_ptr() as *mut core::ffi::c_void,
+            iov_len: 32,
+        };
+
+        let mut mhdr = plat::msghdr_for_recv(
+            &mut iov,
+            anc.0.as_mut_ptr() as *mut core::ffi::c_void,
+            plat::ANCILLARY_BUFFER_SIZE,
+        );
+
+        let n = loop {
+            // SAFETY: `recvmsg(2)` reads from `fd` and writes:
+            //   - up to `iov.iov_len` (= 32) bytes into the `data` stack array
+            //     via `iov.iov_base`;
+            //   - up to `ANCILLARY_BUFFER_SIZE` bytes of ancillary data into
+            //     the `anc` stack array via `mhdr.msg_control`;
+            //   - the actual control length into `mhdr.msg_controllen` and the
+            //     flags into `mhdr.msg_flags`.
+            // All pointed-to buffers are stack-allocated for the duration of
+            // this function. The `Msghdr` field layout is verified at compile
+            // time by `offset_of!` assertions in `plat`. `&mut mhdr` is the
+            // single exclusive borrow for the duration of the call. The return
+            // value is checked below: `< 0` is errno, `>= 0` is byte count.
+            let ret = unsafe { plat::recvmsg(fd, &mut mhdr, 0) };
+            if ret < 0 {
+                let err = io::Error::last_os_error();
+                match err.kind() {
+                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut => {
+                        return RecvResult::WouldBlock;
+                    }
+                    io::ErrorKind::Interrupted => continue,
+                    _ => return RecvResult::IoError(err),
+                }
+            }
+            break ret;
+        };
+
+        if plat::ctrl_truncated(&mhdr) {
+            return RecvResult::CtrlTruncated(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "ancillary data truncated by kernel (ANCILLARY_BUFFER_SIZE too small)",
+            ));
+        }
+
+        if n as usize != 32 {
+            return RecvResult::ShortRead;
+        }
+
+        let (peer_pid, peer_uid) = match plat::peer_pid_after_recv(fd, &mhdr) {
+            Some((pid, uid)) => (pid, uid),
+            None => {
+                return RecvResult::IoError(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "kernel did not attach peer credentials",
+                ));
+            }
+        };
+
+        let my_uid = observer_uid();
+        if peer_pid != 0 && peer_uid != my_uid {
+            return RecvResult::IoError(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!(
+                    "peer credential UID mismatch: kernel reports uid {peer_uid}, expected uid {my_uid}"
+                ),
+            ));
+        }
+
+        // PID-namespace inode resolution is intentionally NOT done here.
+        // It is deferred to the observer poll loop, which resolves it only
+        // after the global rate limiter has admitted the frame. Resolving it
+        // per recvmsg would let a datagram flood force one
+        // readlink(/proc/<pid>/ns/pid) syscall per packet regardless of the
+        // limiter — defeating its purpose of shedding namespace
+        // classification work under a rotation attack. `None` here means
+        // "unresolved"; the observer fills it in for kernel-attested peers
+        // (`peer_pid != 0`). See `Observer::poll_pending`.
+        RecvResult::Authenticated {
+            peer_pid,
+            peer_uid,
+            peer_pid_ns_inode: None,
+            // Derived from attestation — NOT hardcoded. A zero `peer_pid`
+            // (macOS getsockopt sentinel) downgrades to SocketModeOnly so the
+            // recovery gate refuses a beat whose `frame.pid` was never bound
+            // to a kernel-attested peer. See `origin_for_peer_pid`.
+            origin: origin_for_peer_pid(peer_pid),
+            data,
+        }
+    }
+
+    // --- Socket-mode-only fallback (OpenBSD, AIX, HP-UX, … or test mode) --
+    //
+    // Platforms without per-datagram kernel credential passing, and any
+    // platform when `force-socketmode-fallback` is active. The only defence
+    // is `--socket-mode 0600`; any process under the same UID can reach this
+    // socket and forge `frame.pid`. Beats are tagged `SocketModeOnly`; the
+    // recovery gate refuses to spawn commands for them.
+    #[cfg(any(
+        feature = "force-socketmode-fallback",
+        not(any(
+            target_os = "linux",
+            target_os = "macos",
+            target_os = "freebsd",
+            target_os = "dragonfly",
+            target_os = "netbsd",
+            target_os = "illumos",
+            target_os = "solaris",
+        ))
+    ))]
+    {
+        extern "C" {
+            fn recv(fd: i32, buf: *mut core::ffi::c_void, len: usize, flags: i32) -> isize;
+        }
+
+        let mut data = [0u8; 32];
+        let n = loop {
+            // SAFETY: `recv(2)` writes up to `len` bytes into `data`, a
+            // stack-allocated 32-byte array. The buffer outlives the call.
+            // Return value: `< 0` is errno, `>= 0` is byte count.
+            let ret = unsafe { recv(fd, data.as_mut_ptr() as *mut core::ffi::c_void, 32, 0) };
+            if ret < 0 {
+                let err = io::Error::last_os_error();
+                match err.kind() {
+                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut => {
+                        return RecvResult::WouldBlock;
+                    }
+                    io::ErrorKind::Interrupted => continue,
+                    _ => return RecvResult::IoError(err),
+                }
+            }
+            break ret as isize;
+        };
+
+        if n as usize != 32 {
+            return RecvResult::ShortRead;
+        }
+
+        return RecvResult::Authenticated {
+            peer_pid: 0,
+            peer_uid: 0,
+            peer_pid_ns_inode: None,
+            origin: BeatOrigin::SocketModeOnly,
+            data,
+        };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{origin_for_peer_pid, BeatOrigin};
+
+    /// A concrete kernel-attested PID earns `KernelAttested` — the observer
+    /// will enforce `frame.pid == peer_pid` and recovery is eligible.
+    #[test]
+    fn nonzero_peer_pid_is_kernel_attested() {
+        assert_eq!(origin_for_peer_pid(4321), BeatOrigin::KernelAttested);
+        assert_eq!(origin_for_peer_pid(1), BeatOrigin::KernelAttested);
+        assert_eq!(origin_for_peer_pid(u32::MAX), BeatOrigin::KernelAttested);
+    }
+
+    /// Regression: the macOS getsockopt sentinel `(0, 0)` — the kernel
+    /// attributed the datagram to no recognisable peer — must NOT be tagged
+    /// `KernelAttested`. Otherwise the `frame.pid == peer_pid` binding and the
+    /// UID check (both guarded by `peer_pid != 0`) are skipped, and the
+    /// recovery gate would accept a beat whose `frame.pid` any same-UID
+    /// process can forge. Must collapse to `SocketModeOnly` (recovery
+    /// refused). See CLAUDE.md hard constraint #8.
+    #[test]
+    fn zero_peer_pid_collapses_to_socket_mode_only() {
+        assert_eq!(origin_for_peer_pid(0), BeatOrigin::SocketModeOnly);
+        assert_ne!(origin_for_peer_pid(0), BeatOrigin::KernelAttested);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_pathname_uds_recv_is_socket_mode_only() {
+        use super::{enable_credential_passing, recv_authenticated, RecvResult};
+        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::io::AsRawFd;
+        use std::os::unix::net::UnixDatagram;
+        use std::path::PathBuf;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        struct TempDir {
+            path: PathBuf,
+        }
+
+        impl Drop for TempDir {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.path);
+            }
+        }
+
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let dir = TempDir {
+            path: PathBuf::from(format!("/tmp/vmpc-{}-{unique}", std::process::id())),
+        };
+        std::fs::create_dir(&dir.path).expect("create temp dir");
+        std::fs::set_permissions(&dir.path, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod temp dir");
+        let socket_path = dir.path.join("varta.sock");
+
+        let server = UnixDatagram::bind(&socket_path).expect("bind server");
+        enable_credential_passing(server.as_raw_fd()).expect("enable credential passing");
+
+        let sender = UnixDatagram::unbound().expect("sender socket");
+        sender.connect(&socket_path).expect("connect sender");
+        sender.send(&[0u8; 32]).expect("send datagram");
+
+        match recv_authenticated(server.as_raw_fd()) {
+            RecvResult::Authenticated {
+                peer_pid,
+                peer_uid: _,
+                peer_pid_ns_inode: _,
+                origin,
+                data,
+            } => {
+                assert_eq!(peer_pid, 0);
+                assert_eq!(origin, BeatOrigin::SocketModeOnly);
+                assert_eq!(data, [0u8; 32]);
+            }
+            _ => panic!("expected authenticated datagram"),
+        }
+    }
+}

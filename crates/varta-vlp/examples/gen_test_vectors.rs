@@ -1,0 +1,628 @@
+//! Conformance test-vector generator.
+//!
+//! Emits `tools/vlp-test-vectors.json` from the live `varta-vlp`
+//! implementation. The JSON file is the cross-language conformance
+//! contract: external implementers drive their own decoders against
+//! it; the Rust `tests/conformance_vectors.rs` integration test
+//! loads the same file to detect drift.
+//!
+//! Run from the workspace root:
+//!
+//! ```sh
+//! cargo run -p varta-vlp --example gen_test_vectors --features "std crypto"
+//! ```
+//!
+//! The script is deterministic — every key, IV, and frame field is
+//! hand-fixed. Re-running on an unchanged source tree produces
+//! byte-identical output.
+
+use std::fs;
+use std::path::PathBuf;
+
+use varta_vlp::{
+    crc32c,
+    crypto::{kdf, seal, Key},
+    Frame, Status, MAGIC, NONCE_TERMINAL, VERSION,
+};
+
+fn hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        out.push(HEX[(b >> 4) as usize] as char);
+        out.push(HEX[(b & 0x0f) as usize] as char);
+    }
+    out
+}
+
+fn frame_bytes(f: &Frame) -> [u8; 32] {
+    let mut buf = [0u8; 32];
+    f.encode(&mut buf);
+    buf
+}
+
+fn corrupt_at(mut buf: [u8; 32], offset: usize, value: u8) -> [u8; 32] {
+    buf[offset] = value;
+    buf
+}
+
+fn patch_with_valid_crc(mut buf: [u8; 32], offset: usize, value: u8) -> [u8; 32] {
+    buf[offset] = value;
+    let crc = crc32c::compute(&buf[0..28]);
+    buf[28..32].copy_from_slice(&crc.to_le_bytes());
+    buf
+}
+
+fn patch_range_with_valid_crc(
+    mut buf: [u8; 32],
+    range: std::ops::Range<usize>,
+    src: &[u8],
+) -> [u8; 32] {
+    buf[range].copy_from_slice(src);
+    let crc = crc32c::compute(&buf[0..28]);
+    buf[28..32].copy_from_slice(&crc.to_le_bytes());
+    buf
+}
+
+// ---------------------------------------------------------------------------
+// JSON writer — hand-rolled, scoped to our exact schema. Avoids pulling
+// `serde_json` into the workspace.
+// ---------------------------------------------------------------------------
+
+#[derive(Default)]
+struct Json {
+    out: String,
+}
+
+impl Json {
+    fn open_doc(&mut self) {
+        self.out.push_str("{\n");
+    }
+
+    fn close_doc(&mut self) {
+        self.trim_trailing_comma();
+        self.out.push_str("\n}\n");
+    }
+
+    fn string_field(&mut self, indent: usize, key: &str, value: &str, trailing_comma: bool) {
+        self.indent(indent);
+        self.out.push('"');
+        self.out.push_str(key);
+        self.out.push_str("\": \"");
+        self.escape(value);
+        self.out.push('"');
+        if trailing_comma {
+            self.out.push(',');
+        }
+        self.out.push('\n');
+    }
+
+    fn raw_field(&mut self, indent: usize, key: &str, raw_value: &str, trailing_comma: bool) {
+        self.indent(indent);
+        self.out.push('"');
+        self.out.push_str(key);
+        self.out.push_str("\": ");
+        self.out.push_str(raw_value);
+        if trailing_comma {
+            self.out.push(',');
+        }
+        self.out.push('\n');
+    }
+
+    fn open_array(&mut self, indent: usize, key: &str) {
+        self.indent(indent);
+        self.out.push('"');
+        self.out.push_str(key);
+        self.out.push_str("\": [\n");
+    }
+
+    fn close_array(&mut self, indent: usize, trailing_comma: bool) {
+        self.trim_trailing_comma();
+        self.indent(indent);
+        self.out.push(']');
+        if trailing_comma {
+            self.out.push(',');
+        }
+        self.out.push('\n');
+    }
+
+    fn open_object(&mut self, indent: usize) {
+        self.indent(indent);
+        self.out.push_str("{\n");
+    }
+
+    fn close_object(&mut self, indent: usize, trailing_comma: bool) {
+        self.trim_trailing_comma();
+        self.indent(indent);
+        self.out.push('}');
+        if trailing_comma {
+            self.out.push(',');
+        }
+        self.out.push('\n');
+    }
+
+    fn escape(&mut self, s: &str) {
+        for c in s.chars() {
+            match c {
+                '"' => self.out.push_str("\\\""),
+                '\\' => self.out.push_str("\\\\"),
+                '\n' => self.out.push_str("\\n"),
+                _ => self.out.push(c),
+            }
+        }
+    }
+
+    fn indent(&mut self, n: usize) {
+        for _ in 0..n {
+            self.out.push_str("  ");
+        }
+    }
+
+    fn trim_trailing_comma(&mut self) {
+        // Drop a trailing ",\n" pair so JSON stays strict-valid.
+        if self.out.ends_with(",\n") {
+            self.out.truncate(self.out.len() - 2);
+            self.out.push('\n');
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Main generator.
+// ---------------------------------------------------------------------------
+
+fn main() {
+    let mut j = Json::default();
+    j.open_doc();
+
+    j.string_field(1, "spec_version", "0.2", true);
+    j.string_field(
+        1,
+        "description",
+        "Varta Lifeline Protocol conformance vectors. Generated by \
+         crates/varta-vlp/examples/gen_test_vectors.rs against the live \
+         reference implementation. Consult book/src/spec/vlp.md for the \
+         normative wire format.",
+        true,
+    );
+    j.raw_field(1, "magic_hex", &format!("\"{}\"", hex(&MAGIC)), true);
+    j.raw_field(1, "version_byte", &format!("{}", VERSION), true);
+    j.raw_field(
+        1,
+        "nonce_terminal_hex",
+        &format!("\"{:016x}\"", NONCE_TERMINAL),
+        true,
+    );
+
+    // -----------------------------------------------------------------------
+    // CRC-32C vectors — Castagnoli reference values.
+    // -----------------------------------------------------------------------
+    j.open_array(1, "crc32c_vectors");
+
+    let crc_cases: &[(&str, &str, &[u8])] = &[
+        ("crc-empty", "Empty input.", b""),
+        ("crc-single-a", "Single ASCII byte 'a'.", b"a"),
+        (
+            "crc-rfc3720",
+            "RFC 3720 appendix B reference vector.",
+            b"123456789",
+        ),
+        ("crc-thirty-two-zeros", "Thirty-two zero bytes.", &[0u8; 32]),
+        (
+            "crc-thirty-two-ffs",
+            "Thirty-two 0xFF bytes.",
+            &[0xffu8; 32],
+        ),
+    ];
+    for (id, desc, input) in crc_cases {
+        j.open_object(2);
+        j.string_field(3, "id", id, true);
+        j.string_field(3, "description", desc, true);
+        j.string_field(3, "input_hex", &hex(input), true);
+        j.string_field(
+            3,
+            "expected_crc_hex",
+            &format!("{:08x}", crc32c::compute(input)),
+            false,
+        );
+        j.close_object(2, true);
+    }
+    j.close_array(1, true);
+
+    // -----------------------------------------------------------------------
+    // Frame vectors — encode/decode goldens.
+    // -----------------------------------------------------------------------
+    j.open_array(1, "frame_vectors");
+
+    let success: &[(&str, &str, Frame)] = &[
+        (
+            "frame-ok-minimal",
+            "Minimum legal frame: Status::Ok, pid=2, ts=0, nonce=1, payload=0.",
+            Frame::new(Status::Ok, 2, 0, 1, 0),
+        ),
+        (
+            "frame-degraded-typical",
+            "Typical degraded beat with non-trivial payload.",
+            Frame::new(Status::Degraded, 12345, 1_234_567_890, 100, 0xdead_beef),
+        ),
+        (
+            "frame-critical-operational",
+            "Operational critical alert at a regular nonce (not the panic-hook sentinel).",
+            Frame::new(Status::Critical, 99, 10_000, 5, 42),
+        ),
+        (
+            "frame-critical-terminal",
+            "Panic-hook terminal frame: Status::Critical paired with nonce=NONCE_TERMINAL.",
+            Frame::new(Status::Critical, 2, 999, NONCE_TERMINAL, 0),
+        ),
+        (
+            "frame-ok-large-fields",
+            "Status::Ok with maximum-width fields, exercises every LE byte position.",
+            Frame::new(
+                Status::Ok,
+                0xDEAD_BEEF,
+                0x0123_4567_89AB_CDEF,
+                1,
+                0x0000_0042,
+            ),
+        ),
+        (
+            "frame-ok-nonce-wrapped-to-zero",
+            "Status::Ok with nonce=0 — legal after the per-connection counter wraps from \
+             NONCE_TERMINAL-1 back to 0.",
+            Frame::new(Status::Ok, 2, 1, 0, 0),
+        ),
+    ];
+    for (id, desc, frame) in success {
+        let bytes = frame_bytes(frame);
+        j.open_object(2);
+        j.string_field(3, "id", id, true);
+        j.string_field(3, "description", desc, true);
+        j.string_field(3, "kind", "encode_decode_roundtrip", true);
+        j.raw_field(3, "expected_decode_error", "null", true);
+        // Nested "inputs" object — keyed entry, not a bare object.
+        j.indent(3);
+        j.out.push_str("\"inputs\": {\n");
+        j.string_field(4, "status", status_name(frame.status), true);
+        j.raw_field(4, "pid", &format!("{}", frame.pid), true);
+        j.raw_field(4, "timestamp", &format!("{}", frame.timestamp), true);
+        j.raw_field(4, "nonce", &format!("{}", frame.nonce), true);
+        j.raw_field(4, "payload", &format!("{}", frame.payload), false);
+        j.indent(3);
+        j.out.push_str("},\n");
+        j.string_field(3, "expected_wire_hex", &hex(&bytes), false);
+        j.close_object(2, true);
+    }
+
+    // Decode-error vectors — one per error variant.
+    let base = frame_bytes(&Frame::new(Status::Ok, 2, 100, 1, 0));
+
+    // BadMagic: zero the first byte and re-stamp CRC so failure is magic-only.
+    let bad_magic = {
+        let mut b = base;
+        b[0] = 0x00;
+        let crc = crc32c::compute(&b[0..28]);
+        b[28..32].copy_from_slice(&crc.to_le_bytes());
+        b
+    };
+    emit_error_case(
+        &mut j,
+        "frame-error-bad-magic",
+        "First byte 0x00 instead of 'V'. Decoder rejects before CRC check.",
+        &bad_magic,
+        "BadMagic",
+    );
+
+    // BadVersion: version byte 0x01 (legacy).
+    let bad_version = {
+        let mut b = base;
+        b[2] = 0x01;
+        let crc = crc32c::compute(&b[0..28]);
+        b[28..32].copy_from_slice(&crc.to_le_bytes());
+        b
+    };
+    emit_error_case(
+        &mut j,
+        "frame-error-bad-version",
+        "VLP v0.1 frames are rejected: version byte must equal 0x02.",
+        &bad_version,
+        "BadVersion",
+    );
+
+    // BadCrc: corrupt last byte of CRC trailer (without re-stamp).
+    let bad_crc = corrupt_at(base, 31, base[31] ^ 0x01);
+    emit_error_case(
+        &mut j,
+        "frame-error-bad-crc",
+        "Final CRC byte flipped. Decoder rejects before any field-range check.",
+        &bad_crc,
+        "BadCrc",
+    );
+
+    // BadStatus: byte 0xFF at status position.
+    let bad_status = patch_with_valid_crc(base, 3, 0xFF);
+    emit_error_case(
+        &mut j,
+        "frame-error-bad-status",
+        "Status byte 0xFF is not a known variant.",
+        &bad_status,
+        "BadStatus",
+    );
+
+    // StallOnWire: status = 3 (Stall). Observer-synthesized only.
+    let stall_on_wire = patch_with_valid_crc(base, 3, 0x03);
+    emit_error_case(
+        &mut j,
+        "frame-error-stall-on-wire",
+        "Status::Stall (byte 0x03) is observer-synthesized; agents MUST NOT emit it.",
+        &stall_on_wire,
+        "StallOnWire",
+    );
+
+    // BadPid(0): pid bytes all zero.
+    let bad_pid_zero = patch_range_with_valid_crc(base, 4..8, &[0u8; 4]);
+    emit_error_case(
+        &mut j,
+        "frame-error-bad-pid-zero",
+        "pid=0 (kernel/scheduler) is a reserved value.",
+        &bad_pid_zero,
+        "BadPid",
+    );
+
+    // BadPid(1): pid bytes = 1.
+    let bad_pid_one = patch_range_with_valid_crc(base, 4..8, &1u32.to_le_bytes());
+    emit_error_case(
+        &mut j,
+        "frame-error-bad-pid-init",
+        "pid=1 (init/systemd) is a reserved value.",
+        &bad_pid_one,
+        "BadPid",
+    );
+
+    // BadTimestamp: timestamp = u64::MAX.
+    let bad_timestamp = patch_range_with_valid_crc(base, 8..16, &u64::MAX.to_le_bytes());
+    emit_error_case(
+        &mut j,
+        "frame-error-bad-timestamp",
+        "timestamp = u64::MAX is the reserved saturation sentinel.",
+        &bad_timestamp,
+        "BadTimestamp",
+    );
+
+    // BadNonce: nonce = NONCE_TERMINAL with status Ok (must pair with Critical).
+    let bad_nonce = patch_range_with_valid_crc(base, 16..24, &NONCE_TERMINAL.to_le_bytes());
+    emit_error_case(
+        &mut j,
+        "frame-error-bad-nonce-terminal-with-non-critical",
+        "nonce = 0xFFFFFFFFFFFFFFFF is permitted only with Status::Critical.",
+        &bad_nonce,
+        "BadNonce",
+    );
+
+    j.close_array(1, true);
+
+    // -----------------------------------------------------------------------
+    // Secure frame + KDF vectors.
+    // -----------------------------------------------------------------------
+    j.open_array(1, "secure_frame_vectors");
+
+    // Deterministic 32-byte test key: 00 01 02 ... 1f.
+    let test_key_bytes: [u8; 32] = {
+        let mut k = [0u8; 32];
+        for (i, slot) in k.iter_mut().enumerate() {
+            *slot = i as u8;
+        }
+        k
+    };
+    let test_iv_random: [u8; 8] = [0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88];
+    let test_iv_counter: u32 = 0;
+    let plaintext_frame = Frame::new(Status::Ok, 2, 1000, 1, 0);
+    let plaintext_bytes = frame_bytes(&plaintext_frame);
+
+    // --- Shared-key seal (60-byte wire) ---
+    {
+        let key = Key::from_bytes(test_key_bytes);
+        let mut nonce = [0u8; 12];
+        nonce[..8].copy_from_slice(&test_iv_random);
+        nonce[8..].copy_from_slice(&test_iv_counter.to_le_bytes());
+        let (ct, tag) = seal(key.as_bytes(), &nonce, b"", &plaintext_bytes).expect("seal");
+
+        let mut wire = [0u8; 60];
+        wire[0..8].copy_from_slice(&test_iv_random);
+        wire[8..12].copy_from_slice(&test_iv_counter.to_le_bytes());
+        wire[12..44].copy_from_slice(&ct);
+        wire[44..60].copy_from_slice(&tag);
+
+        j.open_object(2);
+        j.string_field(3, "id", "secure-shared-key-seal", true);
+        j.string_field(
+            3,
+            "description",
+            "Shared-key 60-byte secure frame. Wire layout: \
+             iv_random[8] || iv_counter[4] || ciphertext[32] || tag[16]. \
+             AEAD nonce = iv_random || iv_counter (12 B). AAD = empty.",
+            true,
+        );
+        j.string_field(3, "kind", "shared_key_seal", true);
+        j.string_field(3, "key_hex", &hex(&test_key_bytes), true);
+        j.string_field(3, "iv_random_hex", &hex(&test_iv_random), true);
+        j.raw_field(3, "iv_counter", &format!("{}", test_iv_counter), true);
+        j.string_field(3, "plaintext_hex", &hex(&plaintext_bytes), true);
+        j.string_field(3, "expected_wire_hex", &hex(&wire), false);
+        j.close_object(2, true);
+    }
+
+    // --- Master-key seal (64-byte wire) ---
+    {
+        let master = Key::from_bytes(test_key_bytes);
+        let agent_pid: u32 = 2;
+        let agent_key = kdf::derive_agent_key(&master, agent_pid).expect("derive_agent_key");
+
+        let mut nonce = [0u8; 12];
+        nonce[..8].copy_from_slice(&test_iv_random);
+        nonce[8..].copy_from_slice(&test_iv_counter.to_le_bytes());
+        let aad = agent_pid.to_le_bytes();
+        let (ct, tag) = seal(agent_key.as_bytes(), &nonce, &aad, &plaintext_bytes).expect("seal");
+
+        let mut wire = [0u8; 64];
+        wire[0..4].copy_from_slice(&aad);
+        wire[4..12].copy_from_slice(&test_iv_random);
+        wire[12..16].copy_from_slice(&test_iv_counter.to_le_bytes());
+        wire[16..48].copy_from_slice(&ct);
+        wire[48..64].copy_from_slice(&tag);
+
+        j.open_object(2);
+        j.string_field(3, "id", "secure-master-key-seal", true);
+        j.string_field(
+            3,
+            "description",
+            "Master-key 64-byte secure frame. Wire layout: \
+             agent_pid[4] || iv_random[8] || iv_counter[4] || ciphertext[32] || tag[16]. \
+             AEAD nonce = iv_random || iv_counter (12 B). AAD = agent_pid LE bytes \
+             (bound by Poly1305). Per-agent key derived from master via HKDF-SHA256, \
+             info = \"varta-agent-v1\\0\" || agent_pid LE (4 B).",
+            true,
+        );
+        j.string_field(3, "kind", "master_key_seal", true);
+        j.string_field(3, "master_key_hex", &hex(&test_key_bytes), true);
+        j.raw_field(3, "agent_pid", &format!("{}", agent_pid), true);
+        j.string_field(3, "derived_agent_key_hex", &hex(agent_key.as_bytes()), true);
+        j.string_field(3, "iv_random_hex", &hex(&test_iv_random), true);
+        j.raw_field(3, "iv_counter", &format!("{}", test_iv_counter), true);
+        j.string_field(3, "plaintext_hex", &hex(&plaintext_bytes), true);
+        j.string_field(3, "expected_wire_hex", &hex(&wire), false);
+        j.close_object(2, true);
+    }
+
+    // --- HKDF: agent key derivation ---
+    {
+        let master = Key::from_bytes(test_key_bytes);
+        let agent_id: u32 = 42;
+        let key = kdf::derive_agent_key(&master, agent_id).expect("derive_agent_key");
+        j.open_object(2);
+        j.string_field(3, "id", "kdf-agent-key", true);
+        j.string_field(
+            3,
+            "description",
+            "HKDF-SHA256 derive_agent_key. IKM = master_key (32 B). salt = empty. \
+             info = \"varta-agent-v1\\0\" (15 B, including the trailing NUL) || \
+             agent_id LE (4 B). OKM = 32 B.",
+            true,
+        );
+        j.string_field(3, "kind", "kdf_agent_key", true);
+        j.string_field(3, "master_key_hex", &hex(&test_key_bytes), true);
+        j.raw_field(3, "agent_id", &format!("{}", agent_id), true);
+        j.string_field(3, "info_hex", &hex_info_agent(agent_id), true);
+        j.string_field(3, "expected_okm_hex", &hex(key.as_bytes()), false);
+        j.close_object(2, true);
+    }
+
+    // --- HKDF: IV prefix derivation ---
+    {
+        let salt: [u8; 16] = [
+            0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e,
+            0x0f, 0x10,
+        ];
+        let prefix_index: u32 = 7;
+        let iv = kdf::derive_iv_prefix(&salt, prefix_index).expect("derive_iv_prefix");
+        j.open_object(2);
+        j.string_field(3, "id", "kdf-iv-prefix", true);
+        j.string_field(
+            3,
+            "description",
+            "HKDF-SHA256 derive_iv_prefix. IKM = session_salt. salt arg = session_salt \
+             (same 16 B). info = \"varta-iv-prefix-v1\\0\" (19 B) || prefix_index LE \
+             (4 B). OKM = 8 B (the per-session iv_random rotation).",
+            true,
+        );
+        j.string_field(3, "kind", "kdf_iv_prefix", true);
+        j.string_field(3, "session_salt_hex", &hex(&salt), true);
+        j.raw_field(3, "prefix_index", &format!("{}", prefix_index), true);
+        j.string_field(3, "info_hex", &hex_info_iv_prefix(prefix_index), true);
+        j.string_field(3, "expected_iv_prefix_hex", &hex(&iv), false);
+        j.close_object(2, true);
+    }
+
+    // --- HKDF: epoch key derivation ---
+    {
+        let agent_key = Key::from_bytes(test_key_bytes);
+        let epoch: u64 = 100;
+        let derived = kdf::derive_epoch_key(&agent_key, epoch).expect("derive_epoch_key");
+        j.open_object(2);
+        j.string_field(3, "id", "kdf-epoch-key", true);
+        j.string_field(
+            3,
+            "description",
+            "HKDF-SHA256 derive_epoch_key. IKM = agent_key (32 B). salt = empty. \
+             info = \"varta-epoch-v1\\0\" (15 B) || epoch LE (8 B). OKM = 32 B. \
+             Optional / reserved — not currently used on the wire but documented \
+             for forward compatibility.",
+            true,
+        );
+        j.string_field(3, "kind", "kdf_epoch_key", true);
+        j.string_field(3, "agent_key_hex", &hex(&test_key_bytes), true);
+        j.raw_field(3, "epoch", &format!("{}", epoch), true);
+        j.string_field(3, "info_hex", &hex_info_epoch(epoch), true);
+        j.string_field(3, "expected_okm_hex", &hex(derived.as_bytes()), false);
+        j.close_object(2, true);
+    }
+
+    j.close_array(1, false);
+    j.close_doc();
+
+    // Write to workspace_root/tools/vlp-test-vectors.json. CARGO_MANIFEST_DIR
+    // resolves to crates/varta-vlp/ at compile time, so we ascend two levels.
+    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let workspace_root = manifest
+        .parent()
+        .and_then(|p| p.parent())
+        .expect("workspace root");
+    let out_path = workspace_root.join("tools").join("vlp-test-vectors.json");
+
+    fs::write(&out_path, j.out.as_bytes()).expect("write vectors file");
+    println!("wrote {} bytes to {}", j.out.len(), out_path.display());
+}
+
+fn status_name(s: Status) -> &'static str {
+    match s {
+        Status::Ok => "ok",
+        Status::Degraded => "degraded",
+        Status::Critical => "critical",
+        Status::Stall => "stall",
+    }
+}
+
+fn emit_error_case(j: &mut Json, id: &str, desc: &str, wire: &[u8; 32], error: &str) {
+    j.open_object(2);
+    j.string_field(3, "id", id, true);
+    j.string_field(3, "description", desc, true);
+    j.string_field(3, "kind", "decode_error", true);
+    j.string_field(3, "expected_decode_error", error, true);
+    j.string_field(3, "wire_hex", &hex(wire), false);
+    j.close_object(2, true);
+}
+
+// Reproduce the HKDF info-string assembly the production code uses, so the
+// vectors file documents it alongside the OKM. External implementers can
+// reconstruct the same byte string and confirm interop without reading Rust.
+
+fn hex_info_agent(agent_id: u32) -> String {
+    let mut info = [0u8; 19];
+    info[..15].copy_from_slice(b"varta-agent-v1\0");
+    info[15..].copy_from_slice(&agent_id.to_le_bytes());
+    hex(&info)
+}
+
+fn hex_info_iv_prefix(prefix_index: u32) -> String {
+    let mut info = [0u8; 23];
+    info[..19].copy_from_slice(b"varta-iv-prefix-v1\0");
+    info[19..].copy_from_slice(&prefix_index.to_le_bytes());
+    hex(&info)
+}
+
+fn hex_info_epoch(epoch: u64) -> String {
+    let mut info = [0u8; 23];
+    info[..15].copy_from_slice(b"varta-epoch-v1\0");
+    info[15..].copy_from_slice(&epoch.to_le_bytes());
+    hex(&info)
+}

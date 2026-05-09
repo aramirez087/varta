@@ -1,0 +1,50 @@
+name: publish-java-client
+
+# Publish health.varta:varta-client to Maven Central on tags `java-vX.Y.Z`.
+#
+# Required GitHub secrets:
+#   GPG_PRIVATE_KEY  — armored PGP private key (signing plugin in-memory)
+#   GPG_PASSPHRASE   — passphrase for the key
+#
+# The Sonatype Central Portal credential is supplied via OIDC by the
+# sonatype/sonatype-central-publisher action (no stored OSSRH token).
+
+on:
+  push:
+    tags: ['java-v*']
+  workflow_dispatch: {}
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  publish:
+    name: build & publish to Maven Central
+    runs-on: ubuntu-latest
+    environment:
+      name: maven-central
+      url: https://central.sonatype.com/artifact/health.varta/varta-client
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+      - uses: gradle/actions/setup-gradle@v4
+
+      - name: assemble + sign artifacts
+        working-directory: clients/java
+        env:
+          ORG_GRADLE_PROJECT_signingKey: ${{ secrets.GPG_PRIVATE_KEY }}
+          ORG_GRADLE_PROJECT_signingPassword: ${{ secrets.GPG_PASSPHRASE }}
+        run: >
+          ./gradlew :lib:publishAllPublicationsToStagingDeployRepository
+          --no-daemon --stacktrace
+
+      - name: upload to central portal (OIDC)
+        uses: sonatype/sonatype-central-publisher@v1
+        with:
+          deployment-name: varta-client-${{ github.ref_name }}
+          artifact-dir: clients/java/lib/build/staging-deploy/
+          publish: true

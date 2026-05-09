@@ -1,0 +1,33 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <IsPackable>false</IsPackable>
+    <IsTestProject>true</IsTestProject>
+    <RootNamespace>Varta.Tests</RootNamespace>
+    <AssemblyName>Varta.Client.Tests</AssemblyName>
+    <!--
+      Test code intentionally relaxes a few analyzer rules:
+        CA1707     — Method_Naming_With_Underscores is the standard xUnit test convention.
+        CA1416     — Platform-guarded File.SetUnixFileMode calls inside SkipOnWindowsFact.
+        xUnit1026  — Theory takes 'id' as a display-only parameter (xUnit prints it in test names).
+    -->
+    <NoWarn>$(NoWarn);CA1707;CA1416;xUnit1026</NoWarn>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.11.1" />
+    <PackageReference Include="xunit" Version="2.9.2" />
+    <PackageReference Include="xunit.runner.visualstudio" Version="2.8.2" />
+    <PackageReference Include="coverlet.collector" Version="6.0.2" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\Varta.Client\Varta.Client.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <EmbeddedResource Include="..\..\..\..\tools\vlp-test-vectors.json" LogicalName="vectors.json" />
+  </ItemGroup>
+
+</Project>

@@ -1,0 +1,16 @@
+# Patterns to ignore when building packages.
+.DS_Store
+.git/
+.gitignore
+.idea/
+.vscode/
+*.swp
+*.tmp
+*.bak
+*.orig
+.project
+.classpath
+# OWNERS files (not used by Helm).
+OWNERS
+# Test renderings.
+ci/

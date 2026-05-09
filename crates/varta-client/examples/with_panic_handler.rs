@@ -1,0 +1,34 @@
+//! Demonstrates the opt-in panic handler.
+//!
+//! When the process panics, a `Status::Critical` VLP frame is emitted to the
+//! observer before the normal panic message and stack unwind proceed.
+//!
+//! Build and run:
+//!
+//! ```sh
+//! varta-watch --socket /tmp/varta.sock --threshold-ms 2000 &
+//! cargo run --example with_panic_handler --features panic-handler
+//! ```
+
+fn main() -> std::io::Result<()> {
+    // Register the hook before connecting so any early panic is still
+    // signalled. The observer must already be running and listening at
+    // the socket path — `install_panic_handler` performs the connect at
+    // install time so the hook body itself stays async-signal-safe.
+    varta_client::install_panic_handler("/tmp/varta.sock")?;
+
+    let mut agent = varta_client::Varta::connect("/tmp/varta.sock")?;
+    for _ in 0..10 {
+        match agent.beat(varta_client::Status::Ok, 0) {
+            varta_client::BeatOutcome::Sent => {}
+            varta_client::BeatOutcome::Dropped(_) => {
+                eprintln!("varta: beat dropped (observer down or queue full)");
+            }
+            varta_client::BeatOutcome::Failed(e) => {
+                eprintln!("varta: beat failed: {e}");
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+    Ok(())
+}

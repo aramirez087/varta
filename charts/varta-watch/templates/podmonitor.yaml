@@ -1,0 +1,38 @@
+{{- if and .Values.prometheus.podMonitor.enabled .Values.prometheus.bindAddr -}}
+apiVersion: monitoring.coreos.com/v1
+kind: PodMonitor
+metadata:
+  name: {{ include "varta-watch.fullname" . }}
+  namespace: {{ include "varta-watch.namespace" . }}
+  labels:
+    {{- include "varta-watch.labels" . | nindent 4 }}
+    {{- with .Values.prometheus.podMonitor.release }}
+    release: {{ . | quote }}
+    {{- end }}
+    {{- with .Values.prometheus.podMonitor.extraLabels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  selector:
+    matchLabels:
+      {{- include "varta-watch.selectorLabels" . | nindent 6 }}
+  namespaceSelector:
+    matchNames:
+      - {{ include "varta-watch.namespace" . }}
+  podMetricsEndpoints:
+    - port: metrics
+      path: /metrics
+      scheme: http
+      interval: {{ .Values.prometheus.podMonitor.interval }}
+      scrapeTimeout: {{ .Values.prometheus.podMonitor.scrapeTimeout }}
+      bearerTokenSecret:
+        name: {{ include "varta-watch.tokenSecretName" . }}
+        key: {{ include "varta-watch.tokenSecretKey" . }}
+      relabelings:
+        - sourceLabels: [__meta_kubernetes_pod_node_name]
+          targetLabel: node
+        - sourceLabels: [__meta_kubernetes_pod_name]
+          targetLabel: pod
+        - targetLabel: service
+          replacement: {{ include "varta-watch.fullname" . }}
+{{- end -}}

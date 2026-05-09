@@ -1,0 +1,105 @@
+---
+# Varta recording rules.
+#
+# Pre-compute heavy expressions referenced by dashboards and alerts. Load
+# alongside `alerts/varta.rules.yml`. Recording-rule names follow the
+# `level:metric:operation_range` convention:
+#   varta:iteration_seconds:p99_5m -> 99th-pct of iteration_seconds over [5m]
+#
+# Pinning these as recording rules has two benefits:
+#   1. dashboards render in O(1) Prometheus work instead of recomputing
+#      histogram_quantile on every panel.
+#   2. alert thresholds and dashboard panels read identical numbers — no
+#      "the dashboard says 180ms but the alert fired at 200ms" drift.
+
+groups:
+  - name: varta-watch.sli
+    interval: 30s
+    rules:
+      # ----- Observer iteration latency -----
+      - record: varta:iteration_seconds:p50_5m
+        expr: |
+          histogram_quantile(0.50,
+            sum by (le) (rate(varta_observer_iteration_seconds_bucket[5m])))
+
+      - record: varta:iteration_seconds:p99_5m
+        expr: |
+          histogram_quantile(0.99,
+            sum by (le) (rate(varta_observer_iteration_seconds_bucket[5m])))
+
+      - record: varta:iteration_seconds:p999_5m
+        expr: |
+          histogram_quantile(0.999,
+            sum by (le) (rate(varta_observer_iteration_seconds_bucket[5m])))
+
+      # ----- Scrape latency (so beat-path derived metric is exact) -----
+      - record: varta:serve_pending_seconds:p99_5m
+        expr: |
+          histogram_quantile(0.99,
+            sum by (le) (rate(varta_observer_serve_pending_seconds_bucket[5m])))
+
+      # ----- Beat-path latency = iteration - scrape, at P99 -----
+      # Operators wanting "is the beat path itself slow?" should query
+      # varta:beat_path_seconds:p99_5m directly, not derive it on the fly.
+      - record: varta:beat_path_seconds:p99_5m
+        expr: |
+          (varta:iteration_seconds:p99_5m - varta:serve_pending_seconds:p99_5m)
+
+      # ----- Audit-log fsync latency -----
+      - record: varta:audit_fsync_seconds:p99_5m
+        expr: |
+          histogram_quantile(0.99,
+            sum by (le) (rate(varta_audit_fsync_seconds_bucket[5m])))
+
+      # ----- Per-stage latency P99 (one series per stage label value) -----
+      - record: varta:stage_seconds:p99_5m
+        expr: |
+          histogram_quantile(0.99,
+            sum by (le, stage) (rate(varta_observer_stage_seconds_bucket[5m])))
+
+      # ----- Throughput -----
+      - record: varta:beats:rate_1m
+        expr: sum(rate(varta_beats_total[1m]))
+
+      - record: varta:beats:rate_5m
+        expr: sum(rate(varta_beats_total[5m]))
+
+      - record: varta:stalls:rate_5m
+        expr: sum(rate(varta_stalls_total[5m]))
+
+      # ----- Recovery outcomes split by outcome label -----
+      - record: varta:recovery_outcomes:rate_5m
+        expr: sum by (outcome) (rate(varta_recovery_outcomes_total[5m]))
+
+      # ----- Recovery duration mean (over the whole window) -----
+      # ns counters; result is in seconds.
+      - record: varta:recovery_duration_seconds:mean_5m
+        expr: |
+          rate(varta_recovery_duration_ns_sum[5m])
+          / clamp_min(rate(varta_recovery_duration_count_total[5m]), 1)
+          / 1e9
+
+      # ----- Capacity utilisation -----
+      - record: varta:tracker:utilization
+        expr: varta_watch_pids_tracked / clamp_min(varta_tracker_capacity, 1)
+
+      # ----- Decode error rate by kind -----
+      - record: varta:decode_errors:rate_5m
+        expr: sum by (kind) (rate(varta_decode_errors_total[5m]))
+
+      # ----- Rate-limit drops split by reason -----
+      - record: varta:rate_limited:rate_5m
+        expr: sum by (reason) (rate(varta_rate_limited_total[5m]))
+
+      # ----- Recovery refusal split by reason -----
+      - record: varta:recovery_refused:rate_5m
+        expr: sum by (reason) (rate(varta_recovery_refused_total[5m]))
+
+      # ----- Secure-UDP AEAD attempts ratio (sanity check on key rotation) -----
+      # In steady state == keys_loaded * beats_received. Deviation means
+      # either a key was loaded/unloaded mid-stream or the constant-trial
+      # invariant is broken.
+      - record: varta:secure_aead_attempts:ratio_5m
+        expr: |
+          rate(varta_secure_aead_attempts_total[5m])
+          / clamp_min(rate(varta_beats_total[5m]), 1)

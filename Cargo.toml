@@ -1,0 +1,38 @@
+[workspace]
+resolver = "2"
+exclude = ["fuzz"]
+members = [
+    "crates/varta-vlp",
+    "crates/varta-client",
+    "crates/varta-watch",
+    "crates/varta-tests",
+    "crates/varta-bench",
+]
+
+[workspace.package]
+authors = ["Alexander Ramirez"]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/aramirez087/Varta"
+homepage = "https://varta.sh"
+rust-version = "1.70.0"
+edition = "2021"
+
+# Every crate must explicitly opt out of unsafe_code with #![allow(unsafe_code)]
+# where FFI or kernel interfaces require it.  This creates a grep-able audit
+# trail: search for `allow(unsafe_code)` to find all permitted unsafe sites.
+[workspace.lints.rust]
+unsafe_code = "deny"
+# Register `cfg(kani)` so the Kani-injected configuration in
+# `crates/varta-vlp/src/lib.rs` and `proofs.rs` does not trip the
+# `unexpected_cfgs` lint under normal `cargo build` / `cargo clippy`.
+# See `book/src/architecture/verification.md` for the verification strategy.
+#
+# Register `cfg(fuzzing)` so the `cargo fuzz`-set cfg used by the
+# `varta-watch::peer_cred::fuzz_entry` test/fuzz helper does not trip
+# `unexpected_cfgs` under normal builds.
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(kani)", "cfg(fuzzing)"] }
+
+[profile.release]
+overflow-checks = true
+panic = "abort"
+lto = "thin"

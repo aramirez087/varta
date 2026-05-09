@@ -1,0 +1,1247 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  ci:
+    name: gate (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: checkout
+        uses: actions/checkout@v4
+
+      - name: rust toolchain (stable + rustfmt + clippy)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: cargo fmt --check
+        run: cargo fmt --all -- --check
+
+      # `--all-features` cannot be used directly: `prometheus-exporter`
+      # and `compile-time-config` are mutually exclusive (compile_error!
+      # in `crates/varta-watch/src/lib.rs`).  Two explicit lanes cover
+      # the SRE and Class-A profiles.
+      - name: clippy (SRE — argv parser + HTTP exporter)
+        run: |
+          cargo clippy --locked --workspace --all-targets \
+            --features 'varta-watch/secure-udp varta-watch/unsafe-plaintext-udp varta-watch/json-log varta-watch/audit-chain varta-watch/test-hooks varta-watch/prometheus-exporter varta-vlp/crypto varta-vlp/std varta-client/panic-handler varta-client/udp varta-client/secure-udp varta-client/test-hooks varta-tests/udp varta-tests/secure-udp varta-tests/test-hooks varta-tests/prometheus-exporter' \
+            -- -D warnings
+
+      - name: clippy (Class-A — compile-time config, no HTTP, no argv)
+        env:
+          VARTA_CONFIG_FILE: ${{ github.workspace }}/crates/varta-watch/tests/fixtures/safety_critical.varta.conf
+        run: |
+          cargo clippy --locked -p varta-watch --all-targets \
+            --no-default-features --features secure-udp,compile-time-config \
+            -- -D warnings
+
+      - name: clippy (no-default-features)
+        run: cargo clippy --locked --workspace --all-targets --no-default-features -- -D warnings
+
+      - name: varta-vlp no_std build (default features)
+        # Default-feature build of the protocol crate must compile as
+        # `#![no_std]` for avionics targets (FreeRTOS, Zephyr) without libstd.
+        run: cargo build --locked -p varta-vlp --no-default-features
+
+      - name: varta-vlp no_std build (crypto only)
+        # `crypto` must stay no_std-clean — chacha20poly1305 / hkdf / sha2 /
+        # zeroize are all `default-features = false`. This step trips if any
+        # of them inadvertently re-enables `std` in a point release.
+        run: cargo build --locked -p varta-vlp --no-default-features --features crypto
+
+      - name: install no_std target (thumbv7m-none-eabi)
+        if: runner.os == 'Linux'
+        run: rustup target add thumbv7m-none-eabi
+
+      - name: varta-vlp builds for thumbv7m-none-eabi (no_std proof)
+        # Cortex-M3 target — canonical bare-metal Rust target, matches the
+        # FreeRTOS/Zephyr deployment exactly. `cargo build` (no link) is
+        # sufficient for a library crate.
+        if: runner.os == 'Linux'
+        run: |
+          cargo build --locked -p varta-vlp --no-default-features --target thumbv7m-none-eabi
+          cargo build --locked -p varta-vlp --no-default-features --features crypto --target thumbv7m-none-eabi
+
+      # `--all-features` is forbidden by the `prometheus-exporter` +
+      # `compile-time-config` compile_error guard.  Run SRE-profile tests
+      # with the full SRE feature set; Class-A coverage runs in a
+      # dedicated safety-profiles step below.
+      - name: tests (SRE profile, -D warnings)
+        env:
+          RUSTFLAGS: -D warnings
+        run: |
+          cargo test --locked --workspace \
+            --features 'varta-watch/secure-udp varta-watch/unsafe-plaintext-udp varta-watch/json-log varta-watch/audit-chain varta-watch/test-hooks varta-watch/prometheus-exporter varta-vlp/crypto varta-vlp/std varta-client/panic-handler varta-client/udp varta-client/secure-udp varta-client/test-hooks varta-tests/udp varta-tests/secure-udp varta-tests/test-hooks varta-tests/prometheus-exporter'
+
+      - name: doc-tests (SRE profile)
+        run: |
+          cargo test --locked --doc --workspace \
+            --features 'varta-watch/secure-udp varta-watch/unsafe-plaintext-udp varta-watch/json-log varta-watch/audit-chain varta-watch/test-hooks varta-watch/prometheus-exporter varta-vlp/crypto varta-vlp/std varta-client/panic-handler varta-client/udp varta-client/secure-udp varta-client/test-hooks varta-tests/udp varta-tests/secure-udp varta-tests/test-hooks varta-tests/prometheus-exporter'
+
+      - name: release build
+        run: cargo build --locked --workspace --release
+
+      - name: examples build (SRE profile)
+        run: |
+          cargo build --locked --workspace --examples \
+            --features 'varta-watch/secure-udp varta-watch/unsafe-plaintext-udp varta-watch/json-log varta-watch/audit-chain varta-watch/test-hooks varta-watch/prometheus-exporter varta-vlp/crypto varta-vlp/std varta-client/panic-handler varta-client/udp varta-client/secure-udp varta-client/test-hooks varta-tests/udp varta-tests/secure-udp varta-tests/test-hooks varta-tests/prometheus-exporter'
+
+      - name: zero-dep audit (varta-vlp)
+        run: |
+          # varta-vlp: optional crypto deps are allowed under --features crypto;
+          # non-optional deps remain forbidden.
+          awk '/^\[dependencies\]$/{f=1;next} /^\[/{f=0} f && NF && !/^[[:space:]]*#/ && !/optional[[:space:]]*=[[:space:]]*true/{print "FAIL " FILENAME ": non-optional dep: " $0; exit 1}' crates/varta-vlp/Cargo.toml
+
+      - name: crypto source audit (no hand-rolled primitives)
+        run: |
+          # Hand-rolled crypto in varta-vlp is forbidden. RustCrypto crates are
+          # the only sanctioned source for ChaCha20, Poly1305, SHA-2, HKDF, and
+          # related primitives. Historical hand-rolled files (poly1305.rs,
+          # chacha20.rs) were deleted in the 2026-05-12 RustCrypto migration;
+          # re-introducing them — even as a hand-rolled fallback — is a
+          # regression.
+          # See .wolf/cerebrum.md Do-Not-Repeat 2026-05-12.
+          banned=$(find crates/varta-vlp/src/crypto -type f \
+            \( -name 'poly1305.rs' \
+            -o -name 'chacha20.rs' \
+            -o -name 'salsa20.rs' \
+            -o -name 'blake3.rs' \
+            -o -name '*_handrolled*.rs' \) 2>/dev/null || true)
+          if [ -n "$banned" ]; then
+            echo "FAIL hand-rolled crypto file(s) detected:"
+            echo "$banned"
+            echo
+            echo "Use the RustCrypto crates (chacha20poly1305, hkdf, sha2) instead."
+            echo "See .wolf/cerebrum.md Do-Not-Repeat 2026-05-12."
+            exit 1
+          fi
+          echo "OK no hand-rolled crypto in crates/varta-vlp/src/crypto/"
+
+      - name: zero-dep audit (varta-client)
+        run: |
+          awk '/^\[dependencies\]$/{f=1;next} /^\[/{f=0} f && NF{print "FAIL " FILENAME ": " $0; exit 1}' crates/varta-client/Cargo.toml
+
+      - name: zero-dep audit (varta-watch)
+        run: |
+          awk '/^\[dependencies\]$/{f=1;next} /^\[/{f=0} f && NF{print "FAIL " FILENAME ": " $0; exit 1}' crates/varta-watch/Cargo.toml
+
+      - name: acceptance contract audit
+        run: |
+          set -e
+          while IFS=$'\t' read -r name file kind; do
+            case "$name" in \#*|"") continue ;; esac
+            case "$kind" in
+              test|no-harness)
+                grep -qE "^[[:space:]]*(pub(\([^)]+\))?[[:space:]]+)?fn[[:space:]]+${name}\b" "$file" \
+                  || { echo "FAIL [$kind] $name @ $file"; exit 1; }
+                ;;
+              bench-assertion)
+                grep -qF "$name" "$file" \
+                  || { echo "FAIL [bench] $name @ $file"; exit 1; }
+                ;;
+            esac
+            echo "OK [$kind] $name"
+          done < tools/acceptance-contract.tsv
+
+      - name: ignore audit
+        run: |
+          set -e
+          # Find every #[ignore] in tests; each must have a // JUSTIFY: comment within ±2 lines.
+          matches=$(git grep -nE '^[[:space:]]*#\[ignore' -- 'crates/**/tests/*.rs' || true)
+          if [ -z "$matches" ]; then
+            echo "OK no #[ignore] tests in tree"
+            exit 0
+          fi
+          echo "$matches" | while IFS=: read -r f l _; do
+            start=$((l-2)); [ "$start" -lt 1 ] && start=1
+            end=$((l+2))
+            if sed -n "${start},${end}p" "$f" | grep -q 'JUSTIFY:'; then
+              echo "OK $f:$l #[ignore] (justified)"
+            else
+              echo "FAIL $f:$l #[ignore] without adjacent JUSTIFY"
+              exit 1
+            fi
+          done
+
+      - name: bench latency (record only — never fails CI)
+        run: cargo run --locked -p varta-bench --release -- latency || true
+
+  fuzz-smoke:
+    name: fuzz-smoke
+    # Run on every PR and push — fuzzing is mandatory for safety-critical use.
+    runs-on: ubuntu-latest
+    # rust-toolchain.toml pins the workspace to stable; RUSTUP_TOOLCHAIN
+    # overrides that for every step in this job so cargo-fuzz gets nightly.
+    env:
+      RUSTUP_TOOLCHAIN: nightly
+    steps:
+      - name: checkout
+        uses: actions/checkout@v4
+
+      - name: rust toolchain (nightly — cargo-fuzz requires nightly)
+        uses: dtolnay/rust-toolchain@nightly
+
+      - name: install cargo-fuzz
+        # Do NOT pass --locked: cargo-fuzz 0.13.1's own lockfile pins
+        # rustix 0.36.5, which uses #[cfg_attr(rustc_attrs, rustc_layout_*)]
+        # — internal rustc attributes now rejected on recent nightly builds.
+        # Omitting --locked lets cargo resolve a newer rustix that is
+        # compatible.  `cargo fuzz run` subcommands manage their own
+        # workspace under `fuzz/` and are unaffected.
+        run: cargo install cargo-fuzz
+
+      - name: ensure fuzz corpus directories exist
+        # `fuzz/corpus` is gitignored (cargo-fuzz writes generated inputs into
+        # it), so any target that passes an explicit corpus path to
+        # `cargo fuzz run` needs the directory pre-created on a clean checkout.
+        run: |
+          mkdir -p \
+            fuzz/corpus/frame_decode \
+            fuzz/corpus/aead_roundtrip \
+            fuzz/corpus/peer_cred_cmsg \
+            fuzz/corpus/bounded_index_u32 \
+            fuzz/corpus/bounded_index_ip \
+            fuzz/corpus/outstanding_table \
+            fuzz/corpus/ip_state_table
+
+      - name: fuzz frame_decode (30 s)
+        run: cargo fuzz run frame_decode fuzz/corpus/frame_decode -- -max_total_time=30
+
+      - name: fuzz frame_roundtrip (30 s)
+        run: cargo fuzz run frame_roundtrip -- -max_total_time=30
+
+      - name: fuzz aead_roundtrip (30 s)
+        run: cargo fuzz run aead_roundtrip fuzz/corpus/aead_roundtrip -- -max_total_time=30
+
+      - name: fuzz tracker_record (30 s)
+        run: cargo fuzz run tracker_record -- -max_total_time=30
+
+      - name: fuzz config_from_args (30 s)
+        run: cargo fuzz run config_from_args -- -max_total_time=30
+
+      - name: fuzz kdf_derive (30 s)
+        run: cargo fuzz run kdf_derive -- -max_total_time=30
+
+      - name: fuzz peer_cred_cmsg (30 s)
+        run: cargo fuzz run peer_cred_cmsg fuzz/corpus/peer_cred_cmsg -- -max_total_time=30
+
+      - name: fuzz flag_catalogue_lookup (30 s)
+        run: cargo fuzz run flag_catalogue_lookup -- -max_total_time=30
+
+      - name: fuzz bounded_index_u32 (30 s)
+        run: cargo fuzz run bounded_index_u32 fuzz/corpus/bounded_index_u32 -- -max_total_time=30
+
+      - name: fuzz bounded_index_ip (30 s)
+        run: cargo fuzz run bounded_index_ip fuzz/corpus/bounded_index_ip -- -max_total_time=30
+
+      - name: fuzz outstanding_table (30 s)
+        run: cargo fuzz run outstanding_table fuzz/corpus/outstanding_table -- -max_total_time=30
+
+      - name: fuzz ip_state_table (30 s)
+        run: cargo fuzz run ip_state_table fuzz/corpus/ip_state_table -- -max_total_time=30
+
+      - name: assert no fuzz artifacts (reproducer = CI failure)
+        run: test -z "$(find fuzz/artifacts -type f 2>/dev/null)"
+
+  miri:
+    name: miri (unsafe-code interpretation)
+    runs-on: ubuntu-latest
+    # rust-toolchain.toml pins the workspace to stable; RUSTUP_TOOLCHAIN
+    # overrides that for every step in this job so cargo-miri gets nightly.
+    env:
+      RUSTUP_TOOLCHAIN: nightly
+    steps:
+      - uses: actions/checkout@v4
+      - name: rust toolchain (nightly + miri)
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: miri
+      - name: cargo miri setup
+        run: cargo miri setup
+      - name: miri varta-vlp (pure no_std + crypto compute)
+        run: cargo miri test --locked -p varta-vlp --all-features
+        env: { MIRIFLAGS: "-Zmiri-strict-provenance" }
+      - name: miri varta-vlp crypto boundary tests
+        run: cargo miri test --locked -p varta-vlp --features crypto --test crypto_boundary
+        env: { MIRIFLAGS: "-Zmiri-strict-provenance" }
+      - name: miri peer_cred cmsg parsing
+        run: cargo miri test --locked -p varta-watch --lib peer_cred -- --test-threads=1
+        env: { MIRIFLAGS: "-Zmiri-strict-provenance" }
+      - name: miri tracker (pure-compute, no FFI)
+        run: cargo miri test --locked -p varta-watch --lib tracker -- --test-threads=1
+        env: { MIRIFLAGS: "-Zmiri-strict-provenance" }
+      - name: miri client classifier (pure-compute)
+        run: cargo miri test --locked -p varta-client --test classifier
+        env: { MIRIFLAGS: "-Zmiri-strict-provenance" }
+
+  cross-compile-checks:
+    name: cross-compile-checks (illumos + OpenBSD + riscv64 + musl)
+    # Verify that varta-watch compiles cleanly on Tier-2/Tier-3 targets:
+    # illumos (per-datagram SO_RECVUCRED attestation), OpenBSD (SocketModeOnly
+    # fallback), riscv64 (signal-install architecture support), and musl libc
+    # (different struct sigaction layout, SCM_CREDENTIALS encoding).
+    # Type-check only — no linking, no test execution — because we have no
+    # runners for those platforms.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: rust toolchain (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: install cross-compile targets
+        run: rustup target add x86_64-unknown-illumos riscv64gc-unknown-linux-gnu
+
+      - name: cargo check — riscv64gc-unknown-linux-gnu
+        # Verifies the riscv64 KernelSigAction layout, ecall syscall wrapper,
+        # and compile_error! allowlist (no sa_restorer on riscv64 — vDSO handles
+        # signal-return, same as aarch64).  Compile-time regression coverage
+        # until a native riscv64 GHA runner is available.
+        run: cargo check --locked -p varta-watch --target riscv64gc-unknown-linux-gnu
+
+      - name: install illumos target
+        run: rustup target add x86_64-unknown-illumos
+
+      - name: cargo check — x86_64-unknown-illumos
+        # illumos gets full per-datagram SO_RECVUCRED attestation; this check
+        # exercises the illumos module, IllumosCmsg CmsgPlatform impl, and the
+        # validate.rs O_NOFOLLOW / ELOOP constants.
+        run: cargo check --locked -p varta-watch --target x86_64-unknown-illumos
+
+      - name: install musl target
+        run: rustup target add x86_64-unknown-linux-musl
+
+      - name: cargo check — x86_64-unknown-linux-musl
+        # musl libc differs from glibc in struct sigaction layout (no
+        # sa_restorer on musl x86_64) and SCM_CREDENTIALS struct encoding;
+        # this catches compile-time regressions on signal_install/linux/*.rs
+        # and peer_cred/platform/linux.rs without paying for an Alpine runner.
+        run: cargo check --locked -p varta-watch --target x86_64-unknown-linux-musl
+
+      - name: rust toolchain (nightly — OpenBSD needs -Zbuild-std)
+        uses: dtolnay/rust-toolchain@nightly
+
+      - name: install OpenBSD target source (for -Zbuild-std)
+        run: rustup component add rust-src --toolchain nightly
+
+      - name: cargo check — x86_64-unknown-openbsd (SocketModeOnly fallback)
+        # OpenBSD has no per-datagram credential mechanism on SOCK_DGRAM
+        # (SO_PEERCRED returns ENOTCONN); varta-watch degrades to the
+        # SocketModeOnly plain-recv fallback.  -Zbuild-std is required because
+        # OpenBSD is a Tier-3 target with no pre-built std.
+        run: |
+          cargo +nightly check --locked -p varta-watch \
+            --target x86_64-unknown-openbsd \
+            -Zbuild-std=std,panic_abort
+
+  safety-profiles:
+    name: safety-profiles (production-safe binary audit)
+    runs-on: ubuntu-latest
+    steps:
+      - name: checkout
+        uses: actions/checkout@v4
+
+      - name: rust toolchain (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: production-safe build (default features)
+        run: cargo build --locked -p varta-watch --release
+
+      - name: verify no /bin/sh in production binary
+        run: |
+          strings target/release/varta-watch | grep -F "/bin/sh" \
+            && { echo "FAIL: /bin/sh found in production-safe binary"; exit 1; } \
+            || echo "OK: no /bin/sh in production-safe binary"
+
+      - name: observer-liveness integration tests (L1 self-watchdog, L2 sd_notify, L3 hw_watchdog)
+        run: cargo test --locked -p varta-watch --features test-hooks --test notify --test cli_smoke --test self_watchdog
+
+      # --- SRE profile (M3 — Prometheus HTTP exporter compiled in) ----------
+      - name: SRE profile — build
+        run: cargo build --locked -p varta-watch --release --features prometheus-exporter
+
+      - name: SRE profile — tests
+        run: cargo test --locked -p varta-watch --features prometheus-exporter
+
+      # --- Class-A profile (M3 + M4 — no HTTP, no argv parser) --------------
+      # Build with the canonical safety-critical recipe.  The CI fixture
+      # (tests/fixtures/safety_critical.varta.conf) is the same one the
+      # smoke test consumes locally.
+      - name: Class-A profile — build
+        env:
+          VARTA_CONFIG_FILE: ${{ github.workspace }}/crates/varta-watch/tests/fixtures/safety_critical.varta.conf
+        run: |
+          cargo build --locked -p varta-watch --release \
+            --no-default-features --features secure-udp,compile-time-config
+
+      - name: Class-A profile — strings audit
+        run: |
+          B=target/release/varta-watch
+          FORBIDDEN=(
+            "GET /metrics" "HTTP/1.0" "HTTP/1.1" "WWW-Authenticate"
+            "Bearer realm" "/bin/sh"
+            "--socket" "--threshold-ms" "--prom-addr" "--prom-token-file"
+            "--recovery-cmd" "--recovery-exec" "--help" "--secure-key-file"
+            "--master-key-file" "--key-file" "--clock-source" "--i-accept"
+            "--allow-cross-namespace" "--udp-port"
+            "--features audit-chain" "--features secure-udp"
+            "--features unsafe-plaintext-udp"
+          )
+          fail=0
+          for needle in "${FORBIDDEN[@]}"; do
+            if strings "$B" | grep -qF -- "$needle"; then
+              echo "FAIL: Class-A binary contains forbidden literal: $needle"
+              fail=1
+            fi
+          done
+          if [ "$fail" -eq 0 ]; then
+            echo "OK: Class-A strings audit clean"
+          else
+            exit 1
+          fi
+
+      - name: Class-A profile — smoke
+        env:
+          VARTA_CONFIG_FILE: ${{ github.workspace }}/crates/varta-watch/tests/fixtures/safety_critical.varta.conf
+        run: |
+          cargo test --locked -p varta-watch --release \
+            --no-default-features --features secure-udp,compile-time-config \
+            --test compile_time_config_smoke --test strings_audit
+
+      # --- Compile-error guard ---------------------------------------------
+      # The combination `prometheus-exporter` + `compile-time-config` is
+      # explicitly forbidden in lib.rs.  CI confirms the diagnostic fires.
+      - name: Mutually-exclusive features fail to compile
+        env:
+          VARTA_CONFIG_FILE: ${{ github.workspace }}/crates/varta-watch/tests/fixtures/safety_critical.varta.conf
+        run: |
+          if cargo build --locked -p varta-watch --release \
+            --no-default-features --features prometheus-exporter,compile-time-config 2>&1 \
+            | tee /tmp/feature-combo.log \
+            | grep -qF "cannot be combined with"
+          then
+            echo "OK: prometheus-exporter + compile-time-config rejected by compile_error!"
+          else
+            echo "FAIL: combination should have triggered compile_error!"
+            cat /tmp/feature-combo.log
+            exit 1
+          fi
+
+      # --- libc-signal-mode feature ------------------------------------------
+      # Build and test varta-watch with the libc-signal-mode feature, which
+      # excises the inline-asm trampoline and the direct-syscall path. Also
+      # verify the compile_error! fires when both libc-signal-mode and
+      # compile-time-config are enabled together.
+      - name: varta-watch libc-signal-mode build and tests
+        if: runner.os == 'Linux'
+        run: |
+          cargo test --locked -p varta-watch \
+            --no-default-features --features libc-signal-mode \
+            --test signal_handler --test signal_handler_libc_mode \
+            --test signal_handler_libc_only_build
+
+      - name: libc-signal-mode + compile-time-config rejected by compile_error!
+        if: runner.os == 'Linux'
+        env:
+          VARTA_CONFIG_FILE: ${{ github.workspace }}/crates/varta-watch/tests/fixtures/safety_critical.varta.conf
+        run: |
+          if cargo build --locked -p varta-watch --release \
+            --no-default-features --features libc-signal-mode,compile-time-config 2>&1 \
+            | tee /tmp/libc-signal-combo.log \
+            | grep -qF "cannot be combined with"
+          then
+            echo "OK: libc-signal-mode + compile-time-config rejected by compile_error!"
+          else
+            echo "FAIL: combination should have triggered compile_error!"
+            cat /tmp/libc-signal-combo.log
+            exit 1
+          fi
+
+      # --- unsafe-plaintext-udp vs compile-time-config -----------------------
+      # Mission-critical (Class-A) builds must not link the plaintext UDP
+      # listener, which has no per-datagram authentication or replay
+      # protection.  The compile_error! in lib.rs rejects the combination at
+      # build time; CI confirms the diagnostic fires.
+      - name: unsafe-plaintext-udp + compile-time-config rejected by compile_error!
+        env:
+          VARTA_CONFIG_FILE: ${{ github.workspace }}/crates/varta-watch/tests/fixtures/safety_critical.varta.conf
+        run: |
+          if cargo build --locked -p varta-watch --release \
+            --no-default-features --features unsafe-plaintext-udp,compile-time-config 2>&1 \
+            | tee /tmp/plaintext-udp-combo.log \
+            | grep -qF "cannot be combined with"
+          then
+            echo "OK: unsafe-plaintext-udp + compile-time-config rejected by compile_error!"
+          else
+            echo "FAIL: combination should have triggered compile_error!"
+            cat /tmp/plaintext-udp-combo.log
+            exit 1
+          fi
+
+  kani-proofs:
+    name: kani-proofs (${{ matrix.harness }})
+    # Symbolic verification of `Frame::decode` and the CRC-32C primitive.
+    # Required gate on every PR that touches the protocol crate.  See
+    # book/src/architecture/verification.md for the strategy and a mapping
+    # from harness names to invariants proved.
+    #
+    # Fan-out: one matrix entry per `#[kani::proof]` harness.  Each gets its
+    # own 30-min budget and runs in parallel — a single slow proof can no
+    # longer starve the rest of the suite.  Add a new entry here when adding
+    # a new harness to crates/varta-vlp/src/proofs.rs.
+    #
+    # Two harnesses are intentionally NOT in this matrix:
+    #
+    # * `proofs::crc_detects_bit_flip` — two symbolic 28-iteration table-lookup
+    #   expressions; CBMC cannot discharge within 30-min budget.  6h budget in
+    #   kani-nightly.yml.  CRC bit-flip detection guaranteed by polynomial
+    #   construction (CRC-32C/Castagnoli); const-asserts in crc32c.rs.
+    #
+    # * `proofs::encode_decode_roundtrips_exhaustive` — exhaustive round-trip
+    #   over all status values + symbolic pid/timestamp/nonce/payload.  CRC
+    #   computation over symbolic fields creates >80s state.  Per-PR uses
+    #   concrete-value smoke test (~0.9s); nightly runs exhaustive symbolic
+    #   variant (~90s).
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        # Fully-qualified harness names (`<module>::<fn>`) — required by
+        # `cargo kani --harness ... --exact`.  Confirmed via `cargo kani list`.
+        harness:
+          - proofs::decode_never_panics
+          - proofs::decode_classification
+          - proofs::encode_decode_roundtrips
+          - proofs::decode_error_precedence
+    steps:
+      - name: checkout
+        uses: actions/checkout@v4
+
+      - name: detect varta-vlp-relevant changes
+        id: changes
+        uses: dorny/paths-filter@v3
+        with:
+          filters: |
+            vlp:
+              - 'crates/varta-vlp/**'
+              - '.github/workflows/ci.yml'
+
+      - name: rust toolchain (stable — Kani works on stable)
+        if: steps.changes.outputs.vlp == 'true' || github.event_name == 'push'
+        uses: dtolnay/rust-toolchain@stable
+
+      # Cache the cargo-kani binary AND the kani toolchain (~/.kani holds
+      # the CBMC binary + kani-compiler, ~600MB).  Without this, every run
+      # rebuilds kani-verifier from source (~3-5 min) and re-downloads the
+      # toolchain (~2-5 min).  Bump the `-v1` suffix to force a refresh
+      # after a kani-verifier upgrade or a CBMC change.
+      - name: cache kani install
+        if: steps.changes.outputs.vlp == 'true' || github.event_name == 'push'
+        id: cache-kani
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/cargo-kani
+            ~/.cargo/bin/kani
+            ~/.kani
+          key: kani-v1-${{ runner.os }}
+
+      - name: install kani-verifier
+        if: (steps.changes.outputs.vlp == 'true' || github.event_name == 'push') && steps.cache-kani.outputs.cache-hit != 'true'
+        run: |
+          cargo install --locked kani-verifier
+          cargo kani setup
+
+      - name: cargo kani -p varta-vlp --harness ${{ matrix.harness }}
+        if: steps.changes.outputs.vlp == 'true' || github.event_name == 'push'
+        # `cargo kani` does not forward `--locked` to its inner `cargo
+        # build`; the kani harness lives outside the workspace lockfile
+        # contract.  Tracked as a follow-up.
+        # `--exact` pins the harness selector so a future `decode_classification_v2`
+        # would not also be picked up by the `decode_classification` entry.
+        run: cargo kani -p varta-vlp --harness ${{ matrix.harness }} --exact
+
+      - name: skip notice
+        if: steps.changes.outputs.vlp != 'true' && github.event_name != 'push'
+        run: echo "no varta-vlp changes — Kani proofs skipped"
+
+  supply-chain:
+    name: supply-chain (cargo-deny — advisories, bans, sources, licenses)
+    # Audits the resolved dep graph against `deny.toml` at repo root.
+    # The four optional crypto deps in `crates/varta-vlp/Cargo.toml` are
+    # pinned to exact patch versions (`=X.Y.Z`); this job extends the
+    # same posture to every transitive dep (yanked crates, RUSTSEC
+    # advisories, license drift, unknown registries / git sources).
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: rust toolchain (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: install cargo-deny (pinned)
+        # Pin the tool itself — cargo-deny is part of the trusted compute
+        # base.  Bumping this version is a reviewable PR via the dep-bump
+        # procedure in `book/src/architecture/supply-chain.md`.
+        # 0.19.6 is the minimum that parses CVSS:4.0 entries in the
+        # RUSTSEC advisory db (libcrux-poly1305 RUSTSEC-2026-0073 trips
+        # 0.16.x with `unsupported CVSS version: 4.0`).
+        run: cargo install --locked --version 0.19.6 cargo-deny
+
+      - name: cargo deny check
+        run: cargo deny --all-features check advisories bans sources licenses
+
+  python-client:
+    name: python-client (${{ matrix.os }}, py${{ matrix.python-version }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        python-version: ["3.8", "3.12"]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: checkout
+        uses: actions/checkout@v4
+
+      - name: setup python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: rust toolchain (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: cargo cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: build varta-watch (release, prometheus-exporter)
+        run: cargo build --locked --release -p varta-watch --features prometheus-exporter
+
+      - name: install Python client + dev extras
+        working-directory: clients/python
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: conformance vectors
+        working-directory: clients/python
+        run: pytest tests/test_conformance_vectors.py -v
+
+      - name: unit tests
+        working-directory: clients/python
+        run: pytest tests/test_client_unit.py tests/test_panic_hook.py -v
+
+      - name: interop with varta-watch
+        working-directory: clients/python
+        env:
+          VARTA_WATCH_BIN: ${{ github.workspace }}/target/release/varta-watch
+        run: pytest tests/test_interop_observer.py -v --timeout=60
+
+      - name: build sdist + wheel
+        working-directory: clients/python
+        run: |
+          pip install build
+          python -m build
+
+      - name: install built wheel into a fresh venv (smoke)
+        working-directory: clients/python
+        run: |
+          python -m venv /tmp/varta-smoke-venv
+          /tmp/varta-smoke-venv/bin/pip install dist/varta-*.whl
+          /tmp/varta-smoke-venv/bin/python -c "import varta; print(varta.__version__)"
+
+  go-client:
+    name: go-client (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: checkout
+        uses: actions/checkout@v4
+
+      - name: setup go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.21'
+
+      - name: rust toolchain (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: cargo cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: build varta-watch (release, prometheus-exporter)
+        run: cargo build --locked --release -p varta-watch --features prometheus-exporter
+
+      - name: go mod tidy + vet + build
+        working-directory: clients/go
+        run: |
+          go mod tidy
+          go vet ./...
+          go build ./...
+
+      - name: conformance vectors
+        working-directory: clients/go
+        run: go test -v -count=1 ./tests -run TestConformance
+
+      - name: internal package unit tests
+        working-directory: clients/go
+        run: go test -v -count=1 ./internal/...
+
+      - name: client + fork + panic unit tests
+        working-directory: clients/go
+        run: go test -v -count=1 ./tests -run 'TestUnit|TestPanic|TestFork'
+
+      - name: interop with varta-watch
+        working-directory: clients/go
+        env:
+          VARTA_WATCH_BIN: ${{ github.workspace }}/target/release/varta-watch
+        run: go test -v -count=1 -timeout=90s ./tests -run TestInterop
+
+  node-client:
+    name: node-client (${{ matrix.os }}, node-${{ matrix.node }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        node: ['18', '20', '22']
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: checkout
+        uses: actions/checkout@v4
+
+      - name: setup node
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: 'npm'
+          cache-dependency-path: 'clients/node/package-lock.json'
+
+      - name: rust toolchain (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: cargo cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: build varta-watch (release, prometheus-exporter + plaintext-udp)
+        # The Node interop test now drives BOTH UDS (via the optional
+        # `node-unix-socket` addon, since 0.2.0) and loopback UDP
+        # against the same observer process. UDS is default; the
+        # `unsafe-plaintext-udp` feature stays on so the UDP branch
+        # still runs. Loopback only — the test binds 127.0.0.1.
+        run: cargo build --locked --release -p varta-watch --features "prometheus-exporter unsafe-plaintext-udp"
+
+      - name: install deps
+        working-directory: clients/node
+        run: npm ci || npm install
+
+      - name: type-check + build
+        working-directory: clients/node
+        run: npm run build
+
+      - name: conformance vectors
+        working-directory: clients/node
+        run: npm run test:conformance
+
+      - name: unit tests (client + transport + fork + panic)
+        working-directory: clients/node
+        run: npm run test:unit
+
+      - name: interop with varta-watch
+        working-directory: clients/node
+        env:
+          VARTA_WATCH_BIN: ${{ github.workspace }}/target/release/varta-watch
+        timeout-minutes: 2
+        run: npm run test:interop
+
+  dotnet-client:
+    name: dotnet-client (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: checkout
+        uses: actions/checkout@v4
+
+      - name: setup dotnet
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: |
+            8.0.x
+            10.0.x
+
+      - name: rust toolchain (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: cargo cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: build varta-watch (release, prometheus-exporter)
+        run: cargo build --locked --release -p varta-watch --features prometheus-exporter
+
+      - name: restore + build
+        working-directory: clients/dotnet
+        run: |
+          dotnet restore Varta.slnx
+          dotnet build Varta.slnx -c Release --no-restore
+
+      - name: conformance vectors
+        working-directory: clients/dotnet
+        run: >
+          dotnet test tests/Varta.Client.Tests/Varta.Client.Tests.csproj
+          -c Release --no-build --logger "console;verbosity=minimal"
+          --filter "FullyQualifiedName~Conformance"
+
+      - name: unit tests (codec + agent + panic + errno)
+        working-directory: clients/dotnet
+        run: >
+          dotnet test tests/Varta.Client.Tests/Varta.Client.Tests.csproj
+          -c Release --no-build --logger "console;verbosity=minimal"
+          --filter "FullyQualifiedName!~Interop&FullyQualifiedName!~Conformance"
+
+      - name: interop with varta-watch
+        working-directory: clients/dotnet
+        env:
+          VARTA_WATCH_BIN: ${{ github.workspace }}/target/release/varta-watch
+        timeout-minutes: 2
+        run: >
+          dotnet test tests/Varta.Client.Tests/Varta.Client.Tests.csproj
+          -c Release --no-build --logger "console;verbosity=minimal"
+          --filter "FullyQualifiedName~Interop"
+
+      - name: nuget pack (smoke)
+        working-directory: clients/dotnet
+        run: dotnet pack src/Varta.Client/Varta.Client.csproj -c Release -o ./nupkgs
+
+  java-client:
+    name: java-client (${{ matrix.os }}, jdk-${{ matrix.jdk }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        jdk: ['17', '21']
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: checkout
+        uses: actions/checkout@v4
+
+      - name: setup jdk
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: ${{ matrix.jdk }}
+
+      - name: setup gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-home-cache-cleanup: true
+
+      - name: rust toolchain (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: cargo cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: build varta-watch (release, prometheus-exporter)
+        run: cargo build --locked --release -p varta-watch --features prometheus-exporter
+
+      - name: assemble
+        working-directory: clients/java
+        run: ./gradlew :lib:assemble --no-daemon --stacktrace
+
+      - name: verify zero runtime deps
+        working-directory: clients/java
+        run: ./gradlew :lib:verifyZeroRuntimeDeps --no-daemon
+
+      - name: conformance vectors
+        working-directory: clients/java
+        run: ./gradlew :lib:test --tests "*Conformance*" --no-daemon
+
+      - name: unit tests (codec + agent + panic + errno + transports)
+        working-directory: clients/java
+        run: >
+          ./gradlew :lib:test
+          --tests "health.varta.VartaAgentTest"
+          --tests "health.varta.ForkSafetyTest"
+          --tests "health.varta.PanicHandlerTest"
+          --tests "health.varta.vlp.VlpCodecUnitTest"
+          --tests "health.varta.vlpsecure.AeadCodecUnitTest"
+          --tests "health.varta.vlpsecure.HkdfTest"
+          --tests "health.varta.transport.UdpTransportTest"
+          --tests "health.varta.transport.UdsTransportTest"
+          --tests "health.varta.transport.SecureUdpTransportTest"
+          --tests "health.varta.transport.ErrnoClassifierTest"
+          --no-daemon
+
+      - name: interop with varta-watch
+        working-directory: clients/java
+        env:
+          VARTA_WATCH_BIN: ${{ github.workspace }}/target/release/varta-watch
+        timeout-minutes: 2
+        run: ./gradlew :lib:test --tests "health.varta.InteropObserverTest" --no-daemon
+
+      - name: build sources + javadoc jars
+        working-directory: clients/java
+        run: ./gradlew :lib:sourcesJar :lib:javadocJar --no-daemon
+
+  java-client-windows:
+    name: java-client (windows compile)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+      - uses: gradle/actions/setup-gradle@v4
+      - name: compile only (UDS interop is POSIX-only)
+        working-directory: clients/java
+        run: ./gradlew.bat :lib:compileJava --no-daemon
+
+  book:
+    name: build-book
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: install mdbook
+        run: cargo install --locked mdbook
+
+      - name: install mdbook-mermaid
+        run: cargo install --locked mdbook-mermaid
+
+      - name: sync governance docs into book
+        run: |
+          mkdir -p book/src/governance
+          cp CONTRIBUTING.md book/src/governance/contributing.md
+          cp SECURITY.md     book/src/governance/security.md
+          cp ROADMAP.md      book/src/governance/roadmap.md
+
+      - name: build book
+        run: mdbook build book
+
+  observability-lint:
+    name: observability-lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: install promtool + amtool
+        run: |
+          set -euo pipefail
+          PROM_VERSION=2.55.0
+          AM_VERSION=0.27.0
+          # Download to a file with retries before extracting: a transient
+          # 502 from the release CDN otherwise truncates the stream piped
+          # into `tar` and fails the job (curl exits 0 mid-pipe on some
+          # partial responses). --retry-all-errors covers HTTP 5xx, which
+          # curl does not retry by default.
+          dl() {
+            curl -fsSL --retry 5 --retry-all-errors --retry-delay 3 -o "$1" "$2"
+          }
+          dl /tmp/prometheus.tar.gz \
+            "https://github.com/prometheus/prometheus/releases/download/v${PROM_VERSION}/prometheus-${PROM_VERSION}.linux-amd64.tar.gz"
+          tar xzf /tmp/prometheus.tar.gz -C /tmp
+          sudo install -m 0755 "/tmp/prometheus-${PROM_VERSION}.linux-amd64/promtool" /usr/local/bin/promtool
+          dl /tmp/alertmanager.tar.gz \
+            "https://github.com/prometheus/alertmanager/releases/download/v${AM_VERSION}/alertmanager-${AM_VERSION}.linux-amd64.tar.gz"
+          tar xzf /tmp/alertmanager.tar.gz -C /tmp
+          sudo install -m 0755 "/tmp/alertmanager-${AM_VERSION}.linux-amd64/amtool" /usr/local/bin/amtool
+
+      - name: install kubeconform
+        run: |
+          set -euo pipefail
+          KC_VERSION=0.6.7
+          curl -fsSL --retry 5 --retry-all-errors --retry-delay 3 \
+            -o /tmp/kubeconform.tar.gz \
+            "https://github.com/yannh/kubeconform/releases/download/v${KC_VERSION}/kubeconform-linux-amd64.tar.gz"
+          tar xzf /tmp/kubeconform.tar.gz -C /tmp
+          sudo install -m 0755 /tmp/kubeconform /usr/local/bin/kubeconform
+
+      - name: promtool — alert rules
+        run: promtool check rules observability/alerts/varta.rules.yml
+
+      - name: promtool — recording rules
+        run: promtool check rules observability/recording-rules/varta.rules.yml
+
+      - name: promtool — scrape config snippet
+        run: |
+          # Wrap the scrape snippet in a minimal global block so promtool
+          # accepts it standalone. The snippet itself is what operators
+          # actually paste in.
+          {
+            echo "global:"
+            echo "  scrape_interval: 15s"
+            cat observability/examples/prometheus-scrape.yml
+          } > /tmp/prom-full.yml
+          promtool check config /tmp/prom-full.yml
+
+      - name: amtool — alertmanager config
+        run: amtool check-config observability/examples/alertmanager.yml
+
+      - name: kubeconform — kubernetes manifests
+        run: |
+          # ServiceMonitor / PodMonitor are CRDs; ignore-missing-schemas
+          # so the linter doesn't fail on prometheus-operator types.
+          kubeconform -strict -ignore-missing-schemas \
+            -summary \
+            observability/examples/kubernetes/
+
+      - name: systemd-analyze — unit file
+        run: |
+          # Copy unit to a known systemd path; systemd-analyze verify
+          # works on an absolute file path but resolves [Service] paths
+          # to the host (so /usr/local/bin/varta-watch may not exist).
+          # `--no-pager` keeps output CI-clean; missing-binary warnings
+          # are non-fatal for verify.
+          sudo cp observability/examples/varta-watch.service \
+            /etc/systemd/system/varta-watch.service
+          systemd-analyze verify /etc/systemd/system/varta-watch.service \
+            || echo "(non-fatal: warnings expected because binary path is host-relative)"
+
+      - name: dashboard JSON valid
+        run: python3 -c "import json; json.load(open('observability/dashboards/varta-health.json'))"
+
+      - name: cross-check alert / dashboard refs against exporter source
+        run: python3 tools/check_dashboard_metrics.py
+
+  # ----------------------------------------------------------------------
+  # Deployment-surface gates: keep the Dockerfile, Helm chart, and
+  # installer script honest on every PR so a stale artifact never reaches
+  # adopters silently. Tag-driven release.yml is responsible for the
+  # actual push.
+  # ----------------------------------------------------------------------
+
+  docker-build:
+    name: docker-build (smoke)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-qemu-action@v3
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: buildx — linux/amd64 (load + smoke run)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64
+          push: false
+          load: true
+          tags: varta-watch:ci-smoke
+          build-args: |
+            VERSION=ci
+            GIT_SHA=${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: --help exits zero, names varta-watch
+        run: |
+          set -x
+          docker image inspect varta-watch:ci-smoke \
+            --format '{{.Os}}/{{.Architecture}} entrypoint={{json .Config.Entrypoint}} user={{.Config.User}}'
+          tmp=$(mktemp)
+          set +e
+          docker run --rm varta-watch:ci-smoke --help >"$tmp" 2>&1
+          rc=$?
+          set -e
+          echo "--- exit=$rc ---"
+          head -n 20 "$tmp" || true
+          echo "--- end ---"
+          test "$rc" -eq 0
+          grep -qE 'varta-watch' "$tmp"
+
+      - name: buildx — linux/arm64 (build only, no run)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/arm64
+          push: false
+          tags: varta-watch:ci-arm64
+          build-args: |
+            VERSION=ci
+            GIT_SHA=${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  helm-lint:
+    name: helm-lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: azure/setup-helm@v4
+        with:
+          version: v3.16.1
+
+      - name: helm lint
+        run: helm lint charts/varta-watch
+
+      - name: helm template (default values)
+        run: |
+          helm template ci charts/varta-watch \
+            --set 'prometheusToken.token=00000000000000000000000000000000000000000000000000000000deadbeef' \
+            > /tmp/rendered.yaml
+          test -s /tmp/rendered.yaml
+
+      - name: install kubeconform
+        run: |
+          set -euo pipefail
+          KC_VERSION=0.6.7
+          curl -fsSL --retry 5 --retry-all-errors --retry-delay 3 \
+            -o /tmp/kubeconform.tar.gz \
+            "https://github.com/yannh/kubeconform/releases/download/v${KC_VERSION}/kubeconform-linux-amd64.tar.gz"
+          tar xzf /tmp/kubeconform.tar.gz -C /tmp
+          sudo install -m 0755 /tmp/kubeconform /usr/local/bin/kubeconform
+
+      - name: kubeconform — rendered chart
+        run: |
+          kubeconform -strict -ignore-missing-schemas -summary /tmp/rendered.yaml
+
+      - name: helm template — sidecar mode
+        run: |
+          helm template ci charts/varta-watch \
+            --set 'mode=sidecar' \
+            --set 'prometheusToken.token=00000000000000000000000000000000000000000000000000000000deadbeef' \
+            > /tmp/rendered-sidecar.yaml
+          kubeconform -strict -ignore-missing-schemas /tmp/rendered-sidecar.yaml
+
+  helm-parity:
+    name: helm-parity
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: azure/setup-helm@v4
+        with:
+          version: v3.16.1
+
+      - name: install yq
+        run: |
+          set -euo pipefail
+          YQ_VERSION=v4.44.3
+          curl -fsSL --retry 5 --retry-all-errors --retry-delay 3 \
+            "https://github.com/mikefarah/yq/releases/download/${YQ_VERSION}/yq_linux_amd64" \
+            -o /tmp/yq
+          sudo install -m 0755 /tmp/yq /usr/local/bin/yq
+
+      - name: render fixture + diff
+        run: bash tools/render-helm-fixture.sh
+
+  installer-syntax:
+    name: installer-syntax
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: sh -n
+        run: sh -n scripts/install.sh
+
+      - name: shellcheck (POSIX)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y shellcheck
+          shellcheck -s sh scripts/install.sh
+
+  # End-to-end smoke for the published deployment surface: spin up a
+  # local kind cluster, helm-install the chart against a freshly-built
+  # image, wait for the rollout to become Ready, then run the chart's
+  # bundled `helm test` hook which scrapes /metrics with the bearer
+  # token. Catches regressions that helm-lint and helm-parity miss —
+  # most importantly any argv string the chart emits that the
+  # varta-watch binary's parser does not recognise (those crash on
+  # container start with ConfigError::UnknownFlag and would otherwise
+  # only surface in production).
+  helm-deploy-smoke:
+    name: helm-deploy-smoke (kind)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: build varta-watch:ci image (linux/amd64, load locally)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64
+          push: false
+          load: true
+          tags: varta-watch:ci
+          build-args: |
+            VERSION=ci
+            GIT_SHA=${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: create kind cluster
+        uses: helm/kind-action@v1
+        with:
+          version: v0.24.0
+          cluster_name: varta-helm-smoke
+
+      - name: load image into kind
+        run: kind load docker-image varta-watch:ci --name varta-helm-smoke
+
+      - uses: azure/setup-helm@v4
+        with:
+          version: v3.16.1
+
+      - name: helm install (sidecar mode, no hostPath required on kind)
+        run: |
+          set -euxo pipefail
+          # Helm 3 needs the target namespace to exist before it can
+          # persist the release secret, so the chart's templated
+          # Namespace resource cannot bootstrap its own release storage.
+          # Let Helm create the namespace (--create-namespace) and tell
+          # the chart to skip its Namespace template
+          # (namespace.create=false) so there is exactly one owner and
+          # no "invalid ownership metadata" conflict (see bug-041).
+          token=$(openssl rand -hex 32)
+          helm upgrade --install varta-watch charts/varta-watch \
+            --create-namespace \
+            --namespace varta \
+            --set namespace.create=false \
+            --set mode=sidecar \
+            --set image.repository=varta-watch \
+            --set image.tag=ci \
+            --set image.pullPolicy=Never \
+            --set prometheusToken.token="$token" \
+            --set dashboard.enabled=false \
+            --set prometheus.serviceMonitor.enabled=false \
+            --set prometheus.podMonitor.enabled=false
+
+      - name: wait for rollout
+        run: |
+          kubectl -n varta rollout status deployment/varta-watch --timeout=120s
+
+      - name: helm test (scrapes /metrics with bearer token)
+        run: helm test varta-watch -n varta --logs
+
+      - name: dump observer logs on failure
+        if: failure()
+        run: |
+          kubectl -n varta describe pods
+          # --tail=-1 (no cap) so config-parse errors at the top of stdout
+          # aren't truncated by Config::HELP output below them.
+          # --previous covers the first crash in a CrashLoopBackOff cycle —
+          # without it, you only ever see the latest (already-crashed) attempt.
+          for pod in $(kubectl -n varta get pods -o name); do
+            echo "===== $pod (current) ====="
+            kubectl -n varta logs "$pod" --all-containers --tail=-1 || true
+            echo "===== $pod (previous, if any) ====="
+            kubectl -n varta logs "$pod" --all-containers --previous --tail=-1 2>/dev/null || true
+          done

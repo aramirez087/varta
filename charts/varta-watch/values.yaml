@@ -1,0 +1,225 @@
+# Default values for the varta-watch chart.
+# See book/src/operations/helm.md for the full operator guide.
+
+# --- Deployment shape ---------------------------------------------------
+#
+# daemonset  — one observer per node, agents share UDS via hostPath
+#              /run/varta. Default — easiest fit for non-pod workloads.
+# sidecar    — Deployment with an emptyDir UDS, only agents inside the
+#              same Pod can reach the observer. Use for strict-tenant
+#              isolation.
+mode: daemonset
+
+# --- Image --------------------------------------------------------------
+image:
+  repository: ghcr.io/aramirez087/varta-watch
+  # When empty, defaults to .Chart.appVersion at render time. Pin to an
+  # immutable tag for production (avoid the moving `:latest`).
+  tag: ""
+  pullPolicy: IfNotPresent
+  # imagePullSecrets is a list of secret names — leave empty for the
+  # public GHCR image.
+  pullSecrets: []
+
+# --- Token-stage init container ----------------------------------------
+#
+# Init container that copies the K8s Secret-mounted bearer token from
+# `/token-source/prom.token` (root-owned, mode 0400 — what K8s gives us)
+# to an emptyDir at `/token/prom.token` owned by the observer UID with
+# mode 0o400, so varta-watch's validate_secret_file() check passes.
+# See charts/varta-watch/templates/_helpers.tpl for the full rationale.
+tokenInit:
+  image:
+    repository: busybox
+    tag: "1.36"
+    pullPolicy: IfNotPresent
+  resources:
+    requests:
+      cpu: 5m
+      memory: 8Mi
+    limits:
+      cpu: 50m
+      memory: 16Mi
+
+# --- Bearer token for /metrics -----------------------------------------
+#
+# Two paths:
+#   1. Set `token` here. Chart creates a Secret named
+#      `<release>-varta-prom-token`. Suitable for dev / quick start.
+#   2. Provision the Secret out-of-band (SOPS, ESO, Vault Secrets
+#      Operator, …) and set `existingSecret.name`. Chart will mount it
+#      and never look at `token`.
+prometheusToken:
+  existingSecret:
+    name: ""
+    key: token
+  # Generate with: openssl rand -hex 32
+  # Required when existingSecret.name is empty.
+  token: ""
+
+# --- UDS path ----------------------------------------------------------
+uds:
+  path: /run/varta/varta.sock
+  # hostPath used by mode=daemonset; mode=sidecar always uses emptyDir.
+  hostPath: /run/varta
+  hostPathType: DirectoryOrCreate
+
+# --- varta-watch process flags ------------------------------------------
+#
+# `--threshold-ms` is required by the binary's argv parser (no default).
+# 2000 ms matches the value in observability/examples/varta-watch.service
+# and the canonical examples under design.md / clients/*/README.md.
+thresholdMs: 2000
+
+# `--self-watchdog-secs` matches the systemd unit's default (4s, half of
+# the kernel's typical WatchdogSec=8s).
+selfWatchdogSecs: 4
+
+# Additional flags appended verbatim to the binary's argv. See
+# `varta-watch --help` for the catalogue.
+extraArgs: []
+
+# --- Prometheus ---------------------------------------------------------
+prometheus:
+  # Bind address inside the container. The Service exposes it on the
+  # same port. Set to "" to disable the HTTP endpoint entirely (you'll
+  # also need to disable serviceMonitor.enabled below).
+  bindAddr: "0.0.0.0:9100"
+  port: 9100
+  serviceMonitor:
+    enabled: true
+    # Match this to your kube-prometheus release label. The
+    # kube-prometheus-stack Helm chart defaults to
+    # `release: <chart-release-name>`.
+    release: kube-prometheus-stack
+    interval: 15s
+    scrapeTimeout: 10s
+    # Extra labels merged onto the ServiceMonitor metadata.
+    extraLabels: {}
+  podMonitor:
+    enabled: false
+    release: kube-prometheus-stack
+    interval: 15s
+    scrapeTimeout: 10s
+    extraLabels: {}
+
+# --- Grafana dashboard --------------------------------------------------
+#
+# When enabled, the chart creates a ConfigMap with the dashboard sidecar
+# label (`grafana_dashboard: "1"`) so the Grafana sidecar discovers and
+# auto-imports it.
+dashboard:
+  enabled: true
+  # Namespace where the Grafana sidecar watches for dashboards. Empty
+  # means "release namespace".
+  namespace: ""
+  label: grafana_dashboard
+  labelValue: "1"
+
+# --- Service ------------------------------------------------------------
+service:
+  type: ClusterIP
+  # Headless — per-pod targets resolved by ServiceMonitor.
+  clusterIP: None
+  port: 9100
+  annotations: {}
+
+# --- Resources / scheduling --------------------------------------------
+resources:
+  requests:
+    cpu: 25m
+    memory: 32Mi
+  limits:
+    cpu: 250m
+    memory: 128Mi
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
+priorityClassName: ""
+
+# --- Pod-level security context ----------------------------------------
+#
+# `fsGroup` is what lets the non-root main container write to the
+# emptyDir UDS volume (`mode=sidecar`) — kubelet chowns supported
+# volumes to root:fsGroup and adds group-write at mount time. Match it
+# to `runAsGroup` so the container's primary GID owns the dir.
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 65532
+  runAsGroup: 65532
+  fsGroup: 65532
+  seccompProfile:
+    type: RuntimeDefault
+
+# --- Container-level security context ---------------------------------
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop:
+      - ALL
+
+# --- Probes ------------------------------------------------------------
+readinessProbe:
+  tcpSocket:
+    port: metrics
+  initialDelaySeconds: 2
+  periodSeconds: 5
+
+livenessProbe:
+  tcpSocket:
+    port: metrics
+  initialDelaySeconds: 5
+  periodSeconds: 10
+  failureThreshold: 3
+
+# --- RBAC --------------------------------------------------------------
+serviceAccount:
+  create: true
+  name: ""           # Empty → derived from release name.
+  annotations: {}
+  automountToken: false
+
+# --- Namespace creation -------------------------------------------------
+#
+# When true, the chart emits a Namespace object (matching the layout of
+# observability/examples/kubernetes/varta-watch.deployment.yaml). Most
+# operators prefer to manage namespaces out-of-band; set to false in
+# that case.
+namespace:
+  create: true
+  name: varta
+  labels:
+    pod-security.kubernetes.io/enforce: baseline
+
+# --- Pod annotations ----------------------------------------------------
+podAnnotations:
+  # Kept for stock Prometheus users not running the operator.
+  prometheus.io/scrape: "true"
+  prometheus.io/port: "9100"
+  prometheus.io/path: "/metrics"
+
+# --- Alertmanager Slack integration ------------------------------------
+#
+# Two paths (mirrors prometheusToken):
+#   1. Set `webhookUrl` here. Chart creates a Secret named
+#      `<release>-alertmanager-slack`. Suitable for dev / quick start.
+#   2. Provision the Secret out-of-band (SOPS, ESO, Vault Secrets
+#      Operator, …) and set `existingSecret.name`. Chart never touches `webhookUrl`.
+#
+# The Secret key is mounted as SLACK_WEBHOOK_URL in the Alertmanager pod.
+# Requires Alertmanager flag: --config.expand-env
+# See observability/examples/alertmanager.yml for the matching config.
+alertmanager:
+  slack:
+    webhookUrl: ""
+    existingSecret:
+      name: ""
+      key: slack-webhook-url
+
+# --- Update strategy ----------------------------------------------------
+updateStrategy:
+  type: RollingUpdate
+  rollingUpdate:
+    maxUnavailable: 1

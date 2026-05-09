@@ -1,0 +1,75 @@
+{
+  "name": "@varta-health/client",
+  "version": "0.2.2",
+  "description": "Health protocol client for distributed local agents (Varta VLP v0.2).",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./panic": {
+      "types": "./dist/panic.d.ts",
+      "import": "./dist/panic.js"
+    },
+    "./vlp": {
+      "types": "./dist/vlp.d.ts",
+      "import": "./dist/vlp.js"
+    },
+    "./vlp-secure": {
+      "types": "./dist/vlp_secure.d.ts",
+      "import": "./dist/vlp_secure.js"
+    }
+  },
+  "files": [
+    "dist",
+    "LICENSE",
+    "README.md",
+    "CHANGELOG.md"
+  ],
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "clean": "rm -rf dist",
+    "prepublishOnly": "npm run clean && npm run build",
+    "test": "npm run test:conformance && npm run test:unit",
+    "test:conformance": "node --test --import tsx tests/conformance.test.ts",
+    "test:unit": "node --test --import tsx tests/client_unit.test.ts tests/transport.test.ts tests/fork_safety.test.ts tests/panic.test.ts",
+    "test:interop": "node --test --import tsx tests/interop.test.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "keywords": [
+    "varta",
+    "vlp",
+    "heartbeat",
+    "monitoring",
+    "observability",
+    "prometheus",
+    "agent",
+    "watchdog",
+    "healthcheck"
+  ],
+  "author": "Varta Maintainers",
+  "license": "MIT OR Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/aramirez087/Varta.git",
+    "directory": "clients/node"
+  },
+  "homepage": "https://github.com/aramirez087/Varta/tree/main/clients/node",
+  "bugs": {
+    "url": "https://github.com/aramirez087/Varta/issues"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "tsx": "^4.7.0",
+    "typescript": "^5.4.0"
+  },
+  "optionalDependencies": {
+    "node-unix-socket": "^0.2.7"
+  }
+}

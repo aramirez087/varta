@@ -1,0 +1,32 @@
+# OSS-Fuzz project manifest for Varta.
+#
+# This file is consumed by the upstream OSS-Fuzz repository
+# (https://github.com/google/oss-fuzz).  After the upstream PR is
+# merged, OSS-Fuzz infrastructure picks up the corresponding
+# `Dockerfile` and `build.sh` from
+# `projects/varta/` in that repo, which mirror the files here.
+#
+# Keeping a local copy under `oss-fuzz/` lets CI smoke-build the
+# Docker image and confirms the build script still produces every
+# fuzz target before the upstream PR is opened.
+
+homepage: "https://github.com/aramirez087/Varta"
+main_repo: "https://github.com/aramirez087/Varta"
+language: rust
+primary_contact: "alexramirez.cr@gmail.com"
+auto_ccs: []
+
+# AddressSanitizer is the default for Rust on OSS-Fuzz; MemorySanitizer
+# is unsupported (Rust stdlib not built with msan).  UBSan is implicit
+# in the cargo-fuzz nightly toolchain.
+sanitizers:
+  - address
+
+# libFuzzer is the only engine cargo-fuzz uses; AFL/honggfuzz are not
+# applicable to Rust targets in OSS-Fuzz.
+fuzzing_engines:
+  - libfuzzer
+
+# Architectures: x86_64 is the default and matches our CI; we don't run
+# the fuzz harness on aarch64 in CI, so leaving the architectures
+# section unset uses OSS-Fuzz's defaults (x86_64).

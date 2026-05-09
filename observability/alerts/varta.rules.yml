@@ -1,0 +1,357 @@
+---
+# Varta alerting rules.
+#
+# Load with Prometheus by placing this file in the directory pointed at by
+# `rule_files:` and reloading the server. Every alert references a metric
+# that `varta-watch` emits with a stable label set from the first scrape,
+# so `absent()` / `by (label)` queries are safe immediately after startup.
+#
+# Severity convention (Prometheus-community standard):
+#   severity=critical  -> page on-call
+#   severity=warning   -> ticket / investigate within working day
+#   severity=info      -> record for trend analysis, no immediate action
+#
+# All alerts carry annotations.runbook_url pointing at
+# https://github.com/aramirez087/Varta/blob/main/book/src/operations/monitoring.md
+# Operators should mirror that URL to their own forked book if they pin docs.
+
+groups:
+  - name: varta-watch.critical
+    interval: 30s
+    rules:
+      - alert: VartaWatchStalled
+        expr: rate(varta_watch_uptime_seconds[30s]) == 0
+        for: 1m
+        labels:
+          severity: critical
+          service: varta-watch
+        annotations:
+          summary: "varta-watch observer is wedged or dead on {{ $labels.instance }}"
+          description: |
+            `varta_watch_uptime_seconds` has not advanced for at least 30 seconds.
+            The poll loop is stuck or the process is gone; stall detection and
+            recovery are not happening on this host.
+          runbook_url: "https://github.com/aramirez087/Varta/blob/main/book/src/operations/monitoring.md#vartawatchstalled"
+
+      - alert: VartaTrackerCapacityExceeded
+        expr: rate(varta_tracker_capacity_exceeded_total[5m]) > 0
+        for: 5m
+        labels:
+          severity: critical
+          service: varta-watch
+        annotations:
+          summary: "Beats are being dropped at the tracker cap on {{ $labels.instance }}"
+          description: |
+            New agent PIDs are arriving but the tracker is full. This is a
+            silent data-loss event — the dropped beats are not visible to the
+            stall detector. Shard the deployment (see book/architecture/deployment-ceiling-and-sharding)
+            or raise `--tracker-capacity`.
+          runbook_url: "https://github.com/aramirez087/Varta/blob/main/book/src/operations/monitoring.md#vartatrackercapacityexceeded"
+
+      - alert: VartaOutstandingProbeExhausted
+        expr: rate(varta_recovery_outstanding_probe_exhausted_total[5m]) > 0
+        for: 5m
+        labels:
+          severity: critical
+          service: varta-watch
+        annotations:
+          summary: "Recovery outstanding-children index probe exhausted on {{ $labels.instance }}"
+          description: |
+            The bounded `OutstandingTable` hit its probe-budget ceiling. New
+            recoveries cannot be tracked — they would either lose the child
+            handle or refuse the spawn. Shard or raise capacity.
+          runbook_url: "https://github.com/aramirez087/Varta/blob/main/book/src/operations/monitoring.md#vartaoutstandingprobeexhausted"
+
+      - alert: VartaPidIndexProbeExhausted
+        expr: rate(varta_tracker_pid_index_probe_exhausted_total[5m]) > 0
+        for: 5m
+        labels:
+          severity: critical
+          service: varta-watch
+        annotations:
+          summary: "Tracker PidIndex probe exhausted on {{ $labels.instance }}"
+          description: |
+            The open-addressed `PidIndex` exceeded its 64-probe budget for a
+            new PID. Beat is surfaced as `CapacityExceeded` — agent is invisible
+            to the stall detector until the index drains.
+          runbook_url: "https://github.com/aramirez087/Varta/blob/main/book/src/operations/monitoring.md#vartapidindexprobeexhausted"
+
+      - alert: VartaAuditRecordDropped
+        expr: increase(varta_recovery_audit_dropped_total[5m]) > 0
+        for: 0m
+        labels:
+          severity: critical
+          service: varta-watch
+        annotations:
+          summary: "Recovery audit records permanently dropped on {{ $labels.instance }}"
+          description: |
+            The audit-log ring overflowed and at least one record was lost.
+            For IEC 62304 Class C deployments this is a regulatory hole —
+            investigate ring pressure (see `VartaAuditRingWatermarkCritical`),
+            disk latency, and fsync budget.
+          runbook_url: "https://github.com/aramirez087/Varta/blob/main/book/src/operations/monitoring.md#vartaauditrecorddropped"
+
+      - alert: VartaInvariantViolation
+        expr: |
+          rate(varta_tracker_invariant_violations_total[5m]) > 0
+          or
+          rate(varta_recovery_invariant_violations_total[5m]) > 0
+        for: 0m
+        labels:
+          severity: critical
+          service: varta-watch
+        annotations:
+          summary: "Defensive invariant violation on {{ $labels.instance }}"
+          description: |
+            A DO-178C "no unproven panics" defensive fall-through fired. The
+            counter is expected to stay at zero forever; any non-zero value
+            means an unreachable code path executed. File a bug with the
+            varta-watch version and the metric label set.
+          runbook_url: "https://github.com/aramirez087/Varta/blob/main/book/src/operations/monitoring.md#vartainvariantviolation"
+
+      - alert: VartaIterationP99High
+        expr: |
+          histogram_quantile(0.99,
+            sum by (le) (rate(varta_observer_iteration_seconds_bucket[5m]))) > 0.5
+        for: 5m
+        labels:
+          severity: critical
+          service: varta-watch
+        annotations:
+          summary: "Observer iteration P99 above 500 ms on {{ $labels.instance }}"
+          description: |
+            99% of poll-loop iterations are completing within 500 ms; the
+            remaining 1% are slower. Stall-detection latency budget is being
+            burned. Inspect the per-stage histogram `varta_observer_stage_seconds`
+            to find which phase is contributing.
+          runbook_url: "https://github.com/aramirez087/Varta/blob/main/book/src/operations/monitoring.md#vartaiterationp99high"
+
+      - alert: VartaBeatPathP99High
+        expr: |
+          (
+            histogram_quantile(0.99,
+              sum by (le) (rate(varta_observer_iteration_seconds_bucket[5m])))
+            -
+            histogram_quantile(0.99,
+              sum by (le) (rate(varta_observer_serve_pending_seconds_bucket[5m])))
+          ) > 0.2
+        for: 5m
+        labels:
+          severity: critical
+          service: varta-watch
+        annotations:
+          summary: "Beat-path P99 latency above 200 ms on {{ $labels.instance }}"
+          description: |
+            Iteration time minus scrape time exceeds 200 ms at P99. This is
+            scrape-storm-independent; the beat path itself is slow. Investigate
+            tracker eviction window, audit-log fsync latency, or disk health.
+          runbook_url: "https://github.com/aramirez087/Varta/blob/main/book/src/operations/monitoring.md#vartabeatpathp99high"
+
+  - name: varta-watch.warning
+    interval: 30s
+    rules:
+      - alert: VartaIterationBudgetOverruns
+        expr: |
+          rate(varta_observer_iteration_budget_exceeded_total[5m])
+          /
+          rate(varta_observer_iteration_seconds_count[5m]) > 0.10
+        for: 5m
+        labels:
+          severity: warning
+          service: varta-watch
+        annotations:
+          summary: ">10% of observer iterations exceed soft budget on {{ $labels.instance }}"
+          description: |
+            More than 10% of poll-loop iterations exceed `--iteration-budget-ms`.
+            The watchdog has not yet aborted but the headroom is thin.
+          runbook_url: "https://github.com/aramirez087/Varta/blob/main/book/src/operations/monitoring.md#vartaiterationbudgetoverruns"
+
+      - alert: VartaScrapeStormPressure
+        expr: |
+          rate(varta_observer_scrape_budget_exceeded_total[5m])
+          /
+          rate(varta_observer_serve_pending_seconds_count[5m]) > 0.10
+        for: 5m
+        labels:
+          severity: warning
+          service: varta-watch
+        annotations:
+          summary: ">10% of /metrics serve windows exceed scrape budget on {{ $labels.instance }}"
+          description: |
+            Sustained scrape pressure. Reduce scrape frequency, narrow the
+            scraper IP set, or raise `--scrape-budget-ms`. Beat-path alarms
+            (`VartaBeatPathP99High`) route off a different metric and are
+            unaffected.
+          runbook_url: "https://github.com/aramirez087/Varta/blob/main/book/src/operations/monitoring.md#vartascrapestormpressure"
+
+      - alert: VartaTrackerEvictionTruncated
+        expr: rate(varta_tracker_eviction_scan_truncated_total[5m]) > 0
+        for: 5m
+        labels:
+          severity: warning
+          service: varta-watch
+        annotations:
+          summary: "Tracker eviction scan exhausting on {{ $labels.instance }}"
+          description: |
+            The eviction window is running to completion without finding a
+            free slot. Approaching the structural cap; precursor to
+            `VartaTrackerCapacityExceeded`.
+          runbook_url: "https://github.com/aramirez087/Varta/blob/main/book/src/operations/monitoring.md#vartatrackerevictiontruncated"
+
+      - alert: VartaAuditFlushBudgetPressure
+        expr: rate(varta_recovery_audit_flush_budget_exceeded_total[5m]) > 0.1
+        for: 5m
+        labels:
+          severity: warning
+          service: varta-watch
+        annotations:
+          summary: "Audit-log flush consistently exceeding budget on {{ $labels.instance }}"
+          description: |
+            Audit `fdatasync(2)` is running over `--audit-fsync-budget-ms`.
+            The hot path elides further syncs that tick (records still flush
+            to BufWriter), but durability is degraded.
+          runbook_url: "https://github.com/aramirez087/Varta/blob/main/book/src/operations/monitoring.md#vartaauditflushbudgetpressure"
+
+      - alert: VartaRecoveryReapTruncated
+        expr: rate(varta_recovery_reap_truncated_total[5m]) > 0.1
+        for: 5m
+        labels:
+          severity: warning
+          service: varta-watch
+        annotations:
+          summary: "Recovery reap capping at per-tick budget on {{ $labels.instance }}"
+          description: |
+            More than 64 recovery children completed in a single tick.
+            The rotating-cursor reap is keeping up but the queue may grow.
+          runbook_url: "https://github.com/aramirez087/Varta/blob/main/book/src/operations/monitoring.md#vartarecoveryreaptruncated"
+
+      - alert: VartaAuditRingWatermarkCritical
+        expr: rate(varta_audit_ring_watermark_total{level="critical_95pct"}[5m]) > 0
+        for: 5m
+        labels:
+          severity: warning
+          service: varta-watch
+        annotations:
+          summary: "Audit-log ring crossed 95% on {{ $labels.instance }}"
+          description: |
+            Rising-edge counter increased — the audit ring filled past 95% at
+            least once in the last 5 minutes. Drops are imminent if pressure
+            persists.
+          runbook_url: "https://github.com/aramirez087/Varta/blob/main/book/src/operations/monitoring.md#vartaauditringwatermarkcritical"
+
+      - alert: VartaRateLimitingActive
+        expr: rate(varta_rate_limited_total[5m]) > 0
+        for: 10m
+        labels:
+          severity: warning
+          service: varta-watch
+        annotations:
+          summary: "Beats are being rate-limited on {{ $labels.instance }} (reason={{ $labels.reason }})"
+          description: |
+            Sustained drops on either the per-pid (100 bps default) or global
+            (5000 bps / 10k burst) bucket. Either an agent is hot-looping or
+            the limit needs raising via `--max-beat-rate` / `--global-beat-rate`.
+          runbook_url: "https://github.com/aramirez087/Varta/blob/main/book/src/operations/monitoring.md#vartaratelimitingactive"
+
+      - alert: VartaClockJump
+        expr: rate(varta_observer_clock_jump_forward_total[5m]) > 0
+        for: 0m
+        labels:
+          severity: warning
+          service: varta-watch
+        annotations:
+          summary: "Observer clock jumped forward on {{ $labels.instance }}"
+          description: |
+            Forward wall-clock jump > 5s detected. Suspect VM live-migration,
+            NTP step, or hypervisor pause. Stall-detection windows may be off.
+          runbook_url: "https://github.com/aramirez087/Varta/blob/main/book/src/operations/monitoring.md#vartaclockjump"
+
+  - name: varta-watch.info
+    interval: 60s
+    rules:
+      - alert: VartaAuthFailureBurst
+        expr: rate(varta_prom_auth_failures_total[1m]) > 1
+        for: 5m
+        labels:
+          severity: info
+          service: varta-watch
+        annotations:
+          summary: "Bearer-token rejections on /metrics on {{ $labels.instance }}"
+          description: |
+            Sustained `varta_prom_auth_failures_total` increment. Likely a
+            misconfigured scraper or a token-scanning probe; rotate the token
+            via `--prom-token-file` if the source is unknown.
+          runbook_url: "https://github.com/aramirez087/Varta/blob/main/book/src/operations/monitoring.md#vartaauthfailureburst"
+
+      - alert: VartaNamespaceConflict
+        expr: rate(varta_tracker_namespace_conflict_total[5m]) > 0
+        for: 5m
+        labels:
+          severity: info
+          service: varta-watch
+        annotations:
+          summary: "Cross-namespace agent rejections on {{ $labels.instance }}"
+          description: |
+            The cross-PID-namespace attestation is firing. By design — agents
+            in foreign PID namespaces are refused unless
+            `--allow-cross-namespace-agents` is set.
+          runbook_url: "https://github.com/aramirez087/Varta/blob/main/book/src/operations/monitoring.md#vartanamespaceconflict"
+
+      - alert: VartaFrameDecodeAnomaly
+        expr: sum by (kind) (rate(varta_decode_errors_total[5m])) > 1
+        for: 5m
+        labels:
+          severity: info
+          service: varta-watch
+        annotations:
+          summary: "Frame decode errors on {{ $labels.instance }} (kind={{ $labels.kind }})"
+          description: |
+            Frames are arriving with `kind`-specific decode failures (bad_magic,
+            bad_version, bad_status, bad_pid, bad_timestamp, bad_nonce, or
+            stall_on_wire). Investigate sender — likely a client/observer
+            version skew or a malformed sender.
+          runbook_url: "https://github.com/aramirez087/Varta/blob/main/book/src/operations/monitoring.md#vartaframedecodeanomaly"
+
+      - alert: VartaAuditRingWatermarkWarn
+        expr: rate(varta_audit_ring_watermark_total{level="warning_75pct"}[5m]) > 0
+        for: 10m
+        labels:
+          severity: info
+          service: varta-watch
+        annotations:
+          summary: "Audit-log ring crossed 75% on {{ $labels.instance }}"
+          description: |
+            Rising-edge counter increased. Advance warning before the 95%
+            critical threshold; investigate audit-write latency or recovery
+            spawn rate.
+          runbook_url: "https://github.com/aramirez087/Varta/blob/main/book/src/operations/monitoring.md#vartaauditringwatermarkwarn"
+
+      - alert: VartaFrameAuthFailure
+        expr: rate(varta_frame_auth_failures_total[5m]) > 0
+        for: 5m
+        labels:
+          severity: info
+          service: varta-watch
+        annotations:
+          summary: "Frame source-PID attestation failures on {{ $labels.instance }}"
+          description: |
+            Kernel peer-credential check disagreed with the frame's claimed PID.
+            Spoofed sender or unprivileged process forging a frame; investigate
+            the originating UID.
+          runbook_url: "https://github.com/aramirez087/Varta/blob/main/book/src/operations/monitoring.md#vartaframeauthfailure"
+
+      - alert: VartaRecoveryRefused
+        expr: rate(varta_recovery_refused_total[5m]) > 0
+        for: 5m
+        labels:
+          severity: info
+          service: varta-watch
+        annotations:
+          summary: "Recovery refused on {{ $labels.instance }} (reason={{ $labels.reason }})"
+          description: |
+            A stall fired but recovery was refused — likely
+            `unauthenticated_transport` (UDP without peer attestation),
+            `cross_namespace_agent`, `socket_mode_only` (filesystem-only
+            defence), `debounce_capacity`, or `outstanding_capacity`.
+            By design for the first three; capacity reasons are a warning.
+          runbook_url: "https://github.com/aramirez087/Varta/blob/main/book/src/operations/monitoring.md#vartarecoveryrefused"

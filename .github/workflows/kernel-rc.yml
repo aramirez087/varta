@@ -1,0 +1,289 @@
+name: kernel-rc
+
+# Boots the latest mainline / -rc Linux kernel inside virtme-ng and runs
+# the signal-restorer trampoline regression test (`tests/signal_trampoline.rs`)
+# against that kernel. The trampoline at `crates/varta-watch/src/main.rs`
+# is ABI-pinned to today's `rt_sigreturn` / `SA_RESTORER` semantics; any
+# future kernel that breaks those semantics would SIGSEGV the observer on
+# first signal delivery. This workflow surfaces that breakage one -rc
+# ahead of the affected stable release.
+#
+# Modeled on `.github/workflows/fuzz-nightly.yml`: weekly cron, manual
+# dispatch, auto-issue-on-failure with a reproduction command.
+
+on:
+  schedule:
+    - cron: "23 5 * * 1"   # Monday 05:23 UTC
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  vm-signal:
+    name: kernel-rc (${{ matrix.arch }}/${{ matrix.kernel }})
+    runs-on: ${{ matrix.runner }}
+    # arm64 runs under TCG software emulation (no nested KVM), which is
+    # markedly slower than the x86_64 KVM path — bound it so a stuck boot
+    # can't burn the default 6h cap.
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # x86_64 — standard GitHub-hosted runner with nested KVM.
+          - arch: amd64
+            runner: ubuntu-latest
+            qemu_pkg: qemu-system-x86
+            kernel: mainline-stable
+          - arch: amd64
+            runner: ubuntu-latest
+            qemu_pkg: qemu-system-x86
+            kernel: mainline-rc
+          # aarch64 — GitHub-hosted ARM runner (ubuntu-24.04-arm, available
+          # for public repos since 2025).  Exercises the no-restorer path:
+          # aarch64 uses the vDSO for signal-return; the kernel-ABI struct
+          # has no sa_restorer field.
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+            qemu_pkg: qemu-system-arm
+            kernel: mainline-stable
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+            qemu_pkg: qemu-system-arm
+            kernel: mainline-rc
+
+    steps:
+      - name: checkout
+        uses: actions/checkout@v4
+
+      - name: rust toolchain (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: install KVM + qemu
+        # x86_64 hosted runners expose nested KVM; arm64 hosted runners
+        # (ubuntu-24.04-arm) do NOT — there is no /dev/kvm, so virtme-ng
+        # falls back to TCG software emulation (slower, but functional).
+        # `qemu-kvm` is x86-only; install it best-effort so the arm64 leg
+        # doesn't fail on a missing package.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            ${{ matrix.qemu_pkg }} python3-pip
+          sudo apt-get install -y --no-install-recommends qemu-kvm || true
+          # Allow the unprivileged runner to use /dev/kvm when present.
+          if [ -e /dev/kvm ]; then
+            sudo chmod 666 /dev/kvm || true
+            echo "KVM available — hardware acceleration enabled."
+          else
+            echo "::notice::/dev/kvm absent (expected on arm64 hosted runners) — virtme-ng will use TCG software emulation."
+          fi
+
+      - name: install virtme-ng
+        # Pin to a known-good minor: virtme-ng's CLI is stable but the
+        # `--rwdir` semantics changed in early releases.  >=1.30 is safe.
+        run: |
+          python3 -m pip install --user --upgrade pip
+          python3 -m pip install --user 'virtme-ng>=1.30,<2'
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: resolve kernel URL
+        id: kernel
+        run: |
+          set -euo pipefail
+          # Ubuntu's mainline archive publishes per-tag debs at
+          #   https://kernel.ubuntu.com/mainline/<tag>/<arch>/
+          # The HTML index lists every released kernel.  Parse it,
+          # filter for the latest stable or rc tag, and pick the
+          # `linux-image-unsigned-…-generic_…_<arch>.deb`.
+          ARCH="${{ matrix.arch }}"
+          INDEX=https://kernel.ubuntu.com/mainline/
+          curl -fsSL "$INDEX" -o index.html
+          # NOTE: index hrefs carry a trailing slash — `href="v7.0.9/"`.
+          # The previous regexes used `[^/"]*`, which excluded the slash and
+          # therefore matched nothing, so $TAG came out empty and the step
+          # exited 1 (the `(unresolved)` in every auto-filed issue title).
+          case "${{ matrix.kernel }}" in
+            mainline-stable)
+              # Latest pure-version tag: digits and dots only. This naturally
+              # excludes both `-rc` and old distro-suffixed tags (e.g.
+              # v2.6.32.69-precise).
+              TAG=$(grep -oE 'href="v[0-9][0-9.]*/"' index.html \
+                | sed -E 's#href="(v[^"]+)/"#\1#' \
+                | sort -V | tail -n1)
+              ;;
+            mainline-rc)
+              # Latest -rc tag, e.g. v7.1-rc4.
+              TAG=$(grep -oE 'href="v[0-9][0-9.]*-rc[0-9]+/"' index.html \
+                | sed -E 's#href="(v[^"]+)/"#\1#' \
+                | sort -V | tail -n1)
+              ;;
+          esac
+          if [ -z "${TAG:-}" ]; then
+            echo "could not resolve kernel tag for ${{ matrix.kernel }}" >&2
+            exit 1
+          fi
+          DIR_URL="${INDEX}${TAG}/${ARCH}/"
+          curl -fsSL "$DIR_URL" -o tag-index.html
+          # Prefer the unsigned, generic image (no signature check; smaller).
+          DEB=$(grep -oE "href=\"linux-image-unsigned-[^\"]+-generic_[^\"]+_${ARCH}\\.deb\"" tag-index.html \
+            | head -n1 | sed -E 's/href="([^"]+)"/\1/')
+          if [ -z "${DEB:-}" ]; then
+            # Fall back to the signed image if unsigned is absent.
+            DEB=$(grep -oE "href=\"linux-image-[^\"]+-generic_[^\"]+_${ARCH}\\.deb\"" tag-index.html \
+              | head -n1 | sed -E 's/href="([^"]+)"/\1/')
+          fi
+          if [ -z "${DEB:-}" ]; then
+            echo "could not resolve kernel deb for $TAG ($ARCH)" >&2
+            exit 1
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "url=${DIR_URL}${DEB}" >> "$GITHUB_OUTPUT"
+          echo "resolved $TAG ($ARCH) -> ${DIR_URL}${DEB}"
+
+      - name: fetch kernel image
+        run: |
+          set -euo pipefail
+          curl -fsSL -o kernel.deb "${{ steps.kernel.outputs.url }}"
+          mkdir -p kernel-extract
+          dpkg-deb -x kernel.deb kernel-extract
+          # The vmlinuz lives under boot/.  Take the first match.
+          VMLINUZ=$(find kernel-extract/boot -maxdepth 1 -name 'vmlinuz-*' | head -n1)
+          if [ -z "${VMLINUZ:-}" ]; then
+            echo "no vmlinuz in extracted deb" >&2
+            ls -R kernel-extract >&2
+            exit 1
+          fi
+          # x86_64's vmlinuz is a self-extracting bzImage that qemu -kernel
+          # loads directly. arm64's vmlinuz is a gzip-compressed Image and
+          # qemu-system-aarch64 cannot load it ("could not load kernel") —
+          # decompress to a raw Image first. Detect by magic rather than by
+          # arch so a future format change is obvious.
+          if [ "$(head -c2 "$VMLINUZ" | xxd -p)" = "1f8b" ]; then
+            echo "vmlinuz is gzip-compressed — extracting raw Image"
+            zcat "$VMLINUZ" > ./vmlinuz
+          else
+            cp "$VMLINUZ" ./vmlinuz
+          fi
+          ls -lh ./vmlinuz
+          file ./vmlinuz || true
+
+      - name: build varta workspace (release)
+        # Release matches the production posture; trampoline + readback
+        # must work in release as much as in debug.
+        run: |
+          cargo build --locked --workspace --release
+          cargo test --locked --workspace --release --no-run
+
+      - name: run signal_trampoline test inside VM
+        id: vm-test
+        # virtme-ng mounts the cwd r/w inside the VM, boots the downloaded
+        # kernel, and runs the command. `--test-threads=1` keeps the three
+        # trampoline tests serial so socket-path / signal-target races stay
+        # obvious.
+        #
+        # vng CLI (virtme-ng >=1.30): boot a prebuilt image with `--run
+        # <kernel>` (NOT `--kernel`) and pass the guest command via
+        # `--exec` (the old `-- <cmd>` positional was removed). On runners
+        # without /dev/kvm (arm64 hosted), force TCG with `--disable-kvm`.
+        #
+        # IMPORTANT: vng's own exit code conflates "the VM never booted"
+        # (infra) with "the guest command failed" (a real regression). We
+        # disambiguate with a sentinel: the guest echoes
+        # `VNG_TEST_EXIT=<code>` after the test. If the sentinel is absent
+        # the VM didn't run the command (boot/infra failure) and we set
+        # boot_failed — the issue opener below only fires on a genuine
+        # non-zero test exit, never on a boot failure.
+        run: |
+          ACCEL=""
+          [ -e /dev/kvm ] || ACCEL="--disable-kvm"
+          set +e
+          vng --run ./vmlinuz --rwdir . $ACCEL \
+              --exec "cargo test --locked -p varta-tests --release --test signal_trampoline -- --test-threads=1 --nocapture; echo VNG_TEST_EXIT=\$?" \
+              2>&1 | tee vng-console.log
+          set -e
+          line=$(grep -oE 'VNG_TEST_EXIT=[0-9]+' vng-console.log | tail -n1)
+          if [ -z "$line" ]; then
+            echo "::error::VM did not run the test (no VNG_TEST_EXIT sentinel) — boot/infra failure, NOT a trampoline regression."
+            echo "boot_failed=true" >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
+          code=${line#VNG_TEST_EXIT=}
+          echo "test_exit=$code" >> "$GITHUB_OUTPUT"
+          echo "guest test exited $code"
+          [ "$code" = "0" ]
+
+      - name: capture dmesg on regression
+        # Only fire when the guest test actually ran and failed
+        # (test_exit set and non-zero) — never on a boot/infra failure.
+        if: ${{ !cancelled() && steps.vm-test.outputs.test_exit != '' && steps.vm-test.outputs.test_exit != '0' }}
+        run: |
+          ACCEL=""
+          [ -e /dev/kvm ] || ACCEL="--disable-kvm"
+          vng --run ./vmlinuz --rwdir . $ACCEL --exec dmesg > dmesg.log 2>&1 || true
+
+      - name: upload diagnostics (boot failure or regression)
+        # Always upload the vng console on any vm-test failure so boot/infra
+        # failures remain debuggable, even though they don't open an issue.
+        if: ${{ !cancelled() && steps.vm-test.outcome == 'failure' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernel-rc-${{ matrix.arch }}-${{ matrix.kernel }}-artifacts
+          path: |
+            vng-console.log
+            dmesg.log
+            vmlinuz
+          if-no-files-found: warn
+
+      - name: open or update issue (on regression)
+        # Genuine regression only: the guest test ran (test_exit is set) and
+        # returned non-zero. Boot/infra failures (boot_failed, empty
+        # test_exit) never reach here — they show red in Actions with the
+        # vng-console.log artifact, but file no bogus regression issue.
+        if: ${{ !cancelled() && steps.vm-test.outputs.test_exit != '' && steps.vm-test.outputs.test_exit != '0' }}
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const arch = '${{ matrix.arch }}';
+            const kernel = '${{ matrix.kernel }}';
+            const tag = '${{ steps.kernel.outputs.tag }}' || '(unresolved)';
+            const runId = context.runId;
+            const runUrl = `${context.payload.repository.html_url}/actions/runs/${runId}`;
+            // Stable title (no kernel tag) so repeat regressions on the same
+            // arch/channel dedup onto one issue instead of one per week.
+            const title = `kernel-rc: signal_trampoline regression on ${arch}/${kernel}`;
+            const body = `The weekly kernel-rc job failed on **${arch}/${kernel}** (\`${tag}\`).\n\n` +
+                    `* Run: ${runUrl}\n` +
+                    `* Artifacts: download \`kernel-rc-${arch}-${kernel}-artifacts\` from the run page (\`dmesg.log\`).\n\n` +
+                    `Most likely failure mode: the signal-handler kernel-ABI in ` +
+                    `\`crates/varta-watch/src/signal_install/linux/\` (KernelSigAction layout, ` +
+                    `rt_sigaction_raw, or the x86_64 trampoline) ` +
+                    `is no longer ABI-compatible with this kernel, OR the startup ` +
+                    `readback / live-delivery smoke test disagrees with the kernel.\n\n` +
+                    `Reproduce locally:\n\n` +
+                    "```bash\n" +
+                    `# from a Linux ${arch} host with KVM + python3 available:\n` +
+                    `python3 -m pip install --user 'virtme-ng>=1.30,<2'\n` +
+                    `# fetch the kernel manually from\n` +
+                    `#   https://kernel.ubuntu.com/mainline/${tag}/${arch}/\n` +
+                    `cargo build --locked --workspace --release\n` +
+                    `cargo test --locked --workspace --release --no-run\n` +
+                    `vng --kernel ./vmlinuz --rwdir . -- \\\n` +
+                    `    cargo test --locked -p varta-tests --release \\\n` +
+                    `        --test signal_trampoline -- --test-threads=1 --nocapture\n` +
+                    "```\n";
+            const existing = await github.paginate(github.rest.issues.listForRepo, {
+              ...context.repo, state: 'open', labels: 'kernel-rc', per_page: 100,
+            });
+            const hit = existing.find(i => i.title === title);
+            if (hit) {
+              await github.rest.issues.createComment({
+                ...context.repo, issue_number: hit.number,
+                body: `Regression reproduced again on \`${tag}\` in ${runUrl}.`,
+              });
+            } else {
+              await github.rest.issues.create({
+                ...context.repo, title, labels: ['kernel-rc', 'bug'], body,
+              });
+            }

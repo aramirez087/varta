@@ -1,0 +1,28 @@
+[book]
+authors = ["Alexander Ramirez"]
+language = "en"
+src = "src"
+title = "The Varta Book"
+
+[build]
+build-dir = "book"
+
+[preprocessor.mermaid]
+command = "mdbook-mermaid"
+
+[output.html]
+theme = "theme"
+git-repository-url = "https://github.com/aramirez087/Varta"
+edit-url-template = "https://github.com/aramirez087/Varta/edit/main/book/{path}"
+preferred-dark-theme = "navy"
+additional-js = ["mermaid.min.js", "mermaid-init.js"]
+
+[output.html.search]
+limit-results = 30
+use-boolean-and = true
+boost-title = 2
+boost-hierarchy = 1
+boost-paragraph = 1
+expand = true
+heading-split-level = 3
+copy-js = true

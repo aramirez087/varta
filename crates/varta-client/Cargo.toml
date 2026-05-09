@@ -1,0 +1,71 @@
+[package]
+name = "varta-client"
+version = "0.2.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "Varta agent API — emits VLP frames over a Unix Domain Socket."
+authors = ["Alexander Ramirez"]
+repository = "https://github.com/aramirez087/Varta"
+documentation = "https://docs.rs/varta-client"
+readme = "README.md"
+categories = ["network-programming", "embedded", "os"]
+keywords = ["heartbeat", "healthcheck", "monitoring", "distributed-systems", "zero-dependency"]
+rust-version = "1.70.0"
+
+[features]
+default = []
+panic-handler = []
+# Enable UDP transport backend for network-based agents.
+udp = []
+# Enable secure UDP transport with ChaCha20-Poly1305 AEAD encryption.
+# Implies `udp`, `varta-vlp/crypto`, and `varta-vlp/std` — the `secure_udp`
+# example calls `Key::from_file`, which lives behind `varta-vlp/std` so the
+# protocol crate stays `no_std` for embedded consumers.
+secure-udp = ["udp", "varta-vlp/crypto", "varta-vlp/std"]
+# Test-only injection points (H6 counter-wrap fast-forward, etc.).  Default
+# features remain empty; the feature compiles to nothing when absent.
+# Adds no security surface — does NOT use the `unsafe-` prefix.
+test-hooks = []
+# Enables the degraded-entropy panic-hook variant
+# (`install_panic_handler_secure_udp_accept_degraded_entropy`) and the
+# underlying `fallback_iv_random` / `fallback_iv_session_salt` helpers.
+# Off by default — opt-in only for deployments that cannot reach an OS
+# entropy source (QNX, VxWorks, some RTOS) AND have explicitly accepted
+# the non-cryptographic IV-derivation trade-off. Incompatible with
+# `safety-profile-strict` (see compile_error! in lib.rs).
+accept-degraded-entropy = ["panic-handler", "secure-udp"]
+# Class-A / safety-critical posture marker. Refuses to compile alongside
+# any feature that would expose a non-cryptographic IV fallback to the
+# wire. Currently mutually exclusive with `accept-degraded-entropy`. The
+# feature is a no-op at runtime — its only effect is the compile_error!
+# gate in lib.rs that proves the degraded-entropy path is structurally
+# absent from the crate's symbol set. Mirror of `compile-time-config` in
+# varta-watch.
+safety-profile-strict = []
+
+[lints]
+workspace = true
+
+[dependencies]
+
+[dependencies.varta-vlp]
+path = "../varta-vlp"
+version = "0.2.0"
+
+[[example]]
+name = "basic"
+
+[[example]]
+name = "with_payload"
+
+[[example]]
+name = "with_panic_handler"
+required-features = ["panic-handler"]
+
+[[example]]
+name = "udp"
+required-features = ["udp"]
+
+[[example]]
+name = "secure_udp"
+required-features = ["secure-udp"]

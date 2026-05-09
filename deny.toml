@@ -1,0 +1,90 @@
+# cargo-deny configuration for the Varta workspace.
+#
+# Runs in CI under the `supply-chain` job (`.github/workflows/ci.yml`).
+# Locally: `cargo install --locked --version 0.16.4 cargo-deny` then
+# `cargo deny --all-features check advisories bans sources licenses`.
+#
+# Policy summary:
+#   1. Only crates.io is allowed as a source — `unknown-registry` and
+#      `unknown-git` are hard-denied.
+#   2. Direct crypto deps in `crates/varta-vlp/Cargo.toml` are pinned to
+#      exact patch versions (`=X.Y.Z`).  This file is the transitive gate
+#      for everything else.
+#   3. Yanked crates and known RUSTSEC advisories fail CI.
+#   4. License set is restricted to OSI-approved permissive licenses.  Any
+#      future dep with GPL/LGPL/AGPL fails CI by omission (no fallback to
+#      "copyleft-tolerant").
+#
+# See `book/src/architecture/supply-chain.md` for the dep-bump procedure.
+
+# Apply to all targets, not just the host triple.  Without this, a
+# Linux-only transitive dep can sneak in unaudited because cargo-deny by
+# default only walks the host's resolved targets.
+[graph]
+all-features = true
+targets = [
+    { triple = "x86_64-unknown-linux-gnu" },
+    { triple = "aarch64-apple-darwin" },
+    { triple = "thumbv7m-none-eabi" },
+]
+
+[advisories]
+db-urls   = ["https://github.com/rustsec/advisory-db"]
+yanked    = "deny"
+ignore    = []
+# No "unmaintained" / "unsound" tunables here — cargo-deny 0.16 surfaces
+# them via `notice = ...` and a separate notice severity.  Defaults
+# (`warn`) are correct: an unmaintained transitive does not block CI but
+# is visible in the run log.
+
+[licenses]
+# Permissive licenses only.  Every license in the current dep tree
+# (chacha20poly1305, hkdf, sha2, zeroize, RustCrypto traits, libc,
+# proptest, etc.) is one of the values below.  Adding a dep with a
+# license outside this set fails `cargo deny check licenses`.
+confidence-threshold = 0.93
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Zlib",
+    "Unlicense",
+]
+# Per-crate exceptions: none.  Every crate in the tree has an SPDX
+# expression that resolves against the `allow` set above.  If a future
+# dep adds a non-SPDX-clean license string we surface it here rather
+# than relaxing `confidence-threshold` globally.
+exceptions = []
+
+[bans]
+multiple-versions    = "deny"
+wildcards            = "deny"
+# Workspace-internal `path = "../foo"` deps are intra-repo wildcards
+# by construction; cargo-deny treats them as version-wildcards without
+# this opt-in.  External wildcard deps (`foo = "*"`) remain forbidden.
+allow-wildcard-paths = true
+# Allow-list of crate pairs that show up at two versions because of
+# upstream divergence we cannot fix from inside this workspace.
+# Currently: `getrandom 0.3.x` (via `rand_core 0.9`) coexists with
+# `getrandom 0.4.x` (via `tempfile 3.x`).  Both are dev-dep-only — they
+# never link into a production binary — and pinning either back to the
+# other would force a downgrade of the proptest stack.  cargo-deny may
+# report this as "not encountered" depending on the feature set it
+# resolves; the entry is harmless when unmatched.
+skip = [
+    { crate = "getrandom" },
+]
+# No outright-banned crates yet.  Reserve the slot for future entries
+# such as `openssl-sys` (we use RustCrypto) or networking stacks that
+# pull a SipHash-randomised `HashMap` into a hot path.
+deny    = []
+
+[sources]
+unknown-registry = "deny"
+unknown-git      = "deny"
+allow-registry   = ["https://github.com/rust-lang/crates.io-index"]
+allow-git        = []

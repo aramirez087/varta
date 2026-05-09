@@ -1,0 +1,53 @@
+[package]
+name = "varta-vlp"
+version = "0.2.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "Varta Lifeline Protocol — 32-byte fixed-layout health frame."
+authors = ["Alexander Ramirez"]
+repository = "https://github.com/aramirez087/Varta"
+documentation = "https://docs.rs/varta-vlp"
+readme = "README.md"
+categories = ["network-programming", "embedded", "no-std"]
+keywords = ["protocol", "heartbeat", "monitoring", "no-std", "cryptography"]
+rust-version = "1.70.0"
+
+[features]
+default = []
+# Opt-in std-dependent conveniences (currently: `Key::from_file`). Off by
+# default so the crate is `#![no_std]` + alloc-free out of the box, ready
+# for avionics targets (FreeRTOS, Zephyr) without a libstd port.
+std = []
+# Enables ChaCha20-Poly1305 AEAD for secure VLP transport.
+# Pulls four externally-audited RustCrypto crates (NCC Group audit).
+# These are the only registry deps in varta-vlp and are all optional.
+# All four are `default-features = false` so this feature is no_std-clean.
+crypto = ["dep:chacha20poly1305", "dep:hkdf", "dep:sha2", "dep:zeroize"]
+
+[lints]
+workspace = true
+
+[dependencies]
+# Optional: only present when --features crypto is active.
+# Zero impact on the default UDS build — cargo tree shows no registry deps
+# unless the feature is enabled.
+#
+# Exact-version pins (`=X.Y.Z`).  See `book/src/architecture/supply-chain.md`
+# for the bump procedure.  Rationale: a compromised minor/patch release on
+# crates.io must not flow through silently; every dep bump is a reviewable
+# `Cargo.toml` edit that lands together with the matching `Cargo.lock` row.
+# `deny.toml` enforces the same posture for transitive deps via
+# `cargo deny check`.
+chacha20poly1305 = { version = "=0.10.1", default-features = false, optional = true }
+hkdf             = { version = "=0.12.4", default-features = false, optional = true }
+sha2             = { version = "=0.10.9", default-features = false, optional = true }
+zeroize          = { version = "=1.8.2",  default-features = false, optional = true, features = ["derive"] }
+
+# Generator binary for `tools/vlp-test-vectors.json`. Requires `std` (it
+# writes a file) and `crypto` (it produces secure-frame and HKDF goldens).
+# Run with:
+#   cargo run -p varta-vlp --example gen_test_vectors --features "std crypto"
+# The generated file is the source of truth for cross-language conformance.
+[[example]]
+name = "gen_test_vectors"
+required-features = ["std", "crypto"]

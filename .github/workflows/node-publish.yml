@@ -1,0 +1,51 @@
+name: publish-node-client
+
+on:
+  push:
+    tags: ["node-v*"]
+
+# Pinned to the `npm-publish` GitHub environment so the workflow
+# inherits the Trusted Publisher binding configured at
+# https://www.npmjs.com/settings/varta-health/packages (org/scope must
+# match the package name @varta-health/client). The package must be
+# seed-published once with a granular-access token before OIDC can take
+# over — a Trusted Publisher token cannot create a brand-new package.
+# See the repository's plan file for the full setup checklist.
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  build-and-publish:
+    name: build & publish to npm
+    runs-on: ubuntu-latest
+    environment:
+      name: npm-publish
+      url: https://www.npmjs.com/package/@varta-health/client
+    steps:
+      - name: checkout
+        uses: actions/checkout@v4
+
+      - name: setup node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          registry-url: "https://registry.npmjs.org"
+
+      # OIDC Trusted Publishing requires npm >= 11.5.1; node 20 ships
+      # npm 10.x, which silently falls back to the (empty) NODE_AUTH_TOKEN
+      # and PUTs anonymously -> registry returns E404. Upgrade npm first.
+      - name: upgrade npm for OIDC trusted publishing
+        run: npm install -g npm@latest
+
+      - name: install deps
+        working-directory: clients/node
+        run: npm ci || npm install
+
+      - name: build
+        working-directory: clients/node
+        run: npm run build
+
+      - name: publish to npm (OIDC, no token, with provenance)
+        working-directory: clients/node
+        run: npm publish --provenance --access public

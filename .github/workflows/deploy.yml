@@ -1,0 +1,84 @@
+name: deploy
+
+on:
+  push:
+    branches: [main]
+
+# Allow only one concurrent deployment
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    name: Build & Deploy to GitHub Pages
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+
+    steps:
+      - name: checkout
+        uses: actions/checkout@v4
+        # mdBook follows symlinks during build — checkout must preserve them.
+        with:
+          fetch-depth: 0
+
+      - name: install mdbook
+        run: cargo install --locked mdbook
+
+      - name: install mdbook-mermaid
+        run: cargo install --locked mdbook-mermaid
+
+      - name: sync governance docs into book
+        run: |
+          mkdir -p book/src/governance
+          cp CONTRIBUTING.md book/src/governance/contributing.md
+          cp SECURITY.md     book/src/governance/security.md
+          cp ROADMAP.md      book/src/governance/roadmap.md
+
+      - name: build book
+        run: mdbook build book
+        # book/book.toml has build-dir = "book", so output lands in book/book/
+
+      - name: assemble site
+        run: |
+          mkdir -p _site
+          # Copy landing page assets into root
+          cp index.html _site/
+          cp style.css _site/
+          cp script.js _site/
+          cp sitemap.xml _site/ 2>/dev/null || true
+          cp robots.txt _site/ 2>/dev/null || true
+          cp llms.txt _site/ 2>/dev/null || true
+          cp favicon.svg _site/ 2>/dev/null || true
+          cp CNAME _site/
+          cp -r assets _site/assets
+          # Place the compiled book at /book
+          cp -r book/book _site/book
+
+      - name: install redirect
+        run: |
+          # Derive latest released version from CHANGELOG.md (first ## [X.Y.Z] line, skips Unreleased).
+          version=$(grep -m1 '## \[[0-9]' CHANGELOG.md | grep -oP '\d+\.\d+\.\d+')
+          raw_url="https://raw.githubusercontent.com/aramirez087/Varta/v${version}/scripts/install.sh"
+          mkdir -p _site/install.sh
+          cat > _site/install.sh/index.html <<EOF
+          <!DOCTYPE html>
+          <meta http-equiv="refresh" content="0;url=${raw_url}">
+          <title>Redirect</title>
+          <p>Redirecting to <a href="${raw_url}">install script</a>...</p>
+          EOF
+
+      - name: upload pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
+      - name: deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

@@ -1,0 +1,20 @@
+# Build output
+bin/
+obj/
+out/
+
+# Packages
+nupkgs/
+*.nupkg
+*.snupkg
+
+# IDE
+.vs/
+.idea/
+*.user
+*.suo
+
+# Test output
+TestResults/
+coverage.cobertura.xml
+*.trx

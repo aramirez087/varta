@@ -1,0 +1,26 @@
+[package]
+name = "varta-bench"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "Varta performance harness — owned by Session 06."
+# Workspace-internal harness; never published.  The crate uses
+# `path = "../varta-vlp"` etc. without version constraints, which
+# crates.io would reject anyway.  `publish = false` makes that
+# intent explicit and unblocks `cargo deny check bans`.
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+varta-vlp = { path = "../varta-vlp" }
+varta-client = { path = "../varta-client" }
+libc = "0.2"
+
+[features]
+udp = ["varta-client/udp"]
+
+[[bin]]
+name = "varta-bench"
+path = "src/main.rs"
