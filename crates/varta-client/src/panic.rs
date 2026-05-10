@@ -9,7 +9,7 @@ use std::os::unix::net::UnixDatagram;
 use std::path::PathBuf;
 use std::time::Instant;
 
-use varta_vlp::{Frame, Status, MAGIC, VERSION};
+use varta_vlp::{Frame, Status, MAGIC, NONCE_TERMINAL, VERSION};
 
 /// Register a panic hook that emits a [`Status::Critical`] VLP frame on the
 /// Unix Domain Socket at `socket_path` before resuming normal unwinding.
@@ -21,7 +21,7 @@ use varta_vlp::{Frame, Status, MAGIC, VERSION};
 ///
 /// # Nonce sentinel
 ///
-/// The frame carries `nonce = u64::MAX`, distinct from the monotonically
+/// The frame carries `nonce = NONCE_TERMINAL`, distinct from the monotonically
 /// incrementing nonces produced by [`crate::Varta::beat`], so observers can
 /// identify it as a terminal signal.
 ///
@@ -54,7 +54,7 @@ pub fn install(socket_path: impl Into<PathBuf>) {
                 status: Status::Critical as u8,
                 pid,
                 timestamp,
-                nonce: u64::MAX,
+                nonce: NONCE_TERMINAL,
                 payload: 0,
             };
             let mut buf = [0u8; 32];

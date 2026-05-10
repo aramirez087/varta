@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 
 use varta_vlp::{DecodeError, Frame, Status};
 
-use crate::tracker::{Tracker, Update};
+use crate::tracker::{Tracker, Update, CAPACITY};
 
 /// How long [`Observer::poll`] blocks in `recv_from` before returning to the
 /// caller. Bounded so stall detection latency cannot exceed this value.
@@ -63,6 +63,9 @@ pub struct Observer {
     tracker: Tracker,
     threshold_ns: u64,
     start: Instant,
+    stall_queue: Vec<Option<Event>>,
+    stall_pending: Vec<(u32, u64, u64)>,
+    stall_cursor: usize,
 }
 
 impl Observer {
@@ -75,12 +78,15 @@ impl Observer {
     /// indefinitely.
     pub fn bind(path: impl AsRef<Path>, threshold: Duration) -> io::Result<Self> {
         let path = path.as_ref();
-        match std::fs::remove_file(path) {
-            Ok(()) => {}
-            Err(e) if e.kind() == ErrorKind::NotFound => {}
+        let _ = std::fs::remove_file(path);
+        let sock = match UnixDatagram::bind(path) {
+            Ok(s) => s,
+            Err(e) if e.kind() == ErrorKind::AddrInUse => {
+                let _ = std::fs::remove_file(path);
+                UnixDatagram::bind(path)?
+            }
             Err(e) => return Err(e),
-        }
-        let sock = UnixDatagram::bind(path)?;
+        };
         sock.set_read_timeout(Some(READ_TIMEOUT))?;
         let threshold_ns = threshold.as_nanos().min(u64::MAX as u128) as u64;
         Ok(Observer {
@@ -88,6 +94,9 @@ impl Observer {
             tracker: Tracker::new(),
             threshold_ns,
             start: Instant::now(),
+            stall_queue: Vec::new(),
+            stall_pending: Vec::with_capacity(CAPACITY),
+            stall_cursor: 0,
         })
     }
 
@@ -102,6 +111,12 @@ impl Observer {
     /// - `None` if nothing actionable happened (timeout with no new stalls,
     ///   short reads, out-of-order beats, or capacity-exceeded inserts).
     pub fn poll(&mut self) -> Option<Event> {
+        if self.stall_cursor < self.stall_queue.len() {
+            let stall = self.stall_queue[self.stall_cursor].take();
+            self.stall_cursor += 1;
+            return stall;
+        }
+
         let mut buf = [0u8; 32];
         match self.sock.recv(&mut buf) {
             Ok(32) => {
@@ -109,7 +124,6 @@ impl Observer {
                 match Frame::decode(&buf) {
                     Ok(frame) => match self.tracker.record(&frame, now_ns) {
                         Update::Inserted | Update::Refreshed => {
-                            // Status byte was just validated by Frame::decode.
                             let status = Status::try_from_u8(frame.status)
                                 .expect("Frame::decode validated the status byte");
                             Some(Event::Beat {
@@ -124,11 +138,15 @@ impl Observer {
                     Err(e) => Some(Event::Decode(e)),
                 }
             }
-            // Frames must be exactly 32 bytes; treat short / oversized reads
-            // as silently dropped. Session 05 may layer a counter on top.
             Ok(_) => None,
             Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
-                self.next_stall()
+                self.drain_stalls();
+                if self.stall_cursor < self.stall_queue.len() {
+                    let stall = self.stall_queue[self.stall_cursor].take();
+                    self.stall_cursor += 1;
+                    return stall;
+                }
+                None
             }
             Err(e) => Some(Event::Io(e)),
         }
@@ -139,23 +157,26 @@ impl Observer {
         elapsed.min(u64::MAX as u128) as u64
     }
 
-    fn next_stall(&mut self) -> Option<Event> {
+    fn drain_stalls(&mut self) {
         let now_ns = self.now_ns();
-        let candidate = self
+        self.stall_queue.clear();
+        self.stall_cursor = 0;
+        self.stall_pending.clear();
+        for slot in self
             .tracker
             .iter_stalled(now_ns, self.threshold_ns)
-            .find(|slot| !slot.stall_emitted)
-            .map(|slot| (slot.pid, slot.last_nonce, slot.last_ns));
-
-        if let Some((pid, last_nonce, last_ns)) = candidate {
-            self.tracker.mark_stall_emitted(pid);
-            Some(Event::Stall {
+            .filter(|slot| !slot.stall_emitted)
+        {
+            self.stall_pending
+                .push((slot.pid, slot.last_nonce, slot.last_ns));
+        }
+        for &(pid, last_nonce, last_ns) in &self.stall_pending {
+            self.stall_queue.push(Some(Event::Stall {
                 pid,
                 last_nonce,
                 last_ns,
-            })
-        } else {
-            None
+            }));
+            self.tracker.mark_stall_emitted(pid);
         }
     }
 }

@@ -50,6 +50,7 @@ pub trait Exporter {
 pub struct FileExporter {
     sink: BufWriter<File>,
     start: Instant,
+    pending_err: Option<io::Error>,
 }
 
 impl FileExporter {
@@ -63,6 +64,7 @@ impl FileExporter {
         Ok(FileExporter {
             sink: BufWriter::new(file),
             start: Instant::now(),
+            pending_err: None,
         })
     }
 
@@ -73,6 +75,9 @@ impl FileExporter {
 
 impl Exporter for FileExporter {
     fn record(&mut self, ev: &Event) {
+        if self.pending_err.is_some() {
+            return;
+        }
         let ns = self.elapsed_ns();
         let line = match ev {
             Event::Beat {
@@ -92,13 +97,18 @@ impl Exporter for FileExporter {
             Event::Decode(err) => format!("{ns}\tdecode\t-\t-\t-\t{err:?}\n"),
             Event::Io(err) => format!("{ns}\tio\t-\t-\t-\t{err}\n"),
         };
-        // Best-effort write; a transient IO error is surfaced on the next
-        // flush() rather than panicking the daemon poll loop.
-        let _ = self.sink.write_all(line.as_bytes());
+        if let Err(e) = self.sink.write_all(line.as_bytes()) {
+            self.pending_err = Some(e);
+        }
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        self.sink.flush()
+        let sink_result = self.sink.flush();
+        match (self.pending_err.take(), sink_result) {
+            (Some(e), _) => Err(e),
+            (None, Err(e)) => Err(e),
+            (None, Ok(())) => Ok(()),
+        }
     }
 }
 
@@ -137,8 +147,11 @@ impl GaugeRow {
     }
 }
 
-/// Per-connection IO timeouts on the [`PromExporter`]'s accepted streams.
-const PROM_IO_TIMEOUT: Duration = Duration::from_secs(1);
+/// Per-connection read timeout on the [`PromExporter`]'s accepted streams.
+/// Capped so a slow or hostile client cannot stall the observer's poll loop.
+const PROM_READ_DEADLINE: Duration = Duration::from_millis(10);
+/// Per-connection write timeout for the metrics response body.
+const PROM_WRITE_TIMEOUT: Duration = Duration::from_millis(50);
 /// Cap on how many bytes [`PromExporter::serve_pending`] reads from a
 /// single request before responding (we discard the request line/headers).
 const PROM_REQUEST_CAP: usize = 4096;
@@ -185,13 +198,17 @@ impl PromExporter {
     }
 
     fn serve_one(&self, mut stream: TcpStream) -> io::Result<()> {
-        stream.set_nonblocking(false)?;
-        stream.set_read_timeout(Some(PROM_IO_TIMEOUT))?;
-        stream.set_write_timeout(Some(PROM_IO_TIMEOUT))?;
+        // Stream is already non-blocking (inherited from the listener).
+        // A short write timeout bounds the response phase.
+        stream.set_write_timeout(Some(PROM_WRITE_TIMEOUT))?;
 
+        let deadline = Instant::now() + PROM_READ_DEADLINE;
         let mut buf = [0u8; 512];
-        let mut total = 0usize;
+        let mut total = 0;
         loop {
+            if Instant::now() >= deadline {
+                break;
+            }
             match stream.read(&mut buf) {
                 Ok(0) => break,
                 Ok(n) => {
@@ -201,9 +218,7 @@ impl PromExporter {
                         break;
                     }
                 }
-                Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
-                    break;
-                }
+                Err(e) if e.kind() == ErrorKind::WouldBlock => break,
                 Err(e) => return Err(e),
             }
         }

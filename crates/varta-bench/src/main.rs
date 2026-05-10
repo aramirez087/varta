@@ -120,9 +120,9 @@ fn run_latency() -> ExitCode {
     let _ = drainer.join();
 
     lats.sort_unstable();
-    let p50 = percentile(&lats, 50);
-    let p99 = percentile(&lats, 99);
-    let p999 = percentile(&lats, 999);
+    let p50 = percentile_of(&lats, 50, 100);
+    let p99 = percentile_of(&lats, 99, 100);
+    let p999 = percentile_of(&lats, 999, 1000);
 
     eprintln!(
         "latency: iters={ITERS} p50={p50}ns p99={p99}ns p99.9={p999}ns threshold={}ns",
@@ -141,14 +141,9 @@ fn run_latency() -> ExitCode {
     }
 }
 
-fn percentile(sorted: &[u64], pct_thousandths: usize) -> u64 {
-    // pct_thousandths is per-mille (50 → p5.0%? no — interpret as percentile
-    // ×10 only when >100; otherwise plain percent). We pass 50, 99, 999 in.
+fn percentile_of(sorted: &[u64], numerator: usize, denominator: usize) -> u64 {
     let n = sorted.len();
-    let idx = match pct_thousandths {
-        0..=99 => n.saturating_mul(pct_thousandths) / 100,
-        _ => n.saturating_mul(pct_thousandths) / 1000,
-    };
+    let idx = n.saturating_mul(numerator) / denominator;
     sorted[idx.min(n - 1)]
 }
 

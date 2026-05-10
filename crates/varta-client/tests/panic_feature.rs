@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use varta_client::{install_panic_handler, Frame, Status};
+use varta_client::{install_panic_handler, Frame, Status, NONCE_TERMINAL};
 
 /// RAII socket-path holder. `Drop` unlinks the file (best-effort).
 struct TempSocket {
@@ -64,7 +64,10 @@ fn panic_handler_emits_critical_beat_before_unwind() {
         Status::Critical as u8,
         "status must be Critical"
     );
-    assert_eq!(frame.nonce, u64::MAX, "nonce must be u64::MAX sentinel");
+    assert_eq!(
+        frame.nonce, NONCE_TERMINAL,
+        "nonce must be NONCE_TERMINAL sentinel"
+    );
 }
 
 #[test]

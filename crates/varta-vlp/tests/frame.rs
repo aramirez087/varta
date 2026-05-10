@@ -5,7 +5,7 @@
 //! `varta-vlp` exists; the RED capture in the Session 01 handoff is the
 //! compile failure these references produce.
 
-use varta_vlp::{DecodeError, Frame, Status, MAGIC, VERSION};
+use varta_vlp::{DecodeError, Frame, Status, MAGIC, NONCE_TERMINAL, VERSION};
 
 /// A canonical frame whose encoding is hand-computed in
 /// `frame_round_trip_matches_golden_bytes`. Centralised so every round-trip
@@ -112,14 +112,14 @@ fn payload_preserved_at_u64_max() {
         status: Status::Critical as u8,
         pid: u32::MAX,
         timestamp: u64::MAX,
-        nonce: u64::MAX,
+        nonce: NONCE_TERMINAL,
         payload: u64::MAX,
     };
     let mut buf = [0u8; 32];
     frame.encode(&mut buf);
     let decoded = Frame::decode(&buf).expect("u64::MAX frame must decode");
     assert_eq!(decoded.timestamp, u64::MAX);
-    assert_eq!(decoded.nonce, u64::MAX);
+    assert_eq!(decoded.nonce, NONCE_TERMINAL);
     assert_eq!(decoded.payload, u64::MAX);
     assert_eq!(decoded.pid, u32::MAX);
 }

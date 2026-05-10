@@ -6,7 +6,7 @@ use std::os::unix::net::UnixDatagram;
 use std::path::Path;
 use std::time::Instant;
 
-use varta_vlp::{Frame, Status, MAGIC, VERSION};
+use varta_vlp::{Frame, Status, MAGIC, NONCE_TERMINAL, VERSION};
 
 /// Result of a single [`Varta::beat`] call.
 ///
@@ -80,13 +80,13 @@ impl Varta {
     /// Emit a single VLP frame carrying `status` and an opaque 8-byte
     /// `payload`.
     ///
-    /// The nonce increments first (saturating at `u64::MAX`), so the very
-    /// first beat after `connect` carries `nonce == 1`. The frame is
+    /// The nonce increments first (capping at `NONCE_TERMINAL - 1`), so the
+    /// very first beat after `connect` carries `nonce == 1`. The frame is
     /// constructed on the stack, encoded into the owned scratch buffer, and
     /// handed to `send(2)`. This call neither blocks nor allocates on the
     /// heap.
     pub fn beat(&mut self, status: Status, payload: u64) -> BeatOutcome {
-        self.nonce = self.nonce.saturating_add(1);
+        self.nonce = self.nonce.saturating_add(1).min(NONCE_TERMINAL - 1);
         let timestamp = self.start.elapsed().as_nanos() as u64;
         let frame = Frame {
             magic: MAGIC,

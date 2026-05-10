@@ -14,7 +14,7 @@ pub mod client;
 pub mod panic;
 
 pub use client::{BeatOutcome, Varta};
-pub use varta_vlp::{DecodeError, Frame, Status};
+pub use varta_vlp::{DecodeError, Frame, Status, NONCE_TERMINAL};
 
 /// Install the panic hook — see [`panic::install`] for the full contract.
 #[cfg(feature = "panic-handler")]
