@@ -165,6 +165,7 @@ const PROM_REQUEST_CAP: usize = 4096;
 pub struct PromExporter {
     listener: TcpListener,
     rows: HashMap<u32, GaugeRow>,
+    evicted_total: u64,
 }
 
 impl PromExporter {
@@ -175,6 +176,7 @@ impl PromExporter {
         Ok(PromExporter {
             listener,
             rows: HashMap::new(),
+            evicted_total: 0,
         })
     }
 
@@ -182,6 +184,11 @@ impl PromExporter {
     /// bind on port 0 and need to discover the kernel-assigned port.
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
         self.listener.local_addr()
+    }
+
+    /// Record one or more tracker slot evictions.
+    pub fn record_eviction(&mut self, count: u64) {
+        self.evicted_total = self.evicted_total.saturating_add(count);
     }
 
     /// Accept every connection currently ready on the listener and write a
@@ -271,6 +278,11 @@ impl PromExporter {
             if let Some(code) = row.last_status {
                 let _ = writeln!(out, "varta_status{{pid=\"{pid}\"}} {code}");
             }
+        }
+        if self.evicted_total > 0 {
+            out.push_str("# HELP varta_tracker_evicted_total Total tracker slots reclaimed from dead agents.\n");
+            out.push_str("# TYPE varta_tracker_evicted_total counter\n");
+            let _ = writeln!(out, "varta_tracker_evicted_total {}", self.evicted_total);
         }
         out
     }

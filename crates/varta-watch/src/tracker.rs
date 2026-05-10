@@ -70,6 +70,7 @@ pub enum Update {
 pub struct Tracker {
     entries: [Slot; CAPACITY],
     len: usize,
+    evictions: u64,
 }
 
 // Compile-time guard: the slot table must remain a fixed-size array. The
@@ -90,6 +91,7 @@ impl Tracker {
         Tracker {
             entries: [Slot::EMPTY; CAPACITY],
             len: 0,
+            evictions: 0,
         }
     }
 
@@ -98,8 +100,9 @@ impl Tracker {
     /// Returns [`Update::Inserted`] for a brand-new pid, [`Update::Refreshed`]
     /// for an existing pid whose nonce moved forward, [`Update::OutOfOrder`]
     /// if the nonce did not strictly increase, or [`Update::CapacityExceeded`]
-    /// if the slot table is full and the pid is not yet tracked.
-    pub fn record(&mut self, frame: &Frame, now_ns: u64) -> Update {
+    /// if the slot table is full (and no stale slot could be reclaimed) and
+    /// the pid is not yet tracked.
+    pub fn record(&mut self, frame: &Frame, now_ns: u64, threshold_ns: u64) -> Update {
         let status = match Status::try_from_u8(frame.status) {
             Ok(s) => s,
             // Frame::decode validates this byte; defensively treat an invalid
@@ -121,6 +124,17 @@ impl Tracker {
         }
 
         if self.len >= CAPACITY {
+            if let Some(evict_idx) = self.find_evictable_slot(now_ns, threshold_ns) {
+                self.entries[evict_idx] = Slot {
+                    pid: frame.pid,
+                    last_nonce: frame.nonce,
+                    last_ns: now_ns,
+                    status,
+                    stall_emitted: false,
+                };
+                self.evictions = self.evictions.saturating_add(1);
+                return Update::Inserted;
+            }
             return Update::CapacityExceeded;
         }
         self.entries[self.len] = Slot {
@@ -132,6 +146,30 @@ impl Tracker {
         };
         self.len += 1;
         Update::Inserted
+    }
+
+    fn find_evictable_slot(&self, now_ns: u64, threshold_ns: u64) -> Option<usize> {
+        let evict_threshold = threshold_ns.saturating_mul(10);
+        let mut best_idx: Option<usize> = None;
+        let mut best_last_ns: u64 = u64::MAX;
+
+        for (idx, slot) in self.entries[..self.len].iter().enumerate() {
+            if slot.stall_emitted && now_ns.saturating_sub(slot.last_ns) > evict_threshold
+                && slot.last_ns < best_last_ns
+            {
+                best_last_ns = slot.last_ns;
+                best_idx = Some(idx);
+            }
+        }
+        best_idx
+    }
+
+    /// Take and reset the eviction counter. Returns the number of slots
+    /// reclaimed since the last call.
+    pub fn take_evictions(&mut self) -> u64 {
+        let count = self.evictions;
+        self.evictions = 0;
+        count
     }
 
     /// Iterator over every slot whose silence (relative to `now_ns`) has

@@ -104,6 +104,13 @@ fn run(cfg: Config) -> std::io::Result<()> {
             }
         }
 
+        let evicted = observer.drain_evictions();
+        if evicted > 0 {
+            if let Some(pe) = prom_export.as_mut() {
+                pe.record_eviction(evicted);
+            }
+        }
+
         // Reap completed or timeout-exceeded children each tick.
         if let Some(rec) = recovery.as_mut() {
             for outcome in rec.try_reap() {

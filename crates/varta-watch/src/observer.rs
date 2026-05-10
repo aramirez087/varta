@@ -122,7 +122,7 @@ impl Observer {
             Ok(32) => {
                 let now_ns = self.now_ns();
                 match Frame::decode(&buf) {
-                    Ok(frame) => match self.tracker.record(&frame, now_ns) {
+                    Ok(frame) => match self.tracker.record(&frame, now_ns, self.threshold_ns) {
                         Update::Inserted | Update::Refreshed => {
                             let status = Status::try_from_u8(frame.status)
                                 .expect("Frame::decode validated the status byte");
@@ -178,5 +178,11 @@ impl Observer {
             }));
             self.tracker.mark_stall_emitted(pid);
         }
+    }
+
+    /// Drain and reset the eviction counter. Returns the number of slots
+    /// reclaimed since the last call.
+    pub fn drain_evictions(&mut self) -> u64 {
+        self.tracker.take_evictions()
     }
 }

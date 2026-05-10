@@ -192,16 +192,18 @@ fn observer_reports_decode_error_for_bad_magic() {
 fn tracker_capacity_bounded_to_64_pids() {
     let mut tracker = Tracker::new();
     let now_ns: u64 = 1_000;
+    let threshold_ns: u64 = 100;
 
     for pid in 1u32..=64 {
         let f = make_frame(pid, 1, Status::Ok, 0);
-        let update = tracker.record(&f, now_ns);
+        let update = tracker.record(&f, now_ns, threshold_ns);
         assert_eq!(update, Update::Inserted, "pid {pid} should insert");
     }
     assert_eq!(tracker.len(), 64, "tracker should be full at 64 pids");
 
+    // Without any stalled slots, overflow should still be CapacityExceeded
     let overflow = make_frame(65, 1, Status::Ok, 0);
-    let result = tracker.record(&overflow, now_ns);
+    let result = tracker.record(&overflow, now_ns, threshold_ns);
     assert_eq!(result, Update::CapacityExceeded);
     assert_eq!(tracker.len(), 64, "len must not grow past capacity");
 }
