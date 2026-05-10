@@ -14,7 +14,7 @@ use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufWriter, ErrorKind, Read, Write};
-use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::path::Path;
 use std::time::{Duration, Instant};
 
@@ -235,7 +235,7 @@ impl PromExporter {
             body = body,
         );
         stream.write_all(response.as_bytes())?;
-        stream.flush()?;
+        stream.shutdown(Shutdown::Both)?;
         Ok(())
     }
 

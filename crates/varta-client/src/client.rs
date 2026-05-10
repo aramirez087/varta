@@ -3,7 +3,7 @@
 
 use std::io;
 use std::os::unix::net::UnixDatagram;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use varta_vlp::{Frame, Status, MAGIC, NONCE_TERMINAL, VERSION};
@@ -50,6 +50,9 @@ pub struct Varta {
     pid: u32,
     start: Instant,
     nonce: u64,
+    path: PathBuf,
+    consecutive_dropped: u32,
+    reconnect_after: u32,
 }
 
 impl Varta {
@@ -65,8 +68,9 @@ impl Varta {
     /// Returns an [`io::Error`] if the socket cannot be created, the peer
     /// path cannot be reached, or non-blocking mode cannot be enabled.
     pub fn connect<P: AsRef<Path>>(path: P) -> io::Result<Self> {
+        let path = path.as_ref().to_path_buf();
         let sock = UnixDatagram::unbound()?;
-        sock.connect(path.as_ref())?;
+        sock.connect(&path)?;
         sock.set_nonblocking(true)?;
         Ok(Self {
             sock,
@@ -74,7 +78,25 @@ impl Varta {
             pid: std::process::id(),
             start: Instant::now(),
             nonce: 0,
+            path,
+            consecutive_dropped: 0,
+            reconnect_after: 0,
         })
+    }
+
+    fn send_frame(&mut self) -> BeatOutcome {
+        match self.sock.send(&self.buf) {
+            Ok(_) => BeatOutcome::Sent,
+            Err(e) => match e.kind() {
+                io::ErrorKind::WouldBlock
+                | io::ErrorKind::ConnectionRefused
+                | io::ErrorKind::ConnectionReset
+                | io::ErrorKind::NotFound
+                | io::ErrorKind::NotConnected
+                | io::ErrorKind::BrokenPipe => BeatOutcome::Dropped,
+                _ => BeatOutcome::Failed(e),
+            },
+        }
     }
 
     /// Emit a single VLP frame carrying `status` and an opaque 8-byte
@@ -84,7 +106,13 @@ impl Varta {
     /// very first beat after `connect` carries `nonce == 1`. The frame is
     /// constructed on the stack, encoded into the owned scratch buffer, and
     /// handed to `send(2)`. This call neither blocks nor allocates on the
-    /// heap.
+    /// heap on the steady-state path.
+    ///
+    /// When [`set_reconnect_after`](Self::set_reconnect_after) is enabled and
+    /// the consecutive-dropped threshold is crossed, `beat` will internally
+    /// reconnect the socket and retry the send before returning. The retry
+    /// path allocates a fresh socket; this is acceptable because observer
+    /// restarts are rare and the steady-state path remains allocation-free.
     pub fn beat(&mut self, status: Status, payload: u64) -> BeatOutcome {
         self.nonce = self.nonce.saturating_add(1).min(NONCE_TERMINAL - 1);
         let timestamp = self.start.elapsed().as_nanos() as u64;
@@ -98,17 +126,55 @@ impl Varta {
             payload,
         };
         frame.encode(&mut self.buf);
-        match self.sock.send(&self.buf) {
-            Ok(_) => BeatOutcome::Sent,
-            Err(e) => match e.kind() {
-                io::ErrorKind::WouldBlock
-                | io::ErrorKind::ConnectionRefused
-                | io::ErrorKind::ConnectionReset
-                | io::ErrorKind::NotFound
-                | io::ErrorKind::NotConnected
-                | io::ErrorKind::BrokenPipe => BeatOutcome::Dropped,
-                _ => BeatOutcome::Failed(e),
-            },
+        let outcome = self.send_frame();
+        match &outcome {
+            BeatOutcome::Dropped => {
+                self.consecutive_dropped += 1;
+                if self.reconnect_after > 0
+                    && self.consecutive_dropped >= self.reconnect_after
+                    && self.reconnect().is_ok()
+                {
+                    return self.send_frame();
+                }
+                outcome
+            }
+            _ => {
+                self.consecutive_dropped = 0;
+                outcome
+            }
         }
+    }
+
+    /// Re-bind the Unix datagram socket to the original observer path.
+    ///
+    /// After an observer restart the old socket inode is stale — every
+    /// `beat()` returns [`BeatOutcome::Dropped`] forever. Call `reconnect`
+    /// to bind a fresh socket against the path stored at [`connect`](Self::connect)
+    /// time. Agent identity (`pid`, `nonce`, `start` clock) is preserved.
+    ///
+    /// This is the only post-[`connect`](Self::connect) allocation site and
+    /// should only be called when recovery is needed, not on the steady-state
+    /// beat path.
+    pub fn reconnect(&mut self) -> io::Result<()> {
+        let sock = UnixDatagram::unbound()?;
+        sock.connect(&self.path)?;
+        sock.set_nonblocking(true)?;
+        self.sock = sock;
+        self.consecutive_dropped = 0;
+        Ok(())
+    }
+
+    /// Enable automatic reconnect after `n` consecutive
+    /// [`BeatOutcome::Dropped`] outcomes. Set to `0` to disable (the
+    /// default).
+    ///
+    /// When enabled, [`beat`](Self::beat) increments an internal counter on
+    /// each `Dropped` outcome. After `n` consecutive drops — a strong signal
+    /// that the observer socket is stale — `beat` calls [`reconnect`](Self::reconnect)
+    /// internally and retries the send before returning. The counter resets
+    /// to zero on any `Sent` or `Failed` outcome, and after a successful
+    /// reconnect.
+    pub fn set_reconnect_after(&mut self, n: u32) {
+        self.reconnect_after = n;
     }
 }

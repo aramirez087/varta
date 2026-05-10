@@ -9,7 +9,7 @@ use std::net::{SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use varta_vlp::{DecodeError, Status};
 use varta_watch::{Event, Exporter, FileExporter, PromExporter};
@@ -56,28 +56,14 @@ fn http_get(prom: &mut PromExporter, addr: SocketAddr, path: &str) -> String {
         .write_all(req.as_bytes())
         .expect("write http request");
 
-    let deadline = Instant::now() + Duration::from_secs(2);
+    // Yield so the kernel can deliver the bytes to the server's receive
+    // buffer before serve_pending accepts and reads the connection.
+    thread::sleep(Duration::from_millis(5));
+
+    prom.serve_pending().expect("serve_pending");
+
     let mut buf = Vec::with_capacity(2048);
-    let mut tmp = [0u8; 1024];
-    loop {
-        prom.serve_pending().expect("serve_pending");
-        match stream.read(&mut tmp) {
-            Ok(0) => break,
-            Ok(n) => buf.extend_from_slice(&tmp[..n]),
-            Err(e)
-                if matches!(
-                    e.kind(),
-                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-                ) =>
-            {
-                thread::sleep(Duration::from_millis(1));
-            }
-            Err(e) => panic!("read response: {e}"),
-        }
-        if Instant::now() > deadline {
-            break;
-        }
-    }
+    stream.read_to_end(&mut buf).expect("read response");
     let raw = String::from_utf8(buf).expect("utf8 response");
     let split = raw
         .find("\r\n\r\n")
