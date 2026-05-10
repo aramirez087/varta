@@ -94,7 +94,11 @@ fn run(cfg: Config) -> std::io::Result<()> {
                         RecoveryOutcome::SpawnFailed(e) => {
                             eprintln!("varta-watch: recovery for pid {pid} failed to spawn: {e}");
                         }
-                        _ => {}
+                        RecoveryOutcome::Reaped { .. }
+                        | RecoveryOutcome::Killed { .. }
+                        | RecoveryOutcome::ReapFailed(_) => {
+                            unreachable!("on_stall returned a reap-only recovery outcome")
+                        }
                     }
                 }
             }

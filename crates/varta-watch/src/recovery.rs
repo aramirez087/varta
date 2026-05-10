@@ -52,6 +52,7 @@ pub enum RecoveryOutcome {
 struct Outstanding {
     child: Child,
     spawned_at: Instant,
+    killed: bool,
 }
 
 /// Per-pid debounced runner of a `recovery_cmd` template.
@@ -114,6 +115,7 @@ impl Recovery {
                     Outstanding {
                         child,
                         spawned_at: Instant::now(),
+                        killed: false,
                     },
                 );
                 RecoveryOutcome::Spawned { child_pid }
@@ -151,14 +153,16 @@ impl Recovery {
                     // Still running — check timeout.
                     if let Some(to) = self.timeout {
                         if entry.spawned_at.elapsed() >= to {
+                            if entry.killed {
+                                continue;
+                            }
+
                             let child_pid = entry.child.id();
                             match entry.child.kill() {
                                 Ok(()) => {
-                                    // wait() is safe here: kill(2) succeeded,
-                                    // so the process will terminate and we can
-                                    // reap it without blocking indefinitely.
-                                    let _ = entry.child.wait();
-                                    self.outstanding.remove(&pid);
+                                    // Do not wait here; the observer poll loop must remain
+                                    // non-blocking. A later try_wait call will reap the child.
+                                    entry.killed = true;
                                     outcomes.push(RecoveryOutcome::Killed { child_pid });
                                 }
 
