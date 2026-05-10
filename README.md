@@ -1,5 +1,9 @@
 # Varta
 
+<p align="center">
+  <img src="assets/varta-animation.svg" alt="Varta Animation" width="100%">
+</p>
+
 Zero-overhead health protocol for distributed local agents.
 
 Varta lets any local process emit a 32-byte heartbeat over a Unix Domain
