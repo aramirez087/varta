@@ -34,10 +34,8 @@ pub struct Config {
     pub shutdown_after: Option<Duration>,
     /// Optional kill-after deadline for outstanding recovery children.
     /// `None` (the default) preserves v0.1.0 semantics: children are
-    /// reaped on completion but never killed. The CLI parser for
-    /// `--recovery-timeout-ms` lands in Session 03 of the
-    /// recovery-async-spawn epic; in this red phase the field exists
-    /// but is always `None`.
+    /// reaped on completion but never killed. Set via
+    /// `--recovery-timeout-ms`.
     pub recovery_timeout: Option<Duration>,
 }
 
@@ -107,8 +105,12 @@ OPTIONAL:
                                    observer event to this file.
     --prom-addr <IP:PORT>          Bind a Prometheus text-format endpoint at
                                    GET /metrics on this address.
+    --recovery-timeout-ms <MS>     Kill-after deadline for recovery children;
+                                    if a child runs longer than this it is
+                                    killed via kill(2). Without this flag the
+                                    child is allowed to run until completion.
     --shutdown-after-secs <SECS>   Exit cleanly after the given uptime
-                                   (used by integration tests).
+                                    (used by integration tests).
 
     -h, --help                     Print this message and exit.
 ";
@@ -122,6 +124,7 @@ OPTIONAL:
         let mut file_export: Option<PathBuf> = None;
         let mut prom_addr: Option<SocketAddr> = None;
         let mut shutdown_after_secs: Option<u64> = None;
+        let mut recovery_timeout_ms: Option<u64> = None;
 
         let mut iter = args.into_iter();
         while let Some(tok) = iter.next() {
@@ -164,6 +167,12 @@ OPTIONAL:
                             .map_err(|_| ConfigError::BadAddr(v))?,
                     );
                 }
+                "--recovery-timeout-ms" => {
+                    let v = iter
+                        .next()
+                        .ok_or(ConfigError::MissingValue("--recovery-timeout-ms"))?;
+                    recovery_timeout_ms = Some(parse_u64("--recovery-timeout-ms", &v)?);
+                }
                 "--shutdown-after-secs" => {
                     let v = iter
                         .next()
@@ -188,7 +197,7 @@ OPTIONAL:
             file_export,
             prom_addr,
             shutdown_after: shutdown_after_secs.map(Duration::from_secs),
-            recovery_timeout: None,
+            recovery_timeout: recovery_timeout_ms.map(Duration::from_millis),
         })
     }
 }
@@ -279,6 +288,7 @@ mod tests {
             "--threshold-ms",
             "--recovery-cmd",
             "--recovery-debounce-ms",
+            "--recovery-timeout-ms",
             "--export-file",
             "--prom-addr",
             "--shutdown-after-secs",
@@ -289,5 +299,26 @@ mod tests {
                 "Config::HELP missing flag {flag}"
             );
         }
+    }
+
+    #[test]
+    fn parses_recovery_timeout_ms() {
+        let cfg = Config::from_args(args(&[
+            "--socket",
+            "/s",
+            "--threshold-ms",
+            "100",
+            "--recovery-timeout-ms",
+            "2500",
+        ]))
+        .expect("parse");
+        assert_eq!(cfg.recovery_timeout, Some(Duration::from_millis(2500)));
+    }
+
+    #[test]
+    fn recovery_timeout_omitted_is_none() {
+        let cfg =
+            Config::from_args(args(&["--socket", "/s", "--threshold-ms", "100"])).expect("parse");
+        assert!(cfg.recovery_timeout.is_none());
     }
 }

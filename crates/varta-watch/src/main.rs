@@ -52,10 +52,9 @@ fn main() -> ExitCode {
 
 fn run(cfg: Config) -> std::io::Result<()> {
     let mut observer = Observer::bind(&cfg.socket, cfg.threshold)?;
-    let mut recovery = cfg
-        .recovery_cmd
-        .as_ref()
-        .map(|tpl| Recovery::new(tpl.clone(), cfg.recovery_debounce));
+    let mut recovery = cfg.recovery_cmd.as_ref().map(|tpl| {
+        Recovery::with_timeout(tpl.clone(), cfg.recovery_debounce, cfg.recovery_timeout)
+    });
     let mut file_export: Option<FileExporter> = match cfg.file_export.as_ref() {
         Some(path) => Some(FileExporter::create(path)?),
         None => None,
@@ -91,25 +90,32 @@ fn run(cfg: Config) -> std::io::Result<()> {
                                 "varta-watch: recovery for pid {pid} spawned (child {child_pid})"
                             );
                         }
-                        RecoveryOutcome::Reaped { status, .. } if status.success() => {}
-                        RecoveryOutcome::Reaped { child_pid, status } => {
-                            eprintln!(
-                                "varta-watch: recovery for pid {pid} (child {child_pid}) exited {status}"
-                            );
-                        }
-                        RecoveryOutcome::Killed { child_pid } => {
-                            eprintln!(
-                                "varta-watch: recovery for pid {pid} (child {child_pid}) killed after timeout"
-                            );
-                        }
+                        RecoveryOutcome::Debounced => {}
                         RecoveryOutcome::SpawnFailed(e) => {
                             eprintln!("varta-watch: recovery for pid {pid} failed to spawn: {e}");
                         }
-                        RecoveryOutcome::ReapFailed(e) => {
-                            eprintln!("varta-watch: recovery for pid {pid} reap failed: {e}");
-                        }
-                        RecoveryOutcome::Debounced => {}
+                        _ => {}
                     }
+                }
+            }
+        }
+
+        // Reap completed or timeout-exceeded children each tick.
+        if let Some(rec) = recovery.as_mut() {
+            for outcome in rec.try_reap() {
+                match outcome {
+                    RecoveryOutcome::Reaped { child_pid, status } if !status.success() => {
+                        eprintln!(
+                            "varta-watch: recovery child {child_pid} exited non-zero: {status}"
+                        );
+                    }
+                    RecoveryOutcome::Killed { child_pid } => {
+                        eprintln!("varta-watch: recovery child {child_pid} killed after timeout");
+                    }
+                    RecoveryOutcome::ReapFailed(e) => {
+                        eprintln!("varta-watch: recovery reap failed: {e}");
+                    }
+                    _ => {}
                 }
             }
         }
