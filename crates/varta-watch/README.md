@@ -14,6 +14,7 @@ varta-watch \
   --threshold-ms 2000 \
   --recovery-cmd "systemctl restart myapp-{pid}" \
   --recovery-debounce-ms 5000 \
+  --recovery-timeout-ms 3000 \
   --export-file /var/log/varta/events.tsv \
   --prom-addr 127.0.0.1:9100
 ```
@@ -26,6 +27,7 @@ varta-watch \
 | `--threshold-ms <MS>` | u64 ms | **required** | Per-pid silence window before a stall is surfaced. |
 | `--recovery-cmd <TEMPLATE>` | string | — | Shell fragment run via `/bin/sh -c` on each unique stall. The literal `{pid}` is replaced with the stalled pid. |
 | `--recovery-debounce-ms <MS>` | u64 ms | `1000` | Per-pid debounce window for `recovery-cmd` invocations. |
+| `--recovery-timeout-ms <MS>` | u64 ms | — | Kill-after deadline for recovery children; if a child runs longer than this it is killed via kill(2). Without this flag the child is allowed to run until completion. |
 | `--export-file <PATH>` | path | — | Append one tab-separated event line per observer event to this file. |
 | `--prom-addr <IP:PORT>` | `SocketAddr` | — | Bind the Prometheus `/metrics` endpoint here. |
 | `--shutdown-after-secs <SECS>` | u64 secs | — | Exit cleanly after the given uptime (used by integration tests). |
@@ -90,6 +92,11 @@ passed to `/bin/sh -c`. No other substitution tokens exist.
 Recovery invocations are debounced per pid. A second stall for the same pid
 within the debounce window is silently skipped; distinct pids are independent.
 The debounce window resets after each successful or failed spawn.
+
+Each recovery child is spawned asynchronously (non-blocking). The observer
+never blocks on a slow template. Completed children are reaped automatically
+each poll tick. If `--recovery-timeout-ms` is set, any child that exceeds the
+deadline is killed via kill(2) and then reaped.
 
 ## Constraints
 
