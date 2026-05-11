@@ -4,5 +4,7 @@ version = "0.1.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 description = "Varta Lifeline Protocol — 32-byte fixed-layout health frame."
+authors = ["Alexander Ramirez"]
+repository = "https://github.com/aramirez087/Varta"
 
 [dependencies]
