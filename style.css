@@ -10,8 +10,8 @@
   --bg-elevated: #1a1a1a;
   --border: #222222;
   --text-primary: #e4e4e4;
-  --text-secondary: #666666;
-  --text-dim: #444444;
+  --text-secondary: #999999;
+  --text-dim: #666666;
   --accent: #22d3ee;
   --accent-dim: #0e7490;
   --accent-glow: rgba(34, 211, 238, 0.12);
@@ -249,6 +249,7 @@ code { font-family: var(--font-mono); font-size: 0.88em; }
   font-family: var(--font-mono);
   font-size: 0.82rem;
   line-height: 1.9;
+  overflow-x: auto;
 }
 
 .terminal-line { white-space: nowrap; }
@@ -515,7 +516,7 @@ code { font-family: var(--font-mono); font-size: 0.88em; }
   .hero-cta { flex-direction: column; align-items: flex-start; gap: 1rem; }
 
   .terminal-body { font-size: 0.72rem; padding: 1rem; }
-  .terminal-line { white-space: normal; word-break: break-all; }
+  .terminal-line { white-space: nowrap; }
 
   .section { padding: var(--section-pad) 1.25rem; }
 
