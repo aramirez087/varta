@@ -94,10 +94,11 @@ fn observer_emits_beat_per_received_frame() {
         Observer::bind(path.as_path(), Duration::from_secs(60), 0o600).expect("bind observer");
     let client = client_socket(path.as_path());
 
+    let pid = std::process::id();
     let frames = [
-        make_frame(101, 1, Status::Ok, 0xA1),
-        make_frame(101, 2, Status::Ok, 0xA2),
-        make_frame(101, 3, Status::Degraded, 0xA3),
+        make_frame(pid, 1, Status::Ok, 0xA1),
+        make_frame(pid, 2, Status::Ok, 0xA2),
+        make_frame(pid, 3, Status::Degraded, 0xA3),
     ];
     for f in &frames {
         send_frame(&client, f);
@@ -126,9 +127,9 @@ fn observer_emits_beat_per_received_frame() {
     }
 
     assert_eq!(got.len(), 3, "expected 3 beats, got {got:?}");
-    assert_eq!(got[0], (101, 1, Status::Ok, 0xA1));
-    assert_eq!(got[1], (101, 2, Status::Ok, 0xA2));
-    assert_eq!(got[2], (101, 3, Status::Degraded, 0xA3));
+    assert_eq!(got[0], (pid, 1, Status::Ok, 0xA1));
+    assert_eq!(got[1], (pid, 2, Status::Ok, 0xA2));
+    assert_eq!(got[2], (pid, 3, Status::Degraded, 0xA3));
 }
 
 #[test]
@@ -138,31 +139,32 @@ fn observer_emits_stall_after_threshold_elapses() {
     let mut observer = Observer::bind(path.as_path(), threshold, 0o600).expect("bind observer");
     let client = client_socket(path.as_path());
 
-    send_frame(&client, &make_frame(202, 1, Status::Ok, 0xB1));
+    let pid = std::process::id();
+    send_frame(&client, &make_frame(pid, 1, Status::Ok, 0xB1));
 
     // Drain the beat first.
     let beat = poll_until_match(&mut observer, Duration::from_secs(2), |ev| match ev {
-        Event::Beat { pid, nonce, .. } if pid == 202 && nonce == 1 => Ok(()),
+        Event::Beat { pid: p, nonce, .. } if p == pid && nonce == 1 => Ok(()),
         _ => Err(()),
     });
-    assert!(beat.is_some(), "did not observe initial beat for pid 202");
+    assert!(beat.is_some(), "did not observe initial beat for pid {pid}");
 
-    // Now expect a Stall event for pid 202 within threshold + budget.
+    // Now expect a Stall event for the same pid within threshold + budget.
     let stall = poll_until_match(
         &mut observer,
         threshold + Duration::from_secs(1),
         |ev| match ev {
             Event::Stall {
-                pid, last_nonce, ..
-            } if pid == 202 && last_nonce == 1 => Ok(()),
+                pid: p, last_nonce, ..
+            } if p == pid && last_nonce == 1 => Ok(()),
             _ => Err(()),
         },
     );
-    assert!(stall.is_some(), "no Stall event surfaced for pid 202");
+    assert!(stall.is_some(), "no Stall event surfaced for pid {pid}");
 
     // It must fire exactly once — confirm no second stall arrives shortly after.
     let extra = poll_until_match(&mut observer, Duration::from_millis(300), |ev| match ev {
-        Event::Stall { pid: 202, .. } => Ok(()),
+        Event::Stall { pid: p, .. } if p == pid => Ok(()),
         _ => Err(()),
     });
     assert!(
