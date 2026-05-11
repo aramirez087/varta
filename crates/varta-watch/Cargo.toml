@@ -9,6 +9,11 @@ repository = "https://github.com/aramirez087/Varta"
 
 [dependencies]
 
+[features]
+default = []
+# Enable UDP listener transport for network-based agents.
+udp = []
+
 [dependencies.varta-vlp]
 path = "../varta-vlp"
 version = "0.1.0"

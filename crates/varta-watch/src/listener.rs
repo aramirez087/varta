@@ -148,3 +148,75 @@ fn probe_live(path: &Path) -> io::Result<bool> {
         Err(_) => Ok(false),
     }
 }
+
+// ---------------------------------------------------------------------------
+// UDP listener (feature-gated)
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "udp")]
+mod udp_impl {
+    use std::io;
+    use std::net::{SocketAddr, UdpSocket};
+
+    use crate::peer_cred::RecvResult;
+
+    use super::BeatListener;
+
+    /// UDP listener for network-based observers.
+    ///
+    /// Receives 32-byte VLP frames over UDP from remote agents. Created via
+    /// [`UdpListener::bind`] and used with [`Observer::from_listener`].
+    ///
+    /// # PID verification
+    ///
+    /// UDP has no kernel credential attestation — `peer_pid` is always 0 (the
+    /// same sentinel used on macOS for UDS). The observer skips PID
+    /// verification for UDP traffic. Trust should be established via network
+    /// segmentation (firewall, VPC) rather than kernel credential passing.
+    ///
+    /// [`Observer::from_listener`]: crate::Observer::from_listener
+    pub struct UdpListener {
+        sock: UdpSocket,
+    }
+
+    impl UdpListener {
+        /// Bind a non-blocking UDP socket on `addr` and return a [`UdpListener`].
+        ///
+        /// # Errors
+        ///
+        /// Returns an [`io::Error`] if the socket cannot be bound or switched
+        /// to non-blocking mode.
+        pub fn bind(addr: SocketAddr) -> io::Result<Self> {
+            let sock = UdpSocket::bind(addr)?;
+            sock.set_nonblocking(true)?;
+            Ok(UdpListener { sock })
+        }
+    }
+
+    impl BeatListener for UdpListener {
+        fn recv(&mut self) -> RecvResult {
+            let mut buf = [0u8; 32];
+            loop {
+                match self.sock.recv(&mut buf) {
+                    Ok(32) => {
+                        return RecvResult::Authenticated {
+                            peer_pid: 0,
+                            data: buf,
+                        };
+                    }
+                    Ok(_) => return RecvResult::ShortRead,
+                    Err(e) => match e.kind() {
+                        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut => {
+                            return RecvResult::WouldBlock;
+                        }
+                        io::ErrorKind::Interrupted => continue,
+                        _ => return RecvResult::IoError(e),
+                    },
+                }
+            }
+        }
+    }
+}
+
+#[cfg(feature = "udp")]
+pub use udp_impl::UdpListener;
