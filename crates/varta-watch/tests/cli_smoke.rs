@@ -27,7 +27,9 @@ struct UdsPath(PathBuf);
 
 impl UdsPath {
     fn as_str(&self) -> &str {
-        self.0.to_string_lossy().as_ref()
+        self.0
+            .to_str()
+            .expect("test temp paths must be valid UTF-8")
     }
 }
 

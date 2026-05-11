@@ -195,7 +195,6 @@ impl Observer {
                 None
             }
             RecvResult::ShortRead => None,
-            RecvResult::NoCredentials => None,
             RecvResult::IoError(e) => Some(Event::Io(e)),
         }
     }

@@ -82,7 +82,10 @@ impl core::fmt::Display for ConfigError {
                 write!(f, "{flag}: not a valid unsigned integer: {raw:?}")
             }
             ConfigError::BadSocketMode(raw) => {
-                write!(f, "--socket-mode: not a valid octal integer: {raw:?}")
+                write!(
+                    f,
+                    "--socket-mode: expected octal digits (e.g. 600, 0600, or 0o600), got: {raw:?}"
+                )
             }
             ConfigError::BadAddr(raw) => {
                 write!(f, "--prom-addr: not a valid socket address: {raw:?}")
@@ -233,7 +236,17 @@ fn parse_u64(flag: &'static str, raw: &str) -> Result<u64, ConfigError> {
 }
 
 fn parse_octal(raw: &str) -> Result<u32, ConfigError> {
-    u32::from_str_radix(raw, 8).map_err(|_| ConfigError::BadSocketMode(raw.to_string()))
+    // Accept the three forms a user might naturally type: bare octal (`600`),
+    // leading-zero octal (`0600`), or Rust-literal octal (`0o600` / `0O600`).
+    // `from_str_radix` only handles the first two; the prefix is stripped here.
+    let digits = raw
+        .strip_prefix("0o")
+        .or_else(|| raw.strip_prefix("0O"))
+        .unwrap_or(raw);
+    if digits.is_empty() {
+        return Err(ConfigError::BadSocketMode(raw.to_string()));
+    }
+    u32::from_str_radix(digits, 8).map_err(|_| ConfigError::BadSocketMode(raw.to_string()))
 }
 
 #[cfg(test)]
@@ -376,6 +389,63 @@ mod tests {
             "999",
         ])) {
             Err(ConfigError::BadSocketMode(_)) => {}
+            other => panic!("expected BadSocketMode, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn socket_mode_accepts_0o_prefix() {
+        let cfg = Config::from_args(args(&[
+            "--socket",
+            "/s",
+            "--threshold-ms",
+            "100",
+            "--socket-mode",
+            "0o640",
+        ]))
+        .expect("parse");
+        assert_eq!(cfg.socket_mode, 0o640);
+    }
+
+    #[test]
+    fn socket_mode_accepts_uppercase_0o_prefix() {
+        let cfg = Config::from_args(args(&[
+            "--socket",
+            "/s",
+            "--threshold-ms",
+            "100",
+            "--socket-mode",
+            "0O640",
+        ]))
+        .expect("parse");
+        assert_eq!(cfg.socket_mode, 0o640);
+    }
+
+    #[test]
+    fn socket_mode_accepts_leading_zero() {
+        let cfg = Config::from_args(args(&[
+            "--socket",
+            "/s",
+            "--threshold-ms",
+            "100",
+            "--socket-mode",
+            "0644",
+        ]))
+        .expect("parse");
+        assert_eq!(cfg.socket_mode, 0o644);
+    }
+
+    #[test]
+    fn socket_mode_rejects_empty_after_prefix() {
+        match Config::from_args(args(&[
+            "--socket",
+            "/s",
+            "--threshold-ms",
+            "100",
+            "--socket-mode",
+            "0o",
+        ])) {
+            Err(ConfigError::BadSocketMode(raw)) => assert_eq!(raw, "0o"),
             other => panic!("expected BadSocketMode, got {other:?}"),
         }
     }

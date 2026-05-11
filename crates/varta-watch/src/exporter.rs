@@ -289,17 +289,18 @@ impl PromExporter {
             out.push_str("# TYPE varta_tracker_evicted_total counter\n");
             let _ = writeln!(out, "varta_tracker_evicted_total {}", self.evicted_total);
         }
-        if self.auth_failures_total > 0 {
-            out.push_str(
-                "# HELP varta_frame_auth_failures_total Frames rejected due to PID spoofing or authentication failure.\n",
-            );
-            out.push_str("# TYPE varta_frame_auth_failures_total counter\n");
-            let _ = writeln!(
-                out,
-                "varta_frame_auth_failures_total {}",
-                self.auth_failures_total
-            );
-        }
+        // Security counter — always emitted, even at 0.  Otherwise dashboards
+        // and `absent()` alert rules silently produce no series until the
+        // first spoof attempt, which defeats the purpose of an alert.
+        out.push_str(
+            "# HELP varta_frame_auth_failures_total Frames rejected due to PID spoofing or authentication failure.\n",
+        );
+        out.push_str("# TYPE varta_frame_auth_failures_total counter\n");
+        let _ = writeln!(
+            out,
+            "varta_frame_auth_failures_total {}",
+            self.auth_failures_total
+        );
         out
     }
 }

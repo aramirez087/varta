@@ -4,10 +4,11 @@
 //! the kernel attaches `SCM_CREDENTIALS` (containing `struct ucred`) to each
 //! datagram.
 //!
-//! On macOS `getsockopt(LOCAL_PEERPID)` is called after `recvmsg` to obtain
-//! the PID of the last datagram sender.  Because the observer drains the
-//! receive queue quickly (100ms poll deadline) the TOCTOU window between
-//! `recvmsg` and `getsockopt` is bounded.
+//! On macOS per-datagram peer PID is not available for unconnected
+//! `SOCK_DGRAM` (`LOCAL_CREDS` is not supported and `LOCAL_PEERPID` only
+//! works on connected sockets), so the observer falls back to a sentinel
+//! PID and relies on `--socket-mode 0600` to restrict the trust boundary
+//! to the owning UID.  See `docs/architecture/peer-authentication.md`.
 //!
 //! The module uses only inline `extern "C"` FFI — no `libc` crate — to
 //! satisfy the workspace's zero-registry-dependency constraint.
@@ -35,11 +36,10 @@ pub enum RecvResult {
     WouldBlock,
     /// A short (non-32-byte) read — dropped.
     ShortRead,
-    /// Frame was received but no SCM_CREDENTIALS ancillary data was present.
-    /// On a correctly configured Linux socket with SO_PASSCRED this should
-    /// not happen; if it does the frame is silently dropped for safety.
-    NoCredentials,
-    /// Fatal I/O error.
+    /// Fatal I/O error.  Also surfaced when the kernel fails to attach
+    /// `SCM_CREDENTIALS` despite `SO_PASSCRED` being set — that case is
+    /// observable as `Event::Io` rather than a silent drop so operators
+    /// can detect kernel/socket misconfiguration.
     IoError(io::Error),
 }
 
@@ -133,10 +133,10 @@ mod plat {
         unsafe { find_credential_pid(hdr, mhdr, anc_base) }
     }
 
-    /// Confirm the `msghdr` size matches the platform ABI.
-    pub(super) fn check_msghdr_layout() {
-        assert_eq!(mem::size_of::<Msghdr>(), 56);
-    }
+    // Compile-time invariant: glibc/Linux msghdr is 56 bytes on every 64-bit
+    // target Rust supports.  A Rust-side field reorder or padding mistake
+    // becomes a hard compile error instead of UB at recvmsg time.
+    const _: () = assert!(mem::size_of::<Msghdr>() == 56);
 }
 
 #[cfg(target_os = "macos")]
@@ -190,10 +190,8 @@ mod plat {
         Some(0)
     }
 
-    /// Confirm the `msghdr` size matches the platform ABI.
-    pub(super) fn check_msghdr_layout() {
-        assert_eq!(mem::size_of::<Msghdr>(), 48);
-    }
+    // Compile-time invariant: macOS msghdr is 48 bytes on x86_64 + aarch64.
+    const _: () = assert!(mem::size_of::<Msghdr>() == 48);
 }
 
 // ---------------------------------------------------------------------------
@@ -206,11 +204,10 @@ mod plat {
 /// first call to [`recv_authenticated`].
 ///
 /// On Linux this sets `SO_PASSCRED` so the kernel includes `SCM_CREDENTIALS`
-/// ancillary data on every datagram.  On macOS this is a no-op — credential
-/// extraction happens via `getsockopt(LOCAL_PEERPID)` after each `recvmsg`.
+/// ancillary data on every datagram.  On macOS this is a no-op — per-datagram
+/// peer PID is not exposed for unconnected `SOCK_DGRAM`, so the observer
+/// relies on `--socket-mode 0600` to restrict the trust boundary by UID.
 pub fn enable_credential_passing(fd: i32) -> io::Result<()> {
-    plat::check_msghdr_layout();
-
     #[cfg(target_os = "macos")]
     {
         let _ = fd;
@@ -294,7 +291,12 @@ pub fn recv_authenticated(fd: i32) -> RecvResult {
 
     let peer_pid = match plat::peer_pid_after_recv(fd, &mhdr, anc.0.as_ptr()) {
         Some(pid) => pid,
-        None => return RecvResult::NoCredentials,
+        None => {
+            return RecvResult::IoError(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "kernel did not attach SCM_CREDENTIALS ancillary data",
+            ));
+        }
     };
 
     RecvResult::Authenticated { peer_pid, data }
@@ -324,28 +326,23 @@ unsafe fn cmsg_nxthdr<'a>(
 ) -> Option<&'a plat::Cmsghdr> {
     let cur = (cmsg as *const plat::Cmsghdr) as *const u8;
     let offset = unsafe { cur.offset_from(base) } as usize;
-    let advance = cmsg_align(cmsg_len(cmsg) as usize);
+    let advance = cmsg_align(cmsg.cmsg_len);
     let next_offset = offset + advance;
 
     if next_offset + cmsg_hdr_size() > mhdr.msg_controllen {
         return None;
     }
-    let next = unsafe { base.add(next_offset) } as *const plat::Cmsghdr;
+    let next = unsafe { &*(base.add(next_offset) as *const plat::Cmsghdr) };
     let remaining = mhdr.msg_controllen - next_offset;
-    if cmsg_len(unsafe { &*next }) as usize > remaining {
+    if next.cmsg_len > remaining {
         return None;
     }
-    unsafe { Some(&*next) }
+    Some(next)
 }
 
 #[cfg(target_os = "linux")]
 unsafe fn cmsg_data(cmsg: &plat::Cmsghdr) -> *const u8 {
     unsafe { (cmsg as *const plat::Cmsghdr as *const u8).add(cmsg_hdr_size()) }
-}
-
-#[cfg(target_os = "linux")]
-fn cmsg_len(hdr: &plat::Cmsghdr) -> u32 {
-    hdr.cmsg_len as u32
 }
 
 #[cfg(target_os = "linux")]
@@ -356,9 +353,16 @@ unsafe fn find_credential_pid(
 ) -> Option<u32> {
     let target_level = plat::SOL_SOCKET;
     let target_type = plat::SCM_CREDENTIALS;
+    // Minimum bytes a SCM_CREDENTIALS message must contain: aligned cmsghdr
+    // followed by a struct ucred.  Anything shorter is malformed and would
+    // cause an OOB read of the ancillary buffer if dereferenced.
+    let needed = cmsg_hdr_size() + core::mem::size_of::<plat::Ucred>();
 
     while let Some(cmsg) = hdr {
         if cmsg.cmsg_level == target_level && cmsg.cmsg_type == target_type {
+            if cmsg.cmsg_len < needed {
+                return None;
+            }
             let data_ptr = unsafe { cmsg_data(cmsg) };
             let ucred = unsafe { &*(data_ptr as *const plat::Ucred) };
             return Some(ucred.pid as u32);
