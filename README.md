@@ -4,12 +4,9 @@
   <img src="assets/varta-animation.svg" alt="Varta Animation" width="100%">
 </p>
 
-Zero-overhead health protocol for distributed local agents.
+**Zero dependencies. Zero allocations. Agents that never go dark.**
 
-Varta lets any local process emit a 32-byte heartbeat over a Unix Domain
-Socket. A companion observer (`varta-watch`) decodes the frames, detects
-stalls, triggers recovery commands, and exports Prometheus metrics — all
-without a single registry dependency on either side.
+A 32-byte heartbeat protocol for distributed local agents. Your processes talk; Varta listens.
 
 ## Why Varta
 
