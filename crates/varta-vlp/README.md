@@ -1,5 +1,7 @@
 # varta-vlp
 
+[![crates.io](https://img.shields.io/crates/v/varta-vlp)](https://crates.io/crates/varta-vlp)
+
 ← [Workspace root](../../README.md)
 
 Wire protocol crate — defines the 32-byte Varta Lifeline Protocol (VLP) frame

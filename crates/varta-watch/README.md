@@ -1,5 +1,7 @@
 # varta-watch
 
+[![crates.io](https://img.shields.io/crates/v/varta-watch)](https://crates.io/crates/varta-watch)
+
 ← [Workspace root](../../README.md)
 
 Observer binary — decode VLP frames from agent sockets, surface stalls, and

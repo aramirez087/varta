@@ -1,5 +1,7 @@
 # varta-client
 
+[![crates.io](https://img.shields.io/crates/v/varta-client)](https://crates.io/crates/varta-client)
+
 ← [Workspace root](../../README.md)
 
 Agent API — emit VLP frames over a Unix Domain Socket. One `connect` call
