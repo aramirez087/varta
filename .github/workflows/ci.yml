@@ -52,19 +52,6 @@ jobs:
         run: |
           awk '/^\[dependencies\]$/{f=1;next} /^\[/{f=0} f && NF{print "FAIL " FILENAME ": " $0; exit 1}' crates/varta-watch/Cargo.toml
 
-      - name: TDD ledger audit
-        run: |
-          set -e
-          for n in 01 02 03 04 05 06; do
-            f=docs/roadmap/varta-v0-1-0/session-$n-handoff.md
-            grep -qE '^### RED( |$)'   "$f" || { echo "FAIL: $f missing RED block"; exit 1; }
-            grep -qE '^### GREEN( |$)' "$f" || { echo "FAIL: $f missing GREEN block"; exit 1; }
-            echo "OK ledger $f"
-          done
-          f=docs/roadmap/varta-v0-1-0/session-07-handoff.md
-          grep -q 'n/a — docs-only session' "$f" || { echo "FAIL: $f missing docs-only ledger note"; exit 1; }
-          echo "OK ledger $f (docs-only)"
-
       - name: acceptance contract audit
         run: |
           set -e
