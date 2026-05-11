@@ -30,6 +30,8 @@ varta-watch \
 | `--recovery-cmd <TEMPLATE>` | string | — | Shell fragment run via `/bin/sh -c` on each unique stall. The literal `{pid}` is replaced with the stalled pid. |
 | `--recovery-debounce-ms <MS>` | u64 ms | `1000` | Per-pid debounce window for `recovery-cmd` invocations. |
 | `--recovery-timeout-ms <MS>` | u64 ms | — | Kill-after deadline for recovery children; if a child runs longer than this it is killed via kill(2). Without this flag the child is allowed to run until completion. |
+| `--socket-mode <OCTAL>` | octal | `0600` | File mode for the observer socket (default 0600 — owner-only r/w). |
+| `--read-timeout-ms <MS>` | u64 ms | `100` | UDS read timeout per poll call. Bounded so a stalled peer cannot hold the observer loop indefinitely. |
 | `--export-file <PATH>` | path | — | Append one tab-separated event line per observer event to this file. |
 | `--prom-addr <IP:PORT>` | `SocketAddr` | — | Bind the Prometheus `/metrics` endpoint here. |
 | `--shutdown-after-secs <SECS>` | u64 secs | — | Exit cleanly after the given uptime (used by integration tests). |

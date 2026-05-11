@@ -1,7 +1,6 @@
 # Recovery — Non-Blocking Spawn / Async Reap
 
-> Status: charter (Session 01 of the `recovery-async-spawn` epic).
-> Implementation lands in Sessions 02 (impl) and 03 (CLI + loop wiring).
+> Status: implemented (Sessions 01–03 completed). The `--recovery-timeout-ms` flag is live in `varta-watch`; see `crates/varta-watch/src/config.rs` and `crates/varta-watch/src/recovery.rs`.
 
 ## 1. Problem
 

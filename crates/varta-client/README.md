@@ -34,6 +34,8 @@ fn main() -> std::io::Result<()> {
 |--------|-----------|-------------|
 | `connect` | `(path: impl AsRef<Path>) -> io::Result<Varta>` | Open a non-blocking `UnixDatagram` to the observer. The only allocation point. |
 | `beat` | `(&mut self, status: Status, payload: u64) -> BeatOutcome` | Emit one 32-byte VLP frame. Never blocks; never allocates. |
+| `reconnect` | `(&mut self) -> io::Result<()>` | Re-bind the socket to the observer path (e.g. after an observer restart). |
+| `set_reconnect_after` | `(&mut self, n: u32)` | Enable auto-reconnect after `n` consecutive `Dropped` outcomes. |
 
 ### `BeatOutcome`
 
@@ -92,8 +94,7 @@ message and any user hooks). The sole heap allocation is the `Box` created by
   path dep on `varta-vlp`); no registry crate is pulled in.
 - **Zero steady-state allocation.** After `Varta::connect`, `beat()` does not
   touch the heap. Verified by a guard-allocator test in `varta-tests`.
-- **Non-blocking.** `beat()` calls `set_nonblocking(true)` on the socket;
-  `WouldBlock` is treated as `Dropped` — the caller never stalls.
+- **Non-blocking.** The socket is set to non-blocking mode at `connect()` time; `WouldBlock` is treated as `Dropped` — the caller never stalls.
 
 ## See also
 
