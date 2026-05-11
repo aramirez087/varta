@@ -150,10 +150,10 @@ impl Frame {
         }
         let status = Status::try_from_u8(bytes[3])?;
 
-        let pid = u32::from_le_bytes(bytes[4..8].try_into().unwrap_or_else(|_| [0, 0, 0, 0]));
-        let timestamp = u64::from_le_bytes(bytes[8..16].try_into().unwrap_or_else(|_| [0; 8]));
-        let nonce = u64::from_le_bytes(bytes[16..24].try_into().unwrap_or_else(|_| [0; 8]));
-        let payload = u64::from_le_bytes(bytes[24..32].try_into().unwrap_or_else(|_| [0; 8]));
+        let pid = u32::from_le_bytes(bytes[4..8].try_into().unwrap_or([0, 0, 0, 0]));
+        let timestamp = u64::from_le_bytes(bytes[8..16].try_into().unwrap_or([0; 8]));
+        let nonce = u64::from_le_bytes(bytes[16..24].try_into().unwrap_or([0; 8]));
+        let payload = u64::from_le_bytes(bytes[24..32].try_into().unwrap_or([0; 8]));
 
         Ok(Frame {
             magic,
