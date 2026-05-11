@@ -49,7 +49,7 @@ use varta_vlp::{Frame, Status, MAGIC, VERSION, DecodeError};
 let frame = Frame {
     magic: MAGIC,
     version: VERSION,
-    status: Status::Ok as u8,
+    status: Status::Ok,
     pid: std::process::id(),
     timestamp: 0,
     nonce: 1,
@@ -60,7 +60,7 @@ frame.encode(&mut buf);
 
 // Decode
 let decoded = Frame::decode(&buf).unwrap();
-assert_eq!(decoded.status, Status::Ok as u8);
+assert_eq!(decoded.status, Status::Ok);
 ```
 
 ## Version policy

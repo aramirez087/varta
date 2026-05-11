@@ -316,7 +316,7 @@ impl Observer {
                 tracker: Tracker::new(),
                 threshold_ns,
                 start: Instant::now(),
-                stall_queue: Vec::new(),
+                stall_queue: Vec::with_capacity(CAPACITY),
                 stall_pending: Vec::with_capacity(CAPACITY),
                 stall_cursor: 0,
             },

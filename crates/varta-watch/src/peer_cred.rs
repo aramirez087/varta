@@ -129,6 +129,10 @@ mod plat {
     /// Extract peer PID after a successful `recvmsg` — on Linux this is
     /// done via ancillary-data parsing.
     pub(super) fn peer_pid_after_recv(_fd: i32, mhdr: &Msghdr, anc_base: *const u8) -> Option<u32> {
+        debug_assert_eq!(
+            mhdr.msg_control as *const u8, anc_base,
+            "msg_control and ancillary buffer base must be the same address"
+        );
         let hdr = unsafe { super::cmsg_firsthdr(mhdr) };
         unsafe { super::find_credential_pid(hdr, mhdr, anc_base) }
     }
