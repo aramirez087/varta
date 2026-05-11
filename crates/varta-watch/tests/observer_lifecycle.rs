@@ -32,7 +32,7 @@ fn bind_succeeds_on_clean_path() {
     let path = unique_path("clean");
     assert!(!path.exists(), "path must not pre-exist");
 
-    let _obs = Observer::bind(&path, THRESHOLD, 0o600, Duration::from_millis(100))
+    let (_obs, _guard) = Observer::bind(&path, THRESHOLD, 0o600, Duration::from_millis(100))
         .expect("bind on clean path should succeed");
 
     assert!(path.exists(), "socket file must exist after bind");
@@ -44,7 +44,9 @@ fn bind_succeeds_on_clean_path() {
         "permissions must be 0o600"
     );
 
-    // Belt-and-braces cleanup: Drop unlinks once M7 lands; until then, remove explicitly.
+    // Let the SocketGuard clean up.
+    drop(_obs);
+    drop(_guard);
     let _ = std::fs::remove_file(&path);
 }
 
@@ -54,7 +56,7 @@ fn bind_succeeds_on_clean_path() {
 fn bind_fails_when_live_observer_present() {
     let path = unique_path("live");
 
-    let _first = Observer::bind(&path, THRESHOLD, 0o600, Duration::from_millis(100))
+    let (_first, _guard) = Observer::bind(&path, THRESHOLD, 0o600, Duration::from_millis(100))
         .expect("first bind must succeed");
 
     let err = Observer::bind(&path, THRESHOLD, 0o600, Duration::from_millis(100))
@@ -68,9 +70,9 @@ fn bind_fails_when_live_observer_present() {
         "error message mismatch: {err}"
     );
 
-    // Cleanup: drop _first, then unconditionally remove so the test is hermetic
-    // regardless of whether M7 Drop impl is present.
+    // Drop first observer + guard, then belt-and-braces remove.
     drop(_first);
+    drop(_guard);
     let _ = std::fs::remove_file(&path);
 }
 
@@ -84,7 +86,7 @@ fn bind_cleans_up_stale_socket_file() {
     std::fs::write(&path, b"").expect("create stale file");
     assert!(path.exists());
 
-    let _obs = Observer::bind(&path, THRESHOLD, 0o600, Duration::from_millis(100))
+    let (_obs, _guard) = Observer::bind(&path, THRESHOLD, 0o600, Duration::from_millis(100))
         .expect("bind over stale file must succeed");
 
     let meta = std::fs::metadata(&path).expect("metadata");
@@ -95,62 +97,58 @@ fn bind_cleans_up_stale_socket_file() {
 
     // Belt-and-braces cleanup.
     drop(_obs);
+    drop(_guard);
     let _ = std::fs::remove_file(&path);
 }
 
-/// M7 contract — dropping an Observer removes the socket file from disk.
-///
-/// **Depends on M7 Drop impl from session 02.**
-/// Before M7 merges: the assertion `!path.exists()` fails because Drop does
-/// not yet unlink the socket.
+/// M7 contract — dropping a SocketGuard removes the socket file from disk.
+/// The Observer itself does NOT own cleanup; only the SocketGuard does.
 #[test]
 fn drop_unlinks_bound_socket() {
     let path = unique_path("drop-unlink");
 
-    let obs = Observer::bind(&path, THRESHOLD, 0o600, Duration::from_millis(100))
+    let (obs, guard) = Observer::bind(&path, THRESHOLD, 0o600, Duration::from_millis(100))
         .expect("bind must succeed");
 
     assert!(path.exists(), "socket must exist after bind");
 
     drop(obs);
+    assert!(
+        path.exists(),
+        "socket must still exist after observer drop (guard owns cleanup)"
+    );
 
-    assert!(!path.exists(), "socket must be removed after drop");
+    drop(guard);
+    assert!(!path.exists(), "socket must be removed after guard drop");
 }
 
-/// M7 contract — if the socket file is manually removed before the Observer is
-/// dropped, the drop completes silently without panicking.
-///
-/// **Depends on M7 Drop impl from session 02** for the ENOENT-swallow guarantee.
-/// Before M7 merges: passes trivially because no Drop impl means no panic risk.
-/// After M7 merges: continues to pass because Drop swallows missing-file errors.
+/// M7 contract — if the socket file is manually removed before the
+/// SocketGuard is dropped, the drop completes silently without panicking.
 #[test]
 fn drop_swallows_missing_file() {
     let path = unique_path("drop-missing");
 
-    let obs = Observer::bind(&path, THRESHOLD, 0o600, Duration::from_millis(100))
+    let (obs, guard) = Observer::bind(&path, THRESHOLD, 0o600, Duration::from_millis(100))
         .expect("bind must succeed");
 
-    // Manually remove the file before drop.
+    // Manually remove the file before guard drop.
     std::fs::remove_file(&path).expect("manual remove");
     assert!(!path.exists());
 
     // Must not panic. The Drop impl must swallow ENOENT.
     drop(obs);
+    drop(guard);
     // Reaching here means no panic occurred.
 }
 
 /// M7 constraint #6 — if another Observer has won the path (different inode),
-/// the original observer's Drop must NOT remove the foreign file.
-///
-/// **Depends on M7 Drop impl from session 02** (inode-compare in finish_bind + Drop).
-/// Before M7 merges: the final `assert!(!path.exists())` fails because obs_b's
-/// drop does not unlink the socket.
+/// the original SocketGuard's Drop must NOT remove the foreign file.
 #[test]
 fn drop_preserves_foreign_inode() {
     let path = unique_path("drop-inode");
 
     // First observer binds — owns inode A.
-    let obs_a = Observer::bind(&path, THRESHOLD, 0o600, Duration::from_millis(100))
+    let (obs_a, guard_a) = Observer::bind(&path, THRESHOLD, 0o600, Duration::from_millis(100))
         .expect("first bind must succeed");
 
     // Simulate stale-cleanup scenario: manually remove the socket so a second
@@ -158,21 +156,24 @@ fn drop_preserves_foreign_inode() {
     std::fs::remove_file(&path).expect("manual remove for inode swap");
 
     // Second observer binds — owns inode B at the same path.
-    let obs_b = Observer::bind(&path, THRESHOLD, 0o600, Duration::from_millis(100))
+    let (obs_b, guard_b) = Observer::bind(&path, THRESHOLD, 0o600, Duration::from_millis(100))
         .expect("second bind must succeed");
 
-    // Drop obs_a — its bound_dev/bound_ino no longer match the on-disk inode
-    // (which belongs to obs_b). Drop must NOT remove the file.
+    // Drop obs_a and guard_a — guard_a's bound_dev/bound_ino no longer match
+    // the on-disk inode (which belongs to obs_b). Guard must NOT remove the file.
     drop(obs_a);
+    drop(guard_a);
     assert!(
         path.exists(),
-        "drop of stale observer must not remove the current (foreign) socket"
+        "drop of stale guard must not remove the current (foreign) socket"
     );
 
-    // Drop obs_b — it owns the current inode, so it SHOULD remove the file.
+    // Drop obs_b and guard_b — guard_b owns the current inode, so it SHOULD
+    // remove the file.
     drop(obs_b);
+    drop(guard_b);
     assert!(
         !path.exists(),
-        "drop of current observer must remove the socket"
+        "drop of current guard must remove the socket"
     );
 }

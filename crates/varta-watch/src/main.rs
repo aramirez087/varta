@@ -16,7 +16,7 @@
 use std::io::Write;
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use varta_watch::{
     Config, ConfigError, Event, Exporter, FileExporter, Observer, PromExporter, Recovery,
@@ -87,7 +87,7 @@ fn run(cfg: Config) -> std::io::Result<()> {
         install_signal_handlers();
     }
 
-    let mut observer = Observer::bind(
+    let (mut observer, _guard) = Observer::bind(
         &cfg.socket,
         cfg.threshold,
         cfg.socket_mode,
@@ -116,7 +116,11 @@ fn run(cfg: Config) -> std::io::Result<()> {
             }
         }
 
-        if let Some(ev) = observer.poll() {
+        // ------ 1. Drain queued stall events before I/O or maintenance ------
+        // Surface every pending stall immediately; this prevents a batch of
+        // N simultaneous stalls from taking N full poll cycles (each of which
+        // includes Prometheus serving / file I/O / reaping).
+        while let Some(ev) = observer.poll_pending() {
             if let Some(fe) = file_export.as_mut() {
                 fe.record(&ev);
             }
@@ -145,6 +149,22 @@ fn run(cfg: Config) -> std::io::Result<()> {
             }
         }
 
+        // ----- 2. One non-blocking I/O poll for new beats / decode / auth ------
+        // poll() never returns stalls — those are surfaced exclusively via
+        // poll_pending() above.
+        let had_io = if let Some(ev) = observer.poll() {
+            if let Some(fe) = file_export.as_mut() {
+                fe.record(&ev);
+            }
+            if let Some(pe) = prom_export.as_mut() {
+                pe.record(&ev);
+            }
+            true
+        } else {
+            false
+        };
+
+        // ------ 3. Maintenance (evictions, capacity, reaping, /metrics) ------
         let evicted = observer.drain_evictions();
         if evicted > 0 {
             if let Some(pe) = prom_export.as_mut() {
@@ -183,6 +203,15 @@ fn run(cfg: Config) -> std::io::Result<()> {
             if let Err(e) = pe.serve_pending() {
                 eprintln!("varta-watch: /metrics serve error: {e}");
             }
+        }
+
+        // ----- 4. Throttle: sleep only when truly idle ------
+        // Avoid busy-waiting when there are no I/O events and no queued
+        // stalls.  If poll() populated new stalls via drain_stalls() the
+        // check below catches them and the next iteration drains them
+        // without a sleep penalty.
+        if !had_io && !observer.has_pending_stalls() {
+            std::thread::sleep(Duration::from_millis(10));
         }
     }
 

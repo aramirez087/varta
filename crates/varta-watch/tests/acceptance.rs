@@ -61,13 +61,21 @@ fn send_frame(sock: &UnixDatagram, frame: &Frame) {
 }
 
 /// Poll the observer until `pred` returns `Some(_)` or the deadline expires.
-/// Replaces raw sleeps with a bounded retry that yields between empty polls.
+/// Checks queued stalls (via `poll_pending`) before I/O (via `poll`).
 fn poll_until_match<F, T>(observer: &mut Observer, deadline: Duration, mut pred: F) -> Option<T>
 where
     F: FnMut(Event) -> Result<T, ()>,
 {
     let stop = Instant::now() + deadline;
     while Instant::now() < stop {
+        // Drain pending stalls first
+        if let Some(ev) = observer.poll_pending() {
+            if let Ok(value) = pred(ev) {
+                return Some(value);
+            }
+            continue;
+        }
+        // Then check new I/O events
         if let Some(ev) = observer.poll() {
             if let Ok(value) = pred(ev) {
                 return Some(value);
@@ -82,7 +90,7 @@ where
 #[test]
 fn observer_emits_beat_per_received_frame() {
     let path = unique_uds_path("beats");
-    let mut observer = Observer::bind(
+    let (mut observer, _guard) = Observer::bind(
         path.as_path(),
         Duration::from_secs(60),
         0o600,
@@ -104,25 +112,34 @@ fn observer_emits_beat_per_received_frame() {
     let deadline = Duration::from_secs(2);
     let mut got: Vec<(u32, u64, Status, u64)> = Vec::with_capacity(3);
     let stop = Instant::now() + deadline;
-    while got.len() < 3 && Instant::now() < stop {
-        if let Some(ev) = observer.poll() {
-            match ev {
-                Event::Beat {
-                    pid,
-                    nonce,
-                    status,
-                    payload,
-                    observer_ns: _,
-                } => got.push((pid, nonce, status, payload)),
-                Event::Decode(e, _) => panic!("unexpected decode error: {e}"),
-                Event::Io(e, _) => panic!("unexpected io error: {e}"),
-                Event::Stall { .. } => panic!("unexpected stall during beat test"),
-                Event::AuthFailure { .. } => {
-                    panic!("unexpected auth failure during beat test")
-                }
+    'outer: while got.len() < 3 && Instant::now() < stop {
+        // Check queued stalls first, then I/O events.
+        let ev = loop {
+            if let Some(ev) = observer.poll_pending() {
+                break ev;
             }
-        } else {
+            if let Some(ev) = observer.poll() {
+                break ev;
+            }
+            if Instant::now() >= stop {
+                break 'outer;
+            }
             thread::sleep(Duration::from_millis(1));
+        };
+        match ev {
+            Event::Beat {
+                pid,
+                nonce,
+                status,
+                payload,
+                observer_ns: _,
+            } => got.push((pid, nonce, status, payload)),
+            Event::Decode(e, _) => panic!("unexpected decode error: {e}"),
+            Event::Io(e, _) => panic!("unexpected io error: {e}"),
+            Event::Stall { .. } => panic!("unexpected stall during beat test"),
+            Event::AuthFailure { .. } => {
+                panic!("unexpected auth failure during beat test")
+            }
         }
     }
 
@@ -136,8 +153,9 @@ fn observer_emits_beat_per_received_frame() {
 fn observer_emits_stall_after_threshold_elapses() {
     let path = unique_uds_path("stall");
     let threshold = Duration::from_millis(150);
-    let mut observer = Observer::bind(path.as_path(), threshold, 0o600, Duration::from_millis(100))
-        .expect("bind observer");
+    let (mut observer, _guard) =
+        Observer::bind(path.as_path(), threshold, 0o600, Duration::from_millis(100))
+            .expect("bind observer");
     let client = client_socket(path.as_path());
 
     let pid = std::process::id();
@@ -177,7 +195,7 @@ fn observer_emits_stall_after_threshold_elapses() {
 #[test]
 fn observer_reports_decode_error_for_bad_magic() {
     let path = unique_uds_path("decode");
-    let mut observer = Observer::bind(
+    let (mut observer, _guard) = Observer::bind(
         path.as_path(),
         Duration::from_secs(60),
         0o600,
@@ -224,7 +242,7 @@ fn tracker_capacity_bounded_to_64_pids() {
 #[test]
 fn observer_rejects_spoofed_pid_frame() {
     let path = unique_uds_path("spoof");
-    let mut observer = Observer::bind(
+    let (mut observer, _guard) = Observer::bind(
         path.as_path(),
         Duration::from_secs(60),
         0o600,

@@ -17,6 +17,6 @@ pub mod tracker;
 
 pub use config::{Config, ConfigError};
 pub use exporter::{Exporter, FileExporter, PromExporter};
-pub use observer::{Event, Observer};
+pub use observer::{Event, Observer, SocketGuard};
 pub use recovery::{Recovery, RecoveryOutcome};
 pub use tracker::{Slot, Tracker, Update};

@@ -69,22 +69,26 @@ pub enum Event {
     Io(io::Error, u64),
 }
 
+/// Owns the responsibility for unlinking the UDS file node when the
+/// observer shuts down. Checks device + inode before removing to avoid
+/// touching a foreign socket that won a later race.  Errors are swallowed
+/// because [`Drop`] must never panic.
+///
+/// This is a separate type so that observers do not own their own cleanup
+/// — a caller (e.g. the daemon binary) can hold a [`Vec<SocketGuard>`]
+/// and manage lifecycle explicitly.
+pub struct SocketGuard {
+    path: PathBuf,
+    bound_dev: u64,
+    bound_ino: u64,
+}
+
 /// Observer process bound to a Unix Domain Socket.
 ///
-/// Dropping the observer best-effort unlinks the bound socket file (comparing
-/// device + inode to avoid removing a foreign file that won a later race);
-/// errors are ignored.
+/// The observer does **not** own the socket file — the caller receives a
+/// [`SocketGuard`] from [`Observer::bind`] and is responsible for cleanup.
 pub struct Observer {
     sock: UnixDatagram,
-    /// On-disk path this Observer bound to. Used by `Drop` to unlink the
-    /// socket file. Heap-allocated once at `bind()` time; not touched on
-    /// the `poll` hot path.
-    path: PathBuf,
-    /// `st_dev` of the bound socket file, captured immediately after bind.
-    /// Compared at `Drop` to avoid unlinking a foreign inode.
-    bound_dev: u64,
-    /// `st_ino` of the bound socket file, captured immediately after bind.
-    bound_ino: u64,
     tracker: Tracker,
     threshold_ns: u64,
     start: Instant,
@@ -95,7 +99,8 @@ pub struct Observer {
 
 impl Observer {
     /// Bind a Unix datagram socket at `path` and return an [`Observer`]
-    /// configured with the given stall `threshold`.
+    /// configured with the given stall `threshold`, together with a
+    /// [`SocketGuard`] that unlinks the socket file on drop.
     ///
     /// The socket file permissions are set to `socket_mode` (octal, e.g.
     /// `0o600`) immediately after a successful bind. Credential passing is
@@ -118,7 +123,7 @@ impl Observer {
         threshold: Duration,
         socket_mode: u32,
         read_timeout: Duration,
-    ) -> io::Result<Self> {
+    ) -> io::Result<(Self, SocketGuard)> {
         let path = path.as_ref();
         let owned_path: PathBuf = path.to_path_buf();
 
@@ -156,23 +161,26 @@ impl Observer {
         }
     }
 
-    /// Receive at most one frame and return the corresponding [`Event`].
+    /// Attempt a single non-blocking read from the socket and return the
+    /// corresponding I/O [`Event`].
+    ///
+    /// This method never returns [`Event::Stall`] — queued stall events must
+    /// be retrieved via [`Observer::poll_pending`].  Callers should check
+    /// [`Observer::has_pending_stalls`] before calling `poll` to ensure
+    /// previously-queued stalls are drained first.
     ///
     /// Returns:
     /// - `Some(Event::Beat)` for an accepted, ordered frame.
     /// - `Some(Event::Decode(_))` if the next 32 bytes fail VLP decoding.
-    /// - `Some(Event::Stall)` if the read timed out and a tracked pid has
-    ///   crossed the configured threshold without yet being reported.
     /// - `Some(Event::Io(_))` for non-`WouldBlock` socket errors.
-    /// - `None` if nothing actionable happened (timeout with no new stalls,
-    ///   short reads, out-of-order beats, or capacity-exceeded inserts).
+    /// - `Some(Event::AuthFailure)` if the frame pid does not match the
+    ///   kernel-attested sender (Linux only; on macOS this check is
+    ///   unavailable for unconnected `SOCK_DGRAM`).
+    /// - `None` if no I/O was available (`WouldBlock`), the read was a
+    ///   short read, the beat was out-of-order, or capacity was exceeded.
+    ///   `WouldBlock` internally triggers [`Observer::drain_stalls`], which
+    ///   populates the stall queue for subsequent `poll_pending` calls.
     pub fn poll(&mut self) -> Option<Event> {
-        if self.stall_cursor < self.stall_queue.len() {
-            let stall = self.stall_queue[self.stall_cursor].take();
-            self.stall_cursor += 1;
-            return stall;
-        }
-
         match peer_cred::recv_authenticated(self.sock.as_raw_fd()) {
             RecvResult::Authenticated { peer_pid, data } => {
                 let now_ns = self.now_ns();
@@ -207,16 +215,31 @@ impl Observer {
             }
             RecvResult::WouldBlock => {
                 self.drain_stalls();
-                if self.stall_cursor < self.stall_queue.len() {
-                    let stall = self.stall_queue[self.stall_cursor].take();
-                    self.stall_cursor += 1;
-                    return stall;
-                }
                 None
             }
             RecvResult::ShortRead => None,
             RecvResult::IoError(e) => Some(Event::Io(e, self.now_ns())),
         }
+    }
+
+    /// Return the next queued [`Event::Stall`], if any.
+    ///
+    /// Stalls are queued internally by [`Observer::drain_stalls`] (which
+    /// runs on `WouldBlock` inside [`Observer::poll`]).  Callers should
+    /// drain all pending stalls before calling `poll` for new I/O to
+    /// minimize stall-latency.
+    pub fn poll_pending(&mut self) -> Option<Event> {
+        if self.stall_cursor < self.stall_queue.len() {
+            let stall = self.stall_queue[self.stall_cursor].take();
+            self.stall_cursor += 1;
+            return stall;
+        }
+        None
+    }
+
+    /// Whether the stall queue has unconsumed [`Event::Stall`] entries.
+    pub fn has_pending_stalls(&self) -> bool {
+        self.stall_cursor < self.stall_queue.len()
     }
 
     fn now_ns(&self) -> u64 {
@@ -225,6 +248,10 @@ impl Observer {
     }
 
     fn drain_stalls(&mut self) {
+        debug_assert!(
+            self.stall_cursor >= self.stall_queue.len(),
+            "drain_stalls called with unconsumed stall events"
+        );
         let now_ns = self.now_ns();
         self.stall_queue.clear();
         self.stall_cursor = 0;
@@ -265,7 +292,7 @@ impl Observer {
         threshold: Duration,
         path: PathBuf,
         read_timeout: Duration,
-    ) -> io::Result<Self> {
+    ) -> io::Result<(Self, SocketGuard)> {
         use std::os::unix::fs::MetadataExt;
 
         sock.set_read_timeout(Some(read_timeout))?;
@@ -277,18 +304,24 @@ impl Observer {
         let bound_dev = meta.dev();
         let bound_ino = meta.ino();
 
-        Ok(Observer {
-            sock,
+        let guard = SocketGuard {
             path,
             bound_dev,
             bound_ino,
-            tracker: Tracker::new(),
-            threshold_ns,
-            start: Instant::now(),
-            stall_queue: Vec::new(),
-            stall_pending: Vec::with_capacity(CAPACITY),
-            stall_cursor: 0,
-        })
+        };
+
+        Ok((
+            Observer {
+                sock,
+                tracker: Tracker::new(),
+                threshold_ns,
+                start: Instant::now(),
+                stall_queue: Vec::new(),
+                stall_pending: Vec::with_capacity(CAPACITY),
+                stall_cursor: 0,
+            },
+            guard,
+        ))
     }
 }
 
@@ -329,11 +362,11 @@ fn probe_live(path: &Path) -> io::Result<bool> {
     }
 }
 
-impl Drop for Observer {
+impl Drop for SocketGuard {
     /// Unlink the socket file iff the on-disk inode still matches the one
-    /// we bound to. Errors are swallowed: `drop` must never panic (including
-    /// during stack unwinding), the file may have been removed by another
-    /// process, and library code must not emit diagnostics.
+    /// captured at bind time. Errors are swallowed: `drop` must never panic
+    /// (including during stack unwinding), the file may have been removed by
+    /// another process, and library code must not emit diagnostics.
     fn drop(&mut self) {
         use std::os::unix::fs::MetadataExt;
         if let Ok(meta) = std::fs::metadata(&self.path) {
@@ -368,7 +401,7 @@ mod tests {
     #[test]
     fn drop_unlinks_bound_socket() {
         let path = unique_sock_path();
-        let obs = Observer::bind(
+        let (obs, guard) = Observer::bind(
             &path,
             Duration::from_secs(1),
             0o600,
@@ -377,6 +410,14 @@ mod tests {
         .expect("bind should succeed on a clean temp path");
         assert!(path.exists(), "socket file must exist after bind");
         drop(obs);
-        assert!(!path.exists(), "socket file must be removed after drop");
+        assert!(
+            path.exists(),
+            "dropping observer must not remove the socket file"
+        );
+        drop(guard);
+        assert!(
+            !path.exists(),
+            "socket file must be removed after guard drop"
+        );
     }
 }
