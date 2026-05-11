@@ -63,3 +63,49 @@ pub fn install(socket_path: impl Into<PathBuf>) {
         prev(info);
     }));
 }
+
+/// Register a panic hook that emits a [`Status::Critical`] VLP frame over UDP
+/// to `addr` before resuming normal unwinding.
+///
+/// The hook creates a fresh [`UdpSocket`] on an ephemeral source port, connects
+/// to `addr`, encodes a 32-byte frame into a stack buffer, and calls `send`.
+/// All I/O errors are silently swallowed — panicking inside a panic hook
+/// triggers an immediate process abort.
+///
+/// # Nonce sentinel
+///
+/// The frame carries `nonce = NONCE_TERMINAL`, distinct from the monotonically
+/// incrementing nonces produced by [`crate::Varta::beat`].
+///
+/// # Allocation
+///
+/// The sole heap allocation is the `Box` created by [`std::panic::set_hook`]
+/// at install time. The hook closure body performs no heap allocations.
+///
+/// # Chaining
+///
+/// This function captures the previously registered hook via
+/// [`std::panic::take_hook`] and invokes it after firing the VLP frame.
+#[cfg(feature = "udp")]
+pub fn install_panic_handler_udp(addr: std::net::SocketAddr) {
+    let start = Instant::now();
+    let prev = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let _ = (|| {
+            let sock = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
+            sock.connect(addr).ok()?;
+            let timestamp = start.elapsed().as_nanos() as u64;
+            let frame = Frame::new(
+                Status::Critical,
+                std::process::id(),
+                timestamp,
+                NONCE_TERMINAL,
+                0,
+            );
+            let mut buf = [0u8; 32];
+            frame.encode(&mut buf);
+            sock.send(&buf).ok()
+        })();
+        prev(info);
+    }));
+}

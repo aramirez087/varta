@@ -9,6 +9,9 @@ use varta_vlp::{Frame, Status, NONCE_TERMINAL};
 
 use crate::transport::{BeatTransport, UdsTransport};
 
+#[cfg(feature = "udp")]
+use crate::transport::UdpTransport;
+
 /// Linux value of `ENOBUFS` from `<asm-generic/errno.h>`. Hard-coded to
 /// preserve the zero-dependency invariant; do not replace with `libc`.
 #[cfg(target_os = "linux")]
@@ -164,6 +167,38 @@ impl Varta<UdsTransport> {
     /// path cannot be reached, or non-blocking mode cannot be enabled.
     pub fn connect<P: AsRef<Path>>(path: P) -> io::Result<Self> {
         let transport = UdsTransport::connect(path)?;
+        Ok(Self {
+            transport,
+            buf: [0u8; 32],
+            start: Instant::now(),
+            nonce: 0,
+            consecutive_dropped: 0,
+            reconnect_after: 0,
+        })
+    }
+}
+
+#[cfg(feature = "udp")]
+impl Varta<UdpTransport> {
+    /// Connect to the observer listening on `addr` via UDP and prepare the
+    /// agent for non-blocking emission.
+    ///
+    /// The socket is bound to an ephemeral source port and connected to the
+    /// target address. On a connected UDP socket, `send` writes to the fixed
+    /// peer and ICMP errors (e.g. port-unreachable) are surfaced as I/O
+    /// errors handled by [`classify_send_error`].
+    ///
+    /// UDP semantics: there is no connection state — `beat()` returns
+    /// [`BeatOutcome::Sent`] even if no observer is listening. The observer
+    /// must be bound before the first beat is emitted. Reconnect creates a
+    /// fresh ephemeral socket.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`io::Error`] if the socket cannot be created, connected,
+    /// or switched to non-blocking mode.
+    pub fn connect_udp(addr: std::net::SocketAddr) -> io::Result<Self> {
+        let transport = UdpTransport::connect(addr)?;
         Ok(Self {
             transport,
             buf: [0u8; 32],

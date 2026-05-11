@@ -27,3 +27,8 @@ pub use varta_vlp::{DecodeError, Frame, Status, NONCE_TERMINAL};
 /// Install the panic hook — see [`panic::install`] for the full contract.
 #[cfg(feature = "panic-handler")]
 pub use panic::install as install_panic_handler;
+
+/// Install the UDP panic hook — see [`panic::install_panic_handler_udp`] for
+/// the full contract.
+#[cfg(all(feature = "panic-handler", feature = "udp"))]
+pub use panic::install_panic_handler_udp;

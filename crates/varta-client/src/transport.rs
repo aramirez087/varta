@@ -68,3 +68,62 @@ impl BeatTransport for UdsTransport {
         Ok(())
     }
 }
+
+// ---------------------------------------------------------------------------
+// UDP transport (feature-gated)
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "udp")]
+mod udp_impl {
+    use std::io;
+    use std::net::{SocketAddr, UdpSocket};
+
+    use super::BeatTransport;
+
+    /// UDP transport for network-based agents.
+    ///
+    /// Sends 32-byte VLP frames over UDP to a remote observer. Created via
+    /// [`UdpTransport::connect`] and used with [`Varta::connect_udp`].
+    ///
+    /// [`Varta::connect_udp`]: crate::Varta::connect_udp
+    pub struct UdpTransport {
+        sock: UdpSocket,
+        addr: SocketAddr,
+    }
+
+    impl UdpTransport {
+        /// Create a non-blocking UDP socket connected to `addr`.
+        ///
+        /// The socket is bound to an ephemeral source port. On a connected UDP
+        /// socket, `send` writes to the fixed peer address and ICMP errors
+        /// (e.g. port-unreachable) are surfaced as [`io::Error`].
+        ///
+        /// # Errors
+        ///
+        /// Returns an [`io::Error`] if the socket cannot be created,
+        /// connected, or switched to non-blocking mode.
+        pub fn connect(addr: SocketAddr) -> io::Result<Self> {
+            let sock = UdpSocket::bind("0.0.0.0:0")?;
+            sock.connect(addr)?;
+            sock.set_nonblocking(true)?;
+            Ok(UdpTransport { sock, addr })
+        }
+    }
+
+    impl BeatTransport for UdpTransport {
+        fn send(&mut self, buf: &[u8; 32]) -> io::Result<usize> {
+            self.sock.send(buf)
+        }
+
+        fn reconnect(&mut self) -> io::Result<()> {
+            let sock = UdpSocket::bind("0.0.0.0:0")?;
+            sock.connect(self.addr)?;
+            sock.set_nonblocking(true)?;
+            self.sock = sock;
+            Ok(())
+        }
+    }
+}
+
+#[cfg(feature = "udp")]
+pub use udp_impl::UdpTransport;

@@ -10,6 +10,8 @@ repository = "https://github.com/aramirez087/Varta"
 [features]
 default = []
 panic-handler = []
+# Enable UDP transport backend for network-based agents.
+udp = []
 
 [dependencies]
 
@@ -26,3 +28,7 @@ name = "with_payload"
 [[example]]
 name = "with_panic_handler"
 required-features = ["panic-handler"]
+
+[[example]]
+name = "udp"
+required-features = ["udp"]
