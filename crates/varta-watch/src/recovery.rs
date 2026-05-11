@@ -211,8 +211,10 @@ impl Recovery {
 
 impl Drop for Recovery {
     fn drop(&mut self) {
-        // Best-effort reap on shutdown: call try_reap to clean up.
-        let _ = self.try_reap();
+        for (_agent_pid, mut entry) in self.outstanding.drain() {
+            let _ = entry.child.kill();
+            let _ = entry.child.wait();
+        }
     }
 }
 
@@ -334,18 +336,31 @@ mod tests {
     }
 
     #[test]
-    fn drop_does_not_leak_zombies() {
-        // Spawn a fast child; Recovery::drop calls try_reap to clean up.
+    fn drop_kills_and_reaps_still_running_children() {
+        // Spawn a long-running child with no timeout — the child will
+        // still be alive when `rec` goes out of scope. Drop must kill
+        // and wait on it to prevent a zombie.
+        let start = Instant::now();
         {
-            let mut rec = Recovery::new("true".to_string(), Duration::ZERO);
+            let mut rec = Recovery::new("sleep 5".to_string(), Duration::ZERO);
             match rec.on_stall(999) {
                 RecoveryOutcome::Spawned { .. } => {}
                 other => panic!("expected Spawned, got {other:?}"),
             }
-            // Drop happens here; best-effort reap runs.
+            // Drop happens here; kill + wait must run.
         }
+        let elapsed = start.elapsed();
 
-        // If we reach here without hanging or panicking, the child was cleaned up.
+        // If Drop properly kills the child, this completes in well under
+        // 5 seconds. Without the fix, Drop would only call try_reap (which
+        // sees the child is still running and does nothing), and
+        // std::process::Child's Drop does not wait — so the child would
+        // outlive Recovery but this test would still pass without asserting
+        // elapsed time. The timing assert is the proof the child was killed.
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "Drop hung for {elapsed:?}; expected kill+wait to complete quickly"
+        );
     }
 
     #[test]
