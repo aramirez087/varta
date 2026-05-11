@@ -7,6 +7,9 @@ description = "Varta end-to-end test harness — owned by Session 06."
 
 [dependencies]
 
+[features]
+udp = ["varta-client/udp", "varta-watch/udp"]
+
 [dev-dependencies]
 varta-vlp = { path = "../varta-vlp" }
 varta-client = { path = "../varta-client", features = ["panic-handler"] }

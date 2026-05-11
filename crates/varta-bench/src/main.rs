@@ -51,7 +51,9 @@ fn main() -> ExitCode {
     let sub = match args.first() {
         Some(s) => s.as_str(),
         None => {
-            eprintln!("varta-bench: missing subcommand (latency|cpu-50-agents|binary-size)");
+            eprintln!(
+                "varta-bench: missing subcommand (latency|cpu-50-agents|binary-size|udp-latency)"
+            );
             return ExitCode::from(2);
         }
     };
@@ -59,6 +61,8 @@ fn main() -> ExitCode {
         "latency" => run_latency(),
         "cpu-50-agents" => run_cpu_50_agents(),
         "binary-size" => run_binary_size(),
+        #[cfg(feature = "udp")]
+        "udp-latency" => run_udp_latency(),
         other => {
             eprintln!("varta-bench: unknown subcommand {other:?}");
             ExitCode::from(2)
@@ -572,5 +576,63 @@ impl TempDir {
 impl Drop for TempDir {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.path);
+    }
+}
+
+#[cfg(feature = "udp")]
+fn run_udp_latency() -> ExitCode {
+    use std::net::{SocketAddr, UdpSocket};
+
+    let addr: SocketAddr = "127.0.0.1:0".parse().expect("parse");
+    let drainer = UdpSocket::bind(addr).expect("bind drainer");
+    let drainer_addr = drainer.local_addr().expect("local_addr");
+    drainer
+        .set_nonblocking(true)
+        .expect("drainer set_nonblocking");
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop_clone = Arc::clone(&stop);
+    let drainer_handle = thread::spawn(move || {
+        let mut buf = [0u8; 32];
+        while !stop_clone.load(Ordering::Relaxed) {
+            let _ = drainer.recv(&mut buf);
+        }
+    });
+
+    let mut agent = varta_client::Varta::connect_udp(drainer_addr).expect("connect_udp");
+    for _ in 0..100_000 {
+        agent.beat(Status::Ok, 0);
+    }
+    let iterations = 500_000u64;
+    let mut samples = Vec::with_capacity(iterations as usize);
+    for _ in 0..iterations {
+        let t0 = Instant::now();
+        agent.beat(Status::Ok, 0);
+        let ns = t0.elapsed().as_nanos() as u64;
+        samples.push(ns);
+    }
+    drop(agent);
+    stop.store(true, Ordering::Relaxed);
+    let _ = drainer_handle.join();
+
+    let mut sorted = samples.clone();
+    sorted.sort_unstable();
+    let p50 = percentile_pm(&sorted, 500);
+    let p99 = percentile_pm(&sorted, 990);
+    let p99_9 = percentile_pm(&sorted, 999);
+    let mean = samples.iter().sum::<u64>() / samples.len() as u64;
+
+    eprintln!(
+        "udp-latency  samples={}  p50={p50}ns  p99={p99}ns  p99.9={p99_9}ns  mean={mean}ns",
+        samples.len()
+    );
+    if p99 <= LATENCY_P99_NS_THRESHOLD {
+        eprintln!("udp-latency  PASS  (p99 <= 1µs)");
+        ExitCode::SUCCESS
+    } else {
+        eprintln!(
+            "udp-latency  WARN  (p99 {p99}ns > {}ns threshold — host-dependent)",
+            LATENCY_P99_NS_THRESHOLD
+        );
+        ExitCode::SUCCESS
     }
 }

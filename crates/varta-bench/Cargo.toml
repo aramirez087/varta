@@ -10,6 +10,9 @@ varta-vlp = { path = "../varta-vlp" }
 varta-client = { path = "../varta-client" }
 libc = "0.2"
 
+[features]
+udp = ["varta-client/udp"]
+
 [[bin]]
 name = "varta-bench"
 path = "src/main.rs"

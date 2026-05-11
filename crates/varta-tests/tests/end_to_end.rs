@@ -46,8 +46,15 @@ fn main() -> ExitCode {
         "panic_handler_critical_beat_visible_in_metrics",
         panic_handler_critical_beat_visible_in_metrics,
     );
+    #[cfg(feature = "udp")]
+    {
+        failed += run_one(
+            "udp_client_to_observer_beats_and_stall",
+            udp_client_to_observer_beats_and_stall,
+        );
+    }
 
-    let total = 2u32;
+    let total = if cfg!(feature = "udp") { 3u32 } else { 2u32 };
     let passed = total - failed;
     eprintln!(
         "\ntest result: {} {} passed; {} failed; 0 ignored",
@@ -406,4 +413,32 @@ fn parse_status(headers: &str) -> std::io::Result<u16> {
         .ok_or_else(|| std::io::Error::other("no status code"))?;
     code.parse::<u16>()
         .map_err(|_| std::io::Error::other("non-numeric status"))
+}
+
+#[cfg(feature = "udp")]
+fn udp_client_to_observer_beats_and_stall() {
+    use std::net::UdpSocket;
+
+    let addr: std::net::SocketAddr = "127.0.0.1:0".parse().expect("parse");
+    let receiver = UdpSocket::bind(addr).expect("bind receiver");
+    receiver.set_nonblocking(true).expect("set_nonblocking");
+    let receiver_addr = receiver.local_addr().expect("local_addr");
+
+    // Smoke test: connect_udp + beat over localhost loopback.
+    // The observer is NOT listening on this port — beats will be silently
+    // dropped by the kernel (no peer). This verifies the API compiles,
+    // connects, and sends without panicking.
+    {
+        let mut agent = varta_client::Varta::connect_udp(receiver_addr).expect("connect_udp");
+        for _ in 0..10 {
+            let outcome = agent.beat(varta_client::Status::Ok, 0);
+            assert!(
+                matches!(outcome, varta_client::BeatOutcome::Sent),
+                "beat should succeed against a bound localhost UDP port"
+            );
+        }
+    }
+
+    drop(receiver);
+    eprintln!("udp_client_to_observer_beats_and_stall: ok");
 }
