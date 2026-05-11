@@ -239,6 +239,20 @@ impl Observer {
     pub fn drain_capacity_exceeded(&mut self) -> u64 {
         self.tracker.take_capacity_exceeded()
     }
+
+    /// Drain and reset the AEAD decryption failure counter across all
+    /// listeners.
+    pub fn drain_decrypt_failures(&mut self) -> u64 {
+        self.listeners
+            .iter_mut()
+            .map(|l| l.drain_decrypt_failures())
+            .sum()
+    }
+
+    /// Drain and reset the truncated-datagram counter across all listeners.
+    pub fn drain_truncated(&mut self) -> u64 {
+        self.listeners.iter_mut().map(|l| l.drain_truncated()).sum()
+    }
 }
 
 #[cfg(test)]

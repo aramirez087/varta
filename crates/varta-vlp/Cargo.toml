@@ -7,4 +7,9 @@ description = "Varta Lifeline Protocol — 32-byte fixed-layout health frame."
 authors = ["Alexander Ramirez"]
 repository = "https://github.com/aramirez087/Varta"
 
+[features]
+default = []
+# Enables ChaCha20-Poly1305 AEAD for secure VLP transport.
+crypto = []
+
 [dependencies]

@@ -113,6 +113,39 @@ fn run(cfg: Config) -> std::io::Result<()> {
             "UDP support not compiled in",
         ));
     }
+
+    #[cfg(not(feature = "secure-udp"))]
+    if cfg.secure_key_file.is_some()
+        || cfg.accepted_key_file.is_some()
+        || cfg.key_env != "VARTA_KEY"
+    {
+        eprintln!(
+            "varta-watch: --key-file / --accepted-key-file / --key-env require secure UDP support \
+             (rebuild with --features secure-udp)"
+        );
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "secure UDP support not compiled in",
+        ));
+    }
+
+    // --- secure UDP listener (AEAD) ---
+    #[cfg(feature = "secure-udp")]
+    if let Some((keys, accepted_keys)) = cfg.load_secure_keys()? {
+        if let Some(port) = cfg.udp_port {
+            let bind_addr = cfg
+                .udp_bind_addr
+                .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
+            let addr = std::net::SocketAddr::new(bind_addr, port);
+            let mut all_keys = keys;
+            all_keys.extend(accepted_keys);
+            let secure = varta_watch::SecureUdpListener::bind(addr, all_keys).map_err(|e| {
+                std::io::Error::new(e.kind(), format!("secure UDP bind {}: {e}", addr))
+            })?;
+            observer.add_listener(Box::new(secure));
+        }
+    }
+
     let mut recovery = cfg.recovery_cmd.as_ref().map(|tpl| {
         Recovery::with_timeout(tpl.clone(), cfg.recovery_debounce, cfg.recovery_timeout)
     });
@@ -203,6 +236,20 @@ fn run(cfg: Config) -> std::io::Result<()> {
         if capacity_exceeded > 0 {
             if let Some(pe) = prom_export.as_mut() {
                 pe.record_capacity_exceeded(capacity_exceeded);
+            }
+        }
+
+        let decrypt_failures = observer.drain_decrypt_failures();
+        if decrypt_failures > 0 {
+            if let Some(pe) = prom_export.as_mut() {
+                pe.record_decrypt_failures(decrypt_failures);
+            }
+        }
+
+        let truncated = observer.drain_truncated();
+        if truncated > 0 {
+            if let Some(pe) = prom_export.as_mut() {
+                pe.record_truncated(truncated);
             }
         }
 

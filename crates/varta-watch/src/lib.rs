@@ -17,6 +17,9 @@ pub mod peer_cred;
 pub mod recovery;
 pub mod tracker;
 
+#[cfg(feature = "secure-udp")]
+pub mod secure_listener;
+
 pub use config::{Config, ConfigError};
 pub use exporter::{Exporter, FileExporter, PromExporter};
 pub use listener::{BeatListener, UdsListener};
@@ -26,3 +29,6 @@ pub use tracker::{Slot, Tracker, Update};
 
 #[cfg(feature = "udp")]
 pub use listener::UdpListener;
+
+#[cfg(feature = "secure-udp")]
+pub use secure_listener::SecureUdpListener;

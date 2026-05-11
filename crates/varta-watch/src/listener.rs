@@ -25,6 +25,19 @@ pub trait BeatListener: Send + 'static {
     /// `peer_cred::recv_authenticated` — callers see `Authenticated`,
     /// `WouldBlock`, `ShortRead`, or `IoError`.
     fn recv(&mut self) -> RecvResult;
+
+    /// Drain and reset the AEAD decryption failure counter.
+    ///
+    /// The default implementation returns 0 — only listeners that perform
+    /// authenticated decryption will override this.
+    fn drain_decrypt_failures(&mut self) -> u64 {
+        0
+    }
+
+    /// Drain and reset the truncated-datagram counter.
+    fn drain_truncated(&mut self) -> u64 {
+        0
+    }
 }
 
 /// Unix Domain Socket listener for local IPC.

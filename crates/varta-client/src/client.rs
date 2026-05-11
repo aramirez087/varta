@@ -12,6 +12,12 @@ use crate::transport::{BeatTransport, UdsTransport};
 #[cfg(feature = "udp")]
 use crate::transport::UdpTransport;
 
+#[cfg(feature = "secure-udp")]
+use crate::secure_transport::SecureUdpTransport;
+
+#[cfg(feature = "secure-udp")]
+use varta_vlp::crypto::Key;
+
 /// Linux value of `ENOBUFS` from `<asm-generic/errno.h>`. Hard-coded to
 /// preserve the zero-dependency invariant; do not replace with `libc`.
 #[cfg(target_os = "linux")]
@@ -199,6 +205,36 @@ impl Varta<UdpTransport> {
     /// or switched to non-blocking mode.
     pub fn connect_udp(addr: std::net::SocketAddr) -> io::Result<Self> {
         let transport = UdpTransport::connect(addr)?;
+        Ok(Self {
+            transport,
+            buf: [0u8; 32],
+            start: Instant::now(),
+            nonce: 0,
+            consecutive_dropped: 0,
+            reconnect_after: 0,
+        })
+    }
+}
+
+#[cfg(feature = "secure-udp")]
+impl Varta<SecureUdpTransport> {
+    /// Connect to the observer listening on `addr` via secure UDP
+    /// (ChaCha20-Poly1305 AEAD) and prepare the agent for non-blocking
+    /// emission.
+    ///
+    /// Every [`beat`](Self::beat) is encrypted and authenticated with the
+    /// provided pre-shared `key`. The observer must be configured with the
+    /// same key and the `secure-udp` feature enabled.
+    ///
+    /// The IV random prefix is derived from `process_id` and connect
+    /// timestamp — no `/dev/urandom` reads are required.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`io::Error`] if the socket cannot be created, connected,
+    /// or switched to non-blocking mode.
+    pub fn connect_secure_udp(addr: std::net::SocketAddr, key: Key) -> io::Result<Self> {
+        let transport = SecureUdpTransport::connect(addr, key)?;
         Ok(Self {
             transport,
             buf: [0u8; 32],

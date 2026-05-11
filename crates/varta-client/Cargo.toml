@@ -12,6 +12,9 @@ default = []
 panic-handler = []
 # Enable UDP transport backend for network-based agents.
 udp = []
+# Enable secure UDP transport with ChaCha20-Poly1305 AEAD encryption.
+# Implies `udp` and `varta-vlp/crypto`.
+secure-udp = ["udp", "varta-vlp/crypto"]
 
 [dependencies]
 
@@ -32,3 +35,7 @@ required-features = ["panic-handler"]
 [[example]]
 name = "udp"
 required-features = ["udp"]
+
+[[example]]
+name = "secure_udp"
+required-features = ["secure-udp"]

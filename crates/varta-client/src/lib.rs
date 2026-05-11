@@ -17,11 +17,21 @@
 pub mod client;
 pub mod transport;
 
+#[cfg(feature = "secure-udp")]
+pub mod secure_transport;
+
 #[cfg(feature = "panic-handler")]
 pub mod panic;
 
 pub use client::{classify_send_error, BeatOutcome, Varta};
 pub use transport::{BeatTransport, UdsTransport};
+
+#[cfg(feature = "udp")]
+pub use transport::UdpTransport;
+
+#[cfg(feature = "secure-udp")]
+pub use secure_transport::SecureUdpTransport;
+
 pub use varta_vlp::{DecodeError, Frame, Status, NONCE_TERMINAL};
 
 /// Install the panic hook — see [`panic::install`] for the full contract.
@@ -32,3 +42,8 @@ pub use panic::install as install_panic_handler;
 /// the full contract.
 #[cfg(all(feature = "panic-handler", feature = "udp"))]
 pub use panic::install_panic_handler_udp;
+
+/// Install the secure UDP panic hook — see [`panic::install_panic_handler_secure_udp`]
+/// for the full contract.
+#[cfg(all(feature = "panic-handler", feature = "secure-udp"))]
+pub use panic::install_panic_handler_secure_udp;

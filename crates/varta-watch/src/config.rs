@@ -58,6 +58,15 @@ pub struct Config {
     /// IP address to bind the UDP listener on. Defaults to `0.0.0.0` when
     /// `--udp-port` is set. Ignored when `--udp-port` is not set.
     pub udp_bind_addr: Option<std::net::IpAddr>,
+    /// Path to a file containing a 64-character hex key for secure UDP
+    /// (requires `--features secure-udp`).
+    pub secure_key_file: Option<PathBuf>,
+    /// Path to a file with one hex key per line for zero-downtime key
+    /// rotation (requires `--features secure-udp`).
+    pub accepted_key_file: Option<PathBuf>,
+    /// Environment variable name to read the primary key from (default
+    /// `VARTA_KEY`). Ignored when `--key-file` is set.
+    pub key_env: String,
 }
 
 /// Failure modes for [`Config::from_args`].
@@ -151,6 +160,14 @@ OPTIONAL:
                                      use alone.
     --udp-bind-addr <IP>           IP address to bind the UDP listener on
                                      (default 0.0.0.0). Requires --udp-port.
+    --key-file <PATH>              Path to a file containing a 64-hex-char
+                                     key for secure UDP (requires --features
+                                     secure-udp at build time).
+    --accepted-key-file <PATH>     Path to a file with one hex key per line
+                                     for zero-downtime rotation (requires
+                                     --features secure-udp).
+    --key-env <NAME>               Environment variable to read the primary
+                                     key from (default VARTA_KEY).
 
     -h, --help                     Print this message and exit.
 ";
@@ -169,6 +186,9 @@ OPTIONAL:
         let mut read_timeout_ms: Option<u64> = None;
         let mut udp_port: Option<u16> = None;
         let mut udp_bind_addr: Option<std::net::IpAddr> = None;
+        let mut secure_key_file: Option<PathBuf> = None;
+        let mut accepted_key_file: Option<PathBuf> = None;
+        let mut key_env: String = String::from("VARTA_KEY");
 
         let mut iter = args.into_iter();
         while let Some(tok) = iter.next() {
@@ -248,6 +268,19 @@ OPTIONAL:
                             .map_err(|_| ConfigError::BadAddr(v))?,
                     );
                 }
+                "--key-file" => {
+                    let v = iter.next().ok_or(ConfigError::MissingValue("--key-file"))?;
+                    secure_key_file = Some(PathBuf::from(v));
+                }
+                "--accepted-key-file" => {
+                    let v = iter
+                        .next()
+                        .ok_or(ConfigError::MissingValue("--accepted-key-file"))?;
+                    accepted_key_file = Some(PathBuf::from(v));
+                }
+                "--key-env" => {
+                    key_env = iter.next().ok_or(ConfigError::MissingValue("--key-env"))?;
+                }
                 other => return Err(ConfigError::UnknownFlag(other.to_string())),
             }
         }
@@ -271,7 +304,81 @@ OPTIONAL:
             read_timeout: Duration::from_millis(read_timeout_ms.unwrap_or(DEFAULT_READ_TIMEOUT_MS)),
             udp_port,
             udp_bind_addr,
+            secure_key_file,
+            accepted_key_file,
+            key_env,
         })
+    }
+
+    /// Load the primary and accepted secure keys for AEAD transport.
+    ///
+    /// Priority: `--key-file` > `--key-env` (default `VARTA_KEY`).
+    /// Returns `Ok(None)` when neither is configured (UDP without AEAD).
+    ///
+    /// # Errors
+    ///
+    /// Returns an `io::Error` if the file cannot be read or the key(s) cannot
+    /// be parsed as 64-character hex strings.
+    #[cfg(feature = "secure-udp")]
+    pub fn load_secure_keys(
+        &self,
+    ) -> std::io::Result<Option<(Vec<varta_vlp::crypto::Key>, Vec<varta_vlp::crypto::Key>)>> {
+        use std::io;
+        use varta_vlp::crypto::Key;
+
+        let mut primary = Vec::new();
+
+        // Load primary key(s)
+        if let Some(ref path) = self.secure_key_file {
+            let content = std::fs::read_to_string(path)?;
+            for line in content.lines() {
+                let line = line.trim();
+                if line.is_empty() || line.starts_with('#') {
+                    continue;
+                }
+                let key = Key::from_hex(line).map_err(|e| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("{}: {e}", path.display()),
+                    )
+                })?;
+                primary.push(key);
+            }
+        } else {
+            // Try env var
+            match Key::from_env(&self.key_env) {
+                Ok(key) => primary.push(key),
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                    return Ok(None); // No key configured
+                }
+                Err(e) => return Err(e),
+            }
+        }
+
+        if primary.is_empty() {
+            return Ok(None);
+        }
+
+        // Load accepted (rotation) keys
+        let mut accepted = Vec::new();
+        if let Some(ref path) = self.accepted_key_file {
+            let content = std::fs::read_to_string(path)?;
+            for line in content.lines() {
+                let line = line.trim();
+                if line.is_empty() || line.starts_with('#') {
+                    continue;
+                }
+                let key = Key::from_hex(line).map_err(|e| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("{}: {e}", path.display()),
+                    )
+                })?;
+                accepted.push(key);
+            }
+        }
+
+        Ok(Some((primary, accepted)))
     }
 }
 
@@ -391,6 +498,9 @@ mod tests {
             "--shutdown-after-secs",
             "--udp-port",
             "--udp-bind-addr",
+            "--key-file",
+            "--accepted-key-file",
+            "--key-env",
             "--help",
         ] {
             assert!(

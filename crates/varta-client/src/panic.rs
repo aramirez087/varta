@@ -9,6 +9,8 @@ use std::os::unix::net::UnixDatagram;
 use std::path::PathBuf;
 use std::time::Instant;
 
+#[cfg(all(feature = "panic-handler", feature = "secure-udp"))]
+use varta_vlp::crypto::Key;
 use varta_vlp::{Frame, Status, NONCE_TERMINAL};
 
 /// Register a panic hook that emits a [`Status::Critical`] VLP frame on the
@@ -105,6 +107,67 @@ pub fn install_panic_handler_udp(addr: std::net::SocketAddr) {
             let mut buf = [0u8; 32];
             frame.encode(&mut buf);
             sock.send(&buf).ok()
+        })();
+        prev(info);
+    }));
+}
+
+/// Install a UDP panic handler with ChaCha20-Poly1305 encryption.
+///
+/// On panic, creates a one-shot secure UDP socket, encrypts a `Critical`
+/// frame with `NONCE_TERMINAL` using the provided key, and sends it to
+/// `addr`.
+///
+/// All I/O and crypto errors are silently ignored.
+///
+/// # Chaining
+///
+/// This function captures the previously registered hook via
+/// [`std::panic::take_hook`] and invokes it after firing the secure VLP frame.
+#[cfg(all(feature = "panic-handler", feature = "secure-udp"))]
+pub fn install_panic_handler_secure_udp(addr: std::net::SocketAddr, key: Key) {
+    use varta_vlp::crypto::{self, NONCE_BYTES};
+    let start = Instant::now();
+    let prev = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let _ = (|| {
+            let sock = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
+            sock.connect(addr).ok()?;
+            let timestamp = start.elapsed().as_nanos() as u64;
+            let frame = Frame::new(
+                Status::Critical,
+                std::process::id(),
+                timestamp,
+                NONCE_TERMINAL,
+                0,
+            );
+            let mut buf = [0u8; 32];
+            frame.encode(&mut buf);
+
+            let raw = (std::process::id() as u64)
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_nanos() as u64,
+                );
+            let iv_random: [u8; 4] = raw.to_le_bytes()[..4].try_into().unwrap();
+            let iv_counter = 1u64;
+
+            let mut nonce = [0u8; NONCE_BYTES];
+            nonce[..4].copy_from_slice(&iv_random);
+            nonce[4..12].copy_from_slice(&iv_counter.to_le_bytes());
+
+            let (ciphertext, tag) = crypto::seal(key.as_bytes(), &nonce, &buf);
+
+            let mut secure_frame = [0u8; crypto::SECURE_FRAME_BYTES];
+            secure_frame[..4].copy_from_slice(&iv_random);
+            secure_frame[4..12].copy_from_slice(&iv_counter.to_le_bytes());
+            secure_frame[12..44].copy_from_slice(&ciphertext);
+            secure_frame[44..60].copy_from_slice(&tag);
+
+            sock.send(&secure_frame).ok()
         })();
         prev(info);
     }));

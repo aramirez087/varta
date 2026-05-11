@@ -188,6 +188,8 @@ pub struct PromExporter {
     decode_errors_total: [u64; 3],
     io_errors_total: u64,
     capacity_exceeded_total: u64,
+    decrypt_failures_total: u64,
+    truncated_total: u64,
 }
 
 impl PromExporter {
@@ -203,6 +205,8 @@ impl PromExporter {
             decode_errors_total: [0; 3],
             io_errors_total: 0,
             capacity_exceeded_total: 0,
+            decrypt_failures_total: 0,
+            truncated_total: 0,
         })
     }
 
@@ -220,6 +224,16 @@ impl PromExporter {
     /// Record one or more beats dropped due to tracker capacity exceeded.
     pub fn record_capacity_exceeded(&mut self, count: u64) {
         self.capacity_exceeded_total = self.capacity_exceeded_total.saturating_add(count);
+    }
+
+    /// Record one or more AEAD decryption (tag verification) failures.
+    pub fn record_decrypt_failures(&mut self, count: u64) {
+        self.decrypt_failures_total = self.decrypt_failures_total.saturating_add(count);
+    }
+
+    /// Record one or more truncated (wrong-size) datagrams received.
+    pub fn record_truncated(&mut self, count: u64) {
+        self.truncated_total = self.truncated_total.saturating_add(count);
     }
 
     /// Accept ready connections on the listener and write a metrics
@@ -379,6 +393,22 @@ impl PromExporter {
                 self.capacity_exceeded_total
             );
         }
+        out.push_str("# HELP varta_frame_decrypt_failures_total Total AEAD decryption/tag-verification failures.\n");
+        out.push_str("# TYPE varta_frame_decrypt_failures_total counter\n");
+        let _ = writeln!(
+            out,
+            "varta_frame_decrypt_failures_total {}",
+            self.decrypt_failures_total
+        );
+        out.push_str(
+            "# HELP varta_truncated_datagrams_total Total datagrams received with wrong size.\n",
+        );
+        out.push_str("# TYPE varta_truncated_datagrams_total counter\n");
+        let _ = writeln!(
+            out,
+            "varta_truncated_datagrams_total {}",
+            self.truncated_total
+        );
         out
     }
 }

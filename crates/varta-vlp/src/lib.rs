@@ -12,6 +12,9 @@
 //!
 //! See `docs/architecture/vlp-frame.md` for the byte map and design notes.
 
+#[cfg(feature = "crypto")]
+pub mod crypto;
+
 /// Magic prefix on every VLP frame. ASCII `"VA"`, intentionally readable in
 /// hex dumps so a stray byte stream is easy to identify.
 pub const MAGIC: [u8; 2] = [0x56, 0x41];

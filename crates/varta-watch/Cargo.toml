@@ -13,6 +13,9 @@ repository = "https://github.com/aramirez087/Varta"
 default = []
 # Enable UDP listener transport for network-based agents.
 udp = []
+# Enable secure UDP listener with ChaCha20-Poly1305 AEAD decryption.
+# Implies `udp` and `varta-vlp/crypto`.
+secure-udp = ["udp", "varta-vlp/crypto"]
 
 [dependencies.varta-vlp]
 path = "../varta-vlp"

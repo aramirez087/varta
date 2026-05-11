@@ -7,6 +7,24 @@
   <title>Varta — Zero-overhead health protocol for distributed local agents</title>
   <meta name="description"
     content="32-byte heartbeats over Unix Domain Sockets and UDP. No dependencies. No allocations. Sub-microsecond.">
+  <meta name="theme-color" content="#1a1a1a">
+  <link rel="canonical" href="https://varta.sh/">
+  <link rel="alternate" type="application/llms+txt" href="/llms.txt">
+
+  <!-- Open Graph / Facebook -->
+  <meta property="og:type" content="website">
+  <meta property="og:url" content="https://varta.sh/">
+  <meta property="og:title" content="Varta — Zero-overhead health protocol for distributed local agents">
+  <meta property="og:description" content="32-byte heartbeats over Unix Domain Sockets and UDP. No dependencies. No allocations. Sub-microsecond.">
+  <meta property="og:image" content="https://varta.sh/assets/varta-animation.svg">
+
+  <!-- Twitter -->
+  <meta property="twitter:card" content="summary_large_image">
+  <meta property="twitter:url" content="https://varta.sh/">
+  <meta property="twitter:title" content="Varta — Zero-overhead health protocol for distributed local agents">
+  <meta property="twitter:description" content="32-byte heartbeats over Unix Domain Sockets and UDP. No dependencies. No allocations. Sub-microsecond.">
+  <meta property="twitter:image" content="https://varta.sh/assets/varta-animation.svg">
+
   <link rel="icon" href="favicon.svg" type="image/svg+xml">
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -14,6 +32,22 @@
     href="https://fonts.googleapis.com/css2?family=Inter:wght@400;700&family=JetBrains+Mono:wght@400;500;700&family=Press+Start+2P&display=swap"
     rel="stylesheet">
   <link rel="stylesheet" href="style.css">
+
+  <!-- JSON-LD Structured Data -->
+  <script type="application/ld+json">
+  {
+    "@context": "https://schema.org",
+    "@type": "SoftwareSourceCode",
+    "name": "Varta",
+    "description": "Zero-overhead health protocol for distributed local agents and network clusters. 32-byte heartbeats over Unix Domain Sockets and UDP.",
+    "codeRepository": "https://github.com/aramirez087/varta",
+    "programmingLanguage": "Rust",
+    "license": "MIT",
+    "url": "https://varta.sh",
+    "applicationCategory": "DeveloperApplication",
+    "operatingSystem": "Linux, macOS"
+  }
+  </script>
 </head>
 
 <body>
@@ -58,9 +92,9 @@
         </div>
         <div class="terminal-body">
           <div class="terminal-line"><span class="t-prompt">$</span> <span class="t-cmd">varta-watch</span> <span
-              class="t-flag">--socket</span> /tmp/varta.sock <span class="t-flag">--udp-port</span> <span class="t-num">9000</span></div>
+              class="t-flag">--socket</span> /tmp/varta.sock <span class="t-flag">--udp-port</span> <span class="t-num">9000</span> <span class="t-flag">--key-file</span> <span class="t-path">/tmp/varta.key</span></div>
           <div class="terminal-line"><span class="t-info">&bull;</span> listening on <span
-              class="t-path">/tmp/varta.sock</span> &amp; <span class="t-path">0.0.0.0:9000 (UDP)</span></div>
+              class="t-path">/tmp/varta.sock</span> &amp; <span class="t-path">0.0.0.0:9000 (secure UDP)</span></div>
           <div class="terminal-line"><span class="t-info">&bull;</span> pid <span class="t-num">4821</span> &mdash;
             status: <span class="t-ok">Ok</span> &mdash; last beat: <span class="t-num">12ms</span> ago</div>
           <div class="terminal-line"><span class="t-info">&bull;</span> pid <span class="t-num">4821</span> &mdash;
@@ -149,21 +183,21 @@
           <span class="crate-name">varta-vlp</span>
           <span class="crate-dots"></span>
           <span class="crate-arrow">&rarr;</span>
-          <span class="crate-desc">32-byte wire protocol &mdash; Frame, Status, encode/decode</span>
+          <span class="crate-desc">32-byte wire protocol &mdash; Frame, Status, encode/decode, AEAD crypto</span>
         </a>
         <a href="https://github.com/aramirez087/varta/tree/main/crates/varta-client" class="crate-row" target="_blank"
           rel="noopener">
           <span class="crate-name">varta-client</span>
           <span class="crate-dots"></span>
           <span class="crate-arrow">&rarr;</span>
-          <span class="crate-desc">Agent API &mdash; Varta::connect(), beat(), optional panic hook</span>
+          <span class="crate-desc">Agent API &mdash; Varta::connect(), beat(), secure UDP, optional panic hook</span>
         </a>
         <a href="https://github.com/aramirez087/varta/tree/main/crates/varta-watch" class="crate-row" target="_blank"
           rel="noopener">
           <span class="crate-name">varta-watch</span>
           <span class="crate-dots"></span>
           <span class="crate-arrow">&rarr;</span>
-          <span class="crate-desc">Observer binary &mdash; stall detection, recovery, Prometheus</span>
+          <span class="crate-desc">Observer binary &mdash; stall detection, recovery, secure UDP listener, Prometheus</span>
         </a>
       </div>
     </section>
