@@ -1,9 +1,9 @@
 //! Session 02 zero-allocation guard for `Varta::beat`.
 //!
 //! A `#[global_allocator]` wraps the system allocator with an "armed" flag.
-//! Once armed, any `alloc` call panics. The contract test connects, arms the
-//! guard, beats 10 000 times, disarms, then drains the receiver to confirm
-//! datagrams actually travelled the wire.
+//! Once armed, every allocation increments an atomic counter. The contract
+//! test connects, arms the guard, beats 10 000 times, disarms, then asserts
+//! the counter stayed at zero — proving the beat path never touches the heap.
 //!
 //! See `docs/acceptance/varta-v0-1-0.md` §S02
 //! `beat_makes_zero_heap_allocations_after_init`.
@@ -18,23 +18,21 @@ use varta_client::{Frame, Status, Varta};
 struct GuardAlloc;
 
 static ARMED: AtomicBool = AtomicBool::new(false);
+/// Incremented on every allocation while armed. Read after disarm to prove
+/// zero allocations. NOT using a panic inside the allocator because the panic
+/// machinery itself allocates, causing a double-panic abort that obscures the
+/// real failure reason.
+static ALLOC_COUNT: AtomicU64 = AtomicU64::new(0);
 
 unsafe impl GlobalAlloc for GuardAlloc {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         if ARMED.load(Ordering::Relaxed) {
-            // SAFETY note: panicking from inside the allocator is the
-            // intended contract failure — the test is supposed to abort.
-            panic!("heap allocation while guard armed: {} bytes", layout.size());
+            ALLOC_COUNT.fetch_add(1, Ordering::Relaxed);
         }
-        // SAFETY: forwarding (layout) to the System allocator preserves the
-        // GlobalAlloc contract because System: GlobalAlloc upholds it.
         unsafe { System.alloc(layout) }
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        // SAFETY: forwarding (ptr, layout) — the same pair the runtime
-        // handed us — to the System allocator. Dealloc is always permitted;
-        // the guard only blocks new allocations.
         unsafe { System.dealloc(ptr, layout) }
     }
 }
@@ -78,6 +76,13 @@ fn beat_makes_zero_heap_allocations_after_init() {
         let _ = client.beat(Status::Ok, 0);
     }
     ARMED.store(false, Ordering::Relaxed);
+
+    let n_allocs = ALLOC_COUNT.load(Ordering::Relaxed);
+    assert!(
+        n_allocs == 0,
+        "beat allocated {} times on the heap",
+        n_allocs
+    );
 
     server.set_nonblocking(true).expect("set nonblocking");
     let mut buf = [0u8; 32];
