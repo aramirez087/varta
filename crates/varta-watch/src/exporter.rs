@@ -18,7 +18,7 @@ use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use varta_vlp::Status;
+use varta_vlp::{DecodeError, Status};
 
 use crate::observer::Event;
 
@@ -134,6 +134,19 @@ fn status_code(s: Status) -> u8 {
     }
 }
 
+/// Prometheus `kind` label values for `varta_decode_errors_total`. Indexed
+/// by [`decode_kind_index`]; the array doubles as the canonical ordering
+/// for the exposition output, so series remain stable across scrapes.
+const DECODE_KIND_LABELS: [&str; 3] = ["bad_magic", "bad_version", "bad_status"];
+
+fn decode_kind_index(err: &DecodeError) -> usize {
+    match err {
+        DecodeError::BadMagic => 0,
+        DecodeError::BadVersion => 1,
+        DecodeError::BadStatus(_) => 2,
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 struct GaugeRow {
     beats_total: u64,
@@ -171,7 +184,11 @@ pub struct PromExporter {
     rows: HashMap<u32, GaugeRow>,
     evicted_total: u64,
     auth_failures_total: u64,
-    decode_errors_total: u64,
+    /// Per-kind decode failure counters, indexed by [`decode_kind_index`].
+    /// Always emitted in full (even at zero) so `absent()` alert rules and
+    /// dashboards stay green-on-green instead of disappearing until the
+    /// first incident.
+    decode_errors_total: [u64; 3],
     io_errors_total: u64,
     capacity_exceeded_total: u64,
 }
@@ -186,7 +203,7 @@ impl PromExporter {
             rows: HashMap::new(),
             evicted_total: 0,
             auth_failures_total: 0,
-            decode_errors_total: 0,
+            decode_errors_total: [0; 3],
             io_errors_total: 0,
             capacity_exceeded_total: 0,
         })
@@ -229,6 +246,14 @@ impl PromExporter {
     }
 
     fn serve_one(&self, mut stream: TcpStream) -> io::Result<()> {
+        // Accepted streams inherit the listener's non-blocking flag on both
+        // Linux (via `accept4(SOCK_NONBLOCK)` in libstd) and macOS (libstd
+        // calls `fcntl(F_SETFL, O_NONBLOCK)` post-accept). We intentionally
+        // do *not* set a blocking read/write timeout here: a blocking socket
+        // would let a slow peer hold the observer poll loop hostage for up
+        // to the timeout per request. The PROM_READ_DEADLINE /
+        // PROM_WRITE_TIMEOUT below are wall-clock budgets enforced by the
+        // loops themselves, not socket-level timeouts.
         let deadline = Instant::now() + PROM_READ_DEADLINE;
         let mut buf = [0u8; 512];
         let mut total = 0;
@@ -270,7 +295,14 @@ impl PromExporter {
             match stream.write(&buf[written..]) {
                 Ok(0) => break,
                 Ok(n) => written += n,
-                Err(e) if e.kind() == ErrorKind::WouldBlock => continue,
+                Err(e) if e.kind() == ErrorKind::WouldBlock => {
+                    // Peer's recv buffer is full. The deadline check at the
+                    // top of the loop caps the worst case; hint the CPU we
+                    // are in a short busy-wait so it can back off internally
+                    // instead of burning a full core for PROM_WRITE_TIMEOUT.
+                    std::hint::spin_loop();
+                    continue;
+                }
                 Err(e) => return Err(e),
             }
         }
@@ -328,13 +360,17 @@ impl PromExporter {
             "varta_frame_auth_failures_total {}",
             self.auth_failures_total
         );
-        out.push_str("# HELP varta_decode_errors_total Total VLP decode failures.\n");
+        // Always emit one series per kind so dashboards and `absent()` rules
+        // stay green-on-green instead of disappearing until the first incident.
+        out.push_str("# HELP varta_decode_errors_total Total VLP decode failures by kind.\n");
         out.push_str("# TYPE varta_decode_errors_total counter\n");
-        let _ = writeln!(
-            out,
-            "varta_decode_errors_total {}",
-            self.decode_errors_total
-        );
+        for (idx, kind) in DECODE_KIND_LABELS.iter().enumerate() {
+            let _ = writeln!(
+                out,
+                "varta_decode_errors_total{{kind=\"{kind}\"}} {}",
+                self.decode_errors_total[idx]
+            );
+        }
         out.push_str("# HELP varta_io_errors_total Total socket receive errors.\n");
         out.push_str("# TYPE varta_io_errors_total counter\n");
         let _ = writeln!(out, "varta_io_errors_total {}", self.io_errors_total);
@@ -376,8 +412,9 @@ impl Exporter for PromExporter {
             Event::AuthFailure { observer_ns: _, .. } => {
                 self.auth_failures_total = self.auth_failures_total.saturating_add(1);
             }
-            Event::Decode(_, _) => {
-                self.decode_errors_total = self.decode_errors_total.saturating_add(1);
+            Event::Decode(err, _) => {
+                let idx = decode_kind_index(err);
+                self.decode_errors_total[idx] = self.decode_errors_total[idx].saturating_add(1);
             }
             Event::Io(_, _) => {
                 self.io_errors_total = self.io_errors_total.saturating_add(1);
@@ -438,5 +475,30 @@ mod tests {
         prom.record(&Event::Decode(varta_vlp::DecodeError::BadMagic, 0));
         prom.record(&Event::Io(io::Error::other("x"), 0));
         assert!(prom.rows.is_empty());
+    }
+
+    #[test]
+    fn decode_errors_emit_kind_label_for_every_variant_even_at_zero() {
+        let mut prom = PromExporter::bind("127.0.0.1:0".parse().unwrap()).expect("bind");
+        // Bump bad_magic twice, bad_status once, leave bad_version at zero.
+        prom.record(&Event::Decode(DecodeError::BadMagic, 0));
+        prom.record(&Event::Decode(DecodeError::BadMagic, 0));
+        prom.record(&Event::Decode(DecodeError::BadStatus(0xff), 0));
+
+        let body = prom.render_body();
+        // All three kind series must be present so `absent()` rules don't
+        // silently disappear before the first incident of that kind.
+        assert!(
+            body.contains("varta_decode_errors_total{kind=\"bad_magic\"} 2"),
+            "missing or wrong bad_magic series:\n{body}"
+        );
+        assert!(
+            body.contains("varta_decode_errors_total{kind=\"bad_version\"} 0"),
+            "missing zero-valued bad_version series:\n{body}"
+        );
+        assert!(
+            body.contains("varta_decode_errors_total{kind=\"bad_status\"} 1"),
+            "missing or wrong bad_status series:\n{body}"
+        );
     }
 }

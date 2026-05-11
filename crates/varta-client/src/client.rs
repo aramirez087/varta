@@ -118,9 +118,11 @@ impl Varta {
     /// Connect to the observer listening on `path` and prepare the agent for
     /// non-blocking emission.
     ///
-    /// Captures `std::process::id()` once and stores an `Instant` for
-    /// per-frame elapsed-nanosecond timestamps. Subsequent calls to
-    /// [`Varta::beat`] do not allocate.
+    /// Stores an `Instant` for per-frame elapsed-nanosecond timestamps. The
+    /// process ID is intentionally not cached here — it is read afresh on
+    /// every [`Varta::beat`] via [`std::process::id`] so a child that forks
+    /// after `connect` reports its own PID, not the parent's. Subsequent
+    /// calls to [`Varta::beat`] do not allocate.
     ///
     /// # Errors
     ///
@@ -192,7 +194,9 @@ impl Varta {
     /// After an observer restart the old socket inode is stale — every
     /// `beat()` returns [`BeatOutcome::Dropped`] forever. Call `reconnect`
     /// to bind a fresh socket against the path stored at [`connect`](Self::connect)
-    /// time. Agent identity (`pid`, `nonce`, `start` clock) is preserved.
+    /// time. Agent identity (`nonce`, `start` clock) is preserved; the PID
+    /// is re-read from the kernel on every beat so reconnect cannot strand
+    /// a stale identity.
     ///
     /// This is the only post-[`connect`](Self::connect) allocation site and
     /// should only be called when recovery is needed, not on the steady-state
