@@ -60,7 +60,7 @@ fn beat_emits_canonical_32_byte_frame() {
 
     let frame = Frame::decode(&buf).expect("decode");
     assert_eq!(frame.pid, std::process::id());
-    assert_eq!(frame.status, Status::Ok as u8);
+    assert_eq!(frame.status, Status::Ok);
     assert_eq!(frame.payload, 0xCAFE);
     assert_eq!(frame.nonce, 1);
 }

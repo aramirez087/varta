@@ -120,25 +120,24 @@ fn client_to_observer_to_recovery_full_loop() {
     let agent_pid = std::process::id();
     {
         let mut agent = Varta::connect(&socket).expect("Varta::connect");
-        // The agent socket is non-blocking, and the kernel's per-socket UDS
-        // receive buffer on macOS is small (~4 KiB). At line-rate emission
-        // the buffer overflows and `send(2)` returns either `WouldBlock`
-        // (→ `BeatOutcome::Dropped`) or `ENOBUFS` (→ `BeatOutcome::Failed`,
-        // not classified as "dropped" by the client because it's a Linux
-        // synonym for a transient kernel-resource failure). Treat both as
-        // "back off and retry" to satisfy the contract's exact-100 count.
+        // The agent socket is non-blocking. On macOS the per-socket UDS receive
+        // buffer is small (~4 KiB); at line-rate the buffer overflows and send(2)
+        // returns ENOBUFS. varta-client now correctly classifies ENOBUFS as
+        // BeatOutcome::Dropped (kernel-pressure, transient). Any Failed outcome
+        // is an unexpected hard error and should fail the test immediately.
         for _ in 0..100 {
             let mut tries = 0u32;
             loop {
                 match agent.beat(Status::Ok, 0) {
                     BeatOutcome::Sent => break,
-                    BeatOutcome::Dropped | BeatOutcome::Failed(_) => {
+                    BeatOutcome::Dropped => {
                         tries += 1;
                         if tries > 5_000 {
                             panic!("kernel never accepted a beat within 5000 retries");
                         }
                         std::thread::sleep(Duration::from_micros(500));
                     }
+                    BeatOutcome::Failed(e) => panic!("unexpected hard failure: {e}"),
                 }
             }
         }

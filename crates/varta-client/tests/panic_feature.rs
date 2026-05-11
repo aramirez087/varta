@@ -59,11 +59,7 @@ fn panic_handler_emits_critical_beat_before_unwind() {
     let n = server.recv(&mut buf).expect("recv within 500 ms");
     assert_eq!(n, 32, "datagram must be 32 bytes");
     let frame = Frame::decode(&buf).expect("decode");
-    assert_eq!(
-        frame.status,
-        Status::Critical as u8,
-        "status must be Critical"
-    );
+    assert_eq!(frame.status, Status::Critical, "status must be Critical");
     assert_eq!(
         frame.nonce, NONCE_TERMINAL,
         "nonce must be NONCE_TERMINAL sentinel"

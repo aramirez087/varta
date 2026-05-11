@@ -14,7 +14,7 @@ fn fixture_frame() -> Frame {
     Frame {
         magic: MAGIC,
         version: VERSION,
-        status: Status::Ok as u8,
+        status: Status::Ok,
         pid: 0xDEAD_BEEF,
         timestamp: 0x0123_4567_89AB_CDEF,
         nonce: 1,
@@ -88,19 +88,12 @@ fn every_status_variant_round_trips() {
             "byte {byte:#x} did not map to {expected:?}"
         );
 
-        let frame = Frame {
-            magic: MAGIC,
-            version: VERSION,
-            status: byte,
-            pid: 7,
-            timestamp: 0,
-            nonce: 1,
-            payload: 0,
-        };
+        let frame = Frame::new(expected, 7, 0, 1, 0);
         let mut buf = [0u8; 32];
         frame.encode(&mut buf);
+        assert_eq!(buf[3], byte, "encoded status byte must round-trip");
         let decoded = Frame::decode(&buf).expect("variant frame must decode");
-        assert_eq!(decoded.status, byte);
+        assert_eq!(decoded.status, expected);
     }
 }
 
@@ -109,7 +102,7 @@ fn payload_preserved_at_u64_max() {
     let frame = Frame {
         magic: MAGIC,
         version: VERSION,
-        status: Status::Critical as u8,
+        status: Status::Critical,
         pid: u32::MAX,
         timestamp: u64::MAX,
         nonce: NONCE_TERMINAL,

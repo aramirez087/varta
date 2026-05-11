@@ -6,7 +6,65 @@ use std::os::unix::net::UnixDatagram;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use varta_vlp::{Frame, Status, MAGIC, NONCE_TERMINAL, VERSION};
+use varta_vlp::{Frame, Status, NONCE_TERMINAL};
+
+/// Linux value of `ENOBUFS` from `<asm-generic/errno.h>`. Hard-coded to
+/// preserve the zero-dependency invariant; do not replace with `libc`.
+#[cfg(target_os = "linux")]
+const ENOBUFS: i32 = 105;
+
+/// Darwin / BSD value of `ENOBUFS` from `<sys/errno.h>`. Hard-coded for
+/// the same reason.
+#[cfg(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    target_os = "dragonfly",
+))]
+const ENOBUFS: i32 = 55;
+
+/// Classify a `send(2)` error into a [`BeatOutcome`].
+///
+/// Checks the raw OS error code before the `ErrorKind` match so that
+/// `ENOBUFS` (kernel buffer pressure, transient) is caught even when the
+/// toolchain maps it to `ErrorKind::Other`. The `Failed` branch constructs
+/// the returned error without heap allocation.
+pub fn classify_send_error(e: &io::Error) -> BeatOutcome {
+    // (a) Raw-OS path first — catches ENOBUFS even when libstd has not
+    //     minted a dedicated ErrorKind for it on this toolchain.
+    if let Some(code) = e.raw_os_error() {
+        if code == ENOBUFS {
+            return BeatOutcome::Dropped;
+        }
+    }
+
+    match e.kind() {
+        // (b) Peer not present or channel transiently full.
+        io::ErrorKind::WouldBlock
+        | io::ErrorKind::ConnectionRefused
+        | io::ErrorKind::ConnectionReset
+        | io::ErrorKind::NotFound
+        | io::ErrorKind::NotConnected
+        | io::ErrorKind::BrokenPipe
+        // (c) Belt-and-braces: covers toolchains that surface ENOBUFS as a
+        //     kind rather than a raw_os_error.
+        | io::ErrorKind::OutOfMemory
+        | io::ErrorKind::StorageFull => BeatOutcome::Dropped,
+
+        // (d) Unexpected error: clone heap-free and escalate.
+        _ => {
+            let cloned = match e.raw_os_error() {
+                // Repr::Os(i32) — no heap allocation.
+                Some(code) => io::Error::from_raw_os_error(code),
+                // Repr::Simple(kind) — no heap allocation.
+                None => io::Error::from(e.kind()),
+            };
+            BeatOutcome::Failed(cloned)
+        }
+    }
+}
 
 /// Result of a single [`Varta::beat`] call.
 ///
@@ -87,15 +145,7 @@ impl Varta {
     fn send_frame(&mut self) -> BeatOutcome {
         match self.sock.send(&self.buf) {
             Ok(_) => BeatOutcome::Sent,
-            Err(e) => match e.kind() {
-                io::ErrorKind::WouldBlock
-                | io::ErrorKind::ConnectionRefused
-                | io::ErrorKind::ConnectionReset
-                | io::ErrorKind::NotFound
-                | io::ErrorKind::NotConnected
-                | io::ErrorKind::BrokenPipe => BeatOutcome::Dropped,
-                _ => BeatOutcome::Failed(e),
-            },
+            Err(e) => classify_send_error(&e),
         }
     }
 
@@ -116,15 +166,7 @@ impl Varta {
     pub fn beat(&mut self, status: Status, payload: u64) -> BeatOutcome {
         self.nonce = self.nonce.saturating_add(1).min(NONCE_TERMINAL - 1);
         let timestamp = self.start.elapsed().as_nanos() as u64;
-        let frame = Frame {
-            magic: MAGIC,
-            version: VERSION,
-            status: status as u8,
-            pid: self.pid,
-            timestamp,
-            nonce: self.nonce,
-            payload,
-        };
+        let frame = Frame::new(status, self.pid, timestamp, self.nonce, payload);
         frame.encode(&mut self.buf);
         let outcome = self.send_frame();
         match &outcome {

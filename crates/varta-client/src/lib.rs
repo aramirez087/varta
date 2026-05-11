@@ -13,7 +13,7 @@ pub mod client;
 #[cfg(feature = "panic-handler")]
 pub mod panic;
 
-pub use client::{BeatOutcome, Varta};
+pub use client::{classify_send_error, BeatOutcome, Varta};
 pub use varta_vlp::{DecodeError, Frame, Status, NONCE_TERMINAL};
 
 /// Install the panic hook — see [`panic::install`] for the full contract.

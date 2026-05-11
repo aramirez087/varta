@@ -114,5 +114,5 @@ fn beat_makes_zero_heap_allocations_after_init() {
     }
     assert!(count > 0, "receiver got zero datagrams");
     let frame = Frame::decode(&last).expect("latest decode");
-    assert_eq!(frame.status, Status::Ok as u8);
+    assert_eq!(frame.status, Status::Ok);
 }

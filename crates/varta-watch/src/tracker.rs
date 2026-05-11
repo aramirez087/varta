@@ -103,12 +103,7 @@ impl Tracker {
     /// if the slot table is full (and no stale slot could be reclaimed) and
     /// the pid is not yet tracked.
     pub fn record(&mut self, frame: &Frame, now_ns: u64, threshold_ns: u64) -> Update {
-        let status = match Status::try_from_u8(frame.status) {
-            Ok(s) => s,
-            // Frame::decode validates this byte; defensively treat an invalid
-            // status as out-of-order rather than crashing.
-            Err(_) => return Update::OutOfOrder,
-        };
+        let status = frame.status;
 
         for slot in &mut self.entries[..self.len] {
             if slot.pid == frame.pid {

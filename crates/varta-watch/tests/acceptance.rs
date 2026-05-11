@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use varta_vlp::{DecodeError, Frame, Status, MAGIC, VERSION};
+use varta_vlp::{DecodeError, Frame, Status};
 use varta_watch::{Event, Observer, Tracker, Update};
 
 static UDS_COUNTER: AtomicU32 = AtomicU32::new(0);
@@ -43,15 +43,7 @@ impl Drop for UdsPath {
 
 /// Build a canonical 32-byte VLP frame for the given pid/nonce/status.
 fn make_frame(pid: u32, nonce: u64, status: Status, payload: u64) -> Frame {
-    Frame {
-        magic: MAGIC,
-        version: VERSION,
-        status: status as u8,
-        pid,
-        timestamp: nonce,
-        nonce,
-        payload,
-    }
+    Frame::new(status, pid, nonce, nonce, payload)
 }
 
 /// Open a connected client datagram socket pointing at `target`.
