@@ -211,7 +211,7 @@ mod plat {
 /// ancillary data on every datagram.  On macOS this is a no-op — per-datagram
 /// peer PID is not exposed for unconnected `SOCK_DGRAM`, so the observer
 /// relies on `--socket-mode 0600` to restrict the trust boundary by UID.
-pub fn enable_credential_passing(fd: i32) -> io::Result<()> {
+pub(crate) fn enable_credential_passing(fd: i32) -> io::Result<()> {
     #[cfg(target_os = "macos")]
     {
         let _ = fd;
@@ -244,7 +244,7 @@ pub fn enable_credential_passing(fd: i32) -> io::Result<()> {
 /// frame payload. Timed-out reads yield [`RecvResult::WouldBlock`]; short
 /// reads yield [`RecvResult::ShortRead`]; fatal errors yield
 /// [`RecvResult::IoError`].
-pub fn recv_authenticated(fd: i32) -> RecvResult {
+pub(crate) fn recv_authenticated(fd: i32) -> RecvResult {
     let mut data = [0u8; 32];
 
     #[repr(align(8))]

@@ -90,7 +90,7 @@ where
 #[test]
 fn observer_emits_beat_per_received_frame() {
     let path = unique_uds_path("beats");
-    let (mut observer, _guard) = Observer::bind(
+    let mut observer = Observer::bind(
         path.as_path(),
         Duration::from_secs(60),
         0o600,
@@ -153,9 +153,8 @@ fn observer_emits_beat_per_received_frame() {
 fn observer_emits_stall_after_threshold_elapses() {
     let path = unique_uds_path("stall");
     let threshold = Duration::from_millis(150);
-    let (mut observer, _guard) =
-        Observer::bind(path.as_path(), threshold, 0o600, Duration::from_millis(100))
-            .expect("bind observer");
+    let mut observer = Observer::bind(path.as_path(), threshold, 0o600, Duration::from_millis(100))
+        .expect("bind observer");
     let client = client_socket(path.as_path());
 
     let pid = std::process::id();
@@ -195,7 +194,7 @@ fn observer_emits_stall_after_threshold_elapses() {
 #[test]
 fn observer_reports_decode_error_for_bad_magic() {
     let path = unique_uds_path("decode");
-    let (mut observer, _guard) = Observer::bind(
+    let mut observer = Observer::bind(
         path.as_path(),
         Duration::from_secs(60),
         0o600,
@@ -242,7 +241,7 @@ fn tracker_capacity_bounded_to_64_pids() {
 #[test]
 fn observer_rejects_spoofed_pid_frame() {
     let path = unique_uds_path("spoof");
-    let (mut observer, _guard) = Observer::bind(
+    let mut observer = Observer::bind(
         path.as_path(),
         Duration::from_secs(60),
         0o600,

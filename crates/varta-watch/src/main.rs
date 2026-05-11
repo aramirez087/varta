@@ -87,7 +87,7 @@ fn run(cfg: Config) -> std::io::Result<()> {
         install_signal_handlers();
     }
 
-    let (mut observer, _guard) = Observer::bind(
+    let mut observer = Observer::bind(
         &cfg.socket,
         cfg.threshold,
         cfg.socket_mode,
