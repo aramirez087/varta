@@ -52,6 +52,12 @@ pub struct Config {
     /// UDS read timeout for the bound socket. Defaults to
     /// [`DEFAULT_READ_TIMEOUT_MS`] milliseconds.
     pub read_timeout: Duration,
+    /// Optional UDP port for network-based observers. When set, the observer
+    /// also binds a UDP listener alongside the UDS socket.
+    pub udp_port: Option<u16>,
+    /// IP address to bind the UDP listener on. Defaults to `0.0.0.0` when
+    /// `--udp-port` is set. Ignored when `--udp-port` is not set.
+    pub udp_bind_addr: Option<std::net::IpAddr>,
 }
 
 /// Failure modes for [`Config::from_args`].
@@ -108,7 +114,7 @@ impl Config {
     /// Verbatim `--help` text. The acceptance test asserts that every
     /// documented long-flag substring appears in this body.
     pub const HELP: &'static str = "\
-varta-watch — observe Varta Lifeline Protocol agents over a Unix socket.
+varta-watch — observe Varta Lifeline Protocol agents over configurable transports.
 
 USAGE:
     varta-watch --socket <PATH> --threshold-ms <MS> [OPTIONS]
@@ -116,29 +122,35 @@ USAGE:
 REQUIRED:
     --socket <PATH>                Path to bind the observer's UDS.
     --threshold-ms <MS>            Per-pid silence window before a stall is
-                                   surfaced (milliseconds).
+                                    surfaced (milliseconds).
 
 OPTIONAL:
     --recovery-cmd <TEMPLATE>      Shell fragment run on each unique stall.
-                                   The literal {pid} is replaced with the
-                                   stalled pid before /bin/sh -c executes.
+                                    The literal {pid} is replaced with the
+                                    stalled pid before /bin/sh -c executes.
     --recovery-debounce-ms <MS>    Per-pid debounce window for recovery
-                                    invocations (default 1000).
+                                     invocations (default 1000).
     --socket-mode <OCTAL>           File mode for the observer socket
-                                    (default 0600 — owner-only r/w).
+                                     (default 0600 — owner-only r/w).
     --export-file <PATH>            Append one tab-separated event line per
-                                    observer event to this file.
+                                     observer event to this file.
     --prom-addr <IP:PORT>          Bind a Prometheus text-format endpoint at
-                                   GET /metrics on this address.
+                                    GET /metrics on this address.
     --recovery-timeout-ms <MS>     Kill-after deadline for recovery children;
-                                    if a child runs longer than this it is
-                                    killed via kill(2). Without this flag the
-                                    child is allowed to run until completion.
+                                     if a child runs longer than this it is
+                                     killed via kill(2). Without this flag the
+                                     child is allowed to run until completion.
     --read-timeout-ms <MS>         UDS read timeout per poll call
-                                   (default 100).  Bounded so a stalled peer
-                                   cannot hold the observer loop indefinitely.
+                                    (default 100).  Bounded so a stalled peer
+                                    cannot hold the observer loop indefinitely.
     --shutdown-after-secs <SECS>   Exit cleanly after the given uptime
-                                    (used by integration tests).
+                                     (used by integration tests).
+    --udp-port <PORT>              Bind a UDP listener on this port for
+                                     network-based agents (requires --features
+                                     udp at build time). Combine with UDS or
+                                     use alone.
+    --udp-bind-addr <IP>           IP address to bind the UDP listener on
+                                     (default 0.0.0.0). Requires --udp-port.
 
     -h, --help                     Print this message and exit.
 ";
@@ -155,6 +167,8 @@ OPTIONAL:
         let mut recovery_timeout_ms: Option<u64> = None;
         let mut socket_mode: Option<u32> = None;
         let mut read_timeout_ms: Option<u64> = None;
+        let mut udp_port: Option<u16> = None;
+        let mut udp_bind_addr: Option<std::net::IpAddr> = None;
 
         let mut iter = args.into_iter();
         while let Some(tok) = iter.next() {
@@ -221,6 +235,19 @@ OPTIONAL:
                         .ok_or(ConfigError::MissingValue("--shutdown-after-secs"))?;
                     shutdown_after_secs = Some(parse_u64("--shutdown-after-secs", &v)?);
                 }
+                "--udp-port" => {
+                    let v = iter.next().ok_or(ConfigError::MissingValue("--udp-port"))?;
+                    udp_port = Some(parse_u16("--udp-port", &v)?);
+                }
+                "--udp-bind-addr" => {
+                    let v = iter
+                        .next()
+                        .ok_or(ConfigError::MissingValue("--udp-bind-addr"))?;
+                    udp_bind_addr = Some(
+                        v.parse::<std::net::IpAddr>()
+                            .map_err(|_| ConfigError::BadAddr(v))?,
+                    );
+                }
                 other => return Err(ConfigError::UnknownFlag(other.to_string())),
             }
         }
@@ -242,12 +269,21 @@ OPTIONAL:
             recovery_timeout: recovery_timeout_ms.map(Duration::from_millis),
             socket_mode: socket_mode.unwrap_or(DEFAULT_SOCKET_MODE),
             read_timeout: Duration::from_millis(read_timeout_ms.unwrap_or(DEFAULT_READ_TIMEOUT_MS)),
+            udp_port,
+            udp_bind_addr,
         })
     }
 }
 
 fn parse_u64(flag: &'static str, raw: &str) -> Result<u64, ConfigError> {
     raw.parse::<u64>().map_err(|_| ConfigError::BadInteger {
+        flag,
+        raw: raw.to_string(),
+    })
+}
+
+fn parse_u16(flag: &'static str, raw: &str) -> Result<u16, ConfigError> {
+    raw.parse::<u16>().map_err(|_| ConfigError::BadInteger {
         flag,
         raw: raw.to_string(),
     })
@@ -353,6 +389,8 @@ mod tests {
             "--prom-addr",
             "--socket-mode",
             "--shutdown-after-secs",
+            "--udp-port",
+            "--udp-bind-addr",
             "--help",
         ] {
             assert!(

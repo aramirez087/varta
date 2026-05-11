@@ -1,9 +1,14 @@
-//! Single-threaded observer: bind a transport listener, decode incoming
-//! VLP frames, surface beats / stalls / decode errors via [`Event`].
+//! Single-threaded observer: bind one or more transport listeners, decode
+//! incoming VLP frames, surface beats / stalls / decode errors via [`Event`].
 //!
 //! The observer never spawns threads, never allocates after setup,
-//! and surfaces exactly one [`Event`] per call to [`Observer::poll`]. The
+//! and surfaces at most one [`Event`] per call to [`Observer::poll`]. The
 //! caller drives the loop — see `main.rs` for the daemon entrypoint.
+//!
+//! Multiple listeners (e.g. UDS + UDP) are polled round-robin. Each call to
+//! [`Observer::poll`] tries every listener in order; the first successful
+//! receive is returned immediately. If all listeners return `WouldBlock`,
+//! stalls are drained and `None` is returned.
 
 use std::io;
 use std::path::Path;
@@ -62,17 +67,17 @@ pub enum Event {
         /// event was produced.
         observer_ns: u64,
     },
-    /// Receiving from the listener failed with an error other than
+    /// Receiving from a listener failed with an error other than
     /// `WouldBlock` / `TimedOut`.
     Io(io::Error, u64),
 }
 
-/// Observer bound to a transport listener.
+/// Observer bound to one or more transport listeners.
 ///
-/// The observer owns the listener; cleanup (e.g. socket file unlink) happens
+/// The observer owns all listeners; cleanup (e.g. socket file unlink) happens
 /// when the [`Observer`] is dropped.
-pub struct Observer<L: BeatListener = UdsListener> {
-    listener: L,
+pub struct Observer {
+    listeners: Vec<Box<dyn BeatListener>>,
     tracker: Tracker,
     threshold_ns: u64,
     start: Instant,
@@ -81,38 +86,14 @@ pub struct Observer<L: BeatListener = UdsListener> {
     stall_cursor: usize,
 }
 
-impl Observer<UdsListener> {
-    /// Bind a Unix datagram socket at `path` and return an [`Observer`]
-    /// configured with the given stall `threshold`.
-    ///
-    /// The socket file permissions are set to `socket_mode` (octal, e.g.
-    /// `0o600`) immediately after a successful bind. Credential passing is
-    /// enabled on the socket so that [`Observer::poll`] can verify the PID
-    /// of every sender against the kernel's `SO_PASSCRED` / `LOCAL_CREDS`
-    /// attestation (Linux only).
-    ///
-    /// If a genuine stale socket exists at `path` (no one listening),
-    /// it is cleaned up and the bind succeeds. If another process is
-    /// already listening at `path`, the call fails with `AddrInUse`.
-    ///
-    /// The socket file is unlinked when the [`Observer`] is dropped.
-    pub fn bind(
-        path: impl AsRef<Path>,
-        threshold: Duration,
-        socket_mode: u32,
-        read_timeout: Duration,
-    ) -> io::Result<Self> {
-        let listener = UdsListener::bind(path, socket_mode, read_timeout)?;
-        Ok(Self::from_listener(listener, threshold))
-    }
-}
-
-impl<L: BeatListener> Observer<L> {
-    /// Create an [`Observer`] from an already-configured listener.
-    pub fn from_listener(listener: L, threshold: Duration) -> Self {
+impl Observer {
+    /// Create an empty observer with no listeners. Use
+    /// [`Observer::add_listener`] to attach transports, or call
+    /// [`Observer::bind`] for the common single-UDS case.
+    pub fn new(threshold: Duration) -> Self {
         let threshold_ns = threshold.as_nanos().min(u64::MAX as u128) as u64;
         Observer {
-            listener,
+            listeners: Vec::new(),
             tracker: Tracker::new(),
             threshold_ns,
             start: Instant::now(),
@@ -122,67 +103,86 @@ impl<L: BeatListener> Observer<L> {
         }
     }
 
-    /// Attempt a single non-blocking read from the listener and return the
-    /// corresponding I/O [`Event`].
+    /// Create an observer from a single already-configured listener.
+    pub fn from_listener<L: BeatListener + 'static>(listener: L, threshold: Duration) -> Self {
+        let mut obs = Self::new(threshold);
+        obs.add_listener(Box::new(listener));
+        obs
+    }
+
+    /// Bind a Unix datagram socket at `path` and return an [`Observer`]
+    /// with that single UDS listener.
+    ///
+    /// This is the backward-compatible convenience constructor for the common
+    /// single-UDS case. For multi-transport setups, use [`Observer::new`]
+    /// followed by [`Observer::add_listener`].
+    pub fn bind(
+        path: impl AsRef<Path>,
+        threshold: Duration,
+        socket_mode: u32,
+        read_timeout: Duration,
+    ) -> io::Result<Self> {
+        let listener = UdsListener::bind(path, socket_mode, read_timeout)?;
+        Ok(Self::from_listener(listener, threshold))
+    }
+
+    /// Add a listener to the observer. The listener is polled in round-robin
+    /// order alongside any existing listeners.
+    pub fn add_listener(&mut self, listener: Box<dyn BeatListener>) {
+        self.listeners.push(listener);
+    }
+
+    /// Attempt a single non-blocking read from each listener and return the
+    /// first I/O [`Event`] found.
+    ///
+    /// Listeners are polled round-robin: if the first listener returns
+    /// `WouldBlock`, the next is tried. The first non-`WouldBlock` result
+    /// (beat, decode error, auth failure, or I/O error) is returned
+    /// immediately. Remaining listeners are not polled until the next call.
     ///
     /// This method never returns [`Event::Stall`] — queued stall events must
-    /// be retrieved via [`Observer::poll_pending`].  Callers should check
-    /// [`Observer::has_pending_stalls`] before calling `poll` to ensure
-    /// previously-queued stalls are drained first.
-    ///
-    /// Returns:
-    /// - `Some(Event::Beat)` for an accepted, ordered frame.
-    /// - `Some(Event::Decode(_))` if the next 32 bytes fail VLP decoding.
-    /// - `Some(Event::Io(_))` for non-`WouldBlock` listener errors.
-    /// - `Some(Event::AuthFailure)` if the frame pid does not match the
-    ///   kernel-attested sender (Linux UDS only; macOS and UDP skip this).
-    /// - `None` if no I/O was available (`WouldBlock`), the read was a
-    ///   short read, the beat was out-of-order, or capacity was exceeded.
-    ///   `WouldBlock` internally triggers [`Observer::drain_stalls`], which
-    ///   populates the stall queue for subsequent `poll_pending` calls.
+    /// be retrieved via [`Observer::poll_pending`].
     pub fn poll(&mut self) -> Option<Event> {
-        match self.listener.recv() {
-            RecvResult::Authenticated { peer_pid, data } => {
-                let now_ns = self.now_ns();
-                match Frame::decode(&data) {
-                    Ok(frame) => {
-                        #[cfg(target_os = "linux")]
-                        if peer_pid != 0 && frame.pid != peer_pid {
-                            return Some(Event::AuthFailure {
-                                claimed_pid: frame.pid,
-                                observer_ns: now_ns,
-                            });
+        for i in 0..self.listeners.len() {
+            match self.listeners[i].recv() {
+                RecvResult::Authenticated { peer_pid, data } => {
+                    let now_ns = self.now_ns();
+                    match Frame::decode(&data) {
+                        Ok(frame) => {
+                            #[cfg(target_os = "linux")]
+                            if peer_pid != 0 && frame.pid != peer_pid {
+                                return Some(Event::AuthFailure {
+                                    claimed_pid: frame.pid,
+                                    observer_ns: now_ns,
+                                });
+                            }
+                            let _ = peer_pid;
+                            match self.tracker.record(&frame, now_ns, self.threshold_ns) {
+                                Update::Inserted | Update::Refreshed => {
+                                    return Some(Event::Beat {
+                                        pid: frame.pid,
+                                        status: frame.status,
+                                        payload: frame.payload,
+                                        nonce: frame.nonce,
+                                        observer_ns: now_ns,
+                                    });
+                                }
+                                Update::OutOfOrder | Update::CapacityExceeded => continue,
+                            }
                         }
-                        let _ = peer_pid;
-                        match self.tracker.record(&frame, now_ns, self.threshold_ns) {
-                            Update::Inserted | Update::Refreshed => Some(Event::Beat {
-                                pid: frame.pid,
-                                status: frame.status,
-                                payload: frame.payload,
-                                nonce: frame.nonce,
-                                observer_ns: now_ns,
-                            }),
-                            Update::OutOfOrder | Update::CapacityExceeded => None,
-                        }
+                        Err(e) => return Some(Event::Decode(e, now_ns)),
                     }
-                    Err(e) => Some(Event::Decode(e, now_ns)),
                 }
+                RecvResult::WouldBlock => continue,
+                RecvResult::ShortRead => continue,
+                RecvResult::IoError(e) => return Some(Event::Io(e, self.now_ns())),
             }
-            RecvResult::WouldBlock => {
-                self.drain_stalls();
-                None
-            }
-            RecvResult::ShortRead => None,
-            RecvResult::IoError(e) => Some(Event::Io(e, self.now_ns())),
         }
+        self.drain_stalls();
+        None
     }
 
     /// Return the next queued [`Event::Stall`], if any.
-    ///
-    /// Stalls are queued internally by [`Observer::drain_stalls`] (which
-    /// runs on `WouldBlock` inside [`Observer::poll`]).  Callers should
-    /// drain all pending stalls before calling `poll` for new I/O to
-    /// minimize stall-latency.
     pub fn poll_pending(&mut self) -> Option<Event> {
         if self.stall_cursor < self.stall_queue.len() {
             let stall = self.stall_queue[self.stall_cursor].take();
@@ -193,11 +193,6 @@ impl<L: BeatListener> Observer<L> {
     }
 
     /// Whether the stall queue has unconsumed [`Event::Stall`] entries.
-    ///
-    /// Callers should check this before [`Observer::poll`] to ensure
-    /// previously-queued stalls are drained first via
-    /// [`Observer::poll_pending`].  When `true`, the next
-    /// [`Observer::poll_pending`] call is guaranteed to return `Some`.
     pub fn has_pending_stalls(&self) -> bool {
         self.stall_cursor < self.stall_queue.len()
     }
@@ -235,14 +230,12 @@ impl<L: BeatListener> Observer<L> {
         }
     }
 
-    /// Drain and reset the eviction counter. Returns the number of slots
-    /// reclaimed since the last call.
+    /// Drain and reset the eviction counter.
     pub fn drain_evictions(&mut self) -> u64 {
         self.tracker.take_evictions()
     }
 
-    /// Drain and reset the capacity-exceeded counter. Returns the number
-    /// of beats dropped due to a full tracker since the last call.
+    /// Drain and reset the capacity-exceeded counter.
     pub fn drain_capacity_exceeded(&mut self) -> u64 {
         self.tracker.take_capacity_exceeded()
     }
@@ -253,7 +246,6 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
-    use std::time::Duration;
 
     static TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
 

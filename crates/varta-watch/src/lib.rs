@@ -20,9 +20,9 @@ pub mod tracker;
 pub use config::{Config, ConfigError};
 pub use exporter::{Exporter, FileExporter, PromExporter};
 pub use listener::{BeatListener, UdsListener};
-
-#[cfg(feature = "udp")]
-pub use listener::UdpListener;
 pub use observer::{Event, Observer};
 pub use recovery::{Recovery, RecoveryOutcome};
 pub use tracker::{Slot, Tracker, Update};
+
+#[cfg(feature = "udp")]
+pub use listener::UdpListener;

@@ -93,6 +93,26 @@ fn run(cfg: Config) -> std::io::Result<()> {
         cfg.socket_mode,
         cfg.read_timeout,
     )?;
+
+    #[cfg(feature = "udp")]
+    if let Some(port) = cfg.udp_port {
+        let bind_addr = cfg
+            .udp_bind_addr
+            .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
+        let addr = std::net::SocketAddr::new(bind_addr, port);
+        let udp = varta_watch::UdpListener::bind(addr)
+            .map_err(|e| std::io::Error::new(e.kind(), format!("UDP bind {}: {e}", addr)))?;
+        observer.add_listener(Box::new(udp));
+    }
+
+    #[cfg(not(feature = "udp"))]
+    if cfg.udp_port.is_some() {
+        eprintln!("varta-watch: --udp-port requires UDP support (rebuild with --features udp)");
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "UDP support not compiled in",
+        ));
+    }
     let mut recovery = cfg.recovery_cmd.as_ref().map(|tpl| {
         Recovery::with_timeout(tpl.clone(), cfg.recovery_debounce, cfg.recovery_timeout)
     });
