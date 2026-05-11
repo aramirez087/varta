@@ -150,6 +150,8 @@ impl Frame {
         }
         let status = Status::try_from_u8(bytes[3])?;
 
+        // INVARIANT: `bytes` is `&[u8; 32]` by the function signature, so every
+        // range below is statically in-bounds and `try_into().unwrap()` never panics.
         let pid = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
         let timestamp = u64::from_le_bytes(bytes[8..16].try_into().unwrap());
         let nonce = u64::from_le_bytes(bytes[16..24].try_into().unwrap());

@@ -268,22 +268,8 @@ impl PromExporter {
 
         if total < 4 || buf[..4] != *b"GET " {
             let response = b"HTTP/1.0 405 Method Not Allowed\r\nAllow: GET\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
-            let mut written = 0;
-            let write_deadline = Instant::now() + PROM_WRITE_TIMEOUT;
-            while written < response.len() {
-                if Instant::now() >= write_deadline {
-                    break;
-                }
-                match stream.write(&response[written..]) {
-                    Ok(0) => break,
-                    Ok(n) => written += n,
-                    Err(e) if e.kind() == ErrorKind::WouldBlock => {
-                        std::hint::spin_loop();
-                        continue;
-                    }
-                    Err(e) => return Err(e),
-                }
-            }
+            let _ =
+                write_all_nonblocking(&mut stream, response, Instant::now() + PROM_WRITE_TIMEOUT);
             let _ = stream.shutdown(Shutdown::Both);
             return Ok(());
         }
@@ -299,26 +285,7 @@ impl PromExporter {
             len = body.len(),
         );
         let buf = response.as_bytes();
-        let mut written = 0;
-        let write_deadline = Instant::now() + PROM_WRITE_TIMEOUT;
-        while written < buf.len() {
-            if Instant::now() >= write_deadline {
-                break;
-            }
-            match stream.write(&buf[written..]) {
-                Ok(0) => break,
-                Ok(n) => written += n,
-                Err(e) if e.kind() == ErrorKind::WouldBlock => {
-                    // Peer's recv buffer is full. The deadline check at the
-                    // top of the loop caps the worst case; hint the CPU we
-                    // are in a short busy-wait so it can back off internally
-                    // instead of burning a full core for PROM_WRITE_TIMEOUT.
-                    std::hint::spin_loop();
-                    continue;
-                }
-                Err(e) => return Err(e),
-            }
-        }
+        let _ = write_all_nonblocking(&mut stream, buf, Instant::now() + PROM_WRITE_TIMEOUT);
         let _ = stream.shutdown(Shutdown::Both);
         Ok(())
     }
@@ -445,6 +412,31 @@ fn contains_subsequence(haystack: &[u8], needle: &[u8]) -> bool {
         return needle.is_empty();
     }
     haystack.windows(needle.len()).any(|w| w == needle)
+}
+
+/// Non-blocking `write_all` with a wall-clock deadline. Returns `Ok(())`
+/// whether the full buffer was written or the deadline expired; the caller
+/// is responsible for deciding whether a short write is an error.
+///
+/// On `WouldBlock` the loop hints the CPU with [`std::hint::spin_loop`] so
+/// a full peer recv buffer doesn't burn a core for the entire deadline.
+fn write_all_nonblocking(stream: &mut TcpStream, buf: &[u8], deadline: Instant) -> io::Result<()> {
+    let mut written = 0;
+    while written < buf.len() {
+        if Instant::now() >= deadline {
+            break;
+        }
+        match stream.write(&buf[written..]) {
+            Ok(0) => break,
+            Ok(n) => written += n,
+            Err(e) if e.kind() == ErrorKind::WouldBlock => {
+                std::hint::spin_loop();
+                continue;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
