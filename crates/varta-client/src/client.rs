@@ -1,12 +1,13 @@
-//! Agent surface — `Varta` connects to the observer's UDS and `beat()` emits
-//! one fire-and-forget 32-byte VLP frame per call.
+//! Agent surface — `Varta` connects to the observer over a configured
+//! transport and `beat()` emits one fire-and-forget 32-byte VLP frame per call.
 
 use std::io;
-use std::os::unix::net::UnixDatagram;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::Instant;
 
 use varta_vlp::{Frame, Status, NONCE_TERMINAL};
+
+use crate::transport::{BeatTransport, UdsTransport};
 
 /// Linux value of `ENOBUFS` from `<asm-generic/errno.h>`. Hard-coded to
 /// preserve the zero-dependency invariant; do not replace with `libc`.
@@ -100,15 +101,19 @@ pub enum BeatOutcome {
     Failed(io::Error),
 }
 
-/// Agent-side handle that owns a connected [`UnixDatagram`] and a 32-byte
+/// Agent-side handle that owns a configured [`BeatTransport`] and a 32-byte
 /// scratch buffer.
 ///
-/// `Varta::connect` is the single allocation point: it creates the socket,
-/// switches it to non-blocking mode, and captures the epoch used for
-/// monotonic timestamps. The process ID is fetched afresh via
+/// `Varta::connect` is the single allocation point: it creates the transport,
+/// switches it to non-blocking mode (where applicable), and captures the epoch
+/// used for monotonic timestamps. The process ID is fetched afresh via
 /// [`std::process::id`] on every [`beat`](Self::beat) so forked children
 /// report their own PID. Every subsequent `beat()` reuses the owned buffer
 /// and emits a frame without touching the heap.
+///
+/// The default transport is [`UdsTransport`] (Unix Domain Socket). Use
+/// `Varta::connect()` to create a UDS-backed agent. Other transports (e.g.
+/// UDP) are available behind feature flags.
 ///
 /// # Examples
 ///
@@ -120,7 +125,7 @@ pub enum BeatOutcome {
 /// ```
 /// # Thread safety
 ///
-/// `Varta` is [`Send`]: the underlying [`UnixDatagram`] is `Send`, and a beat
+/// `Varta` is [`Send`]: the underlying transport is `Send`, and a beat
 /// issues no shared state. `Varta` is **not** [`Sync`]: concurrent
 /// `&Varta::beat` calls would race on the kernel-side socket send buffer
 /// ordering. To share across threads, wrap in a [`std::sync::Mutex`] or move
@@ -128,25 +133,24 @@ pub enum BeatOutcome {
 ///
 /// The fork-safety contract (pid re-read per beat) is unaffected by the
 /// thread-safety choice.
-pub struct Varta {
-    sock: UnixDatagram,
+pub struct Varta<T: BeatTransport = UdsTransport> {
+    transport: T,
     buf: [u8; 32],
     start: Instant,
     nonce: u64,
-    path: PathBuf,
     consecutive_dropped: u32,
     reconnect_after: u32,
 }
 
-// Static assertion: Varta is Send and must remain so.
+// Static assertion: Varta<UdsTransport> is Send and must remain so.
 const _: () = {
     const fn assert_send<T: Send>() {}
-    assert_send::<Varta>();
+    assert_send::<Varta<UdsTransport>>();
 };
 
-impl Varta {
-    /// Connect to the observer listening on `path` and prepare the agent for
-    /// non-blocking emission.
+impl Varta<UdsTransport> {
+    /// Connect to the observer listening on `path` via Unix Domain Socket and
+    /// prepare the agent for non-blocking emission.
     ///
     /// Stores an `Instant` for per-frame elapsed-nanosecond timestamps. The
     /// process ID is intentionally not cached here — it is read afresh on
@@ -159,23 +163,21 @@ impl Varta {
     /// Returns an [`io::Error`] if the socket cannot be created, the peer
     /// path cannot be reached, or non-blocking mode cannot be enabled.
     pub fn connect<P: AsRef<Path>>(path: P) -> io::Result<Self> {
-        let path = path.as_ref().to_path_buf();
-        let sock = UnixDatagram::unbound()?;
-        sock.connect(&path)?;
-        sock.set_nonblocking(true)?;
+        let transport = UdsTransport::connect(path)?;
         Ok(Self {
-            sock,
+            transport,
             buf: [0u8; 32],
             start: Instant::now(),
             nonce: 0,
-            path,
             consecutive_dropped: 0,
             reconnect_after: 0,
         })
     }
+}
 
+impl<T: BeatTransport> Varta<T> {
     fn send_frame(&mut self) -> BeatOutcome {
-        match self.sock.send(&self.buf) {
+        match self.transport.send(&self.buf) {
             Ok(_) => BeatOutcome::Sent,
             Err(e) => classify_send_error(&e),
         }
@@ -206,14 +208,10 @@ impl Varta {
                 self.consecutive_dropped = self.consecutive_dropped.saturating_add(1);
                 if self.reconnect_after > 0
                     && self.consecutive_dropped >= self.reconnect_after
-                    && self.reconnect().is_ok()
+                    && self.transport.reconnect().is_ok()
                 {
                     let retry = self.send_frame();
                     if matches!(&retry, BeatOutcome::Dropped) {
-                        // Reconnect succeeded at the OS level but the retry
-                        // still dropped — keep the counter at reconnect_after
-                        // to avoid reconnecting on every single beat when the
-                        // observer is unreachable.
                         self.consecutive_dropped = self.reconnect_after;
                     } else {
                         self.consecutive_dropped = 0;
@@ -229,25 +227,18 @@ impl Varta {
         }
     }
 
-    /// Re-bind the Unix datagram socket to the original observer path.
+    /// Re-establish the underlying transport connection.
     ///
-    /// After an observer restart the old socket inode is stale — every
-    /// `beat()` returns [`BeatOutcome::Dropped`] forever. Call `reconnect`
-    /// to bind a fresh socket against the path stored at [`connect`](Self::connect)
-    /// time. Agent identity (`nonce`, `start` clock) is preserved; the PID
-    /// is re-read from the kernel on every beat so reconnect cannot strand
-    /// a stale identity.
+    /// After an observer restart the old channel is stale — every `beat()`
+    /// returns [`BeatOutcome::Dropped`] forever. Call `reconnect` to establish
+    /// a fresh connection to the target stored at [`connect`](Self::connect)
+    /// time. Agent identity (`nonce`, `start` clock) is preserved.
     ///
     /// This is the only post-[`connect`](Self::connect) allocation site and
     /// should only be called when recovery is needed, not on the steady-state
-    /// beat path.  Callers own the responsibility to reset
-    /// `consecutive_dropped` after a successful beat.
+    /// beat path.
     pub fn reconnect(&mut self) -> io::Result<()> {
-        let sock = UnixDatagram::unbound()?;
-        sock.connect(&self.path)?;
-        sock.set_nonblocking(true)?;
-        self.sock = sock;
-        Ok(())
+        self.transport.reconnect()
     }
 
     /// Enable automatic reconnect after `n` consecutive
@@ -256,7 +247,7 @@ impl Varta {
     ///
     /// When enabled, [`beat`](Self::beat) increments an internal counter on
     /// each `Dropped` outcome. After `n` consecutive drops — a strong signal
-    /// that the observer socket is stale — `beat` calls [`reconnect`](Self::reconnect)
+    /// that the observer channel is stale — `beat` calls [`reconnect`](Self::reconnect)
     /// internally and retries the send before returning. The counter resets
     /// to zero on any `Sent` or `Failed` outcome, and after a successful
     /// reconnect.
