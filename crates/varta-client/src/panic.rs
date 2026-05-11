@@ -9,7 +9,7 @@ use std::os::unix::net::UnixDatagram;
 use std::path::PathBuf;
 use std::time::Instant;
 
-use varta_vlp::{Frame, Status, MAGIC, NONCE_TERMINAL, VERSION};
+use varta_vlp::{Frame, Status, NONCE_TERMINAL};
 
 /// Register a panic hook that emits a [`Status::Critical`] VLP frame on the
 /// Unix Domain Socket at `socket_path` before resuming normal unwinding.
@@ -48,15 +48,7 @@ pub fn install(socket_path: impl Into<PathBuf>) {
             let sock = UnixDatagram::unbound().ok()?;
             sock.connect(&path).ok()?;
             let timestamp = start.elapsed().as_nanos() as u64;
-            let frame = Frame {
-                magic: MAGIC,
-                version: VERSION,
-                status: Status::Critical as u8,
-                pid,
-                timestamp,
-                nonce: NONCE_TERMINAL,
-                payload: 0,
-            };
+            let frame = Frame::new(Status::Critical, pid, timestamp, NONCE_TERMINAL, 0);
             let mut buf = [0u8; 32];
             frame.encode(&mut buf);
             sock.send(&buf).ok()

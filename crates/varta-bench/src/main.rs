@@ -524,22 +524,14 @@ fn write_fixture_with_client(
     fs::write(
         root.join("src/main.rs"),
         "use varta_client::{Status, Varta};\n\
-         use varta_vlp::{Frame, MAGIC, VERSION};\n\
+         use varta_vlp::Frame;\n\
          \n\
          fn main() {\n    \
             let path = std::env::args().nth(1).unwrap_or_else(|| String::from(\"/tmp/x.sock\"));\n    \
             if let Ok(mut a) = Varta::connect(&path) {\n        \
                 let _ = a.beat(Status::Ok, 0);\n    \
             }\n    \
-            let frame = Frame {\n        \
-                magic: MAGIC,\n        \
-                version: VERSION,\n        \
-                status: Status::Ok as u8,\n        \
-                pid: 0,\n        \
-                timestamp: 0,\n        \
-                nonce: 1,\n        \
-                payload: 0,\n    \
-            };\n    \
+            let frame = Frame::new(Status::Ok, 0, 0, 1, 0);\n    \
             let mut buf = [0u8; 32];\n    \
             frame.encode(&mut buf);\n    \
             std::process::exit(buf[0] as i32);\n\

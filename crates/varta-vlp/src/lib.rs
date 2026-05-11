@@ -79,8 +79,9 @@ pub struct Frame {
     pub magic: [u8; 2],
     /// Protocol version, always equal to [`VERSION`] on emit.
     pub version: u8,
-    /// Status byte, one of the [`Status`] discriminants.
-    pub status: u8,
+    /// Health status reported by the agent. Encoded on the wire as a
+    /// single byte at offset 3 ([`Status`] discriminants are `#[repr(u8)]`).
+    pub status: Status,
     /// OS process id of the emitting agent.
     pub pid: u32,
     /// Monotonic timestamp chosen by the emitter (typically nanoseconds since
@@ -98,15 +99,37 @@ pub struct Frame {
 
 const _: () = assert!(core::mem::size_of::<Frame>() == 32);
 const _: () = assert!(core::mem::align_of::<Frame>() == 8);
+const _: () = assert!(core::mem::offset_of!(Frame, magic) == 0);
+const _: () = assert!(core::mem::offset_of!(Frame, version) == 2);
+const _: () = assert!(core::mem::offset_of!(Frame, status) == 3);
+const _: () = assert!(core::mem::offset_of!(Frame, pid) == 4);
+const _: () = assert!(core::mem::offset_of!(Frame, timestamp) == 8);
+const _: () = assert!(core::mem::offset_of!(Frame, nonce) == 16);
+const _: () = assert!(core::mem::offset_of!(Frame, payload) == 24);
 
 impl Frame {
+    /// Construct a new frame with the canonical [`MAGIC`] prefix and
+    /// [`VERSION`] byte already populated. All other fields are
+    /// caller-supplied.
+    pub const fn new(status: Status, pid: u32, timestamp: u64, nonce: u64, payload: u64) -> Frame {
+        Frame {
+            magic: MAGIC,
+            version: VERSION,
+            status,
+            pid,
+            timestamp,
+            nonce,
+            payload,
+        }
+    }
+
     /// Serialise this frame into a 32-byte buffer in canonical
     /// little-endian layout. The output buffer is overwritten in place; this
     /// method allocates nothing.
     pub fn encode(&self, out: &mut [u8; 32]) {
         out[0..2].copy_from_slice(&self.magic);
         out[2] = self.version;
-        out[3] = self.status;
+        out[3] = self.status as u8;
         out[4..8].copy_from_slice(&self.pid.to_le_bytes());
         out[8..16].copy_from_slice(&self.timestamp.to_le_bytes());
         out[16..24].copy_from_slice(&self.nonce.to_le_bytes());
@@ -125,8 +148,7 @@ impl Frame {
         if version != VERSION {
             return Err(DecodeError::BadVersion);
         }
-        let status = bytes[3];
-        Status::try_from_u8(status)?;
+        let status = Status::try_from_u8(bytes[3])?;
 
         let pid = u32::from_le_bytes(bytes[4..8].try_into().expect("len 4"));
         let timestamp = u64::from_le_bytes(bytes[8..16].try_into().expect("len 8"));

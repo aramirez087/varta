@@ -169,16 +169,12 @@ impl Observer {
                         }
                         let _ = peer_pid; // silence unused on macOS
                         match self.tracker.record(&frame, now_ns, self.threshold_ns) {
-                            Update::Inserted | Update::Refreshed => {
-                                let status = Status::try_from_u8(frame.status)
-                                    .expect("Frame::decode validated the status byte");
-                                Some(Event::Beat {
-                                    pid: frame.pid,
-                                    status,
-                                    payload: frame.payload,
-                                    nonce: frame.nonce,
-                                })
-                            }
+                            Update::Inserted | Update::Refreshed => Some(Event::Beat {
+                                pid: frame.pid,
+                                status: frame.status,
+                                payload: frame.payload,
+                                nonce: frame.nonce,
+                            }),
                             Update::OutOfOrder | Update::CapacityExceeded => None,
                         }
                     }

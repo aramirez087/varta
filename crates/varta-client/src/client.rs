@@ -6,7 +6,7 @@ use std::os::unix::net::UnixDatagram;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use varta_vlp::{Frame, Status, MAGIC, NONCE_TERMINAL, VERSION};
+use varta_vlp::{Frame, Status, NONCE_TERMINAL};
 
 /// Linux value of `ENOBUFS` from `<asm-generic/errno.h>`. Hard-coded to
 /// preserve the zero-dependency invariant; do not replace with `libc`.
@@ -166,15 +166,7 @@ impl Varta {
     pub fn beat(&mut self, status: Status, payload: u64) -> BeatOutcome {
         self.nonce = self.nonce.saturating_add(1).min(NONCE_TERMINAL - 1);
         let timestamp = self.start.elapsed().as_nanos() as u64;
-        let frame = Frame {
-            magic: MAGIC,
-            version: VERSION,
-            status: status as u8,
-            pid: self.pid,
-            timestamp,
-            nonce: self.nonce,
-            payload,
-        };
+        let frame = Frame::new(status, self.pid, timestamp, self.nonce, payload);
         frame.encode(&mut self.buf);
         let outcome = self.send_frame();
         match &outcome {
