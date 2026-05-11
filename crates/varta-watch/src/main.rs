@@ -101,7 +101,14 @@ fn run(cfg: Config) -> std::io::Result<()> {
         None => None,
     };
     let mut prom_export: Option<PromExporter> = match cfg.prom_addr {
-        Some(addr) => Some(PromExporter::bind(addr)?),
+        Some(addr) => {
+            let pe = PromExporter::bind(addr)?;
+            if let Ok(bound_addr) = pe.local_addr() {
+                let line = format!("{bound_addr}\n");
+                let _ = std::io::stdout().lock().write_all(line.as_bytes());
+            }
+            Some(pe)
+        }
         None => None,
     };
 

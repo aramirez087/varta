@@ -238,6 +238,11 @@ impl Observer {
     }
 
     /// Whether the stall queue has unconsumed [`Event::Stall`] entries.
+    ///
+    /// Callers should check this before [`Observer::poll`] to ensure
+    /// previously-queued stalls are drained first via
+    /// [`Observer::poll_pending`].  When `true`, the next
+    /// [`Observer::poll_pending`] call is guaranteed to return `Some`.
     pub fn has_pending_stalls(&self) -> bool {
         self.stall_cursor < self.stall_queue.len()
     }

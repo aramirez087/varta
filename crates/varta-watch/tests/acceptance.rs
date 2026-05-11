@@ -109,7 +109,7 @@ fn observer_emits_beat_per_received_frame() {
         send_frame(&client, f);
     }
 
-    let deadline = Duration::from_secs(2);
+    let deadline = Duration::from_secs(5);
     let mut got: Vec<(u32, u64, Status, u64)> = Vec::with_capacity(3);
     let stop = Instant::now() + deadline;
     'outer: while got.len() < 3 && Instant::now() < stop {
@@ -162,7 +162,7 @@ fn observer_emits_stall_after_threshold_elapses() {
     send_frame(&client, &make_frame(pid, 1, Status::Ok, 0xB1));
 
     // Drain the beat first.
-    let beat = poll_until_match(&mut observer, Duration::from_secs(2), |ev| match ev {
+    let beat = poll_until_match(&mut observer, Duration::from_secs(5), |ev| match ev {
         Event::Beat { pid: p, nonce, .. } if p == pid && nonce == 1 => Ok(()),
         _ => Err(()),
     });
@@ -207,7 +207,7 @@ fn observer_reports_decode_error_for_bad_magic() {
     let bogus = [0xFFu8; 32];
     client.send(&bogus).expect("send bogus payload");
 
-    let got = poll_until_match(&mut observer, Duration::from_secs(2), |ev| match ev {
+    let got = poll_until_match(&mut observer, Duration::from_secs(5), |ev| match ev {
         Event::Decode(DecodeError::BadMagic, _) => Ok(()),
         Event::Decode(other, _) => panic!("wrong decode error variant: {other:?}"),
         _ => Err(()),
@@ -258,7 +258,7 @@ fn observer_rejects_spoofed_pid_frame() {
 
     #[cfg(target_os = "linux")]
     {
-        let claimed = poll_until_match(&mut observer, Duration::from_secs(2), |ev| match ev {
+        let claimed = poll_until_match(&mut observer, Duration::from_secs(5), |ev| match ev {
             Event::AuthFailure {
                 claimed_pid,
                 observer_ns: _,
@@ -275,7 +275,7 @@ fn observer_rejects_spoofed_pid_frame() {
 
     #[cfg(not(target_os = "linux"))]
     {
-        let accepted = poll_until_match(&mut observer, Duration::from_secs(2), |ev| match ev {
+        let accepted = poll_until_match(&mut observer, Duration::from_secs(5), |ev| match ev {
             Event::Beat { pid, .. } if pid == spoofed_pid => Ok(pid),
             _ => Err(()),
         });

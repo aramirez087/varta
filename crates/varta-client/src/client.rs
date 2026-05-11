@@ -25,6 +25,20 @@ const ENOBUFS: i32 = 105;
 ))]
 const ENOBUFS: i32 = 55;
 
+/// Catch-all for unlisted Unix targets (Solaris/illumos, etc.).
+/// Cross-compilation to an unsupported target silently uses the wrong
+/// value; fail at compile time instead.
+#[cfg(not(any(
+    target_os = "linux",
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    target_os = "dragonfly",
+)))]
+compile_error!("ENOBUFS value is unknown for this target — add it to the cfg gates above");
+
 /// Classify a `send(2)` error into a [`BeatOutcome`].
 ///
 /// Checks the raw OS error code before the `ErrorKind` match so that
@@ -189,12 +203,22 @@ impl Varta {
         let outcome = self.send_frame();
         match &outcome {
             BeatOutcome::Dropped => {
-                self.consecutive_dropped += 1;
+                self.consecutive_dropped = self.consecutive_dropped.saturating_add(1);
                 if self.reconnect_after > 0
                     && self.consecutive_dropped >= self.reconnect_after
                     && self.reconnect().is_ok()
                 {
-                    return self.send_frame();
+                    let retry = self.send_frame();
+                    if matches!(&retry, BeatOutcome::Dropped) {
+                        // Reconnect succeeded at the OS level but the retry
+                        // still dropped — keep the counter at reconnect_after
+                        // to avoid reconnecting on every single beat when the
+                        // observer is unreachable.
+                        self.consecutive_dropped = self.reconnect_after;
+                    } else {
+                        self.consecutive_dropped = 0;
+                    }
+                    return retry;
                 }
                 outcome
             }
@@ -216,13 +240,13 @@ impl Varta {
     ///
     /// This is the only post-[`connect`](Self::connect) allocation site and
     /// should only be called when recovery is needed, not on the steady-state
-    /// beat path.
+    /// beat path.  Callers own the responsibility to reset
+    /// `consecutive_dropped` after a successful beat.
     pub fn reconnect(&mut self) -> io::Result<()> {
         let sock = UnixDatagram::unbound()?;
         sock.connect(&self.path)?;
         sock.set_nonblocking(true)?;
         self.sock = sock;
-        self.consecutive_dropped = 0;
         Ok(())
     }
 

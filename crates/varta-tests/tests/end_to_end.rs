@@ -12,9 +12,12 @@
 
 #![deny(missing_docs, unsafe_op_in_unsafe_fn, rust_2018_idioms)]
 #![forbid(clippy::dbg_macro, clippy::print_stdout)]
+// clippy::print_stdout bans println! but allows eprintln!.  The custom test
+// runner (harness = false) below uses eprintln! for test status output,
+// which is correct: harness = false tests report results to stderr.
 
-use std::io::{Read, Write};
-use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::io::{BufRead, Read, Write};
+use std::net::{SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitCode, Stdio};
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -86,10 +89,9 @@ fn client_to_observer_to_recovery_full_loop() {
     let tmp = TempDir::new("loop");
     let socket = tmp.path().join("varta.sock");
     let marker = tmp.path().join("recovered.marker");
-    let prom_addr = probe_port();
     let recovery_cmd = format!("touch {}", marker.display());
 
-    let mut child = spawn_watch(&[
+    let (mut child, prom_addr) = spawn_watch(&[
         "--socket",
         socket.to_str().unwrap(),
         "--threshold-ms",
@@ -99,7 +101,7 @@ fn client_to_observer_to_recovery_full_loop() {
         "--recovery-debounce-ms",
         "1000",
         "--prom-addr",
-        &prom_addr.to_string(),
+        "127.0.0.1:0",
         "--shutdown-after-secs",
         "10",
     ]);
@@ -182,15 +184,14 @@ fn client_to_observer_to_recovery_full_loop() {
 fn panic_handler_critical_beat_visible_in_metrics() {
     let tmp = TempDir::new("panic");
     let socket = tmp.path().join("varta.sock");
-    let prom_addr = probe_port();
 
-    let mut watch_child = spawn_watch(&[
+    let (mut watch_child, prom_addr) = spawn_watch(&[
         "--socket",
         socket.to_str().unwrap(),
         "--threshold-ms",
         "5000",
         "--prom-addr",
-        &prom_addr.to_string(),
+        "127.0.0.1:0",
         "--shutdown-after-secs",
         "10",
     ]);
@@ -260,6 +261,11 @@ fn panic_handler_critical_beat_visible_in_metrics() {
 /// `VARTA_E2E_PANIC_CHILD=<socket>`. Installs the panic hook, beats once
 /// so a pid label exists, then panics so the hook fires the Critical
 /// frame.
+///
+/// This function must never write to stdout/stderr — the parent process
+/// spawns the child with both streams set to `Stdio::null()`, and any
+/// output would be silently discarded (or leak to a shared terminal if
+/// the null redirection were removed).
 fn run_panic_child(socket_path: &str) {
     install_panic_handler(PathBuf::from(socket_path));
     let mut agent = Varta::connect(socket_path).expect("panic child: connect");
@@ -311,14 +317,25 @@ impl Drop for ChildGuard<'_> {
     }
 }
 
-fn spawn_watch(args: &[&str]) -> Child {
+fn spawn_watch(args: &[&str]) -> (Child, SocketAddr) {
     let exe = locate_watch_binary();
-    Command::new(&exe)
+    let mut child = Command::new(&exe)
         .args(args)
-        .stdout(Stdio::null())
+        .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
-        .unwrap_or_else(|e| panic!("spawn {}: {e}", exe.display()))
+        .unwrap_or_else(|e| panic!("spawn {}: {e}", exe.display()));
+    let stdout = child.stdout.take().expect("stdout was piped");
+    let mut reader = std::io::BufReader::new(stdout);
+    let mut line = String::new();
+    reader
+        .read_line(&mut line)
+        .expect("read prom addr from daemon stdout");
+    let addr = line
+        .trim()
+        .parse::<SocketAddr>()
+        .unwrap_or_else(|_| panic!("parse prom addr from daemon: {line:?}"));
+    (child, addr)
 }
 
 /// Resolve `target/<profile>/varta-watch` relative to the running test
@@ -347,16 +364,6 @@ fn locate_watch_binary() -> PathBuf {
          (e.g. `cargo build --workspace`)",
         direct.display()
     );
-}
-
-/// Bind a fresh ephemeral port, capture its address, then drop the
-/// listener so the daemon can take it. Tiny TOCTOU window on a non-
-/// hostile test host — documented in the session handoff.
-fn probe_port() -> SocketAddr {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("probe bind");
-    let addr = listener.local_addr().expect("local_addr");
-    drop(listener);
-    addr
 }
 
 fn wait_until<F: FnMut() -> bool>(mut f: F, timeout: Duration) -> bool {
