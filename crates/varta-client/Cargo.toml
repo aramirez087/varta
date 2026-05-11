@@ -15,6 +15,7 @@ panic-handler = []
 
 [dependencies.varta-vlp]
 path = "../varta-vlp"
+version = "0.1.0"
 
 [[example]]
 name = "basic"

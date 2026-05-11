@@ -11,6 +11,7 @@ repository = "https://github.com/aramirez087/Varta"
 
 [dependencies.varta-vlp]
 path = "../varta-vlp"
+version = "0.1.0"
 
 [lib]
 path = "src/lib.rs"
