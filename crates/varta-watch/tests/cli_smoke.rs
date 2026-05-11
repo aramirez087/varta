@@ -8,7 +8,7 @@
 //! tests below for the new `--recovery-timeout-ms` flag. Session 03
 //! turns them green.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::Command;
 use std::sync::atomic::{AtomicU32, Ordering};
 

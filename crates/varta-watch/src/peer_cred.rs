@@ -129,8 +129,8 @@ mod plat {
     /// Extract peer PID after a successful `recvmsg` — on Linux this is
     /// done via ancillary-data parsing.
     pub(super) fn peer_pid_after_recv(_fd: i32, mhdr: &Msghdr, anc_base: *const u8) -> Option<u32> {
-        let hdr = unsafe { cmsg_firsthdr(mhdr) };
-        unsafe { find_credential_pid(hdr, mhdr, anc_base) }
+        let hdr = unsafe { super::cmsg_firsthdr(mhdr) };
+        unsafe { super::find_credential_pid(hdr, mhdr, anc_base) }
     }
 
     // Compile-time invariant: glibc/Linux msghdr is 56 bytes on every 64-bit
