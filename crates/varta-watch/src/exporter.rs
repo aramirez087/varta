@@ -160,6 +160,12 @@ impl GaugeRow {
 const PROM_READ_DEADLINE: Duration = Duration::from_millis(10);
 /// Per-connection write timeout for the metrics response body.
 const PROM_WRITE_TIMEOUT: Duration = Duration::from_millis(50);
+/// Maximum connections accepted per [`PromExporter::serve_pending`] call.
+/// Caps the amount of work done before returning control to the observer
+/// loop so that stall detection, I/O polling, and reaping are not starved
+/// under a storm of slow scrapers. The 100 ms serve deadline still applies
+/// as an additional guard.
+const PROM_MAX_CONNECTIONS_PER_SERVE: usize = 8;
 /// Cap on how many bytes [`PromExporter::serve_pending`] reads from a
 /// single request before responding (we discard the request line/headers).
 const PROM_REQUEST_CAP: usize = 4096;
@@ -216,20 +222,30 @@ impl PromExporter {
         self.capacity_exceeded_total = self.capacity_exceeded_total.saturating_add(count);
     }
 
-    /// Accept every connection currently ready on the listener and write a
-    /// metrics response back. Returns `Ok(())` when the accept queue
+    /// Accept ready connections on the listener and write a metrics
+    /// response back to each. Returns `Ok(())` when the accept queue
     /// drains cleanly; returns the first non-`WouldBlock` error otherwise.
     ///
-    /// Total service time per call is bounded to avoid starving the
-    /// observer poll loop under a storm of slow scrapers.
+    /// Service budget per call is bounded by two limits (whichever hits
+    /// first): a 100 ms wall-clock deadline and
+    /// [`PROM_MAX_CONNECTIONS_PER_SERVE`] accepted connections. Both
+    /// exist to prevent a storm of slow scrapers from starving the
+    /// observer poll loop (stall detection, I/O polling, reaping).
     pub fn serve_pending(&mut self) -> io::Result<()> {
         let serve_deadline = Instant::now() + Duration::from_millis(100);
+        let mut served = 0;
         loop {
             if Instant::now() >= serve_deadline {
                 return Ok(());
             }
+            if served >= PROM_MAX_CONNECTIONS_PER_SERVE {
+                return Ok(());
+            }
             match self.listener.accept() {
-                Ok((stream, _)) => self.serve_one(stream)?,
+                Ok((stream, _)) => {
+                    self.serve_one(stream)?;
+                    served += 1;
+                }
                 Err(e) if e.kind() == ErrorKind::WouldBlock => return Ok(()),
                 Err(e) => return Err(e),
             }
@@ -418,8 +434,10 @@ fn contains_subsequence(haystack: &[u8], needle: &[u8]) -> bool {
 /// whether the full buffer was written or the deadline expired; the caller
 /// is responsible for deciding whether a short write is an error.
 ///
-/// On `WouldBlock` the loop hints the CPU with [`std::hint::spin_loop`] so
-/// a full peer recv buffer doesn't burn a core for the entire deadline.
+/// On `WouldBlock` the loop yields the thread to the OS scheduler rather
+/// than busy-spinning.  Spinning for the full write deadline (up to
+/// [`PROM_WRITE_TIMEOUT`]) would burn a core with zero progress on
+/// stall detection or I/O in the single-threaded observer loop.
 fn write_all_nonblocking(stream: &mut TcpStream, buf: &[u8], deadline: Instant) -> io::Result<()> {
     let mut written = 0;
     while written < buf.len() {
@@ -430,7 +448,7 @@ fn write_all_nonblocking(stream: &mut TcpStream, buf: &[u8], deadline: Instant) 
             Ok(0) => break,
             Ok(n) => written += n,
             Err(e) if e.kind() == ErrorKind::WouldBlock => {
-                std::hint::spin_loop();
+                std::thread::yield_now();
                 continue;
             }
             Err(e) => return Err(e),
