@@ -98,6 +98,10 @@ impl Recovery {
     pub fn on_stall(&mut self, pid: u32) -> RecoveryOutcome {
         let now = Instant::now();
 
+        let prune_threshold = self.debounce.saturating_mul(10);
+        self.last_fired
+            .retain(|_, &mut fired_at| now.duration_since(fired_at) < prune_threshold);
+
         if let Some(prev) = self.last_fired.get(&pid) {
             if now.duration_since(*prev) < self.debounce {
                 return RecoveryOutcome::Debounced;
@@ -352,5 +356,19 @@ mod tests {
             Duration::ZERO,
             Some(Duration::from_millis(50)),
         );
+    }
+
+    #[test]
+    fn last_fired_hashmap_is_pruned_after_debounce_times_ten() {
+        let debounce = Duration::from_millis(10);
+        let mut rec = Recovery::new("true".to_string(), debounce);
+
+        assert!(matches!(rec.on_stall(1), RecoveryOutcome::Spawned { .. }));
+        assert!(matches!(rec.on_stall(1), RecoveryOutcome::Debounced));
+
+        let prune_threshold = debounce.saturating_mul(10);
+        std::thread::sleep(prune_threshold + Duration::from_millis(40));
+
+        assert!(matches!(rec.on_stall(1), RecoveryOutcome::Spawned { .. }));
     }
 }

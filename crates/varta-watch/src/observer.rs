@@ -38,6 +38,9 @@ pub enum Event {
         payload: u64,
         /// Monotonic nonce of the beat.
         nonce: u64,
+        /// Observer-local timestamp (ns since [`Observer`] start) when this
+        /// event was produced.
+        observer_ns: u64,
     },
     /// A tracked pid has not beaten within the configured threshold and the
     /// observer has not yet surfaced a stall event for this silence run.
@@ -49,19 +52,25 @@ pub enum Event {
         /// Observer-local timestamp (ns since [`Observer`] start) of the
         /// last accepted beat for this pid.
         last_ns: u64,
+        /// Observer-local timestamp (ns since [`Observer`] start) when this
+        /// stall event was produced.
+        observer_ns: u64,
     },
     /// A 32-byte payload arrived but failed VLP decoding.
-    Decode(DecodeError),
+    Decode(DecodeError, u64),
     /// Frame decoded but the `frame.pid` does not match the kernel-verified
     /// peer PID of the sender. The claimed pid is preserved so exporters can
     /// record what the frame *claimed* to be.
     AuthFailure {
         /// The pid the frame on the wire claimed to be.
         claimed_pid: u32,
+        /// Observer-local timestamp (ns since [`Observer`] start) when this
+        /// event was produced.
+        observer_ns: u64,
     },
     /// Receiving from the socket failed with an error other than
     /// `WouldBlock` / `TimedOut`.
-    Io(io::Error),
+    Io(io::Error, u64),
 }
 
 /// Observer process bound to a Unix Domain Socket.
@@ -176,6 +185,7 @@ impl Observer {
                         if frame.pid != peer_pid {
                             return Some(Event::AuthFailure {
                                 claimed_pid: frame.pid,
+                                observer_ns: now_ns,
                             });
                         }
                         let _ = peer_pid; // silence unused on macOS
@@ -185,11 +195,12 @@ impl Observer {
                                 status: frame.status,
                                 payload: frame.payload,
                                 nonce: frame.nonce,
+                                observer_ns: now_ns,
                             }),
                             Update::OutOfOrder | Update::CapacityExceeded => None,
                         }
                     }
-                    Err(e) => Some(Event::Decode(e)),
+                    Err(e) => Some(Event::Decode(e, now_ns)),
                 }
             }
             RecvResult::WouldBlock => {
@@ -202,7 +213,7 @@ impl Observer {
                 None
             }
             RecvResult::ShortRead => None,
-            RecvResult::IoError(e) => Some(Event::Io(e)),
+            RecvResult::IoError(e) => Some(Event::Io(e, self.now_ns())),
         }
     }
 
@@ -229,6 +240,7 @@ impl Observer {
                 pid,
                 last_nonce,
                 last_ns,
+                observer_ns: now_ns,
             }));
             self.tracker.mark_stall_emitted(pid);
         }
@@ -238,6 +250,12 @@ impl Observer {
     /// reclaimed since the last call.
     pub fn drain_evictions(&mut self) -> u64 {
         self.tracker.take_evictions()
+    }
+
+    /// Drain and reset the capacity-exceeded counter. Returns the number
+    /// of beats dropped due to a full tracker since the last call.
+    pub fn drain_capacity_exceeded(&mut self) -> u64 {
+        self.tracker.take_capacity_exceeded()
     }
 
     fn finish_bind(sock: UnixDatagram, threshold: Duration, path: PathBuf) -> io::Result<Self> {

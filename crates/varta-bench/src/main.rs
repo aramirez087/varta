@@ -16,7 +16,6 @@
 //! - `binary-size`     — `bench_binary_size_delta_under_twenty_kilobytes`
 //!   (linking `varta-client` adds < 20 KB to a stripped release binary).
 
-use std::ffi::c_int;
 use std::fs;
 use std::mem::MaybeUninit;
 use std::os::unix::net::UnixDatagram;
@@ -120,9 +119,9 @@ fn run_latency() -> ExitCode {
     let _ = drainer.join();
 
     lats.sort_unstable();
-    let p50 = percentile_of(&lats, 50, 100);
-    let p99 = percentile_of(&lats, 99, 100);
-    let p999 = percentile_of(&lats, 999, 1000);
+    let p50 = percentile_pm(&lats, 500);
+    let p99 = percentile_pm(&lats, 990);
+    let p999 = percentile_pm(&lats, 999);
 
     eprintln!(
         "latency: iters={ITERS} p50={p50}ns p99={p99}ns p99.9={p999}ns threshold={}ns",
@@ -141,9 +140,9 @@ fn run_latency() -> ExitCode {
     }
 }
 
-fn percentile_of(sorted: &[u64], numerator: usize, denominator: usize) -> u64 {
+fn percentile_pm(sorted: &[u64], per_mille: usize) -> u64 {
     let n = sorted.len();
-    let idx = n.saturating_mul(numerator) / denominator;
+    let idx = n.saturating_mul(per_mille) / 1000;
     sorted[idx.min(n - 1)]
 }
 
@@ -321,54 +320,20 @@ fn wait_for_path(p: &Path, budget: Duration) -> bool {
 
 // --- getrusage(RUSAGE_CHILDREN) ---------------------------------------------
 
-#[repr(C)]
-#[derive(Clone, Copy, Default)]
-struct Timeval {
-    tv_sec: i64,
-    tv_usec: i64,
-}
-
-/// `struct rusage` on Linux and macOS both have `ru_utime` / `ru_stime` as
-/// the leading two fields, followed by 14 `i64`-shaped counters. We reserve
-/// 144 bytes of trailing padding to cover the larger of the two ABIs and
-/// only read the leading timeval fields.
-#[repr(C)]
-struct Rusage {
-    ru_utime: Timeval,
-    ru_stime: Timeval,
-    _padding: [u8; 144],
-}
-
-const RUSAGE_CHILDREN: c_int = -1;
-
-extern "C" {
-    fn getrusage(who: c_int, usage: *mut Rusage) -> c_int;
-}
-
-fn rusage_children() -> Rusage {
-    let mut r = MaybeUninit::<Rusage>::zeroed();
-    // SAFETY: getrusage(2) writes a fully-initialised `struct rusage` into
-    // the supplied pointer when it returns 0. We pass an exclusive pointer
-    // to a fresh MaybeUninit<Rusage> stack slot whose lifetime extends
-    // past the call, RUSAGE_CHILDREN (-1) is a valid `who` value on Linux
-    // and macOS, and we panic if the syscall fails so the assume_init
-    // path never reads uninitialised memory.
-    let rc = unsafe { getrusage(RUSAGE_CHILDREN, r.as_mut_ptr()) };
+fn rusage_children() -> libc::rusage {
+    let mut r = MaybeUninit::<libc::rusage>::zeroed();
+    let rc = unsafe { libc::getrusage(libc::RUSAGE_CHILDREN, r.as_mut_ptr()) };
     assert_eq!(rc, 0, "getrusage(RUSAGE_CHILDREN) failed");
-    // SAFETY: rc == 0 above, so the kernel has fully initialised the
-    // leading fields of `struct rusage`. The trailing padding was
-    // zero-initialised by `MaybeUninit::zeroed`, so the whole struct is
-    // valid for read.
     unsafe { r.assume_init() }
 }
 
-fn rusage_delta_ns(start: &Rusage, end: &Rusage) -> u64 {
+fn rusage_delta_ns(start: &libc::rusage, end: &libc::rusage) -> u64 {
     let delta_user = timeval_ns(&end.ru_utime).saturating_sub(timeval_ns(&start.ru_utime));
     let delta_sys = timeval_ns(&end.ru_stime).saturating_sub(timeval_ns(&start.ru_stime));
     delta_user.saturating_add(delta_sys)
 }
 
-fn timeval_ns(tv: &Timeval) -> u64 {
+fn timeval_ns(tv: &libc::timeval) -> u64 {
     let secs = tv.tv_sec.max(0) as u64;
     let usecs = tv.tv_usec.max(0) as u64;
     secs.saturating_mul(1_000_000_000)

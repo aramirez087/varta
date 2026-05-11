@@ -43,13 +43,11 @@ pub trait Exporter {
 /// `mismatch` events the pid / nonce / status / payload columns are written
 /// as `-` so the line count and column count remain stable.
 ///
-/// `observer_ns` is the elapsed nanoseconds since this exporter was
-/// created, captured at `record()` time. The `Event` enum carries no
-/// per-event timestamp, so each exporter snapshots its own monotonic
-/// clock — values are comparable within a single observer process.
+/// `observer_ns` is the observer-local nanosecond timestamp carried by every
+/// [`Event`], captured at observer poll time. All exporters sharing an event
+/// stream see the same timestamps.
 pub struct FileExporter {
     sink: BufWriter<File>,
-    start: Instant,
     pending_err: Option<io::Error>,
 }
 
@@ -63,13 +61,8 @@ impl FileExporter {
             .open(path.as_ref())?;
         Ok(FileExporter {
             sink: BufWriter::new(file),
-            start: Instant::now(),
             pending_err: None,
         })
-    }
-
-    fn elapsed_ns(&self) -> u128 {
-        self.start.elapsed().as_nanos()
     }
 }
 
@@ -78,26 +71,34 @@ impl Exporter for FileExporter {
         if self.pending_err.is_some() {
             return;
         }
-        let ns = self.elapsed_ns();
         let line = match ev {
             Event::Beat {
                 pid,
                 status,
                 payload,
                 nonce,
+                observer_ns,
             } => format!(
-                "{ns}\tbeat\t{pid}\t{nonce}\t{status}\t{payload}\n",
+                "{observer_ns}\tbeat\t{pid}\t{nonce}\t{status}\t{payload}\n",
                 status = status_label(*status),
             ),
             Event::Stall {
                 pid,
                 last_nonce,
                 last_ns: _,
-            } => format!("{ns}\tstall\t{pid}\t{last_nonce}\tstall\t-\n"),
-            Event::Decode(err) => format!("{ns}\tdecode\t-\t-\t-\t{err:?}\n"),
-            Event::Io(err) => format!("{ns}\tio\t-\t-\t-\t{err}\n"),
-            Event::AuthFailure { claimed_pid } => {
-                format!("{ns}\tmismatch\t{claimed_pid}\t-\t-\tauth_failure\n")
+                observer_ns,
+            } => format!("{observer_ns}\tstall\t{pid}\t{last_nonce}\tstall\t-\n"),
+            Event::Decode(err, observer_ns) => {
+                format!("{observer_ns}\tdecode\t-\t-\t-\t{err:?}\n")
+            }
+            Event::Io(err, observer_ns) => {
+                format!("{observer_ns}\tio\t-\t-\t-\t{err}\n")
+            }
+            Event::AuthFailure {
+                claimed_pid,
+                observer_ns,
+            } => {
+                format!("{observer_ns}\tmismatch\t{claimed_pid}\t-\t-\tauth_failure\n")
             }
         };
         if let Err(e) = self.sink.write_all(line.as_bytes()) {
@@ -170,6 +171,9 @@ pub struct PromExporter {
     rows: HashMap<u32, GaugeRow>,
     evicted_total: u64,
     auth_failures_total: u64,
+    decode_errors_total: u64,
+    io_errors_total: u64,
+    capacity_exceeded_total: u64,
 }
 
 impl PromExporter {
@@ -182,6 +186,9 @@ impl PromExporter {
             rows: HashMap::new(),
             evicted_total: 0,
             auth_failures_total: 0,
+            decode_errors_total: 0,
+            io_errors_total: 0,
+            capacity_exceeded_total: 0,
         })
     }
 
@@ -196,11 +203,23 @@ impl PromExporter {
         self.evicted_total = self.evicted_total.saturating_add(count);
     }
 
+    /// Record one or more beats dropped due to tracker capacity exceeded.
+    pub fn record_capacity_exceeded(&mut self, count: u64) {
+        self.capacity_exceeded_total = self.capacity_exceeded_total.saturating_add(count);
+    }
+
     /// Accept every connection currently ready on the listener and write a
     /// metrics response back. Returns `Ok(())` when the accept queue
     /// drains cleanly; returns the first non-`WouldBlock` error otherwise.
+    ///
+    /// Total service time per call is bounded to avoid starving the
+    /// observer poll loop under a storm of slow scrapers.
     pub fn serve_pending(&mut self) -> io::Result<()> {
+        let serve_deadline = Instant::now() + Duration::from_millis(100);
         loop {
+            if Instant::now() >= serve_deadline {
+                return Ok(());
+            }
             match self.listener.accept() {
                 Ok((stream, _)) => self.serve_one(stream)?,
                 Err(e) if e.kind() == ErrorKind::WouldBlock => return Ok(()),
@@ -210,10 +229,6 @@ impl PromExporter {
     }
 
     fn serve_one(&self, mut stream: TcpStream) -> io::Result<()> {
-        // Stream is already non-blocking (inherited from the listener).
-        // A short write timeout bounds the response phase.
-        stream.set_write_timeout(Some(PROM_WRITE_TIMEOUT))?;
-
         let deadline = Instant::now() + PROM_READ_DEADLINE;
         let mut buf = [0u8; 512];
         let mut total = 0;
@@ -244,10 +259,22 @@ impl PromExporter {
              \r\n\
              {body}",
             len = body.len(),
-            body = body,
         );
-        stream.write_all(response.as_bytes())?;
-        stream.shutdown(Shutdown::Both)?;
+        let buf = response.as_bytes();
+        let mut written = 0;
+        let write_deadline = Instant::now() + PROM_WRITE_TIMEOUT;
+        while written < buf.len() {
+            if Instant::now() >= write_deadline {
+                break;
+            }
+            match stream.write(&buf[written..]) {
+                Ok(0) => break,
+                Ok(n) => written += n,
+                Err(e) if e.kind() == ErrorKind::WouldBlock => continue,
+                Err(e) => return Err(e),
+            }
+        }
+        let _ = stream.shutdown(Shutdown::Both);
         Ok(())
     }
 
@@ -301,6 +328,25 @@ impl PromExporter {
             "varta_frame_auth_failures_total {}",
             self.auth_failures_total
         );
+        out.push_str("# HELP varta_decode_errors_total Total VLP decode failures.\n");
+        out.push_str("# TYPE varta_decode_errors_total counter\n");
+        let _ = writeln!(
+            out,
+            "varta_decode_errors_total {}",
+            self.decode_errors_total
+        );
+        out.push_str("# HELP varta_io_errors_total Total socket receive errors.\n");
+        out.push_str("# TYPE varta_io_errors_total counter\n");
+        let _ = writeln!(out, "varta_io_errors_total {}", self.io_errors_total);
+        if self.capacity_exceeded_total > 0 {
+            out.push_str("# HELP varta_tracker_capacity_exceeded_total Total beats dropped because tracker is full.\n");
+            out.push_str("# TYPE varta_tracker_capacity_exceeded_total counter\n");
+            let _ = writeln!(
+                out,
+                "varta_tracker_capacity_exceeded_total {}",
+                self.capacity_exceeded_total
+            );
+        }
         out
     }
 }
@@ -308,25 +354,39 @@ impl PromExporter {
 impl Exporter for PromExporter {
     fn record(&mut self, ev: &Event) {
         match ev {
-            Event::Beat { pid, status, .. } => {
+            Event::Beat {
+                pid,
+                status,
+                observer_ns: _,
+                ..
+            } => {
                 let row = self.rows.entry(*pid).or_insert_with(GaugeRow::new);
                 row.beats_total = row.beats_total.saturating_add(1);
                 row.last_status = Some(status_code(*status));
             }
-            Event::Stall { pid, .. } => {
+            Event::Stall {
+                pid,
+                observer_ns: _,
+                ..
+            } => {
                 let row = self.rows.entry(*pid).or_insert_with(GaugeRow::new);
                 row.stalls_total = row.stalls_total.saturating_add(1);
                 row.last_status = Some(status_code(Status::Stall));
             }
-            Event::AuthFailure { .. } => {
+            Event::AuthFailure { observer_ns: _, .. } => {
                 self.auth_failures_total = self.auth_failures_total.saturating_add(1);
             }
-            Event::Decode(_) | Event::Io(_) => {}
+            Event::Decode(_, _) => {
+                self.decode_errors_total = self.decode_errors_total.saturating_add(1);
+            }
+            Event::Io(_, _) => {
+                self.io_errors_total = self.io_errors_total.saturating_add(1);
+            }
         }
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        self.serve_pending()
+        Ok(())
     }
 }
 
@@ -349,18 +409,21 @@ mod tests {
             status: Status::Ok,
             nonce: 1,
             payload: 0,
+            observer_ns: 0,
         });
         prom.record(&Event::Beat {
             pid: 2,
             status: Status::Ok,
             nonce: 1,
             payload: 0,
+            observer_ns: 0,
         });
         prom.record(&Event::Beat {
             pid: 11,
             status: Status::Ok,
             nonce: 1,
             payload: 0,
+            observer_ns: 0,
         });
         let body = prom.render_body();
         let pos2 = body.find("pid=\"2\"").expect("pid 2");
@@ -372,8 +435,8 @@ mod tests {
     #[test]
     fn decode_and_io_events_do_not_create_rows() {
         let mut prom = PromExporter::bind("127.0.0.1:0".parse().unwrap()).expect("bind");
-        prom.record(&Event::Decode(varta_vlp::DecodeError::BadMagic));
-        prom.record(&Event::Io(io::Error::other("x")));
+        prom.record(&Event::Decode(varta_vlp::DecodeError::BadMagic, 0));
+        prom.record(&Event::Io(io::Error::other("x"), 0));
         assert!(prom.rows.is_empty());
     }
 }

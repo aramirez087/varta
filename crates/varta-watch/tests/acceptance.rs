@@ -107,11 +107,14 @@ fn observer_emits_beat_per_received_frame() {
                     nonce,
                     status,
                     payload,
+                    observer_ns: _,
                 } => got.push((pid, nonce, status, payload)),
-                Event::Decode(e) => panic!("unexpected decode error: {e}"),
-                Event::Io(e) => panic!("unexpected io error: {e}"),
+                Event::Decode(e, _) => panic!("unexpected decode error: {e}"),
+                Event::Io(e, _) => panic!("unexpected io error: {e}"),
                 Event::Stall { .. } => panic!("unexpected stall during beat test"),
-                Event::AuthFailure { .. } => panic!("unexpected auth failure during beat test"),
+                Event::AuthFailure { .. } => {
+                    panic!("unexpected auth failure during beat test")
+                }
             }
         } else {
             thread::sleep(Duration::from_millis(1));
@@ -176,8 +179,8 @@ fn observer_reports_decode_error_for_bad_magic() {
     client.send(&bogus).expect("send bogus payload");
 
     let got = poll_until_match(&mut observer, Duration::from_secs(2), |ev| match ev {
-        Event::Decode(DecodeError::BadMagic) => Ok(()),
-        Event::Decode(other) => panic!("wrong decode error variant: {other:?}"),
+        Event::Decode(DecodeError::BadMagic, _) => Ok(()),
+        Event::Decode(other, _) => panic!("wrong decode error variant: {other:?}"),
         _ => Err(()),
     });
     assert!(got.is_some(), "expected Event::Decode(BadMagic)");
@@ -222,7 +225,10 @@ fn observer_rejects_spoofed_pid_frame() {
     #[cfg(target_os = "linux")]
     {
         let claimed = poll_until_match(&mut observer, Duration::from_secs(2), |ev| match ev {
-            Event::AuthFailure { claimed_pid } => Ok(claimed_pid),
+            Event::AuthFailure {
+                claimed_pid,
+                observer_ns: _,
+            } => Ok(claimed_pid),
             Event::Stall { .. } => Err(()),
             _ => Err(()),
         });

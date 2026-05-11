@@ -81,6 +81,7 @@ fn prom_exporter_reports_beats_total_per_pid() {
             status: Status::Ok,
             payload: 0,
             nonce: n,
+            observer_ns: 0,
         });
     }
     let body = http_get(&mut prom, addr, "/metrics");
@@ -99,11 +100,13 @@ fn prom_exporter_reports_stalls_total_per_pid() {
         status: Status::Ok,
         payload: 0,
         nonce: 1,
+        observer_ns: 0,
     });
     prom.record(&Event::Stall {
         pid: 9,
         last_nonce: 1,
         last_ns: 0,
+        observer_ns: 0,
     });
     let body = http_get(&mut prom, addr, "/metrics");
     assert!(
@@ -122,19 +125,22 @@ fn file_exporter_appends_one_line_per_event() {
             status: Status::Ok,
             payload: 0,
             nonce: 1,
+            observer_ns: 0,
         },
         Event::Beat {
             pid: 1,
             status: Status::Degraded,
             payload: 0,
             nonce: 2,
+            observer_ns: 0,
         },
         Event::Stall {
             pid: 1,
             last_nonce: 2,
             last_ns: 0,
+            observer_ns: 0,
         },
-        Event::Decode(DecodeError::BadMagic),
+        Event::Decode(DecodeError::BadMagic, 0),
     ];
     for ev in &events {
         fe.record(ev);

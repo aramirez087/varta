@@ -71,6 +71,7 @@ pub struct Tracker {
     entries: [Slot; CAPACITY],
     len: usize,
     evictions: u64,
+    capacity_exceeded: u64,
 }
 
 // Compile-time guard: the slot table must remain a fixed-size array. The
@@ -92,6 +93,7 @@ impl Tracker {
             entries: [Slot::EMPTY; CAPACITY],
             len: 0,
             evictions: 0,
+            capacity_exceeded: 0,
         }
     }
 
@@ -130,6 +132,7 @@ impl Tracker {
                 self.evictions = self.evictions.saturating_add(1);
                 return Update::Inserted;
             }
+            self.capacity_exceeded = self.capacity_exceeded.saturating_add(1);
             return Update::CapacityExceeded;
         }
         self.entries[self.len] = Slot {
@@ -165,6 +168,14 @@ impl Tracker {
     pub fn take_evictions(&mut self) -> u64 {
         let count = self.evictions;
         self.evictions = 0;
+        count
+    }
+
+    /// Take and reset the capacity-exceeded counter. Returns the number of
+    /// beats dropped due to a full tracker since the last call.
+    pub fn take_capacity_exceeded(&mut self) -> u64 {
+        let count = self.capacity_exceeded;
+        self.capacity_exceeded = 0;
         count
     }
 

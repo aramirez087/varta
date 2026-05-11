@@ -90,9 +90,11 @@ pub enum BeatOutcome {
 /// scratch buffer.
 ///
 /// `Varta::connect` is the single allocation point: it creates the socket,
-/// switches it to non-blocking mode, and captures process identity plus the
-/// epoch used for monotonic timestamps. Every subsequent `beat()` reuses the
-/// owned buffer and emits a frame without touching the heap.
+/// switches it to non-blocking mode, and captures the epoch used for
+/// monotonic timestamps. The process ID is fetched afresh via
+/// [`std::process::id`] on every [`beat`](Self::beat) so forked children
+/// report their own PID. Every subsequent `beat()` reuses the owned buffer
+/// and emits a frame without touching the heap.
 ///
 /// # Examples
 ///
@@ -105,7 +107,6 @@ pub enum BeatOutcome {
 pub struct Varta {
     sock: UnixDatagram,
     buf: [u8; 32],
-    pid: u32,
     start: Instant,
     nonce: u64,
     path: PathBuf,
@@ -133,7 +134,6 @@ impl Varta {
         Ok(Self {
             sock,
             buf: [0u8; 32],
-            pid: std::process::id(),
             start: Instant::now(),
             nonce: 0,
             path,
@@ -166,7 +166,7 @@ impl Varta {
     pub fn beat(&mut self, status: Status, payload: u64) -> BeatOutcome {
         self.nonce = self.nonce.saturating_add(1).min(NONCE_TERMINAL - 1);
         let timestamp = self.start.elapsed().as_nanos() as u64;
-        let frame = Frame::new(status, self.pid, timestamp, self.nonce, payload);
+        let frame = Frame::new(status, std::process::id(), timestamp, self.nonce, payload);
         frame.encode(&mut self.buf);
         let outcome = self.send_frame();
         match &outcome {

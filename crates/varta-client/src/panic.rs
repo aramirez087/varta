@@ -37,7 +37,6 @@ use varta_vlp::{Frame, Status, NONCE_TERMINAL};
 /// preserving the default panic message and any user-installed hooks.
 pub fn install(socket_path: impl Into<PathBuf>) {
     let path: PathBuf = socket_path.into();
-    let pid = std::process::id();
     let start = Instant::now();
     let prev = std::panic::take_hook();
     // The Box allocation happens here, at install time — not in the hot path.
@@ -48,7 +47,13 @@ pub fn install(socket_path: impl Into<PathBuf>) {
             let sock = UnixDatagram::unbound().ok()?;
             sock.connect(&path).ok()?;
             let timestamp = start.elapsed().as_nanos() as u64;
-            let frame = Frame::new(Status::Critical, pid, timestamp, NONCE_TERMINAL, 0);
+            let frame = Frame::new(
+                Status::Critical,
+                std::process::id(),
+                timestamp,
+                NONCE_TERMINAL,
+                0,
+            );
             let mut buf = [0u8; 32];
             frame.encode(&mut buf);
             sock.send(&buf).ok()

@@ -8,6 +8,7 @@ description = "Varta performance harness — owned by Session 06."
 [dependencies]
 varta-vlp = { path = "../varta-vlp" }
 varta-client = { path = "../varta-client" }
+libc = "0.2"
 
 [[bin]]
 name = "varta-bench"
