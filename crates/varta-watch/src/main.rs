@@ -6,13 +6,15 @@
 //! Parses argv into a [`Config`], binds an [`Observer`], optionally
 //! installs a [`Recovery`] runner and the file / Prometheus exporters,
 //! then drives [`Observer::poll`] in a single thread until either a
-//! `--shutdown-after-secs` deadline elapses or the process is killed.
+//! `--shutdown-after-secs` deadline elapses or a signal (SIGINT /
+//! SIGTERM) flips the [`SHUTDOWN`] latch.
 //!
 //! This binary is the only place in the workspace where `eprintln!` is
 //! permitted. Diagnostics (errors, recovery outcomes) go to stderr; the
 //! `--help` text goes to stdout via `std::io::stdout`.
 
 use std::io::Write;
+use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
@@ -22,10 +24,48 @@ use varta_watch::{
     RecoveryOutcome,
 };
 
-/// Shutdown latch. A future SIGINT hook flips this to `true`; v0.1.0 ships
-/// without a signal handler (no `libc` dep is on the surface), so the
-/// only way to flip it today is `--shutdown-after-secs`.
+/// Shutdown latch flipped by [`install_signal_handlers`] on SIGINT/SIGTERM
+/// and by the `--shutdown-after-secs` deadline path. The poll loop exits
+/// when this becomes `true`.
 static SHUTDOWN: AtomicBool = AtomicBool::new(false);
+
+/// RAII guard that removes the socket file on drop so a clean shutdown
+/// (signal or `--shutdown-after-secs`) never leaves a stale socket behind.
+struct SocketGuard(PathBuf);
+
+impl Drop for SocketGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+#[cfg(unix)]
+unsafe fn install_signal_handlers() {
+    const SIGINT: i32 = 2;
+    const SIGTERM: i32 = 15;
+
+    extern "C" {
+        fn signal(signum: i32, handler: extern "C" fn(i32)) -> extern "C" fn(i32);
+    }
+
+    extern "C" fn handle(_sig: i32) {
+        SHUTDOWN.store(true, Ordering::Release);
+    }
+
+    // SAFETY: We are the only caller of signal() in this binary; no other
+    // library or thread installs competing handlers. The handler itself is
+    // async-signal-safe: it writes to a lock-free AtomicBool and performs no
+    // allocation, I/O, or non-reentrant calls.
+    unsafe {
+        let _ = signal(SIGINT, handle);
+        let _ = signal(SIGTERM, handle);
+    }
+}
+
+#[cfg(not(unix))]
+unsafe fn install_signal_handlers() {
+    // No-op on non-Unix; --shutdown-after-secs remains the only exit path.
+}
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -51,7 +91,15 @@ fn main() -> ExitCode {
 }
 
 fn run(cfg: Config) -> std::io::Result<()> {
+    // SAFETY: `install_signal_handlers` is safe to call here because this is
+    // the sole entry point of a single-threaded binary with no other libraries
+    // that install their own SIGINT/SIGTERM handlers.
+    unsafe {
+        install_signal_handlers();
+    }
+
     let mut observer = Observer::bind(&cfg.socket, cfg.threshold)?;
+    let _guard = SocketGuard(cfg.socket.clone());
     let mut recovery = cfg.recovery_cmd.as_ref().map(|tpl| {
         Recovery::with_timeout(tpl.clone(), cfg.recovery_debounce, cfg.recovery_timeout)
     });

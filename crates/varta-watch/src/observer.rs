@@ -72,32 +72,43 @@ impl Observer {
     /// Bind a Unix datagram socket at `path` and return an [`Observer`]
     /// configured with the given stall `threshold`.
     ///
-    /// Any pre-existing file at `path` is removed before bind so a stale
-    /// socket from a prior run does not block startup. The socket is given a
-    /// fixed read timeout (100 ms) so [`Observer::poll`] cannot block
-    /// indefinitely.
+    /// If a genuine stale socket exists at `path` (no one listening),
+    /// it is cleaned up and the bind succeeds. If another process is
+    /// already listening at `path`, the call fails with `AddrInUse`.
+    /// If the path exists but the probe fails with
+    /// `PermissionDenied`, the call fails — we cannot determine
+    /// whether the socket is live and will not delete it.
+    ///
+    /// The socket is given a fixed read timeout (100 ms) so
+    /// [`Observer::poll`] cannot block indefinitely.
     pub fn bind(path: impl AsRef<Path>, threshold: Duration) -> io::Result<Self> {
         let path = path.as_ref();
-        let _ = std::fs::remove_file(path);
-        let sock = match UnixDatagram::bind(path) {
-            Ok(s) => s,
+
+        match UnixDatagram::bind(path) {
+            Ok(sock) => Self::finish_bind(sock, threshold),
             Err(e) if e.kind() == ErrorKind::AddrInUse => {
-                let _ = std::fs::remove_file(path);
-                UnixDatagram::bind(path)?
+                match probe_live(path) {
+                    Ok(true) => Err(io::Error::new(
+                        ErrorKind::AddrInUse,
+                        format!(
+                            "another varta-watch is already running at {}",
+                            path.display()
+                        ),
+                    )),
+                    Ok(false) => {
+                        // Genuine stale socket — clean up and retry bind.
+                        std::fs::remove_file(path)?;
+                        let sock = UnixDatagram::bind(path)?;
+                        Self::finish_bind(sock, threshold)
+                    }
+                    Err(e) => Err(io::Error::new(
+                        e.kind(),
+                        format!("cannot probe socket at {}: {e}", path.display()),
+                    )),
+                }
             }
-            Err(e) => return Err(e),
-        };
-        sock.set_read_timeout(Some(READ_TIMEOUT))?;
-        let threshold_ns = threshold.as_nanos().min(u64::MAX as u128) as u64;
-        Ok(Observer {
-            sock,
-            tracker: Tracker::new(),
-            threshold_ns,
-            start: Instant::now(),
-            stall_queue: Vec::new(),
-            stall_pending: Vec::with_capacity(CAPACITY),
-            stall_cursor: 0,
-        })
+            Err(e) => Err(e),
+        }
     }
 
     /// Receive at most one frame and return the corresponding [`Event`].
@@ -184,5 +195,56 @@ impl Observer {
     /// reclaimed since the last call.
     pub fn drain_evictions(&mut self) -> u64 {
         self.tracker.take_evictions()
+    }
+
+    fn finish_bind(sock: UnixDatagram, threshold: Duration) -> io::Result<Self> {
+        sock.set_read_timeout(Some(READ_TIMEOUT))?;
+        let threshold_ns = threshold.as_nanos().min(u64::MAX as u128) as u64;
+        Ok(Observer {
+            sock,
+            tracker: Tracker::new(),
+            threshold_ns,
+            start: Instant::now(),
+            stall_queue: Vec::new(),
+            stall_pending: Vec::with_capacity(CAPACITY),
+            stall_cursor: 0,
+        })
+    }
+}
+
+/// Probe whether a live listener is accepting datagrams at `path`.
+///
+/// Strategy:
+/// - Try to connect an unbound datagram socket to the path. On macOS this
+///   fails immediately with ECONNREFUSED if no one is listening; on Linux it
+///   may succeed (connect only sets default peer) so we fall through to send().
+/// - If connect() succeeds, attempt a zero-byte send(). A live listener will
+///   accept the datagram. A stale socket file with no listener will cause
+///   ECONNREFUSED / ENOENT on send().
+///
+/// Returns:
+/// - `Ok(true)` if we believe another process is listening (send succeeded).
+/// - `Ok(false)` if connect() or send() fails in a way that indicates no
+///   active listener — the socket file is stale and safe to remove.
+/// - `Err` for PermissionDenied — we cannot determine liveness and must not
+///   delete the file.
+fn probe_live(path: &Path) -> io::Result<bool> {
+    let sock = UnixDatagram::unbound()?;
+
+    // On macOS, connect() to a dead UDS DGRAM returns ECONNREFUSED immediately.
+    // On Linux, it may succeed (sets default peer only), so we must also check send().
+    if let Err(e) = sock.connect(path) {
+        return match e.kind() {
+            ErrorKind::PermissionDenied => Err(e),
+            _ => Ok(false), // ECONNREFUSED / ENOENT — no listener.
+        };
+    }
+
+    // If connect() succeeded, try to send a zero-byte datagram. A live listener
+    // will accept it; a stale socket file with no listener will reject it.
+    match sock.send(&[]) {
+        Ok(_) => Ok(true),
+        Err(e) if e.kind() == ErrorKind::PermissionDenied => Err(e),
+        Err(_) => Ok(false), // ECONNREFUSED / ENOTCONN — stale socket.
     }
 }

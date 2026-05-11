@@ -154,7 +154,8 @@ impl Tracker {
         let mut best_last_ns: u64 = u64::MAX;
 
         for (idx, slot) in self.entries[..self.len].iter().enumerate() {
-            if slot.stall_emitted && now_ns.saturating_sub(slot.last_ns) > evict_threshold
+            if slot.stall_emitted
+                && now_ns.saturating_sub(slot.last_ns) > evict_threshold
                 && slot.last_ns < best_last_ns
             {
                 best_last_ns = slot.last_ns;
