@@ -9,7 +9,7 @@ use std::io::{self, ErrorKind};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::io::AsRawFd;
 use std::os::unix::net::UnixDatagram;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use varta_vlp::{DecodeError, Frame, Status};
@@ -66,10 +66,20 @@ pub enum Event {
 
 /// Observer process bound to a Unix Domain Socket.
 ///
-/// The observer owns the socket file for its lifetime; dropping it does not
-/// remove the file from disk (Session 05 owns the daemon shutdown sequence).
+/// Dropping the observer best-effort unlinks the bound socket file (comparing
+/// device + inode to avoid removing a foreign file that won a later race);
+/// errors are ignored.
 pub struct Observer {
     sock: UnixDatagram,
+    /// On-disk path this Observer bound to. Used by `Drop` to unlink the
+    /// socket file. Heap-allocated once at `bind()` time; not touched on
+    /// the `poll` hot path.
+    path: PathBuf,
+    /// `st_dev` of the bound socket file, captured immediately after bind.
+    /// Compared at `Drop` to avoid unlinking a foreign inode.
+    bound_dev: u64,
+    /// `st_ino` of the bound socket file, captured immediately after bind.
+    bound_ino: u64,
     tracker: Tracker,
     threshold_ns: u64,
     start: Instant,
@@ -99,11 +109,12 @@ impl Observer {
     /// [`Observer::poll`] cannot block indefinitely.
     pub fn bind(path: impl AsRef<Path>, threshold: Duration, socket_mode: u32) -> io::Result<Self> {
         let path = path.as_ref();
+        let owned_path: PathBuf = path.to_path_buf();
 
         match UnixDatagram::bind(path) {
             Ok(sock) => {
                 std::fs::set_permissions(path, std::fs::Permissions::from_mode(socket_mode))?;
-                Self::finish_bind(sock, threshold)
+                Self::finish_bind(sock, threshold, owned_path)
             }
             Err(e) if e.kind() == ErrorKind::AddrInUse => {
                 match probe_live(path) {
@@ -122,7 +133,7 @@ impl Observer {
                             path,
                             std::fs::Permissions::from_mode(socket_mode),
                         )?;
-                        Self::finish_bind(sock, threshold)
+                        Self::finish_bind(sock, threshold, owned_path)
                     }
                     Err(e) => Err(io::Error::new(
                         e.kind(),
@@ -229,13 +240,23 @@ impl Observer {
         self.tracker.take_evictions()
     }
 
-    fn finish_bind(sock: UnixDatagram, threshold: Duration) -> io::Result<Self> {
+    fn finish_bind(sock: UnixDatagram, threshold: Duration, path: PathBuf) -> io::Result<Self> {
+        use std::os::unix::fs::MetadataExt;
+
         sock.set_read_timeout(Some(READ_TIMEOUT))?;
         let raw_fd = sock.as_raw_fd();
         peer_cred::enable_credential_passing(raw_fd)?;
         let threshold_ns = threshold.as_nanos().min(u64::MAX as u128) as u64;
+
+        let meta = std::fs::metadata(&path)?;
+        let bound_dev = meta.dev();
+        let bound_ino = meta.ino();
+
         Ok(Observer {
             sock,
+            path,
+            bound_dev,
+            bound_ino,
             tracker: Tracker::new(),
             threshold_ns,
             start: Instant::now(),
@@ -280,5 +301,52 @@ fn probe_live(path: &Path) -> io::Result<bool> {
         Ok(_) => Ok(true),
         Err(e) if e.kind() == ErrorKind::PermissionDenied => Err(e),
         Err(_) => Ok(false), // ECONNREFUSED / ENOTCONN — stale socket.
+    }
+}
+
+impl Drop for Observer {
+    /// Unlink the socket file iff the on-disk inode still matches the one
+    /// we bound to. Errors are swallowed: `drop` must never panic (including
+    /// during stack unwinding), the file may have been removed by another
+    /// process, and library code must not emit diagnostics.
+    fn drop(&mut self) {
+        use std::os::unix::fs::MetadataExt;
+        if let Ok(meta) = std::fs::metadata(&self.path) {
+            if meta.dev() == self.bound_dev && meta.ino() == self.bound_ino {
+                let _ = std::fs::remove_file(&self.path);
+            }
+        }
+        // Missing file or foreign inode → silent no-op.
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::Duration;
+
+    static TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    fn unique_sock_path() -> PathBuf {
+        let n = TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let mut p = std::env::temp_dir();
+        p.push(format!(
+            "varta-observer-drop-{}-{}.sock",
+            std::process::id(),
+            n
+        ));
+        let _ = std::fs::remove_file(&p);
+        p
+    }
+
+    #[test]
+    fn drop_unlinks_bound_socket() {
+        let path = unique_sock_path();
+        let obs = Observer::bind(&path, Duration::from_secs(1), 0o600)
+            .expect("bind should succeed on a clean temp path");
+        assert!(path.exists(), "socket file must exist after bind");
+        drop(obs);
+        assert!(!path.exists(), "socket file must be removed after drop");
     }
 }

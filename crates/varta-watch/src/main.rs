@@ -14,7 +14,6 @@
 //! `--help` text goes to stdout via `std::io::stdout`.
 
 use std::io::Write;
-use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
@@ -28,16 +27,6 @@ use varta_watch::{
 /// and by the `--shutdown-after-secs` deadline path. The poll loop exits
 /// when this becomes `true`.
 static SHUTDOWN: AtomicBool = AtomicBool::new(false);
-
-/// RAII guard that removes the socket file on drop so a clean shutdown
-/// (signal or `--shutdown-after-secs`) never leaves a stale socket behind.
-struct SocketGuard(PathBuf);
-
-impl Drop for SocketGuard {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.0);
-    }
-}
 
 #[cfg(unix)]
 unsafe fn install_signal_handlers() {
@@ -99,7 +88,6 @@ fn run(cfg: Config) -> std::io::Result<()> {
     }
 
     let mut observer = Observer::bind(&cfg.socket, cfg.threshold, cfg.socket_mode)?;
-    let _guard = SocketGuard(cfg.socket.clone());
     let mut recovery = cfg.recovery_cmd.as_ref().map(|tpl| {
         Recovery::with_timeout(tpl.clone(), cfg.recovery_debounce, cfg.recovery_timeout)
     });
