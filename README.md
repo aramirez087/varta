@@ -6,7 +6,7 @@
 
 **Zero dependencies. Zero allocations. Agents that never go dark.**
 
-A 32-byte heartbeat protocol for distributed local agents. Your processes talk; Varta listens.
+A 32-byte heartbeat protocol for distributed local agents and networked clusters. Your processes talk; Varta listens.
 
 ## Why Varta
 
@@ -32,12 +32,12 @@ Varta is not yet published to crates.io (post-v0.1.0). Use a path dependency:
 path = "path/to/varta/crates/varta-client"
 ```
 
-To enable the optional panic hook:
+To enable the optional panic hook or UDP transport:
 
 ```toml
 [dependencies.varta-client]
 path = "path/to/varta/crates/varta-client"
-features = ["panic-handler"]
+features = ["panic-handler", "udp"]
 ```
 
 ## Quickstart
@@ -46,8 +46,10 @@ features = ["panic-handler"]
 use varta_client::{BeatOutcome, Status, Varta};
 
 fn main() -> std::io::Result<()> {
-    // One allocation: opens the Unix Domain Socket.
+    // One allocation: opens the socket.
     let mut agent = Varta::connect("/tmp/varta.sock")?;
+    // For network-based agents, enable the `udp` feature:
+    // let mut agent = Varta::connect_udp("192.168.1.100:9000")?;
 
     loop {
         // Zero allocation: encodes on the stack, hands to send(2).
@@ -66,6 +68,7 @@ Start the observer in a separate terminal:
 ```sh
 varta-watch \
   --socket /tmp/varta.sock \
+  --udp-port 9000 \
   --threshold-ms 2000 \
   --prom-addr 127.0.0.1:9100
 ```

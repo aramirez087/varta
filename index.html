@@ -6,7 +6,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Varta — Zero-overhead health protocol for distributed local agents</title>
   <meta name="description"
-    content="32-byte heartbeats over Unix Domain Sockets. No dependencies. No allocations. Sub-microsecond.">
+    content="32-byte heartbeats over Unix Domain Sockets and UDP. No dependencies. No allocations. Sub-microsecond.">
   <link rel="icon" href="favicon.svg" type="image/svg+xml">
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -37,8 +37,8 @@
     <section class="hero">
       <div class="hero-copy">
         <h1 class="hero-title">VARTA</h1>
-        <p class="hero-tagline">Zero-overhead health protocol for distributed local agents.</p>
-        <p class="hero-sub">32-byte heartbeats over Unix Domain Sockets. No dependencies. No allocations.
+        <p class="hero-tagline">Zero-overhead health protocol for distributed local agents and network clusters.</p>
+        <p class="hero-sub">32-byte heartbeats over Unix Domain Sockets and UDP. No dependencies. No allocations.
           Sub-microsecond.</p>
         <div class="hero-cta">
           <button class="cta-primary" id="copy-cargo" data-copy="cargo add varta-client">
@@ -58,10 +58,9 @@
         </div>
         <div class="terminal-body">
           <div class="terminal-line"><span class="t-prompt">$</span> <span class="t-cmd">varta-watch</span> <span
-              class="t-flag">--socket</span> /tmp/varta.sock <span class="t-flag">--threshold-ms</span> <span
-              class="t-num">2000</span></div>
+              class="t-flag">--socket</span> /tmp/varta.sock <span class="t-flag">--udp-port</span> <span class="t-num">9000</span></div>
           <div class="terminal-line"><span class="t-info">&bull;</span> listening on <span
-              class="t-path">/tmp/varta.sock</span></div>
+              class="t-path">/tmp/varta.sock</span> &amp; <span class="t-path">0.0.0.0:9000 (UDP)</span></div>
           <div class="terminal-line"><span class="t-info">&bull;</span> pid <span class="t-num">4821</span> &mdash;
             status: <span class="t-ok">Ok</span> &mdash; last beat: <span class="t-num">12ms</span> ago</div>
           <div class="terminal-line"><span class="t-info">&bull;</span> pid <span class="t-num">4821</span> &mdash;
@@ -89,7 +88,7 @@
           <span class="step-num">1</span>
           <div class="step-content">
             <h3 class="step-title">Connect</h3>
-            <p><code>Varta::connect()</code> opens a non-blocking Unix Datagram socket. One allocation. That's it.</p>
+            <p><code>Varta::connect()</code> opens a non-blocking Unix Datagram socket (or <code>connect_udp()</code> for networks). One allocation. That's it.</p>
           </div>
         </li>
         <li class="step">
