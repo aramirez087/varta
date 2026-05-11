@@ -105,16 +105,11 @@ impl SecureUdpListener {
     /// years — not a practical concern.
     fn check_replay(&mut self, sender: SocketAddr, iv_random: [u8; 4], counter: u64) -> bool {
         match self.sender_state.get(&sender) {
-            Some(state) => {
-                if state.iv_random == iv_random {
-                    // Same IV prefix: counter must strictly increase
-                    counter > state.last_counter
-                } else {
-                    // Different IV prefix: new session, always accept
-                    true
-                }
+            Some(state) if state.iv_random == iv_random => {
+                // Same IV prefix: counter must strictly increase
+                counter > state.last_counter
             }
-            None => true, // New sender, always accept
+            _ => true,
         }
     }
 }
