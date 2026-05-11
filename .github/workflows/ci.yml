@@ -6,8 +6,12 @@ on:
 
 jobs:
   ci:
-    name: gate
-    runs-on: ubuntu-latest
+    name: gate (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - name: checkout
         uses: actions/checkout@v4
@@ -55,31 +59,8 @@ jobs:
       - name: acceptance contract audit
         run: |
           set -e
-          contract='connect_succeeds_when_observer_socket_exists|crates/varta-client/tests/acceptance.rs|test
-          beat_emits_canonical_32_byte_frame|crates/varta-client/tests/acceptance.rs|test
-          beat_increments_nonce_monotonically|crates/varta-client/tests/acceptance.rs|test
-          beat_returns_dropped_when_observer_absent|crates/varta-client/tests/acceptance.rs|test
-          beat_makes_zero_heap_allocations_after_init|crates/varta-client/tests/zero_alloc.rs|test
-          observer_emits_beat_per_received_frame|crates/varta-watch/tests/acceptance.rs|test
-          observer_emits_stall_after_threshold_elapses|crates/varta-watch/tests/acceptance.rs|test
-          observer_reports_decode_error_for_bad_magic|crates/varta-watch/tests/acceptance.rs|test
-          tracker_capacity_bounded_to_64_pids|crates/varta-watch/tests/acceptance.rs|test
-          panic_handler_emits_critical_beat_before_unwind|crates/varta-client/tests/panic_feature.rs|test
-          panic_handler_preserves_original_panic_outcome|crates/varta-client/tests/panic_feature.rs|test
-          panic_module_excluded_without_feature|crates/varta-client/tests/panic_feature.rs|test
-          recovery_cmd_fires_once_per_stall_within_debounce|crates/varta-watch/tests/recovery_e2e.rs|test
-          recovery_cmd_template_substitutes_pid|crates/varta-watch/tests/recovery_e2e.rs|test
-          prom_exporter_reports_beats_total_per_pid|crates/varta-watch/tests/exporter_endpoint.rs|test
-          prom_exporter_reports_stalls_total_per_pid|crates/varta-watch/tests/exporter_endpoint.rs|test
-          file_exporter_appends_one_line_per_event|crates/varta-watch/tests/exporter_endpoint.rs|test
-          cli_help_lists_every_documented_flag|crates/varta-watch/tests/cli_smoke.rs|test
-          client_to_observer_to_recovery_full_loop|crates/varta-tests/tests/end_to_end.rs|no-harness
-          panic_handler_critical_beat_visible_in_metrics|crates/varta-tests/tests/end_to_end.rs|no-harness
-          bench_latency_p99_under_one_microsecond|crates/varta-bench/src/main.rs|bench-assertion
-          bench_observer_cpu_under_zero_point_one_percent|crates/varta-bench/src/main.rs|bench-assertion
-          bench_binary_size_delta_under_twenty_kilobytes|crates/varta-bench/src/main.rs|bench-assertion'
-          echo "$contract" | sed 's/^[[:space:]]*//' | while IFS='|' read -r name file kind; do
-            [ -z "$name" ] && continue
+          while IFS=$'\t' read -r name file kind; do
+            case "$name" in \#*|"") continue ;; esac
             case "$kind" in
               test|no-harness)
                 grep -qE "^[[:space:]]*fn[[:space:]]+${name}\b" "$file" \
@@ -91,7 +72,7 @@ jobs:
                 ;;
             esac
             echo "OK [$kind] $name"
-          done
+          done < tools/acceptance-contract.tsv
 
       - name: ignore audit
         run: |

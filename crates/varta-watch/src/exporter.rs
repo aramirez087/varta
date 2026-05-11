@@ -125,15 +125,6 @@ fn status_label(s: Status) -> &'static str {
     }
 }
 
-fn status_code(s: Status) -> u8 {
-    match s {
-        Status::Ok => 0,
-        Status::Degraded => 1,
-        Status::Critical => 2,
-        Status::Stall => 3,
-    }
-}
-
 /// Prometheus `kind` label values for `varta_decode_errors_total`. Indexed
 /// by [`decode_kind_index`]; the array doubles as the canonical ordering
 /// for the exposition output, so series remain stable across scrapes.
@@ -275,6 +266,28 @@ impl PromExporter {
             }
         }
 
+        if total < 4 || buf[..4] != *b"GET " {
+            let response = b"HTTP/1.0 405 Method Not Allowed\r\nAllow: GET\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+            let mut written = 0;
+            let write_deadline = Instant::now() + PROM_WRITE_TIMEOUT;
+            while written < response.len() {
+                if Instant::now() >= write_deadline {
+                    break;
+                }
+                match stream.write(&response[written..]) {
+                    Ok(0) => break,
+                    Ok(n) => written += n,
+                    Err(e) if e.kind() == ErrorKind::WouldBlock => {
+                        std::hint::spin_loop();
+                        continue;
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+            let _ = stream.shutdown(Shutdown::Both);
+            return Ok(());
+        }
+
         let body = self.render_body();
         let response = format!(
             "HTTP/1.0 200 OK\r\n\
@@ -398,7 +411,7 @@ impl Exporter for PromExporter {
             } => {
                 let row = self.rows.entry(*pid).or_insert_with(GaugeRow::new);
                 row.beats_total = row.beats_total.saturating_add(1);
-                row.last_status = Some(status_code(*status));
+                row.last_status = Some(*status as u8);
             }
             Event::Stall {
                 pid,
@@ -407,7 +420,7 @@ impl Exporter for PromExporter {
             } => {
                 let row = self.rows.entry(*pid).or_insert_with(GaugeRow::new);
                 row.stalls_total = row.stalls_total.saturating_add(1);
-                row.last_status = Some(status_code(Status::Stall));
+                row.last_status = Some(Status::Stall as u8);
             }
             Event::AuthFailure { observer_ns: _, .. } => {
                 self.auth_failures_total = self.auth_failures_total.saturating_add(1);
@@ -499,6 +512,27 @@ mod tests {
         assert!(
             body.contains("varta_decode_errors_total{kind=\"bad_status\"} 1"),
             "missing or wrong bad_status series:\n{body}"
+        );
+    }
+
+    #[test]
+    fn non_get_request_returns_405() {
+        let mut prom = PromExporter::bind("127.0.0.1:0".parse().unwrap()).expect("bind");
+        let addr = prom.local_addr().expect("local_addr");
+        let mut stream = TcpStream::connect(addr).expect("connect");
+        stream
+            .write_all(b"POST /metrics HTTP/1.0\r\n\r\n")
+            .expect("write");
+        prom.serve_pending().expect("serve_pending");
+        let mut response = String::new();
+        stream.read_to_string(&mut response).expect("read");
+        assert!(
+            response.starts_with("HTTP/1.0 405 Method Not Allowed"),
+            "expected 405, got: {response}"
+        );
+        assert!(
+            response.contains("Allow: GET"),
+            "missing Allow header: {response}"
         );
     }
 }

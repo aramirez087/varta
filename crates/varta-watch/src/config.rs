@@ -18,6 +18,10 @@ pub const DEFAULT_RECOVERY_DEBOUNCE_MS: u64 = 1000;
 /// speak to the observer socket.
 pub const DEFAULT_SOCKET_MODE: u32 = 0o600;
 
+/// Default UDS read timeout in milliseconds. Capped so a stalled peer
+/// cannot hold the observer poll loop indefinitely.
+pub const DEFAULT_READ_TIMEOUT_MS: u64 = 100;
+
 /// Parsed daemon configuration.
 #[derive(Clone, Debug)]
 pub struct Config {
@@ -45,6 +49,9 @@ pub struct Config {
     /// UDS file mode applied after bind (octal, e.g. `0o600`).
     /// Defaults to [`DEFAULT_SOCKET_MODE`].
     pub socket_mode: u32,
+    /// UDS read timeout for the bound socket. Defaults to
+    /// [`DEFAULT_READ_TIMEOUT_MS`] milliseconds.
+    pub read_timeout: Duration,
 }
 
 /// Failure modes for [`Config::from_args`].
@@ -127,6 +134,9 @@ OPTIONAL:
                                     if a child runs longer than this it is
                                     killed via kill(2). Without this flag the
                                     child is allowed to run until completion.
+    --read-timeout-ms <MS>         UDS read timeout per poll call
+                                   (default 100).  Bounded so a stalled peer
+                                   cannot hold the observer loop indefinitely.
     --shutdown-after-secs <SECS>   Exit cleanly after the given uptime
                                     (used by integration tests).
 
@@ -144,6 +154,7 @@ OPTIONAL:
         let mut shutdown_after_secs: Option<u64> = None;
         let mut recovery_timeout_ms: Option<u64> = None;
         let mut socket_mode: Option<u32> = None;
+        let mut read_timeout_ms: Option<u64> = None;
 
         let mut iter = args.into_iter();
         while let Some(tok) = iter.next() {
@@ -198,6 +209,12 @@ OPTIONAL:
                         .ok_or(ConfigError::MissingValue("--recovery-timeout-ms"))?;
                     recovery_timeout_ms = Some(parse_u64("--recovery-timeout-ms", &v)?);
                 }
+                "--read-timeout-ms" => {
+                    let v = iter
+                        .next()
+                        .ok_or(ConfigError::MissingValue("--read-timeout-ms"))?;
+                    read_timeout_ms = Some(parse_u64("--read-timeout-ms", &v)?);
+                }
                 "--shutdown-after-secs" => {
                     let v = iter
                         .next()
@@ -224,6 +241,7 @@ OPTIONAL:
             shutdown_after: shutdown_after_secs.map(Duration::from_secs),
             recovery_timeout: recovery_timeout_ms.map(Duration::from_millis),
             socket_mode: socket_mode.unwrap_or(DEFAULT_SOCKET_MODE),
+            read_timeout: Duration::from_millis(read_timeout_ms.unwrap_or(DEFAULT_READ_TIMEOUT_MS)),
         })
     }
 }
@@ -330,6 +348,7 @@ mod tests {
             "--recovery-cmd",
             "--recovery-debounce-ms",
             "--recovery-timeout-ms",
+            "--read-timeout-ms",
             "--export-file",
             "--prom-addr",
             "--socket-mode",
@@ -447,6 +466,42 @@ mod tests {
         ])) {
             Err(ConfigError::BadSocketMode(raw)) => assert_eq!(raw, "0o"),
             other => panic!("expected BadSocketMode, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_read_timeout_ms() {
+        let cfg = Config::from_args(args(&[
+            "--socket",
+            "/s",
+            "--threshold-ms",
+            "100",
+            "--read-timeout-ms",
+            "50",
+        ]))
+        .expect("parse");
+        assert_eq!(cfg.read_timeout, Duration::from_millis(50));
+    }
+
+    #[test]
+    fn read_timeout_omitted_is_default() {
+        let cfg =
+            Config::from_args(args(&["--socket", "/s", "--threshold-ms", "100"])).expect("parse");
+        assert_eq!(cfg.read_timeout, Duration::from_millis(100));
+    }
+
+    #[test]
+    fn read_timeout_rejects_non_numeric() {
+        match Config::from_args(args(&[
+            "--socket",
+            "/s",
+            "--threshold-ms",
+            "100",
+            "--read-timeout-ms",
+            "abc",
+        ])) {
+            Err(ConfigError::BadInteger { flag, .. }) => assert_eq!(flag, "--read-timeout-ms"),
+            other => panic!("expected BadInteger, got {other:?}"),
         }
     }
 }

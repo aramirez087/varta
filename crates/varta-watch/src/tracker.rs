@@ -32,6 +32,9 @@ pub struct Slot {
     pub last_ns: u64,
     /// Most recent [`Status`] reported by this pid.
     pub status: Status,
+    /// False iff this slot has never been written; observers treat the
+    /// slot's other fields as undefined when `used == false`.
+    pub(crate) used: bool,
     /// True iff the observer has already emitted a stall event for the
     /// current silence run. Cleared when a fresh beat arrives.
     pub(crate) stall_emitted: bool,
@@ -43,6 +46,7 @@ impl Slot {
         last_nonce: 0,
         last_ns: 0,
         status: Status::Ok,
+        used: false,
         stall_emitted: false,
     };
 }
@@ -108,6 +112,9 @@ impl Tracker {
         let status = frame.status;
 
         for slot in &mut self.entries[..self.len] {
+            if !slot.used {
+                continue;
+            }
             if slot.pid == frame.pid {
                 if frame.nonce <= slot.last_nonce {
                     return Update::OutOfOrder;
@@ -127,6 +134,7 @@ impl Tracker {
                     last_nonce: frame.nonce,
                     last_ns: now_ns,
                     status,
+                    used: true,
                     stall_emitted: false,
                 };
                 self.evictions = self.evictions.saturating_add(1);
@@ -140,6 +148,7 @@ impl Tracker {
             last_nonce: frame.nonce,
             last_ns: now_ns,
             status,
+            used: true,
             stall_emitted: false,
         };
         self.len += 1;
@@ -203,7 +212,7 @@ impl Tracker {
     /// same pid. No-op if the pid is unknown.
     pub(crate) fn mark_stall_emitted(&mut self, pid: u32) {
         for slot in &mut self.entries[..self.len] {
-            if slot.pid == pid {
+            if slot.used && slot.pid == pid {
                 slot.stall_emitted = true;
                 return;
             }

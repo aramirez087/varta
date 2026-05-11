@@ -104,6 +104,16 @@ pub enum BeatOutcome {
 /// agent.beat(Status::Ok, 0);
 /// # Ok::<(), std::io::Error>(())
 /// ```
+/// # Thread safety
+///
+/// `Varta` is [`Send`]: the underlying [`UnixDatagram`] is `Send`, and a beat
+/// issues no shared state. `Varta` is **not** [`Sync`]: concurrent
+/// `&Varta::beat` calls would race on the kernel-side socket send buffer
+/// ordering. To share across threads, wrap in a [`std::sync::Mutex`] or move
+/// the handle into a dedicated emitter thread or channel.
+///
+/// The fork-safety contract (pid re-read per beat) is unaffected by the
+/// thread-safety choice.
 pub struct Varta {
     sock: UnixDatagram,
     buf: [u8; 32],
@@ -113,6 +123,12 @@ pub struct Varta {
     consecutive_dropped: u32,
     reconnect_after: u32,
 }
+
+// Static assertion: Varta is Send and must remain so.
+const _: () = {
+    const fn assert_send<T: Send>() {}
+    assert_send::<Varta>();
+};
 
 impl Varta {
     /// Connect to the observer listening on `path` and prepare the agent for

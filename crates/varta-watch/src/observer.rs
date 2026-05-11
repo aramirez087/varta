@@ -17,10 +17,6 @@ use varta_vlp::{DecodeError, Frame, Status};
 use crate::peer_cred::{self, RecvResult};
 use crate::tracker::{Tracker, Update, CAPACITY};
 
-/// How long [`Observer::poll`] blocks in `recv_from` before returning to the
-/// caller. Bounded so stall detection latency cannot exceed this value.
-const READ_TIMEOUT: Duration = Duration::from_millis(100);
-
 /// Event surfaced by [`Observer::poll`].
 ///
 /// Each call to `poll` returns at most one event. Unknown-pid overflow and
@@ -114,16 +110,22 @@ impl Observer {
     /// `PermissionDenied`, the call fails — we cannot determine
     /// whether the socket is live and will not delete it.
     ///
-    /// The socket is given a fixed read timeout (100 ms) so
-    /// [`Observer::poll`] cannot block indefinitely.
-    pub fn bind(path: impl AsRef<Path>, threshold: Duration, socket_mode: u32) -> io::Result<Self> {
+    /// The socket is given a read timeout so [`Observer::poll`] cannot
+    /// block indefinitely. Pass `read_timeout` to override the default
+    /// (100 ms).
+    pub fn bind(
+        path: impl AsRef<Path>,
+        threshold: Duration,
+        socket_mode: u32,
+        read_timeout: Duration,
+    ) -> io::Result<Self> {
         let path = path.as_ref();
         let owned_path: PathBuf = path.to_path_buf();
 
         match UnixDatagram::bind(path) {
             Ok(sock) => {
                 std::fs::set_permissions(path, std::fs::Permissions::from_mode(socket_mode))?;
-                Self::finish_bind(sock, threshold, owned_path)
+                Self::finish_bind(sock, threshold, owned_path, read_timeout)
             }
             Err(e) if e.kind() == ErrorKind::AddrInUse => {
                 match probe_live(path) {
@@ -142,7 +144,7 @@ impl Observer {
                             path,
                             std::fs::Permissions::from_mode(socket_mode),
                         )?;
-                        Self::finish_bind(sock, threshold, owned_path)
+                        Self::finish_bind(sock, threshold, owned_path, read_timeout)
                     }
                     Err(e) => Err(io::Error::new(
                         e.kind(),
@@ -258,10 +260,15 @@ impl Observer {
         self.tracker.take_capacity_exceeded()
     }
 
-    fn finish_bind(sock: UnixDatagram, threshold: Duration, path: PathBuf) -> io::Result<Self> {
+    fn finish_bind(
+        sock: UnixDatagram,
+        threshold: Duration,
+        path: PathBuf,
+        read_timeout: Duration,
+    ) -> io::Result<Self> {
         use std::os::unix::fs::MetadataExt;
 
-        sock.set_read_timeout(Some(READ_TIMEOUT))?;
+        sock.set_read_timeout(Some(read_timeout))?;
         let raw_fd = sock.as_raw_fd();
         peer_cred::enable_credential_passing(raw_fd)?;
         let threshold_ns = threshold.as_nanos().min(u64::MAX as u128) as u64;
@@ -361,8 +368,13 @@ mod tests {
     #[test]
     fn drop_unlinks_bound_socket() {
         let path = unique_sock_path();
-        let obs = Observer::bind(&path, Duration::from_secs(1), 0o600)
-            .expect("bind should succeed on a clean temp path");
+        let obs = Observer::bind(
+            &path,
+            Duration::from_secs(1),
+            0o600,
+            Duration::from_millis(100),
+        )
+        .expect("bind should succeed on a clean temp path");
         assert!(path.exists(), "socket file must exist after bind");
         drop(obs);
         assert!(!path.exists(), "socket file must be removed after drop");

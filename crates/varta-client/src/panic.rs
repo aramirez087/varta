@@ -28,7 +28,9 @@ use varta_vlp::{Frame, Status, NONCE_TERMINAL};
 /// # Allocation
 ///
 /// The sole heap allocation is the `Box` created by [`std::panic::set_hook`]
-/// at install time. The hook closure itself operates entirely on the stack.
+/// at install time. The hook closure body performs no heap allocations;
+/// kernel-side allocation inside connect(2) and send(2) is out of our
+/// control but does not affect the Rust allocator.
 ///
 /// # Chaining
 ///

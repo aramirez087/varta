@@ -23,4 +23,9 @@ target
 # Wolf/AI Agent state and logs
 .wolf/
 docs/claude-sessions
+
+# cargo-fuzz artifacts
+fuzz/target
+fuzz/corpus
+fuzz/artifacts
 scripts/resolve-wolf.sh
