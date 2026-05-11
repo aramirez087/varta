@@ -8,7 +8,34 @@
 //! tests below for the new `--recovery-timeout-ms` flag. Session 03
 //! turns them green.
 
+use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicU32, Ordering};
+
+static UDS_COUNTER: AtomicU32 = AtomicU32::new(0);
+
+fn unique_uds_path(tag: &str) -> UdsPath {
+    let pid = std::process::id();
+    let n = UDS_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let mut p = std::env::temp_dir();
+    p.push(format!("varta-cli-{tag}-{pid}-{n}.sock"));
+    let _ = std::fs::remove_file(&p);
+    UdsPath(p)
+}
+
+struct UdsPath(PathBuf);
+
+impl UdsPath {
+    fn as_str(&self) -> &str {
+        self.0.to_string_lossy().as_ref()
+    }
+}
+
+impl Drop for UdsPath {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
 
 #[test]
 fn cli_help_lists_every_documented_flag() {
@@ -28,6 +55,8 @@ fn cli_help_lists_every_documented_flag() {
         "--threshold-ms",
         "--recovery-cmd",
         "--recovery-debounce-ms",
+        "--recovery-timeout-ms",
+        "--socket-mode",
         "--export-file",
         "--prom-addr",
         "--shutdown-after-secs",
@@ -71,10 +100,11 @@ fn cli_help_lists_recovery_timeout_ms_flag() {
 /// 01 leaves the parser unchanged so this exits 2 (UnknownFlag).
 #[test]
 fn cli_parses_recovery_timeout_ms() {
+    let path = unique_uds_path("recovery-timeout");
     let out = Command::new(env!("CARGO_BIN_EXE_varta-watch"))
         .args([
             "--socket",
-            "/tmp/varta-watch-cli-recovery-timeout.sock",
+            path.as_str(),
             "--threshold-ms",
             "100",
             "--recovery-timeout-ms",
@@ -87,6 +117,32 @@ fn cli_parses_recovery_timeout_ms() {
     assert!(
         out.status.success(),
         "--recovery-timeout-ms must parse cleanly; got {:?} (stderr: {})",
+        out.status,
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// `varta-watch --socket-mode <OCTAL>` must parse cleanly and the
+/// binary must start (implying chmod succeeded).
+#[test]
+fn cli_parses_socket_mode() {
+    let path = unique_uds_path("sockmode");
+    let out = Command::new(env!("CARGO_BIN_EXE_varta-watch"))
+        .args([
+            "--socket",
+            path.as_str(),
+            "--threshold-ms",
+            "100",
+            "--socket-mode",
+            "600",
+            "--shutdown-after-secs",
+            "0",
+        ])
+        .output()
+        .expect("spawn varta-watch with --socket-mode");
+    assert!(
+        out.status.success(),
+        "--socket-mode must parse cleanly; got {:?} (stderr: {})",
         out.status,
         String::from_utf8_lossy(&out.stderr)
     );

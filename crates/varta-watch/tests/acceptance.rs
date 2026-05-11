@@ -91,7 +91,7 @@ where
 fn observer_emits_beat_per_received_frame() {
     let path = unique_uds_path("beats");
     let mut observer =
-        Observer::bind(path.as_path(), Duration::from_secs(60)).expect("bind observer");
+        Observer::bind(path.as_path(), Duration::from_secs(60), 0o600).expect("bind observer");
     let client = client_socket(path.as_path());
 
     let frames = [
@@ -118,6 +118,7 @@ fn observer_emits_beat_per_received_frame() {
                 Event::Decode(e) => panic!("unexpected decode error: {e}"),
                 Event::Io(e) => panic!("unexpected io error: {e}"),
                 Event::Stall { .. } => panic!("unexpected stall during beat test"),
+                Event::AuthFailure { .. } => panic!("unexpected auth failure during beat test"),
             }
         } else {
             thread::sleep(Duration::from_millis(1));
@@ -134,7 +135,7 @@ fn observer_emits_beat_per_received_frame() {
 fn observer_emits_stall_after_threshold_elapses() {
     let path = unique_uds_path("stall");
     let threshold = Duration::from_millis(150);
-    let mut observer = Observer::bind(path.as_path(), threshold).expect("bind observer");
+    let mut observer = Observer::bind(path.as_path(), threshold, 0o600).expect("bind observer");
     let client = client_socket(path.as_path());
 
     send_frame(&client, &make_frame(202, 1, Status::Ok, 0xB1));
@@ -174,7 +175,7 @@ fn observer_emits_stall_after_threshold_elapses() {
 fn observer_reports_decode_error_for_bad_magic() {
     let path = unique_uds_path("decode");
     let mut observer =
-        Observer::bind(path.as_path(), Duration::from_secs(60)).expect("bind observer");
+        Observer::bind(path.as_path(), Duration::from_secs(60), 0o600).expect("bind observer");
     let client = client_socket(path.as_path());
 
     let bogus = [0xFFu8; 32];
@@ -206,4 +207,47 @@ fn tracker_capacity_bounded_to_64_pids() {
     let result = tracker.record(&overflow, now_ns, threshold_ns);
     assert_eq!(result, Update::CapacityExceeded);
     assert_eq!(tracker.len(), 64, "len must not grow past capacity");
+}
+
+/// A frame whose `pid` field does not match the kernel-attested sender
+/// PID must yield `Event::AuthFailure` on Linux.  On macOS the kernel
+/// does not expose per-datagram PIDs for unconnected `SOCK_DGRAM`, so
+/// the beat is accepted (defence relies on `--socket-mode 0600`).
+#[test]
+fn observer_rejects_spoofed_pid_frame() {
+    let path = unique_uds_path("spoof");
+    let mut observer =
+        Observer::bind(path.as_path(), Duration::from_secs(60), 0o600).expect("bind observer");
+    let client = client_socket(path.as_path());
+
+    let real_pid = std::process::id();
+    let spoofed_pid = real_pid + 999;
+    let frame = make_frame(spoofed_pid, 1, Status::Ok, 0xCC);
+    send_frame(&client, &frame);
+
+    #[cfg(target_os = "linux")]
+    {
+        let claimed = poll_until_match(&mut observer, Duration::from_secs(2), |ev| match ev {
+            Event::AuthFailure { claimed_pid } => Ok(claimed_pid),
+            Event::Stall { .. } => Err(()),
+            _ => Err(()),
+        });
+        let c = claimed.expect("expected Event::AuthFailure on Linux when pid is spoofed");
+        assert_eq!(
+            c, spoofed_pid,
+            "AuthFailure claimed_pid must match spoofed pid"
+        );
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        let accepted = poll_until_match(&mut observer, Duration::from_secs(2), |ev| match ev {
+            Event::Beat { pid, .. } if pid == spoofed_pid => Ok(pid),
+            _ => Err(()),
+        });
+        assert!(
+            accepted.is_some(),
+            "on macOS spoofed frame should be accepted as a beat"
+        );
+    }
 }

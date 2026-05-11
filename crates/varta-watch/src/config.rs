@@ -13,6 +13,11 @@ use std::time::Duration;
 /// without an explicit `--recovery-debounce-ms`.
 pub const DEFAULT_RECOVERY_DEBOUNCE_MS: u64 = 1000;
 
+/// Default UDS file permissions applied after bind (octal 0600 — owner-only
+/// read and write). Tightens the blast radius so only the owning UID can
+/// speak to the observer socket.
+pub const DEFAULT_SOCKET_MODE: u32 = 0o600;
+
 /// Parsed daemon configuration.
 #[derive(Clone, Debug)]
 pub struct Config {
@@ -37,6 +42,9 @@ pub struct Config {
     /// reaped on completion but never killed. Set via
     /// `--recovery-timeout-ms`.
     pub recovery_timeout: Option<Duration>,
+    /// UDS file mode applied after bind (octal, e.g. `0o600`).
+    /// Defaults to [`DEFAULT_SOCKET_MODE`].
+    pub socket_mode: u32,
 }
 
 /// Failure modes for [`Config::from_args`].
@@ -55,6 +63,8 @@ pub enum ConfigError {
         /// The raw string that did not parse.
         raw: String,
     },
+    /// A value on `--socket-mode` could not be parsed as octal.
+    BadSocketMode(String),
     /// `--prom-addr` value did not parse as `IP:PORT`.
     BadAddr(String),
     /// The user passed `--help` / `-h`. Not a true error; `main` prints
@@ -70,6 +80,9 @@ impl core::fmt::Display for ConfigError {
             ConfigError::UnknownFlag(s) => write!(f, "unknown flag {s}"),
             ConfigError::BadInteger { flag, raw } => {
                 write!(f, "{flag}: not a valid unsigned integer: {raw:?}")
+            }
+            ConfigError::BadSocketMode(raw) => {
+                write!(f, "--socket-mode: not a valid octal integer: {raw:?}")
             }
             ConfigError::BadAddr(raw) => {
                 write!(f, "--prom-addr: not a valid socket address: {raw:?}")
@@ -100,9 +113,11 @@ OPTIONAL:
                                    The literal {pid} is replaced with the
                                    stalled pid before /bin/sh -c executes.
     --recovery-debounce-ms <MS>    Per-pid debounce window for recovery
-                                   invocations (default 1000).
-    --export-file <PATH>           Append one tab-separated event line per
-                                   observer event to this file.
+                                    invocations (default 1000).
+    --socket-mode <OCTAL>           File mode for the observer socket
+                                    (default 0600 — owner-only r/w).
+    --export-file <PATH>            Append one tab-separated event line per
+                                    observer event to this file.
     --prom-addr <IP:PORT>          Bind a Prometheus text-format endpoint at
                                    GET /metrics on this address.
     --recovery-timeout-ms <MS>     Kill-after deadline for recovery children;
@@ -125,6 +140,7 @@ OPTIONAL:
         let mut prom_addr: Option<SocketAddr> = None;
         let mut shutdown_after_secs: Option<u64> = None;
         let mut recovery_timeout_ms: Option<u64> = None;
+        let mut socket_mode: Option<u32> = None;
 
         let mut iter = args.into_iter();
         while let Some(tok) = iter.next() {
@@ -151,6 +167,12 @@ OPTIONAL:
                         .next()
                         .ok_or(ConfigError::MissingValue("--recovery-debounce-ms"))?;
                     recovery_debounce_ms = Some(parse_u64("--recovery-debounce-ms", &v)?);
+                }
+                "--socket-mode" => {
+                    let v = iter
+                        .next()
+                        .ok_or(ConfigError::MissingValue("--socket-mode"))?;
+                    socket_mode = Some(parse_octal(&v)?);
                 }
                 "--export-file" => {
                     let v = iter
@@ -198,6 +220,7 @@ OPTIONAL:
             prom_addr,
             shutdown_after: shutdown_after_secs.map(Duration::from_secs),
             recovery_timeout: recovery_timeout_ms.map(Duration::from_millis),
+            socket_mode: socket_mode.unwrap_or(DEFAULT_SOCKET_MODE),
         })
     }
 }
@@ -207,6 +230,10 @@ fn parse_u64(flag: &'static str, raw: &str) -> Result<u64, ConfigError> {
         flag,
         raw: raw.to_string(),
     })
+}
+
+fn parse_octal(raw: &str) -> Result<u32, ConfigError> {
+    u32::from_str_radix(raw, 8).map_err(|_| ConfigError::BadSocketMode(raw.to_string()))
 }
 
 #[cfg(test)]
@@ -224,6 +251,7 @@ mod tests {
         assert_eq!(cfg.socket, PathBuf::from("/tmp/x.sock"));
         assert_eq!(cfg.threshold, Duration::from_millis(250));
         assert_eq!(cfg.recovery_debounce, Duration::from_millis(1000));
+        assert_eq!(cfg.socket_mode, 0o600);
         assert!(cfg.recovery_cmd.is_none());
         assert!(cfg.prom_addr.is_none());
     }
@@ -291,6 +319,7 @@ mod tests {
             "--recovery-timeout-ms",
             "--export-file",
             "--prom-addr",
+            "--socket-mode",
             "--shutdown-after-secs",
             "--help",
         ] {
@@ -320,5 +349,34 @@ mod tests {
         let cfg =
             Config::from_args(args(&["--socket", "/s", "--threshold-ms", "100"])).expect("parse");
         assert!(cfg.recovery_timeout.is_none());
+    }
+
+    #[test]
+    fn parses_socket_mode_octal() {
+        let cfg = Config::from_args(args(&[
+            "--socket",
+            "/s",
+            "--threshold-ms",
+            "100",
+            "--socket-mode",
+            "660",
+        ]))
+        .expect("parse");
+        assert_eq!(cfg.socket_mode, 0o660);
+    }
+
+    #[test]
+    fn socket_mode_rejects_non_octal() {
+        match Config::from_args(args(&[
+            "--socket",
+            "/s",
+            "--threshold-ms",
+            "100",
+            "--socket-mode",
+            "999",
+        ])) {
+            Err(ConfigError::BadSocketMode(_)) => {}
+            other => panic!("expected BadSocketMode, got {other:?}"),
+        }
     }
 }

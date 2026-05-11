@@ -98,7 +98,7 @@ fn run(cfg: Config) -> std::io::Result<()> {
         install_signal_handlers();
     }
 
-    let mut observer = Observer::bind(&cfg.socket, cfg.threshold)?;
+    let mut observer = Observer::bind(&cfg.socket, cfg.threshold, cfg.socket_mode)?;
     let _guard = SocketGuard(cfg.socket.clone());
     let mut recovery = cfg.recovery_cmd.as_ref().map(|tpl| {
         Recovery::with_timeout(tpl.clone(), cfg.recovery_debounce, cfg.recovery_timeout)

@@ -11,6 +11,7 @@
 pub mod config;
 pub mod exporter;
 pub mod observer;
+pub mod peer_cred;
 pub mod recovery;
 pub mod tracker;
 

@@ -1,73 +1,20 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 64 64">
   <defs>
-    <!-- Background Gradient -->
-    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
-      <stop offset="0%" stop-color="#18181b" />
-      <stop offset="100%" stop-color="#09090b" />
-    </linearGradient>
-    
-    <!-- Cyberpunk grid gradient -->
-    <linearGradient id="gridGrad" x1="0" y1="0" x2="0" y2="1">
-      <stop offset="0%" stop-color="#22d3ee" stop-opacity="0.15" />
-      <stop offset="50%" stop-color="#22d3ee" stop-opacity="0.0" />
-      <stop offset="100%" stop-color="#22d3ee" stop-opacity="0.15" />
-    </linearGradient>
-
-    <!-- Neon Glow Filter -->
     <filter id="glow" x="-50%" y="-50%" width="200%" height="200%">
-      <feGaussianBlur in="SourceGraphic" stdDeviation="2.5" result="blur1" />
-      <feGaussianBlur in="SourceGraphic" stdDeviation="5" result="blur2" />
+      <feGaussianBlur stdDeviation="3" result="blur" />
       <feMerge>
-        <feMergeNode in="blur2" />
-        <feMergeNode in="blur1" />
+        <feMergeNode in="blur" />
         <feMergeNode in="SourceGraphic" />
       </feMerge>
     </filter>
-
-    <!-- The Heartbeat Trace -->
-    <path id="pulse" d="M -50 32 L 16 32 L 22 40 L 32 10 L 42 48 L 48 32 L 114 32" />
+    <path id="beat" d="M -10 32 L 16 32 L 24 44 L 36 12 L 44 38 L 50 32 L 74 32" />
   </defs>
 
-  <!-- Base Rectangle -->
-  <rect width="64" height="64" rx="14" fill="url(#bg)" />
-  
-  <!-- Subtle inner border for 3D depth -->
-  <rect width="62" height="62" x="1" y="1" rx="13" fill="none" stroke="#2a2a2f" stroke-width="1.5" />
-  <path d="M 14 1 L 50 1" stroke="#ffffff" stroke-opacity="0.2" stroke-width="1.5" stroke-linecap="round" />
+  <!-- Thick cyan trace (always visible, highly contrasting) -->
+  <use href="#beat" fill="none" stroke="#22d3ee" stroke-width="7" stroke-linecap="round" stroke-linejoin="round" filter="url(#glow)" />
 
-  <!-- Background Grid -->
-  <g stroke="url(#gridGrad)" stroke-width="1">
-    <line x1="0" y1="16" x2="64" y2="16" />
-    <line x1="0" y1="32" x2="64" y2="32" opacity="0.6" />
-    <line x1="0" y1="48" x2="64" y2="48" />
-    <line x1="16" y1="0" x2="16" y2="64" />
-    <line x1="32" y1="0" x2="32" y2="64" />
-    <line x1="48" y1="0" x2="48" y2="64" />
-  </g>
-
-  <!-- Faint static track -->
-  <use href="#pulse" fill="none" stroke="#22d3ee" stroke-width="2" stroke-opacity="0.15" stroke-linecap="round" stroke-linejoin="round" />
-
-  <!-- The moving neon beam -->
-  <use href="#pulse" fill="none" stroke="#22d3ee" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" filter="url(#glow)" stroke-dasharray="40 230">
-    <animate attributeName="stroke-dashoffset" values="40; -190" dur="2s" repeatCount="indefinite" />
+  <!-- Animated bright white pulse moving across the trace -->
+  <use href="#beat" fill="none" stroke="#ffffff" stroke-width="4" stroke-linecap="round" stroke-linejoin="round" stroke-dasharray="25 150">
+    <animate attributeName="stroke-dashoffset" values="25; -150" dur="1.5s" repeatCount="indefinite" />
   </use>
-
-  <!-- White-hot leading dot -->
-  <circle cx="0" cy="0" r="2" fill="#ffffff" filter="url(#glow)">
-    <animateMotion dur="2s" repeatCount="indefinite" path="M -50 32 L 16 32 L 22 40 L 32 10 L 42 48 L 48 32 L 114 32" />
-  </circle>
-
-  <!-- First peak ripple (High) -->
-  <circle cx="32" cy="10" r="2" fill="none" stroke="#22d3ee" stroke-width="2" opacity="0">
-    <animate attributeName="r" values="2; 2; 22; 22" keyTimes="0; 0.467; 0.717; 1" dur="2s" repeatCount="indefinite" />
-    <animate attributeName="opacity" values="0; 0; 0.9; 0; 0" keyTimes="0; 0.467; 0.468; 0.717; 1" dur="2s" repeatCount="indefinite" />
-  </circle>
-  
-  <!-- Second peak ripple (Low) -->
-  <circle cx="42" cy="48" r="2" fill="none" stroke="#ef4444" stroke-width="1.5" opacity="0">
-    <animate attributeName="r" values="2; 2; 16; 16" keyTimes="0; 0.638; 0.888; 1" dur="2s" repeatCount="indefinite" />
-    <animate attributeName="opacity" values="0; 0; 0.8; 0; 0" keyTimes="0; 0.638; 0.639; 0.888; 1" dur="2s" repeatCount="indefinite" />
-    <animate attributeName="stroke" values="#ef4444; #ef4444; #22d3ee; #22d3ee" keyTimes="0; 0.638; 0.888; 1" dur="2s" repeatCount="indefinite" />
-  </circle>
 </svg>

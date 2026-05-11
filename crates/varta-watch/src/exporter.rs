@@ -39,9 +39,9 @@ pub trait Exporter {
 /// <observer_ns>\t<kind>\t<pid>\t<nonce>\t<status>\t<payload>\n
 /// ```
 ///
-/// `kind` ∈ `{beat, stall, decode, io}`. For `decode` and `io` events the
-/// pid / nonce / status / payload columns are written as `-` so the line
-/// count and column count remain stable.
+/// `kind` ∈ `{beat, stall, decode, io, mismatch}`. For `decode`, `io`, and
+/// `mismatch` events the pid / nonce / status / payload columns are written
+/// as `-` so the line count and column count remain stable.
 ///
 /// `observer_ns` is the elapsed nanoseconds since this exporter was
 /// created, captured at `record()` time. The `Event` enum carries no
@@ -96,6 +96,9 @@ impl Exporter for FileExporter {
             } => format!("{ns}\tstall\t{pid}\t{last_nonce}\tstall\t-\n"),
             Event::Decode(err) => format!("{ns}\tdecode\t-\t-\t-\t{err:?}\n"),
             Event::Io(err) => format!("{ns}\tio\t-\t-\t-\t{err}\n"),
+            Event::AuthFailure { claimed_pid } => {
+                format!("{ns}\tmismatch\t{claimed_pid}\t-\t-\tauth_failure\n")
+            }
         };
         if let Err(e) = self.sink.write_all(line.as_bytes()) {
             self.pending_err = Some(e);
@@ -166,6 +169,7 @@ pub struct PromExporter {
     listener: TcpListener,
     rows: HashMap<u32, GaugeRow>,
     evicted_total: u64,
+    auth_failures_total: u64,
 }
 
 impl PromExporter {
@@ -177,6 +181,7 @@ impl PromExporter {
             listener,
             rows: HashMap::new(),
             evicted_total: 0,
+            auth_failures_total: 0,
         })
     }
 
@@ -284,6 +289,17 @@ impl PromExporter {
             out.push_str("# TYPE varta_tracker_evicted_total counter\n");
             let _ = writeln!(out, "varta_tracker_evicted_total {}", self.evicted_total);
         }
+        if self.auth_failures_total > 0 {
+            out.push_str(
+                "# HELP varta_frame_auth_failures_total Frames rejected due to PID spoofing or authentication failure.\n",
+            );
+            out.push_str("# TYPE varta_frame_auth_failures_total counter\n");
+            let _ = writeln!(
+                out,
+                "varta_frame_auth_failures_total {}",
+                self.auth_failures_total
+            );
+        }
         out
     }
 }
@@ -300,6 +316,9 @@ impl Exporter for PromExporter {
                 let row = self.rows.entry(*pid).or_insert_with(GaugeRow::new);
                 row.stalls_total = row.stalls_total.saturating_add(1);
                 row.last_status = Some(status_code(Status::Stall));
+            }
+            Event::AuthFailure { .. } => {
+                self.auth_failures_total = self.auth_failures_total.saturating_add(1);
             }
             Event::Decode(_) | Event::Io(_) => {}
         }

@@ -6,12 +6,15 @@
 //! caller drives the loop — see Session 05 for the daemon entrypoint.
 
 use std::io::{self, ErrorKind};
+use std::os::unix::fs::PermissionsExt;
+use std::os::unix::io::AsRawFd;
 use std::os::unix::net::UnixDatagram;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
 use varta_vlp::{DecodeError, Frame, Status};
 
+use crate::peer_cred::{self, RecvResult};
 use crate::tracker::{Tracker, Update, CAPACITY};
 
 /// How long [`Observer::poll`] blocks in `recv_from` before returning to the
@@ -49,6 +52,13 @@ pub enum Event {
     },
     /// A 32-byte payload arrived but failed VLP decoding.
     Decode(DecodeError),
+    /// Frame decoded but the `frame.pid` does not match the kernel-verified
+    /// peer PID of the sender. The claimed pid is preserved so exporters can
+    /// record what the frame *claimed* to be.
+    AuthFailure {
+        /// The pid the frame on the wire claimed to be.
+        claimed_pid: u32,
+    },
     /// Receiving from the socket failed with an error other than
     /// `WouldBlock` / `TimedOut`.
     Io(io::Error),
@@ -72,6 +82,12 @@ impl Observer {
     /// Bind a Unix datagram socket at `path` and return an [`Observer`]
     /// configured with the given stall `threshold`.
     ///
+    /// The socket file permissions are set to `socket_mode` (octal, e.g.
+    /// `0o600`) immediately after a successful bind. Credential passing is
+    /// enabled on the socket so that [`Observer::poll`] can verify the PID
+    /// of every sender against the kernel's `SO_PASSCRED` / `LOCAL_CREDS`
+    /// attestation.
+    ///
     /// If a genuine stale socket exists at `path` (no one listening),
     /// it is cleaned up and the bind succeeds. If another process is
     /// already listening at `path`, the call fails with `AddrInUse`.
@@ -81,11 +97,14 @@ impl Observer {
     ///
     /// The socket is given a fixed read timeout (100 ms) so
     /// [`Observer::poll`] cannot block indefinitely.
-    pub fn bind(path: impl AsRef<Path>, threshold: Duration) -> io::Result<Self> {
+    pub fn bind(path: impl AsRef<Path>, threshold: Duration, socket_mode: u32) -> io::Result<Self> {
         let path = path.as_ref();
 
         match UnixDatagram::bind(path) {
-            Ok(sock) => Self::finish_bind(sock, threshold),
+            Ok(sock) => {
+                std::fs::set_permissions(path, std::fs::Permissions::from_mode(socket_mode))?;
+                Self::finish_bind(sock, threshold)
+            }
             Err(e) if e.kind() == ErrorKind::AddrInUse => {
                 match probe_live(path) {
                     Ok(true) => Err(io::Error::new(
@@ -99,6 +118,10 @@ impl Observer {
                         // Genuine stale socket — clean up and retry bind.
                         std::fs::remove_file(path)?;
                         let sock = UnixDatagram::bind(path)?;
+                        std::fs::set_permissions(
+                            path,
+                            std::fs::Permissions::from_mode(socket_mode),
+                        )?;
                         Self::finish_bind(sock, threshold)
                     }
                     Err(e) => Err(io::Error::new(
@@ -128,29 +151,41 @@ impl Observer {
             return stall;
         }
 
-        let mut buf = [0u8; 32];
-        match self.sock.recv(&mut buf) {
-            Ok(32) => {
+        match peer_cred::recv_authenticated(self.sock.as_raw_fd()) {
+            RecvResult::Authenticated { peer_pid, data } => {
                 let now_ns = self.now_ns();
-                match Frame::decode(&buf) {
-                    Ok(frame) => match self.tracker.record(&frame, now_ns, self.threshold_ns) {
-                        Update::Inserted | Update::Refreshed => {
-                            let status = Status::try_from_u8(frame.status)
-                                .expect("Frame::decode validated the status byte");
-                            Some(Event::Beat {
-                                pid: frame.pid,
-                                status,
-                                payload: frame.payload,
-                                nonce: frame.nonce,
-                            })
+                match Frame::decode(&data) {
+                    Ok(frame) => {
+                        // PID verification: on Linux the kernel provides
+                        // SO_PASSCRED → SCM_CREDENTIALS with the true
+                        // sender PID.  On macOS this mechanism is not
+                        // available for unconnected SOCK_DGRAM, so we
+                        // rely on --socket-mode 0600 to restrict access.
+                        #[cfg(target_os = "linux")]
+                        if frame.pid != peer_pid {
+                            return Some(Event::AuthFailure {
+                                claimed_pid: frame.pid,
+                            });
                         }
-                        Update::OutOfOrder | Update::CapacityExceeded => None,
-                    },
+                        let _ = peer_pid; // silence unused on macOS
+                        match self.tracker.record(&frame, now_ns, self.threshold_ns) {
+                            Update::Inserted | Update::Refreshed => {
+                                let status = Status::try_from_u8(frame.status)
+                                    .expect("Frame::decode validated the status byte");
+                                Some(Event::Beat {
+                                    pid: frame.pid,
+                                    status,
+                                    payload: frame.payload,
+                                    nonce: frame.nonce,
+                                })
+                            }
+                            Update::OutOfOrder | Update::CapacityExceeded => None,
+                        }
+                    }
                     Err(e) => Some(Event::Decode(e)),
                 }
             }
-            Ok(_) => None,
-            Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
+            RecvResult::WouldBlock => {
                 self.drain_stalls();
                 if self.stall_cursor < self.stall_queue.len() {
                     let stall = self.stall_queue[self.stall_cursor].take();
@@ -159,7 +194,9 @@ impl Observer {
                 }
                 None
             }
-            Err(e) => Some(Event::Io(e)),
+            RecvResult::ShortRead => None,
+            RecvResult::NoCredentials => None,
+            RecvResult::IoError(e) => Some(Event::Io(e)),
         }
     }
 
@@ -199,6 +236,8 @@ impl Observer {
 
     fn finish_bind(sock: UnixDatagram, threshold: Duration) -> io::Result<Self> {
         sock.set_read_timeout(Some(READ_TIMEOUT))?;
+        let raw_fd = sock.as_raw_fd();
+        peer_cred::enable_credential_passing(raw_fd)?;
         let threshold_ns = threshold.as_nanos().min(u64::MAX as u128) as u64;
         Ok(Observer {
             sock,
