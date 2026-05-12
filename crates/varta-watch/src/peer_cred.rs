@@ -48,13 +48,13 @@ pub enum RecvResult {
 // ---------------------------------------------------------------------------
 
 #[cfg(target_os = "linux")]
-fn cmsg_align(len: usize) -> usize {
+const fn cmsg_align(len: usize) -> usize {
     let align = core::mem::size_of::<usize>();
     (len + align - 1) & !(align - 1)
 }
 
 #[cfg(target_os = "linux")]
-fn cmsg_hdr_size() -> usize {
+const fn cmsg_hdr_size() -> usize {
     cmsg_align(core::mem::size_of::<plat::Cmsghdr>())
 }
 

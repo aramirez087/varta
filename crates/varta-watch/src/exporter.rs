@@ -318,7 +318,7 @@ impl PromExporter {
             let response = b"HTTP/1.0 405 Method Not Allowed\r\nAllow: GET\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
             let _ =
                 write_all_nonblocking(&mut stream, response, Instant::now() + PROM_WRITE_TIMEOUT);
-            let _ = stream.shutdown(Shutdown::Both);
+            let _ = stream.shutdown(Shutdown::Write);
             return Ok(());
         }
 
@@ -329,7 +329,7 @@ impl PromExporter {
         // combined response String.
         let _ = write_headers_with_len(&mut stream, body_len, write_deadline);
         let _ = write_all_nonblocking(&mut stream, self.body_buf.as_bytes(), write_deadline);
-        let _ = stream.shutdown(Shutdown::Both);
+        let _ = stream.shutdown(Shutdown::Write);
         Ok(())
     }
 
