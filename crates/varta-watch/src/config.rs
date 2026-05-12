@@ -107,6 +107,10 @@ pub struct Config {
     /// faster than this rate from the same pid are dropped and counted
     /// via `varta_rate_limited_total`.
     pub max_beat_rate: Option<u32>,
+    /// Optional path for a heartbeat file. When set, the observer
+    /// writes a timestamp + loop-counter line on every poll iteration,
+    /// allowing external watchdogs to detect observer stalls.
+    pub heartbeat_file: Option<PathBuf>,
 }
 
 /// Failure modes for [`Config::from_args`].
@@ -269,6 +273,10 @@ OPTIONAL:
                                      Beats arriving faster than this rate
                                      from the same pid are dropped.
                                      Default: unlimited.
+    --heartbeat-file <PATH>        Write a timestamp + loop-counter line to
+                                     this file on every poll iteration.
+                                     External watchdogs can monitor the file
+                                     mtime to detect observer stalls.
 
     -h, --help                     Print this message and exit.
 ";
@@ -298,6 +306,7 @@ OPTIONAL:
         let mut master_key_file: Option<PathBuf> = None;
         let mut key_env: String = String::from("VARTA_KEY");
         let mut max_beat_rate: Option<u32> = None;
+        let mut heartbeat_file: Option<PathBuf> = None;
 
         let mut iter = args.into_iter();
         while let Some(tok) = iter.next() {
@@ -446,6 +455,12 @@ OPTIONAL:
                             raw: v,
                         })?);
                 }
+                "--heartbeat-file" => {
+                    let v = iter
+                        .next()
+                        .ok_or(ConfigError::MissingValue("--heartbeat-file"))?;
+                    heartbeat_file = Some(PathBuf::from(v));
+                }
                 other => return Err(ConfigError::UnknownFlag(other.to_string())),
             }
         }
@@ -487,6 +502,7 @@ OPTIONAL:
             master_key_file,
             key_env,
             max_beat_rate,
+            heartbeat_file,
         })
     }
 
@@ -867,6 +883,7 @@ mod tests {
             "--read-timeout-ms",
             "--tracker-capacity",
             "--export-file",
+            "--export-file-max-bytes",
             "--prom-addr",
             "--socket-mode",
             "--shutdown-after-secs",
@@ -877,6 +894,7 @@ mod tests {
             "--master-key-file",
             "--key-env",
             "--max-beat-rate",
+            "--heartbeat-file",
             "--help",
         ] {
             assert!(
@@ -1185,5 +1203,26 @@ mod tests {
         let cfg =
             Config::from_args(args(&["--socket", "/s", "--threshold-ms", "100"])).expect("parse");
         assert!(cfg.recovery_env.is_empty());
+    }
+
+    #[test]
+    fn parses_heartbeat_file() {
+        let cfg = Config::from_args(args(&[
+            "--socket",
+            "/s",
+            "--threshold-ms",
+            "100",
+            "--heartbeat-file",
+            "/tmp/varta-hb",
+        ]))
+        .expect("parse");
+        assert_eq!(cfg.heartbeat_file, Some(PathBuf::from("/tmp/varta-hb")));
+    }
+
+    #[test]
+    fn heartbeat_file_omitted_is_none() {
+        let cfg =
+            Config::from_args(args(&["--socket", "/s", "--threshold-ms", "100"])).expect("parse");
+        assert!(cfg.heartbeat_file.is_none());
     }
 }

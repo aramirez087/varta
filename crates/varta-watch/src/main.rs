@@ -356,6 +356,7 @@ fn run(cfg: Config) -> std::io::Result<()> {
     };
 
     let started = Instant::now();
+    let mut loop_count: u64 = 0;
     loop {
         if SHUTDOWN.load(Ordering::Acquire) {
             break;
@@ -501,6 +502,7 @@ fn run(cfg: Config) -> std::io::Result<()> {
             if let Err(e) = pe.serve_pending() {
                 eprintln!("varta-watch: /metrics serve error: {e}");
             }
+            pe.record_loop_tick();
         }
 
         // ----- 4. Throttle: sleep only when truly idle ------
@@ -510,6 +512,16 @@ fn run(cfg: Config) -> std::io::Result<()> {
         // without a sleep penalty.
         if !had_io && !observer.has_pending_stalls() {
             std::thread::sleep(Duration::from_millis(10));
+        }
+
+        // ----- 5. Heartbeat file update ------
+        loop_count = loop_count.wrapping_add(1);
+        if let Some(ref hb_path) = cfg.heartbeat_file {
+            let ts = observer.now_ns();
+            let line = format!("{loop_count} {ts}\n");
+            if let Err(e) = std::fs::write(hb_path, line.as_bytes()) {
+                eprintln!("varta-watch: heartbeat file write error: {e}");
+            }
         }
     }
 

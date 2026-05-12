@@ -16,7 +16,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{self, BufWriter, ErrorKind, Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use varta_vlp::{DecodeError, Status};
 
@@ -408,6 +408,13 @@ pub struct PromExporter {
     sender_state_full_total: u64,
     rate_limited_total: u64,
     nonce_wrap_total: u64,
+    /// Observer startup instant (monotonic). Used to emit
+    /// `varta_watch_uptime_seconds`.
+    started_at: Instant,
+    /// Wall-clock timestamp of the most recent poll loop tick. Used to emit
+    /// `varta_watch_last_poll_loop_timestamp_seconds` so operators can
+    /// detect observer stalls.
+    last_loop_system: SystemTime,
 }
 
 impl PromExporter {
@@ -431,6 +438,8 @@ impl PromExporter {
             sender_state_full_total: 0,
             rate_limited_total: 0,
             nonce_wrap_total: 0,
+            started_at: Instant::now(),
+            last_loop_system: SystemTime::now(),
         })
     }
 
@@ -482,6 +491,13 @@ impl PromExporter {
     /// space and looped to 0).
     pub fn record_nonce_wraps(&mut self, count: u64) {
         self.nonce_wrap_total = self.nonce_wrap_total.saturating_add(count);
+    }
+
+    /// Record that the observer poll loop has completed another tick.
+    /// Called once per outer loop iteration so that
+    /// `varta_watch_last_poll_loop_timestamp_seconds` stays fresh.
+    pub fn record_loop_tick(&mut self) {
+        self.last_loop_system = SystemTime::now();
     }
 
     /// Record one or more `MSG_CTRUNC` ancillary-data truncation events.
@@ -740,6 +756,37 @@ impl PromExporter {
             self.body_buf,
             "varta_nonce_wrap_total {}",
             self.nonce_wrap_total
+        );
+        // --- Observer self-health metrics ---------------------------------
+        self.body_buf
+            .push_str("# HELP varta_watch_uptime_seconds Observer process uptime in seconds.\n");
+        self.body_buf
+            .push_str("# TYPE varta_watch_uptime_seconds gauge\n");
+        let uptime = self.started_at.elapsed().as_secs_f64();
+        let _ = writeln!(self.body_buf, "varta_watch_uptime_seconds {uptime:.3}");
+        self.body_buf.push_str(
+            "# HELP varta_watch_last_poll_loop_timestamp_seconds Unix timestamp of the most recent poll loop iteration.\n",
+        );
+        self.body_buf
+            .push_str("# TYPE varta_watch_last_poll_loop_timestamp_seconds gauge\n");
+        let loop_ts = self
+            .last_loop_system
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs_f64();
+        let _ = writeln!(
+            self.body_buf,
+            "varta_watch_last_poll_loop_timestamp_seconds {loop_ts:.3}"
+        );
+        self.body_buf.push_str(
+            "# HELP varta_watch_pids_tracked Current number of agent PIDs in the tracker.\n",
+        );
+        self.body_buf
+            .push_str("# TYPE varta_watch_pids_tracked gauge\n");
+        let _ = writeln!(
+            self.body_buf,
+            "varta_watch_pids_tracked {}",
+            self.rows.len()
         );
     }
 }
@@ -1020,5 +1067,45 @@ mod tests {
         prom.record_evicted_pid(99);
         // Verify rows is still empty.
         assert!(prom.rows.is_empty());
+    }
+
+    #[test]
+    fn self_health_metrics_are_emitted() {
+        let mut prom = PromExporter::bind("127.0.0.1:0".parse().unwrap()).expect("bind");
+        // Add a tracked PID so pids_tracked > 0
+        prom.record(&Event::Beat {
+            pid: 7,
+            status: Status::Ok,
+            nonce: 1,
+            payload: 0,
+            observer_ns: 1,
+        })
+        .unwrap();
+        prom.record_loop_tick();
+        prom.render_body();
+        let body = &prom.body_buf;
+        assert!(
+            body.contains("varta_watch_uptime_seconds"),
+            "missing varta_watch_uptime_seconds:\n{body}"
+        );
+        assert!(
+            body.contains("varta_watch_last_poll_loop_timestamp_seconds"),
+            "missing varta_watch_last_poll_loop_timestamp_seconds:\n{body}"
+        );
+        assert!(
+            body.contains("varta_watch_pids_tracked 1"),
+            "missing/incorrect varta_watch_pids_tracked:\n{body}"
+        );
+        // Uptime should be small (just created)
+        let needle = "varta_watch_uptime_seconds 0.";
+        assert!(body.contains(needle), "uptime should start near 0:\n{body}");
+        // pids_tracked after eviction
+        prom.record_evicted_pid(7);
+        prom.render_body();
+        let body2 = &prom.body_buf;
+        assert!(
+            body2.contains("varta_watch_pids_tracked 0"),
+            "pids_tracked should be 0 after eviction:\n{body2}"
+        );
     }
 }
