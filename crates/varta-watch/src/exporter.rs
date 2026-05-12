@@ -412,6 +412,11 @@ pub struct PromExporter {
     /// [`PROM_MIN_SCRAPE_INTERVAL`] had not elapsed since the last fresh
     /// render.  Operators can alert on this to detect scrape pressure.
     scrape_skipped_total: u64,
+    /// Times [`serve_pending`](Self::serve_pending) exhausted its per-tick
+    /// budget (connection cap or wall-clock deadline).  Operators can alert
+    /// on this to detect when the exporter cannot serve all incoming scrapes
+    /// within a single poll tick.
+    scrape_budget_exhausted_total: u64,
     /// Observer startup instant (monotonic). Used to emit
     /// `varta_watch_uptime_seconds`.
     started_at: Instant,
@@ -443,6 +448,7 @@ impl PromExporter {
             rate_limited_total: 0,
             nonce_wrap_total: 0,
             scrape_skipped_total: 0,
+            scrape_budget_exhausted_total: 0,
             started_at: Instant::now(),
             last_loop_system: SystemTime::now(),
         })
@@ -542,9 +548,13 @@ impl PromExporter {
         let mut served = 0;
         let result = loop {
             if Instant::now() >= serve_deadline {
+                self.scrape_budget_exhausted_total =
+                    self.scrape_budget_exhausted_total.saturating_add(1);
                 break Ok(());
             }
             if served >= PROM_MAX_CONNECTIONS_PER_SERVE {
+                self.scrape_budget_exhausted_total =
+                    self.scrape_budget_exhausted_total.saturating_add(1);
                 break Ok(());
             }
             match self.listener.accept() {
@@ -770,6 +780,16 @@ impl PromExporter {
             self.body_buf,
             "varta_scrape_skipped_total {}",
             self.scrape_skipped_total
+        );
+        self.body_buf.push_str(
+            "# HELP varta_scrape_budget_exhausted_total Times the serve budget (max connections or deadline) was exhausted during a poll tick.\n",
+        );
+        self.body_buf
+            .push_str("# TYPE varta_scrape_budget_exhausted_total counter\n");
+        let _ = writeln!(
+            self.body_buf,
+            "varta_scrape_budget_exhausted_total {}",
+            self.scrape_budget_exhausted_total
         );
         self.body_buf.push_str(
             "# HELP varta_nonce_wrap_total Total nonce-space wrap events detected (agent exhausted u64 nonces).\n",
