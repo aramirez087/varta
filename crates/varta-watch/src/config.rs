@@ -181,8 +181,8 @@ OPTIONAL:
                                     GET /metrics on this address.
     --recovery-timeout-ms <MS>     Kill-after deadline for recovery children;
                                      if a child runs longer than this it is
-                                     killed via kill(2). Without this flag the
-                                     child is allowed to run until completion.
+                                     killed via kill(2) (default: none —
+                                     child runs until completion).
     --read-timeout-ms <MS>         UDS read timeout per poll call
                                      (default 100).  Bounded so a stalled peer
                                      cannot hold the observer loop indefinitely.

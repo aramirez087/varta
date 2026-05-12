@@ -224,6 +224,7 @@ fn status_label(s: Status) -> &'static str {
         Status::Degraded => "degraded",
         Status::Critical => "critical",
         Status::Stall => "stall",
+        _ => "unknown",
     }
 }
 

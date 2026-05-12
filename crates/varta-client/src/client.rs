@@ -116,7 +116,8 @@ pub enum BeatOutcome {
     Dropped,
     /// An unexpected I/O error surfaced from the underlying `send(2)`. The
     /// inner [`io::Error`] is forwarded verbatim; constructing it does not
-    /// allocate on the heap.
+    /// allocate on the heap. Callers must inspect the error rather than
+    /// silently discarding it with `Failed(_)`.
     Failed(io::Error),
 }
 

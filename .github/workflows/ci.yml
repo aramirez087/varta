@@ -96,3 +96,33 @@ jobs:
 
       - name: bench latency (record only — never fails CI)
         run: cargo run -p varta-bench --release -- latency || true
+
+  fuzz-smoke:
+    name: fuzz-smoke
+    # Run on push to main only — fuzz is too heavy for every PR commit.
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - name: checkout
+        uses: actions/checkout@v4
+
+      - name: rust toolchain (nightly — cargo-fuzz requires nightly)
+        uses: dtolnay/rust-toolchain@nightly
+
+      - name: install cargo-fuzz
+        run: cargo install cargo-fuzz
+
+      - name: fuzz frame_decode (30 s)
+        run: cargo fuzz run frame_decode -- -max_total_time=30
+
+      - name: fuzz frame_roundtrip (30 s)
+        run: cargo fuzz run frame_roundtrip -- -max_total_time=30
+
+      - name: fuzz aead_roundtrip (30 s)
+        run: cargo fuzz run aead_roundtrip -- -max_total_time=30
+
+      - name: fuzz tracker_record (30 s)
+        run: cargo fuzz run tracker_record -- -max_total_time=30
+
+      - name: fuzz config_from_args (30 s)
+        run: cargo fuzz run config_from_args -- -max_total_time=30

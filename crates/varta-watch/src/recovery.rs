@@ -245,9 +245,18 @@ impl Recovery {
 
 impl Drop for Recovery {
     fn drop(&mut self) {
+        const SHUTDOWN_DEADLINE: Duration = Duration::from_secs(5);
+        const POLL_INTERVAL: Duration = Duration::from_millis(50);
         for (_agent_pid, mut entry) in self.outstanding.drain() {
             let _ = entry.child.kill();
-            let _ = entry.child.wait();
+            let deadline = Instant::now() + SHUTDOWN_DEADLINE;
+            loop {
+                match entry.child.try_wait() {
+                    Ok(Some(_)) | Err(_) => break,
+                    Ok(None) if Instant::now() >= deadline => break,
+                    Ok(None) => std::thread::sleep(POLL_INTERVAL),
+                }
+            }
         }
     }
 }

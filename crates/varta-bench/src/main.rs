@@ -600,13 +600,13 @@ fn run_udp_latency() -> ExitCode {
 
     let mut agent = varta_client::Varta::connect_udp(drainer_addr).expect("connect_udp");
     for _ in 0..100_000 {
-        agent.beat(Status::Ok, 0);
+        let _ = agent.beat(Status::Ok, 0);
     }
     let iterations = 500_000u64;
     let mut samples = Vec::with_capacity(iterations as usize);
     for _ in 0..iterations {
         let t0 = Instant::now();
-        agent.beat(Status::Ok, 0);
+        let _ = agent.beat(Status::Ok, 0);
         let ns = t0.elapsed().as_nanos() as u64;
         samples.push(ns);
     }

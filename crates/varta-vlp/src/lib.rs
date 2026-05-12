@@ -37,6 +37,7 @@ pub const NONCE_TERMINAL: u64 = u64::MAX;
 /// contract: agents serialise `Status as u8` and observers reconstruct via
 /// [`Status::try_from_u8`].
 #[repr(u8)]
+#[non_exhaustive]
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub enum Status {
     /// The agent is healthy and making progress.
