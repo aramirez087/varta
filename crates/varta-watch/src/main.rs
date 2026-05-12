@@ -253,6 +253,13 @@ fn run(cfg: Config) -> std::io::Result<()> {
             }
         }
 
+        let sender_state_full = observer.drain_sender_state_full();
+        if sender_state_full > 0 {
+            if let Some(pe) = prom_export.as_mut() {
+                pe.record_sender_state_full(sender_state_full);
+            }
+        }
+
         // Reap completed or timeout-exceeded children each tick.
         if let Some(rec) = recovery.as_mut() {
             for outcome in rec.try_reap() {

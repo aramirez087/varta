@@ -84,6 +84,8 @@ pub struct Observer {
     stall_queue: Vec<Option<Event>>,
     stall_pending: Vec<(u32, u64, u64)>,
     stall_cursor: usize,
+    /// Next index to start polling from for fair round-robin across listeners.
+    next_listener_start: usize,
 }
 
 impl Observer {
@@ -100,6 +102,7 @@ impl Observer {
             stall_queue: Vec::with_capacity(CAPACITY),
             stall_pending: Vec::with_capacity(CAPACITY),
             stall_cursor: 0,
+            next_listener_start: 0,
         }
     }
 
@@ -135,18 +138,25 @@ impl Observer {
     /// Attempt a single non-blocking read from each listener and return the
     /// first I/O [`Event`] found.
     ///
-    /// Listeners are polled round-robin: if the first listener returns
-    /// `WouldBlock`, the next is tried. The first non-`WouldBlock` result
+    /// Listeners are polled round-robin: polling starts at the index after the
+    /// listener that produced the last non-`WouldBlock` event. Each listener
+    /// is tried exactly once per call; the first non-`WouldBlock` result
     /// (beat, decode error, auth failure, or I/O error) is returned
     /// immediately. Remaining listeners are not polled until the next call.
     ///
     /// This method never returns [`Event::Stall`] — queued stall events must
     /// be retrieved via [`Observer::poll_pending`].
     pub fn poll(&mut self) -> Option<Event> {
-        for i in 0..self.listeners.len() {
+        let len = self.listeners.len();
+        let start = self.next_listener_start;
+        let mut round = 0;
+        while round < len {
+            let i = (start + round) % len;
+            round += 1;
             match self.listeners[i].recv() {
                 RecvResult::Authenticated { peer_pid, data } => {
                     let now_ns = self.now_ns();
+                    self.next_listener_start = (i + 1) % len;
                     match Frame::decode(&data) {
                         Ok(frame) => {
                             #[cfg(target_os = "linux")]
@@ -175,7 +185,10 @@ impl Observer {
                 }
                 RecvResult::WouldBlock => continue,
                 RecvResult::ShortRead => continue,
-                RecvResult::IoError(e) => return Some(Event::Io(e, self.now_ns())),
+                RecvResult::IoError(e) => {
+                    self.next_listener_start = (i + 1) % len;
+                    return Some(Event::Io(e, self.now_ns()));
+                }
             }
         }
         self.drain_stalls();
@@ -252,6 +265,14 @@ impl Observer {
     /// Drain and reset the truncated-datagram counter across all listeners.
     pub fn drain_truncated(&mut self) -> u64 {
         self.listeners.iter_mut().map(|l| l.drain_truncated()).sum()
+    }
+
+    /// Drain and reset the sender-state-full counter across all listeners.
+    pub fn drain_sender_state_full(&mut self) -> u64 {
+        self.listeners
+            .iter_mut()
+            .map(|l| l.drain_sender_state_full())
+            .sum()
     }
 }
 

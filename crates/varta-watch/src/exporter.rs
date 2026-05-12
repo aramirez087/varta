@@ -190,6 +190,7 @@ pub struct PromExporter {
     capacity_exceeded_total: u64,
     decrypt_failures_total: u64,
     truncated_total: u64,
+    sender_state_full_total: u64,
 }
 
 impl PromExporter {
@@ -207,6 +208,7 @@ impl PromExporter {
             capacity_exceeded_total: 0,
             decrypt_failures_total: 0,
             truncated_total: 0,
+            sender_state_full_total: 0,
         })
     }
 
@@ -234,6 +236,12 @@ impl PromExporter {
     /// Record one or more truncated (wrong-size) datagrams received.
     pub fn record_truncated(&mut self, count: u64) {
         self.truncated_total = self.truncated_total.saturating_add(count);
+    }
+
+    /// Record one or more times the sender-state map was at capacity,
+    /// forcing eviction of the oldest entry.
+    pub fn record_sender_state_full(&mut self, count: u64) {
+        self.sender_state_full_total = self.sender_state_full_total.saturating_add(count);
     }
 
     /// Accept ready connections on the listener and write a metrics
@@ -409,6 +417,17 @@ impl PromExporter {
             "varta_truncated_datagrams_total {}",
             self.truncated_total
         );
+        if self.sender_state_full_total > 0 {
+            out.push_str(
+                "# HELP varta_sender_state_full_total Total times the sender-state map was full and an entry was force-evicted.\n",
+            );
+            out.push_str("# TYPE varta_sender_state_full_total counter\n");
+            let _ = writeln!(
+                out,
+                "varta_sender_state_full_total {}",
+                self.sender_state_full_total
+            );
+        }
         out
     }
 }

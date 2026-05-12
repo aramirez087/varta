@@ -13,6 +13,17 @@ use varta_vlp::{Frame, Status};
 /// the CPU target (50 agents × 1 Hz). Raising the cap is a v0.2 conversation.
 pub const CAPACITY: usize = 64;
 
+/// Multiplier applied to the stall threshold when choosing eviction victims.
+///
+/// A slot is only evictable if (a) the observer has already surfaced a stall
+/// event for its pid (`stall_emitted == true`) **and** (b) the silence duration
+/// exceeds `threshold * EVICTION_MULTIPLIER`. The 10× multiplier ensures that
+/// only agents which have been silent for **significantly** longer than the
+/// stall threshold are evicted — a slow-beating but alive agent (e.g. every
+/// 40 s with a 5 s threshold) will not be evicted because it resets
+/// `stall_emitted` on every beat.
+const EVICTION_MULTIPLIER: u32 = 10;
+
 /// Liveness slot for a single agent pid.
 ///
 /// `Slot` is internal to the observer and never crosses the wire, so it uses
@@ -155,8 +166,18 @@ impl Tracker {
         Update::Inserted
     }
 
+    /// Find a slot that can be evicted to make room for a new pid.
+    ///
+    /// A slot is evictable when both conditions hold:
+    /// 1. The observer has already surfaced a stall event for this pid
+    ///    (`stall_emitted == true`).
+    /// 2. Silence duration exceeds `threshold_ns * EVICTION_MULTIPLIER`.
+    ///
+    /// Among eligible slots the one with the oldest `last_ns` is chosen
+    /// (oldest-dead-first). If no slot satisfies both criteria, returns
+    /// `None` and the caller receives [`Update::CapacityExceeded`].
     fn find_evictable_slot(&self, now_ns: u64, threshold_ns: u64) -> Option<usize> {
-        let evict_threshold = threshold_ns.saturating_mul(10);
+        let evict_threshold = threshold_ns.saturating_mul(EVICTION_MULTIPLIER as u64);
         let mut best_idx: Option<usize> = None;
         let mut best_last_ns: u64 = u64::MAX;
 

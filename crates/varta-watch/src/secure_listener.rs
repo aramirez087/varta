@@ -79,6 +79,7 @@ pub struct SecureUdpListener {
     next_eviction_check: Instant,
     decrypt_failures: u64,
     truncated_count: u64,
+    sender_state_full: u64,
 }
 
 impl SecureUdpListener {
@@ -108,6 +109,7 @@ impl SecureUdpListener {
             next_eviction_check: Instant::now() + EVICTION_INTERVAL,
             decrypt_failures: 0,
             truncated_count: 0,
+            sender_state_full: 0,
         })
     }
 
@@ -118,6 +120,22 @@ impl SecureUdpListener {
         let cutoff = Instant::now() - EVICTION_TTL;
         self.sender_state
             .retain(|_, state| state.last_seen > cutoff);
+    }
+
+    /// When the sender-state map is full after a stale-sender sweep, evict
+    /// the single entry with the oldest `last_seen` to make room for a new
+    /// sender. This prevents replay-protection gaps that would occur if we
+    /// silently dropped the beat and the next beat from the same sender
+    /// were accepted with no replay state.
+    fn force_evict_oldest_sender(&mut self) {
+        if let Some(oldest) = self
+            .sender_state
+            .iter()
+            .min_by_key(|(_, s)| s.last_seen)
+            .map(|(addr, _)| *addr)
+        {
+            self.sender_state.remove(&oldest);
+        }
     }
 
     /// Atomic replay check + state update: returns `true` if the
@@ -231,11 +249,14 @@ impl BeatListener for SecureUdpListener {
                             self.evict_stale_senders();
                         }
                         if self.sender_state.len() >= MAX_SENDER_STATES {
-                            // Map is still full — silently drop the beat
-                            // (extreme edge case: 1024+ unique concurrently-
-                            // beating agents). Return WouldBlock so the
-                            // observer moves on instead of spinning.
-                            return RecvResult::WouldBlock;
+                            // Map is still full after stale-sender sweep — force-evict
+                            // the oldest entry to maintain replay protection.
+                            self.force_evict_oldest_sender();
+                            self.sender_state_full = self.sender_state_full.saturating_add(1);
+                            debug_assert!(
+                                self.sender_state.len() < MAX_SENDER_STATES,
+                                "force_evict_oldest_sender should have freed a slot"
+                            );
                         }
 
                         // Atomic replay check + state update (after AEAD
@@ -268,6 +289,12 @@ impl BeatListener for SecureUdpListener {
     fn drain_truncated(&mut self) -> u64 {
         let n = self.truncated_count;
         self.truncated_count = 0;
+        n
+    }
+
+    fn drain_sender_state_full(&mut self) -> u64 {
+        let n = self.sender_state_full;
+        self.sender_state_full = 0;
         n
     }
 }
@@ -451,20 +478,21 @@ mod tests {
     }
 
     #[test]
-    fn capacity_exceeded_returns_would_block() {
+    fn capacity_exceeded_forces_evict_and_increments_counter() {
         let mut listener = new_listener();
-        // Fill the map with unique addresses (simulating MAX_SENDER_STATES senders)
+        // Fill the map with unique addresses.
         for i in 0..MAX_SENDER_STATES {
             let addr = SocketAddr::from(([127, 0, 0, 1], (10_000 + i as u16)));
             assert!(listener.try_record_replay_state(addr, test_iv(), 1));
         }
         assert_eq!(listener.sender_state.len(), MAX_SENDER_STATES);
 
-        // Next new sender should trigger eviction, but since all are fresh,
-        // eviction won't free anything and the map stays full.
-        // We verify that evict_stale_senders is a no-op for fresh entries.
-        let before = listener.sender_state.len();
+        // Eviction before force-evict is a no-op for fresh entries.
         listener.evict_stale_senders();
-        assert_eq!(listener.sender_state.len(), before);
+        assert_eq!(listener.sender_state.len(), MAX_SENDER_STATES);
+
+        // Force-evict should remove one entry.
+        listener.force_evict_oldest_sender();
+        assert_eq!(listener.sender_state.len(), MAX_SENDER_STATES - 1);
     }
 }

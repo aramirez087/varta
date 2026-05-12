@@ -107,6 +107,8 @@ mod plat {
     pub(super) const SOL_SOCKET: i32 = 1;
     pub(super) const SO_PASSCRED: i32 = 16;
     pub(super) const SCM_CREDENTIALS: i32 = 2;
+    /// Set by the kernel when ancillary data was truncated (buffer too small).
+    pub(super) const MSG_CTRUNC: i32 = 0x20;
 
     // --- FFI --------------------------------------------------------------
 
@@ -124,7 +126,21 @@ mod plat {
 
     // --- ancillary buffer sizing ------------------------------------------
 
+    // CMSG_SPACE for a single SCM_CREDENTIALS on 64-bit Linux:
+    //   cmsg_align(sizeof(Cmsghdr)) + cmsg_align(sizeof(Ucred))
+    //   = cmsg_align(16)          + cmsg_align(12)
+    //   = 16                      + 16
+    //   = 32 bytes
+    //
+    // 64 bytes provides 2× headroom — safe for a single credential message
+    // with alignment padding. Bumped to 96 would cover SCM_CREDENTIALS +
+    // SCM_SECURITY, but that's unnecessary for v0.1.0.
     pub(super) const ANCILLARY_BUFFER_SIZE: usize = 64;
+
+    // Compile-time guard: the ancillary buffer must fit at least one
+    // SCM_CREDENTIALS message (aligned cmsghdr + struct ucred).
+    const _: () =
+        assert!(ANCILLARY_BUFFER_SIZE >= super::cmsg_hdr_size() + core::mem::size_of::<Ucred>());
 
     /// Extract peer PID after a successful `recvmsg` — on Linux this is
     /// done via ancillary-data parsing.
@@ -300,6 +316,15 @@ pub(crate) fn recv_authenticated(fd: i32) -> RecvResult {
         }
         break ret as isize;
     };
+
+    #[cfg(target_os = "linux")]
+    if mhdr.msg_flags & plat::MSG_CTRUNC != 0 {
+        return RecvResult::IoError(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "ancillary data truncated by kernel (ANCILLARY_BUFFER_SIZE too small)",
+        ));
+    }
+    let _ = mhdr.msg_flags;
 
     if n as usize != 32 {
         return RecvResult::ShortRead;

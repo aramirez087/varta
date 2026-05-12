@@ -118,7 +118,7 @@ impl Recovery {
                     pid,
                     Outstanding {
                         child,
-                        spawned_at: Instant::now(),
+                        spawned_at: now,
                         killed: false,
                     },
                 );
