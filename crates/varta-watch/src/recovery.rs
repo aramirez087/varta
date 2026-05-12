@@ -153,7 +153,8 @@ impl Recovery {
             .arg(&self.template)
             .arg("varta-recovery")
             .arg(pid.to_string())
-            .spawn() {
+            .spawn()
+        {
             Ok(child) => {
                 let child_pid = child.id();
                 self.outstanding.insert(

@@ -28,11 +28,7 @@ use varta_watch::{
 /// when this becomes `true`.
 static SHUTDOWN: AtomicBool = AtomicBool::new(false);
 
-#[cfg(any(
-    target_os = "linux",
-    target_os = "macos",
-    target_os = "freebsd",
-))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd",))]
 unsafe fn install_signal_handlers() {
     const SIGINT: i32 = 2;
     const SIGTERM: i32 = 15;
@@ -94,11 +90,7 @@ unsafe fn install_signal_handlers() {
 
 #[cfg(all(
     unix,
-    not(any(
-        target_os = "linux",
-        target_os = "macos",
-        target_os = "freebsd",
-    )),
+    not(any(target_os = "linux", target_os = "macos", target_os = "freebsd",)),
 ))]
 unsafe fn install_signal_handlers() {
     const SIGINT: i32 = 2;

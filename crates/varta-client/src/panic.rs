@@ -13,6 +13,7 @@ use std::time::Instant;
 use varta_vlp::crypto::Key;
 use varta_vlp::{Frame, Status, NONCE_TERMINAL};
 
+#[cfg(feature = "udp")]
 fn bind_udp_any_for(addr: std::net::SocketAddr) -> std::io::Result<std::net::UdpSocket> {
     match addr {
         std::net::SocketAddr::V4(_) => std::net::UdpSocket::bind("0.0.0.0:0"),
