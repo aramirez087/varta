@@ -14,7 +14,7 @@ use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufWriter, ErrorKind, Read, Write};
-use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
+use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::Path;
 use std::time::{Duration, Instant};
 
@@ -318,7 +318,10 @@ impl PromExporter {
             let response = b"HTTP/1.0 405 Method Not Allowed\r\nAllow: GET\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
             let _ =
                 write_all_nonblocking(&mut stream, response, Instant::now() + PROM_WRITE_TIMEOUT);
-            let _ = stream.shutdown(Shutdown::Write);
+            // Drop at scope exit closes the connection. Using close() with
+            // default SO_LINGER (l_onoff=0) flushes the send buffer in the
+            // background and sends FIN – avoiding the macOS RST quirk that
+            // shutdown(SHUT_WR) triggers on non-blocking sockets.
             return Ok(());
         }
 
@@ -329,7 +332,7 @@ impl PromExporter {
         // combined response String.
         let _ = write_headers_with_len(&mut stream, body_len, write_deadline);
         let _ = write_all_nonblocking(&mut stream, self.body_buf.as_bytes(), write_deadline);
-        let _ = stream.shutdown(Shutdown::Write);
+        // Drop at scope exit closes the connection (see 405 branch).
         Ok(())
     }
 

@@ -9,6 +9,16 @@
 //! Children are spawned asynchronously; they never block the observer's
 //! poll loop. On each tick, [`Recovery::try_reap`] drains completed or
 //! deadline-exceeded children and returns outcomes for logging.
+//!
+//! # Security
+//!
+//! The `recovery_cmd` template is executed verbatim by `/bin/sh -c`.
+//! The `{pid}` substitution is numeric and safe, but **the template body
+//! is under full operator control** — anyone who can pass `--recovery-cmd`
+//! to `varta-watch` already has arbitrary code execution by launching
+//! their own subprocess.  Treat the template as a trusted shell fragment
+//! and never accept it from an untrusted source (e.g. a network request
+//! or environment variable from a less-privileged context).
 
 use std::collections::HashMap;
 use std::process::{Child, Command};

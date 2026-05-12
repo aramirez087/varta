@@ -226,8 +226,8 @@ impl Varta<SecureUdpTransport> {
     /// provided pre-shared `key`. The observer must be configured with the
     /// same key and the `secure-udp` feature enabled.
     ///
-    /// The IV random prefix is derived from `process_id` and connect
-    /// timestamp — no `/dev/urandom` reads are required.
+    /// The IV random prefix is read from `/dev/urandom` at connect time —
+    /// no file I/O on the beat path.
     ///
     /// # Errors
     ///

@@ -134,9 +134,12 @@ REQUIRED:
                                     surfaced (milliseconds).
 
 OPTIONAL:
-    --recovery-cmd <TEMPLATE>      Shell fragment run on each unique stall.
-                                    The literal {pid} is replaced with the
-                                    stalled pid before /bin/sh -c executes.
+    --recovery-cmd <TEMPLATE>      Shell fragment run on each unique stall
+                                     via /bin/sh -c. The literal {pid} is
+                                     replaced with the stalled pid. SECURITY:
+                                     the template body is under full operator
+                                     control; never accept it from an untrusted
+                                     source.
     --recovery-debounce-ms <MS>    Per-pid debounce window for recovery
                                      invocations (default 1000).
     --socket-mode <OCTAL>           File mode for the observer socket

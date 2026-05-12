@@ -126,8 +126,14 @@ pub fn install_panic_handler_udp(addr: std::net::SocketAddr) {
 /// [`std::panic::take_hook`] and invokes it after firing the secure VLP frame.
 #[cfg(all(feature = "panic-handler", feature = "secure-udp"))]
 pub fn install_panic_handler_secure_udp(addr: std::net::SocketAddr, key: Key) {
+    use crate::secure_transport::{lcg_iv_random, read_iv_random};
     use varta_vlp::crypto::{self, NONCE_BYTES};
+
     let start = Instant::now();
+    // Pre-compute the IV random prefix at install time — /dev/urandom
+    // reads are not async-signal-safe and must not happen inside the
+    // panic hook.  Fall back to the LCG if /dev/urandom is unavailable.
+    let iv_random: [u8; 4] = read_iv_random().unwrap_or_else(|_| lcg_iv_random());
     let prev = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         let _ = (|| {
@@ -144,15 +150,8 @@ pub fn install_panic_handler_secure_udp(addr: std::net::SocketAddr, key: Key) {
             let mut buf = [0u8; 32];
             frame.encode(&mut buf);
 
-            let raw = (std::process::id() as u64)
-                .wrapping_mul(6364136223846793005)
-                .wrapping_add(
-                    std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_nanos() as u64,
-                );
-            let iv_random: [u8; 4] = raw.to_le_bytes()[..4].try_into().unwrap();
+            // Use the pre-computed IV from install time (read_iv_random() or
+            // LCG fallback).  File I/O inside a panic hook is not signal-safe.
             let iv_counter = 1u64;
 
             let mut nonce = [0u8; NONCE_BYTES];

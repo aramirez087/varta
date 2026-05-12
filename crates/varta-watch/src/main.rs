@@ -61,13 +61,18 @@ unsafe fn install_signal_handlers() {
         fn sigaction(signum: i32, act: *const SigAction, oldact: *mut SigAction) -> i32;
     }
 
-    // SAFETY: std::mem::zeroed is safe for *const () pointers; we
-    // immediately overwrite sa_handler with a valid handler. sa_mask of
-    // all zeros and sa_flags of 0 are correct defaults (no blocked
-    // signals, SA_RESETHAND not set). The handler is async-signal-safe:
-    // it writes to a lock-free AtomicBool only.
-    let mut act: SigAction = unsafe { std::mem::zeroed() };
-    act.sa_handler = handle as *const ();
+    // SAFETY: MaybeUninit::zeroed() allocates zeroed stack memory without
+    // constructing a SigAction value, so there is no UB regardless of the
+    // fields' validity requirements.  We write sa_handler through the raw
+    // pointer before passing the struct to sigaction(2).  sa_mask of all
+    // zeros and sa_flags of 0 are correct defaults (no blocked signals,
+    // SA_RESETHAND not set).  The handler is async-signal-safe: it writes
+    // to a lock-free AtomicBool only.
+    let mut act = std::mem::MaybeUninit::<SigAction>::zeroed();
+    unsafe {
+        (*act.as_mut_ptr()).sa_handler = handle as *const ();
+    }
+    let act = unsafe { act.assume_init() };
     unsafe {
         let _ = sigaction(SIGINT, &act, std::ptr::null_mut());
         let _ = sigaction(SIGTERM, &act, std::ptr::null_mut());
@@ -218,7 +223,7 @@ fn run(cfg: Config) -> std::io::Result<()> {
 
     let started = Instant::now();
     loop {
-        if SHUTDOWN.load(Ordering::Relaxed) {
+        if SHUTDOWN.load(Ordering::Acquire) {
             break;
         }
         if let Some(deadline) = cfg.shutdown_after {

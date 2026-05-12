@@ -8,30 +8,20 @@
 //!
 //! # Security
 //!
-//! The IV random prefix is derived from `pid * prime + connect_timestamp`
-//! (a linear congruential generator) — it is **not** cryptographically
-//! random. This design avoids a dependency on `/dev/urandom` (consistent
-//! with the project's zero-dependency and no-filesystem-read-on-beat-path
-//! goals), but has the following implications:
+//! The IV random prefix is read from `/dev/urandom` at `connect()` time
+//! (once, not on the beat path).  This gives a cryptographically random
+//! 4-byte (32-bit) IV prefix with a birthday bound of ~2^16 agents
+//! sharing the same key.
 //!
-//! * **32-bit IV space**: The derived prefix is 4 bytes. With many agents
-//!   sharing the same key, the birthday bound (~2^16 agents) makes nonce
-//!   prefix collisions likely. A collision between two agents with the same
-//!   key would cause the observer to reject frames (replay protection on
-//!   `iv_random`). In the worst case — same `iv_random` from two agents
-//!   and coincident counters — AEAD nonce reuse would be catastrophic
-//!   (confidentiality and authentication are completely broken).
-//! * **Predictability**: An attacker who observes the agent's PID and start
-//!   time can predict the IV sequence. On a trusted local network this is
-//!   acceptable; do not use this transport over the public internet.
 //! * **Nonce uniqueness guarantee**: Within a single connection the
 //!   monotonic 8-byte counter ensures unique nonces. Across connections the
-//!   4-byte `iv_random` prefix (derived fresh each reconnect) provides
-//!   uniqueness.
+//!   4-byte `iv_random` prefix (fresh `/dev/urandom` read each `connect`
+//!   or `reconnect`) provides uniqueness.
+//! * **Trusted local network**: The 32-bit IV space is sufficient for
+//!   local-network deployments.  Do not use this transport with more than
+//!   ~10^4 agents under a single key without auditing collision risk.
 //!
-//! **This transport is designed for trusted local networks with few agents.
-//! For stronger IV generation, provide an external nonce source through
-//! the transport trait.**
+//! **This transport is designed for trusted local networks.**
 
 use std::io;
 use std::net::{SocketAddr, UdpSocket};
@@ -58,15 +48,14 @@ const SECURE_FRAME_LEN: usize = crypto::SECURE_FRAME_BYTES;
 /// * **Integrity**: Tampering is detected (Poly1305 authentication tag).
 /// * **Replay resistance**: Monotonic counter per connection; observer verifies
 ///   that counter values strictly increase for a given IV prefix.
-/// * **Nonce uniqueness**: The 4-byte random prefix (derived from pid ^ connect
-///   timestamp) plus the 8-byte counter ensures no nonce reuse within a
+/// * **Nonce uniqueness**: The 4-byte random prefix (from `/dev/urandom` at
+///   connect time) plus the 8-byte counter ensures no nonce reuse within a
 ///   connection lifetime.
 ///
 /// # Security
 ///
 /// See the [module-level security documentation](self) for important
-/// caveats about the IV generation strategy (LCG-based, 32-bit space)
-/// and the conditions under which nonce reuse could occur.
+/// caveats about the 32-bit IV space.
 ///
 /// [`Varta::connect_secure_udp`]: crate::Varta::connect_secure_udp
 /// [module-level security documentation]: self#security
@@ -82,7 +71,7 @@ impl SecureUdpTransport {
     /// Create a non-blocking secure UDP socket connected to `addr`.
     ///
     /// The socket is bound to an ephemeral source port. The IV random prefix
-    /// is derived from `process_id ^ connect_timestamp` (no syscall needed).
+    /// is read from `/dev/urandom` at connect time (no syscall on the beat path).
     ///
     /// # Errors
     ///
@@ -93,18 +82,11 @@ impl SecureUdpTransport {
         sock.connect(addr)?;
         sock.set_nonblocking(true)?;
 
-        // Derive a per-connection IV prefix from pid and timestamp.
-        // This ensures uniqueness across reconnects and process restarts
-        // without requiring /dev/urandom.
-        let raw = (std::process::id() as u64)
-            .wrapping_mul(6364136223846793005) // prime
-            .wrapping_add(
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_nanos() as u64,
-            );
-        let iv_random = raw.to_le_bytes()[..4].try_into().unwrap();
+        // Read a cryptographically-random IV prefix from /dev/urandom.
+        // This read happens once at connect time (not on the beat path)
+        // and is consistent with the project's file-I/O-at-startup policy
+        // (key files, config files).
+        let iv_random = read_iv_random()?;
 
         Ok(SecureUdpTransport {
             sock,
@@ -143,23 +125,45 @@ impl BeatTransport for SecureUdpTransport {
         sock.set_nonblocking(true)?;
         self.sock = sock;
 
-        // Derive a fresh iv_random from a new timestamp.  The observer tracks
+        // Derive a fresh iv_random from /dev/urandom.  The observer tracks
         // per-sender state by (SocketAddr, iv_random), so a changed prefix
         // makes this a new session from the observer's perspective.  Resetting
         // iv_counter to 0 is safe — the next send() increments it to 1, and
         // no prior session with this iv_random prefix exists in the observer's
         // state (different iv_random = different session).
-        let raw = (std::process::id() as u64)
-            .wrapping_mul(6364136223846793005)
-            .wrapping_add(
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_nanos() as u64,
-            );
-        self.iv_random = raw.to_le_bytes()[..4].try_into().unwrap();
+        self.iv_random = read_iv_random()?;
         self.iv_counter = 0;
 
         Ok(())
     }
+}
+
+/// Read a cryptographically-random 4-byte IV prefix from `/dev/urandom`.
+///
+/// Called once at `connect()` / `reconnect()` time — never on the beat path.
+/// The returned `[u8; 4]` is suitable as the `iv_random` prefix for ChaCha20-
+/// Poly1305 AEAD nonce construction.
+pub(crate) fn read_iv_random() -> io::Result<[u8; 4]> {
+    let mut buf = [0u8; 4];
+    std::fs::File::open("/dev/urandom").and_then(|mut f| {
+        use std::io::Read;
+        f.read_exact(&mut buf)
+    })?;
+    Ok(buf)
+}
+
+/// Fallback IV derivation using an LCG (pid * prime + timestamp).
+///
+/// Produces a deterministic 4-byte prefix.  Used only when `/dev/urandom`
+/// is unavailable (e.g. inside a panic handler, where file I/O is not safe).
+pub(crate) fn lcg_iv_random() -> [u8; 4] {
+    let raw = (std::process::id() as u64)
+        .wrapping_mul(6364136223846793005)
+        .wrapping_add(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos() as u64,
+        );
+    raw.to_le_bytes()[..4].try_into().unwrap()
 }
