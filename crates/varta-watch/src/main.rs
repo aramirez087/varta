@@ -141,15 +141,36 @@ fn run(cfg: Config) -> std::io::Result<()> {
         cfg.read_timeout,
     )?;
 
+    #[cfg(feature = "secure-udp")]
+    let secure_udp_keys = cfg.load_secure_keys()?;
+
     #[cfg(feature = "udp")]
     if let Some(port) = cfg.udp_port {
         let bind_addr = cfg
             .udp_bind_addr
             .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
         let addr = std::net::SocketAddr::new(bind_addr, port);
-        let udp = varta_watch::UdpListener::bind(addr)
-            .map_err(|e| std::io::Error::new(e.kind(), format!("UDP bind {}: {e}", addr)))?;
-        observer.add_listener(Box::new(udp));
+
+        #[cfg(feature = "secure-udp")]
+        if let Some((primary_key, accepted_keys)) = secure_udp_keys {
+            let mut all_keys = vec![primary_key];
+            all_keys.extend(accepted_keys);
+            let secure = varta_watch::SecureUdpListener::bind(addr, all_keys).map_err(|e| {
+                std::io::Error::new(e.kind(), format!("secure UDP bind {}: {e}", addr))
+            })?;
+            observer.add_listener(Box::new(secure));
+        } else {
+            let udp = varta_watch::UdpListener::bind(addr)
+                .map_err(|e| std::io::Error::new(e.kind(), format!("UDP bind {}: {e}", addr)))?;
+            observer.add_listener(Box::new(udp));
+        }
+
+        #[cfg(not(feature = "secure-udp"))]
+        {
+            let udp = varta_watch::UdpListener::bind(addr)
+                .map_err(|e| std::io::Error::new(e.kind(), format!("UDP bind {}: {e}", addr)))?;
+            observer.add_listener(Box::new(udp));
+        }
     }
 
     #[cfg(not(feature = "udp"))]
@@ -174,23 +195,6 @@ fn run(cfg: Config) -> std::io::Result<()> {
             std::io::ErrorKind::InvalidInput,
             "secure UDP support not compiled in",
         ));
-    }
-
-    // --- secure UDP listener (AEAD) ---
-    #[cfg(feature = "secure-udp")]
-    if let Some((primary_key, accepted_keys)) = cfg.load_secure_keys()? {
-        if let Some(port) = cfg.udp_port {
-            let bind_addr = cfg
-                .udp_bind_addr
-                .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
-            let addr = std::net::SocketAddr::new(bind_addr, port);
-            let mut all_keys = vec![primary_key];
-            all_keys.extend(accepted_keys);
-            let secure = varta_watch::SecureUdpListener::bind(addr, all_keys).map_err(|e| {
-                std::io::Error::new(e.kind(), format!("secure UDP bind {}: {e}", addr))
-            })?;
-            observer.add_listener(Box::new(secure));
-        }
     }
 
     let mut recovery = cfg.recovery_cmd.as_ref().map(|tpl| {

@@ -141,7 +141,7 @@ pub fn poly1305_mac(otk: &[u8; 32], msg: &[u8]) -> [u8; 16] {
     let r = bytes_to_limbs_26(&r_bytes, false);
 
     let s_bytes: [u8; 16] = otk[16..32].try_into().unwrap();
-    let s = bytes_to_limbs_26(&s_bytes, true); // s includes the 0x01 padding byte (RFC §2.5.1)
+    let s = bytes_to_limbs_26(&s_bytes, false);
 
     let mut h = [0u64; 5];
 

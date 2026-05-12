@@ -6,6 +6,7 @@
 
 use std::io::ErrorKind;
 use std::os::unix::fs::{FileTypeExt, PermissionsExt};
+use std::os::unix::net::UnixDatagram;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -75,17 +76,24 @@ fn bind_fails_when_live_observer_present() {
     let _ = std::fs::remove_file(&path);
 }
 
-/// M5 contract — a regular file (stale artifact) at the path is removed and
-/// replaced by the observer's socket.
+/// M5 contract — a stale socket inode at the path is removed and replaced by
+/// the observer's socket.
 #[test]
 fn bind_cleans_up_stale_socket_file() {
     let path = unique_path("stale");
 
-    std::fs::write(&path, b"").expect("create stale file");
-    assert!(path.exists());
+    let stale = UnixDatagram::bind(&path).expect("create stale socket");
+    drop(stale);
+    assert!(
+        std::fs::metadata(&path)
+            .expect("stale socket metadata")
+            .file_type()
+            .is_socket(),
+        "test setup must leave a stale socket inode"
+    );
 
     let _obs = Observer::bind(&path, THRESHOLD, 0o600, Duration::from_millis(100))
-        .expect("bind over stale file must succeed");
+        .expect("bind over stale socket must succeed");
 
     let meta = std::fs::metadata(&path).expect("metadata");
     assert!(
@@ -94,6 +102,31 @@ fn bind_cleans_up_stale_socket_file() {
     );
 
     drop(_obs);
+    let _ = std::fs::remove_file(&path);
+}
+
+/// M5 safety constraint — a non-socket occupant is not a stale observer
+/// socket and must never be unlinked by bind recovery.
+#[test]
+fn bind_preserves_non_socket_file_at_path() {
+    let path = unique_path("regular-file");
+
+    std::fs::write(&path, b"do not delete").expect("create regular file");
+
+    let err = Observer::bind(&path, THRESHOLD, 0o600, Duration::from_millis(100))
+        .err()
+        .expect("bind over regular file must fail");
+
+    assert_eq!(err.kind(), ErrorKind::AddrInUse);
+    assert!(
+        err.to_string().contains("path exists and is not a socket"),
+        "error message mismatch: {err}"
+    );
+    assert_eq!(
+        std::fs::read(&path).expect("regular file must be preserved"),
+        b"do not delete"
+    );
+
     let _ = std::fs::remove_file(&path);
 }
 

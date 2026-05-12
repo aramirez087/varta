@@ -71,9 +71,10 @@ impl UdsListener {
     /// the socket so that `recv` can verify the PID of every sender against
     /// the kernel's `SO_PASSCRED` / `LOCAL_CREDS` attestation.
     ///
-    /// If a genuine stale socket exists at `path` (no one listening),
-    /// it is cleaned up and the bind succeeds. If another process is
-    /// already listening at `path`, the call fails with `AddrInUse`.
+    /// If a genuine stale socket exists at `path` (a socket inode with no
+    /// listener), it is cleaned up and the bind succeeds. If another
+    /// process is already listening at `path`, or if the path is occupied by
+    /// a non-socket file, the call fails with `AddrInUse`.
     ///
     /// The socket is given a read timeout so `recv` cannot block
     /// indefinitely.
@@ -87,29 +88,67 @@ impl UdsListener {
 
         let sock = match UnixDatagram::bind(path) {
             Ok(sock) => sock,
-            Err(e) if e.kind() == ErrorKind::AddrInUse => match probe_live(path) {
-                Ok(true) => {
+            Err(e) if e.kind() == ErrorKind::AddrInUse => {
+                let PathOccupant::Socket(stale_socket) = path_occupant(path)? else {
                     return Err(io::Error::new(
                         ErrorKind::AddrInUse,
                         format!(
-                            "another varta-watch is already running at {}",
+                            "cannot bind observer socket at {}: path exists and is not a socket",
                             path.display()
                         ),
                     ));
+                };
+
+                match probe_live(path) {
+                    Ok(true) => {
+                        return Err(io::Error::new(
+                            ErrorKind::AddrInUse,
+                            format!(
+                                "another varta-watch is already running at {}",
+                                path.display()
+                            ),
+                        ));
+                    }
+                    Ok(false) => {
+                        match path_occupant(path)? {
+                            PathOccupant::Socket(current) if current == stale_socket => {
+                                std::fs::remove_file(path)?;
+                            }
+                            PathOccupant::Missing => {}
+                            PathOccupant::Socket(_) => {
+                                return Err(io::Error::new(
+                                    ErrorKind::AddrInUse,
+                                    format!(
+                                        "observer socket path changed while probing {}; retry bind",
+                                        path.display()
+                                    ),
+                                ));
+                            }
+                            PathOccupant::Other => {
+                                return Err(io::Error::new(
+                                    ErrorKind::AddrInUse,
+                                    format!(
+                                        "cannot bind observer socket at {}: path exists and is not a socket",
+                                        path.display()
+                                    ),
+                                ));
+                            }
+                        }
+                        let sock = UnixDatagram::bind(path)?;
+                        std::fs::set_permissions(
+                            path,
+                            std::fs::Permissions::from_mode(socket_mode),
+                        )?;
+                        return Self::finish_bind(sock, owned_path, read_timeout);
+                    }
+                    Err(e) => {
+                        return Err(io::Error::new(
+                            e.kind(),
+                            format!("cannot probe socket at {}: {e}", path.display()),
+                        ));
+                    }
                 }
-                Ok(false) => {
-                    std::fs::remove_file(path)?;
-                    let sock = UnixDatagram::bind(path)?;
-                    std::fs::set_permissions(path, std::fs::Permissions::from_mode(socket_mode))?;
-                    return Self::finish_bind(sock, owned_path, read_timeout);
-                }
-                Err(e) => {
-                    return Err(io::Error::new(
-                        e.kind(),
-                        format!("cannot probe socket at {}: {e}", path.display()),
-                    ));
-                }
-            },
+            }
             Err(e) => return Err(e),
         };
 
@@ -151,6 +190,32 @@ impl Drop for UdsListener {
                 let _ = std::fs::remove_file(&self.path);
             }
         }
+    }
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+struct SocketIdentity {
+    dev: u64,
+    ino: u64,
+}
+
+enum PathOccupant {
+    Missing,
+    Socket(SocketIdentity),
+    Other,
+}
+
+fn path_occupant(path: &Path) -> io::Result<PathOccupant> {
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_socket() => Ok(PathOccupant::Socket(SocketIdentity {
+            dev: meta.dev(),
+            ino: meta.ino(),
+        })),
+        Ok(_) => Ok(PathOccupant::Other),
+        Err(e) if e.kind() == ErrorKind::NotFound => Ok(PathOccupant::Missing),
+        Err(e) => Err(e),
     }
 }
 

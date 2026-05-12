@@ -39,6 +39,15 @@ impl Drop for UdsPath {
     }
 }
 
+#[cfg(feature = "secure-udp")]
+fn unused_udp_port() -> u16 {
+    std::net::UdpSocket::bind("127.0.0.1:0")
+        .expect("bind ephemeral UDP port")
+        .local_addr()
+        .expect("read ephemeral UDP local_addr")
+        .port()
+}
+
 #[test]
 fn cli_help_lists_every_documented_flag() {
     let out = Command::new(env!("CARGO_BIN_EXE_varta-watch"))
@@ -145,6 +154,40 @@ fn cli_parses_socket_mode() {
     assert!(
         out.status.success(),
         "--socket-mode must parse cleanly; got {:?} (stderr: {})",
+        out.status,
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[cfg(feature = "secure-udp")]
+#[test]
+fn cli_secure_udp_binds_single_listener_for_udp_port() {
+    let path = unique_uds_path("secure-udp");
+    let port = unused_udp_port().to_string();
+    let key = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
+
+    let out = Command::new(env!("CARGO_BIN_EXE_varta-watch"))
+        .env("VARTA_KEY", key)
+        .args([
+            "--socket",
+            path.as_str(),
+            "--threshold-ms",
+            "100",
+            "--udp-bind-addr",
+            "127.0.0.1",
+            "--udp-port",
+            &port,
+            "--key-env",
+            "VARTA_KEY",
+            "--shutdown-after-secs",
+            "0",
+        ])
+        .output()
+        .expect("spawn varta-watch with secure UDP");
+
+    assert!(
+        out.status.success(),
+        "secure UDP must bind the configured UDP port exactly once; got {:?} (stderr: {})",
         out.status,
         String::from_utf8_lossy(&out.stderr)
     );
