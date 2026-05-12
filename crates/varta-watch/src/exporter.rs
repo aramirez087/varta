@@ -107,6 +107,9 @@ impl Exporter for FileExporter {
                     "{observer_ns}\tmismatch\t{claimed_pid}\t-\t-\tauth_failure",
                 )
             }
+            Event::CtrlTruncated(err, observer_ns) => {
+                writeln!(self.sink, "{observer_ns}\tctrunc\t-\t-\t-\t{err}")
+            }
         };
         if let Err(e) = result {
             self.pending_err = Some(e);

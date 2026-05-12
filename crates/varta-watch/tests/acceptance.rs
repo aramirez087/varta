@@ -141,6 +141,7 @@ fn observer_emits_beat_per_received_frame() {
             Event::AuthFailure { .. } => {
                 panic!("unexpected auth failure during beat test")
             }
+            Event::CtrlTruncated(e, _) => panic!("unexpected ctrl truncation: {e}"),
         }
     }
 
