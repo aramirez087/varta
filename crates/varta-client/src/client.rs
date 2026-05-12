@@ -98,6 +98,7 @@ pub fn classify_send_error(e: &io::Error) -> BeatOutcome {
 /// translated into one of three steady-state outcomes. `Failed` carries the
 /// underlying error untouched for higher layers that wish to log or escalate.
 #[derive(Debug)]
+#[must_use]
 pub enum BeatOutcome {
     /// The 32-byte datagram was accepted by the kernel.
     Sent,
@@ -272,7 +273,9 @@ impl<T: BeatTransport> Varta<T> {
     /// path allocates a fresh socket; this is acceptable because observer
     /// restarts are rare and the steady-state path remains allocation-free.
     pub fn beat(&mut self, status: Status, payload: u64) -> BeatOutcome {
-        self.nonce = self.nonce.saturating_add(1).min(NONCE_TERMINAL - 1);
+        if self.nonce < NONCE_TERMINAL - 1 {
+            self.nonce += 1;
+        }
         let timestamp = self.start.elapsed().as_nanos().min(u64::MAX as u128) as u64;
         let frame = Frame::new(status, std::process::id(), timestamp, self.nonce, payload);
         frame.encode(&mut self.buf);

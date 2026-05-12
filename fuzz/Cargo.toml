@@ -10,6 +10,7 @@ cargo-fuzz = true
 [dependencies]
 libfuzzer-sys = "0.4"
 varta-vlp = { path = "../crates/varta-vlp", features = ["crypto"] }
+varta-watch = { path = "../crates/varta-watch" }
 
 [[bin]]
 name = "frame_decode"
@@ -21,6 +22,27 @@ bench = false
 [[bin]]
 name = "aead_roundtrip"
 path = "fuzz_targets/aead_roundtrip.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "frame_roundtrip"
+path = "fuzz_targets/frame_roundtrip.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "tracker_record"
+path = "fuzz_targets/tracker_record.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "config_from_args"
+path = "fuzz_targets/config_from_args.rs"
 test = false
 doc = false
 bench = false

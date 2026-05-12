@@ -158,11 +158,30 @@ mod plat {
     // becomes a hard compile error instead of UB at recvmsg time.
     const _: () = assert!(mem::size_of::<Msghdr>() == 56);
 
-    // Field-level offset guards catch layout divergence that same-size
-    // asserts miss (e.g. wrong padding on musl or new architectures).
+    // Compile-time offset-of assertions for every field the recvmsg path
+    // touches.  Manual layouts are a tradeoff: we avoid the libc crate to
+    // satisfy the zero-dependency constraint, but field-order / padding
+    // mistakes would silently corrupt I/O.  These guards catch divergence
+    // on any kernel/libc version, turning undefined behaviour into a hard
+    // compile error.
+    const _: () = assert!(mem::offset_of!(Msghdr, msg_name) == 0);
+    const _: () = assert!(mem::offset_of!(Msghdr, msg_namelen) == 8);
+    const _: () = assert!(mem::offset_of!(Msghdr, msg_iov) == 16);
+    const _: () = assert!(mem::offset_of!(Msghdr, msg_iovlen) == 24);
     const _: () = assert!(mem::offset_of!(Msghdr, msg_control) == 32);
     const _: () = assert!(mem::offset_of!(Msghdr, msg_controllen) == 40);
     const _: () = assert!(mem::offset_of!(Msghdr, msg_flags) == 48);
+
+    const _: () = assert!(mem::offset_of!(Iovec, iov_base) == 0);
+    const _: () = assert!(mem::offset_of!(Iovec, iov_len) == 8);
+
+    const _: () = assert!(mem::offset_of!(Cmsghdr, cmsg_len) == 0);
+    const _: () = assert!(mem::offset_of!(Cmsghdr, cmsg_level) == 8);
+    const _: () = assert!(mem::offset_of!(Cmsghdr, cmsg_type) == 12);
+
+    const _: () = assert!(mem::offset_of!(Ucred, pid) == 0);
+    const _: () = assert!(mem::offset_of!(Ucred, uid) == 4);
+    const _: () = assert!(mem::offset_of!(Ucred, gid) == 8);
 }
 
 #[cfg(target_os = "macos")]
@@ -219,11 +238,22 @@ mod plat {
     // Compile-time invariant: macOS msghdr is 48 bytes on x86_64 + aarch64.
     const _: () = assert!(mem::size_of::<Msghdr>() == 48);
 
-    // Field-level offset guards catch layout divergence that same-size
-    // asserts miss (e.g. future macOS SDK changes, new architectures).
+    // Compile-time offset-of assertions for every field the recvmsg path
+    // touches.  Manual layouts are a tradeoff: we avoid the libc crate to
+    // satisfy the zero-dependency constraint, but field-order / padding
+    // mistakes would silently corrupt I/O.  These guards catch divergence
+    // on any kernel/libc version, turning undefined behaviour into a hard
+    // compile error.
+    const _: () = assert!(mem::offset_of!(Msghdr, msg_name) == 0);
+    const _: () = assert!(mem::offset_of!(Msghdr, msg_namelen) == 8);
+    const _: () = assert!(mem::offset_of!(Msghdr, msg_iov) == 16);
+    const _: () = assert!(mem::offset_of!(Msghdr, msg_iovlen) == 24);
     const _: () = assert!(mem::offset_of!(Msghdr, msg_control) == 32);
     const _: () = assert!(mem::offset_of!(Msghdr, msg_controllen) == 40);
     const _: () = assert!(mem::offset_of!(Msghdr, msg_flags) == 44);
+
+    const _: () = assert!(mem::offset_of!(Iovec, iov_base) == 0);
+    const _: () = assert!(mem::offset_of!(Iovec, iov_len) == 8);
 }
 
 // ---------------------------------------------------------------------------

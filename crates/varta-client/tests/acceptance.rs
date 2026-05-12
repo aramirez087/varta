@@ -72,7 +72,7 @@ fn beat_increments_nonce_monotonically() {
     let mut client = Varta::connect(&temp.path).expect("connect");
 
     for _ in 0..5 {
-        client.beat(Status::Ok, 0);
+        let _ = client.beat(Status::Ok, 0);
     }
 
     let mut buf = [0u8; 32];
