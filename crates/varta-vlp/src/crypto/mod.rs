@@ -60,7 +60,7 @@ impl core::fmt::Display for KeyError {
 ///
 /// Created from a hex string (64 characters) or raw bytes. Both the agent
 /// and observer must share the same key.
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub struct Key {
     pub(crate) bytes: [u8; KEY_BYTES],
 }

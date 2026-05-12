@@ -72,7 +72,7 @@ varta-vlp  ←  varta-client  ←  (consumers)
 These are load-bearing invariants — do not relax them:
 
 1. **Zero registry dependencies** in production crates (`varta-vlp`, `varta-client`, `varta-watch`). `[dependencies]` must remain empty or path-only.
-2. **Zero heap allocation** on the `beat()` path after `Varta::connect()`. All steady-state code operates on stack buffers. The guard-allocator test in `varta-tests` enforces this.
+2. **Zero heap allocation** on the `beat()` path after `Varta::connect()`. All steady-state code operates on stack buffers. The guard-allocator test in `varta-client/tests/zero_alloc.rs` enforces this — it covers the **client-side** beat path specifically (not the observer/exporter pipeline).
 3. **Non-blocking only** — the agent socket is non-blocking at connect time. Code must never call `set_nonblocking(false)` or add blocking I/O to the beat path.
 4. **Frame layout is ABI-stable.** Any change to the `Frame` field layout requires a VLP version bump and updated integration tests.
 5. **Edition 2021**, toolchain pinned to `stable` via `rust-toolchain.toml`. Do not change the channel without updating all five crates.

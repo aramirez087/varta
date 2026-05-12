@@ -165,15 +165,12 @@ pub(crate) fn read_iv_random() -> io::Result<[u8; 8]> {
 ///
 /// Produces a deterministic 8-byte prefix.  Used only when `/dev/urandom`
 /// is unavailable (e.g. inside a panic handler, where file I/O is not safe).
+#[allow(dead_code)]
 pub(crate) fn lcg_iv_random() -> [u8; 8] {
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let raw = (std::process::id() as u64)
         .wrapping_mul(6364136223846793005)
-        .wrapping_add(
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos() as u64,
-        );
+        .wrapping_add(SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
     raw.to_le_bytes()
 }
 

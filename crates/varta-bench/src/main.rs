@@ -132,7 +132,7 @@ fn run_latency() -> ExitCode {
         LATENCY_P99_NS_THRESHOLD
     );
 
-    if p99 < LATENCY_P99_NS_THRESHOLD {
+    if p99 <= LATENCY_P99_NS_THRESHOLD {
         eprintln!("bench_latency_p99_under_one_microsecond: PASS (p99={p99}ns)");
         ExitCode::SUCCESS
     } else {

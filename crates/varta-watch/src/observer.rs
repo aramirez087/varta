@@ -87,7 +87,6 @@ pub struct Observer {
     threshold_ns: u64,
     start: Instant,
     stall_queue: Vec<Option<Event>>,
-    stall_pending: Vec<(u32, u64, u64)>,
     stall_cursor: usize,
     /// Next index to start polling from for fair round-robin across listeners.
     next_listener_start: usize,
@@ -110,7 +109,6 @@ impl Observer {
             threshold_ns,
             start: Instant::now(),
             stall_queue: Vec::with_capacity(tracker_capacity),
-            stall_pending: Vec::with_capacity(tracker_capacity),
             stall_cursor: 0,
             next_listener_start: 0,
         }
@@ -251,31 +249,21 @@ impl Observer {
     }
 
     fn drain_stalls(&mut self) {
-        debug_assert!(
-            self.stall_cursor >= self.stall_queue.len(),
-            "drain_stalls called with unconsumed stall events"
-        );
+        if self.stall_cursor < self.stall_queue.len() {
+            return;
+        }
         let now_ns = self.now_ns();
         self.stall_queue.clear();
         self.stall_cursor = 0;
-        self.stall_pending.clear();
-        for slot in self
-            .tracker
-            .iter_stalled(now_ns, self.threshold_ns)
-            .filter(|slot| !slot.stall_emitted)
-        {
-            self.stall_pending
-                .push((slot.pid, slot.last_nonce, slot.last_ns));
-        }
-        for &(pid, last_nonce, last_ns) in &self.stall_pending {
-            self.stall_queue.push(Some(Event::Stall {
-                pid,
-                last_nonce,
-                last_ns,
-                observer_ns: now_ns,
-            }));
-            self.tracker.mark_stall_emitted(pid);
-        }
+        self.tracker
+            .drain_stalled_slots(now_ns, self.threshold_ns, |pid, last_nonce, last_ns| {
+                self.stall_queue.push(Some(Event::Stall {
+                    pid,
+                    last_nonce,
+                    last_ns,
+                    observer_ns: now_ns,
+                }));
+            });
     }
 
     /// Drain and reset the eviction counter.

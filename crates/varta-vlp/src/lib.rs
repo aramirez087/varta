@@ -76,6 +76,7 @@ impl Status {
 /// [`Frame::encode`] to write to a socket buffer or [`Frame::decode`] to read
 /// one. There is no `Default`; agents always supply a real `pid`, `nonce` and
 /// timestamp.
+#[non_exhaustive]
 #[repr(C, align(8))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Frame {
@@ -185,6 +186,7 @@ impl Frame {
 /// The variants form an exhaustive list of validation failures the protocol
 /// can detect statically; everything else (timestamp drift, nonce regression)
 /// is policy enforced higher in the stack.
+#[non_exhaustive]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DecodeError {
     /// First two bytes did not equal [`MAGIC`].

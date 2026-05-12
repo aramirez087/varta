@@ -102,12 +102,6 @@ impl Tracker {
     /// than reallocating.
     pub fn new(capacity: usize) -> Self {
         let cap = capacity.min(MAX_CAPACITY);
-        if capacity > MAX_CAPACITY {
-            eprintln!(
-                "varta-watch: tracker capacity {} exceeds maximum {}; clamping to {}",
-                capacity, MAX_CAPACITY, cap
-            );
-        }
         Tracker {
             entries: Vec::with_capacity(cap),
             len: 0,
@@ -222,15 +216,6 @@ impl Tracker {
         count
     }
 
-    /// Iterator over every slot whose silence (relative to `now_ns`) has
-    /// crossed `threshold_ns`, regardless of whether the observer has already
-    /// surfaced a stall event for it.
-    pub fn iter_stalled(&self, now_ns: u64, threshold_ns: u64) -> impl Iterator<Item = &Slot> + '_ {
-        self.entries[..self.len]
-            .iter()
-            .filter(move |slot| now_ns.saturating_sub(slot.last_ns) >= threshold_ns)
-    }
-
     /// Number of pids currently tracked.
     pub fn len(&self) -> usize {
         self.len
@@ -241,14 +226,28 @@ impl Tracker {
         self.len == 0
     }
 
-    /// Mark a pid's slot as having had its stall event surfaced. The latch is
-    /// cleared automatically on the next [`Tracker::record`] call for the
-    /// same pid. No-op if the pid is unknown.
-    pub(crate) fn mark_stall_emitted(&mut self, pid: u32) {
+    /// Find newly-stalled slots and mark them emitted in one atomic pass.
+    ///
+    /// A slot is "newly stalled" when its silence duration exceeds
+    /// `threshold_ns` **and** the observer has not yet surfaced a stall
+    /// event for the current silence run (`stall_emitted == false`).
+    /// Qualifying slots are marked `stall_emitted = true` and the callback
+    /// is invoked with `(pid, last_nonce, last_ns)` — all within the same
+    /// mutable borrow, closing the TOCTOU window that existed between the
+    /// former `iter_stalled` / `mark_stall_emitted` pair.
+    pub fn drain_stalled_slots(
+        &mut self,
+        now_ns: u64,
+        threshold_ns: u64,
+        mut cb: impl FnMut(u32, u64, u64),
+    ) {
         for slot in &mut self.entries[..self.len] {
-            if slot.used && slot.pid == pid {
+            if !slot.used || slot.stall_emitted {
+                continue;
+            }
+            if now_ns.saturating_sub(slot.last_ns) >= threshold_ns {
                 slot.stall_emitted = true;
-                return;
+                cb(slot.pid, slot.last_nonce, slot.last_ns);
             }
         }
     }

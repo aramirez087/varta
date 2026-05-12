@@ -80,6 +80,7 @@ pub struct SecureUdpListener {
     decrypt_failures: u64,
     truncated_count: u64,
     sender_state_full: u64,
+    last_evicted: Option<(SocketAddr, SenderState)>,
 }
 
 impl SecureUdpListener {
@@ -110,6 +111,7 @@ impl SecureUdpListener {
             decrypt_failures: 0,
             truncated_count: 0,
             sender_state_full: 0,
+            last_evicted: None,
         })
     }
 
@@ -124,18 +126,47 @@ impl SecureUdpListener {
 
     /// When the sender-state map is full after a stale-sender sweep, evict
     /// the single entry with the oldest `last_seen` to make room for a new
-    /// sender. This prevents replay-protection gaps that would occur if we
-    /// silently dropped the beat and the next beat from the same sender
-    /// were accepted with no replay state.
+    /// sender. The evicted sender's replay state is preserved in
+    /// `last_evicted` so that a replayed frame from the evicted sender is
+    /// still rejected.
     fn force_evict_oldest_sender(&mut self) {
-        if let Some(oldest) = self
+        let oldest = self
             .sender_state
             .iter()
             .min_by_key(|(_, s)| s.last_seen)
-            .map(|(addr, _)| *addr)
-        {
-            self.sender_state.remove(&oldest);
+            .map(|(addr, state)| (*addr, state.clone()));
+        if let Some((addr, state)) = oldest {
+            self.sender_state.remove(&addr);
+            self.last_evicted = Some((addr, state));
         }
+    }
+
+    /// Validate (iv_random, counter) replay against an immutable `SenderState`
+    /// reference. Returns `true` if the combination is not a replay.
+    fn validate_replay(state: &SenderState, iv_random: [u8; 8], counter: u32) -> bool {
+        if state.iv_random == iv_random {
+            return counter > state.last_counter;
+        }
+        if state.prev_iv_random == iv_random {
+            return counter > state.prev_last_counter;
+        }
+        true
+    }
+
+    /// Apply a valid replay update to a `SenderState`, mutating counters
+    /// and rotating IV history as needed.
+    fn apply_replay_update(state: &mut SenderState, iv_random: [u8; 8], counter: u32) {
+        if state.iv_random == iv_random {
+            state.last_counter = counter;
+        } else if state.prev_iv_random == iv_random {
+            state.prev_last_counter = counter;
+        } else {
+            state.prev_iv_random = state.iv_random;
+            state.prev_last_counter = state.last_counter;
+            state.iv_random = iv_random;
+            state.last_counter = counter;
+        }
+        state.last_seen = Instant::now();
     }
 
     /// Atomic replay check + state update: returns `true` if the
@@ -149,6 +180,11 @@ impl SecureUdpListener {
     /// 3. Neither matches   → accepted as new or rotated IV, current state
     ///    moves to `prev_*` fields
     ///
+    /// If the sender was recently force-evicted, its replay state is
+    /// checked against the `last_evicted` shadow before being accepted
+    /// as new — closing the replay-protection gap that would otherwise
+    /// exist after a capacity-forced eviction.
+    ///
     /// Note: `counter > state.last_counter` would become false after u64
     /// wraparound, but at 1 beat/nanosecond this requires ~585 million
     /// years — not a practical concern.
@@ -160,6 +196,18 @@ impl SecureUdpListener {
     ) -> bool {
         match self.sender_state.entry(sender) {
             Entry::Vacant(e) => {
+                if let Some((evicted_addr, ref evicted_state)) = self.last_evicted {
+                    if evicted_addr == *e.key() {
+                        let valid = Self::validate_replay(evicted_state, iv_random, counter);
+                        if valid {
+                            let mut new_state = evicted_state.clone();
+                            Self::apply_replay_update(&mut new_state, iv_random, counter);
+                            e.insert(new_state);
+                        }
+                        self.last_evicted = None;
+                        return valid;
+                    }
+                }
                 e.insert(SenderState::new(iv_random, counter));
                 true
             }
@@ -167,7 +215,6 @@ impl SecureUdpListener {
                 let state = e.get_mut();
 
                 if state.iv_random == iv_random {
-                    // Same IV prefix: counter must strictly increase
                     if counter > state.last_counter {
                         state.last_counter = counter;
                         state.last_seen = Instant::now();
@@ -177,7 +224,6 @@ impl SecureUdpListener {
                 }
 
                 if state.prev_iv_random == iv_random {
-                    // Previous IV prefix: counter must strictly increase
                     if counter > state.prev_last_counter {
                         state.prev_last_counter = counter;
                         state.last_seen = Instant::now();
@@ -186,8 +232,6 @@ impl SecureUdpListener {
                     return false;
                 }
 
-                // Neither current nor previous matches → new IV rotation.
-                // Shift current into prev, store new as current.
                 state.prev_iv_random = state.iv_random;
                 state.prev_last_counter = state.last_counter;
                 state.iv_random = iv_random;

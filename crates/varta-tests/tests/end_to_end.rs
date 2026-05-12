@@ -53,8 +53,17 @@ fn main() -> ExitCode {
             udp_client_to_observer_beats_and_stall,
         );
     }
+    #[cfg(feature = "secure-udp")]
+    {
+        failed += run_one(
+            "secure_udp_client_to_observer_beats",
+            secure_udp_client_to_observer_beats,
+        );
+    }
 
-    let total = if cfg!(feature = "udp") { 3u32 } else { 2u32 };
+    let total = 2u32
+        + if cfg!(feature = "udp") { 1 } else { 0 }
+        + if cfg!(feature = "secure-udp") { 1 } else { 0 };
     let passed = total - failed;
     eprintln!(
         "\ntest result: {} {} passed; {} failed; 0 ignored",
@@ -441,4 +450,86 @@ fn udp_client_to_observer_beats_and_stall() {
 
     drop(receiver);
     eprintln!("udp_client_to_observer_beats_and_stall: ok");
+}
+
+#[cfg(feature = "secure-udp")]
+fn secure_udp_client_to_observer_beats() {
+    use std::io::Write;
+    use std::net::UdpSocket;
+
+    let tmp = TempDir::new("secure-udp");
+    let key_path = tmp.path().join("test.key");
+    // 32-byte test key as 64-character hex
+    let key_hex = "abababababababababababababababababababababababababababababababab";
+    std::fs::write(&key_path, format!("{key_hex}\n")).expect("write key file");
+    let key = varta_vlp::crypto::Key::from_bytes([0xabu8; 32]);
+
+    // Reserve an ephemeral UDP port for the observer
+    let probe = UdpSocket::bind("127.0.0.1:0").expect("bind probe");
+    let udp_port = probe.local_addr().expect("local_addr").port();
+    drop(probe);
+
+    let (mut child, prom_addr) = spawn_watch(&[
+        "--socket",
+        tmp.path().join("varta.sock").to_str().unwrap(),
+        "--threshold-ms",
+        "5000",
+        "--udp-port",
+        &udp_port.to_string(),
+        "--key-file",
+        key_path.to_str().unwrap(),
+        "--prom-addr",
+        "127.0.0.1:0",
+        "--shutdown-after-secs",
+        "8",
+    ]);
+    let _guard = ChildGuard(&mut child);
+
+    assert!(
+        wait_until(
+            || TcpStream::connect(prom_addr).is_ok(),
+            Duration::from_secs(3)
+        ),
+        "/metrics not reachable within 3s"
+    );
+
+    let agent_pid = std::process::id();
+    let observer_addr = std::net::SocketAddr::new(
+        std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+        udp_port,
+    );
+    {
+        let mut agent = varta_client::Varta::connect_secure_udp(observer_addr, key)
+            .expect("connect_secure_udp");
+        for _ in 0..10 {
+            match agent.beat(varta_client::Status::Ok, 0) {
+                varta_client::BeatOutcome::Sent => {}
+                varta_client::BeatOutcome::Dropped => {
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                varta_client::BeatOutcome::Failed(e) => {
+                    panic!("unexpected hard failure: {e}");
+                }
+            }
+        }
+    }
+
+    let needle = format!("varta_beats_total{{pid=\"{agent_pid}\"}}");
+    let mut last_body = String::new();
+    let satisfied = wait_until(
+        || match http_get(prom_addr, "/metrics") {
+            Ok((200, body)) => {
+                last_body = body;
+                last_body.contains(&needle)
+            }
+            _ => false,
+        },
+        Duration::from_secs(5),
+    );
+    assert!(
+        satisfied,
+        "/metrics did not surface {needle:?} for secure UDP; last body:\n{last_body}"
+    );
+
+    eprintln!("secure_udp_client_to_observer_beats: ok");
 }

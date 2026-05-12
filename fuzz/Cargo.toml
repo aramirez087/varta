@@ -9,7 +9,8 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
-varta-vlp = { path = "../crates/varta-vlp", features = ["crypto"] }
+varta-vlp = { path = "../crates/varta-vlp" }
+varta-vlp-crypto = { path = "../crates/varta-vlp", features = ["crypto"], package = "varta-vlp" }
 varta-watch = { path = "../crates/varta-watch" }
 
 [[bin]]

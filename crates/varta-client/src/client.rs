@@ -79,9 +79,6 @@ pub fn classify_send_error(e: &io::Error) -> BeatOutcome {
         | io::ErrorKind::NotFound
         | io::ErrorKind::NotConnected
         | io::ErrorKind::BrokenPipe
-        // (c) Belt-and-braces: covers toolchains that surface ENOBUFS as a
-        //     kind rather than a raw_os_error.
-        | io::ErrorKind::OutOfMemory
         | io::ErrorKind::StorageFull => BeatOutcome::Dropped,
 
         // (d) Unexpected error: clone and escalate.

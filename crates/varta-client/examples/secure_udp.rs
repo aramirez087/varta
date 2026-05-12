@@ -32,11 +32,12 @@ use std::time::Duration;
 use varta_client::{BeatOutcome, SecureUdpTransport, Status, Varta};
 
 fn main() -> io::Result<()> {
-    let key_val = std::env::var("VARTA_KEY").unwrap_or_else(|_| {
-        eprintln!("VARTA_KEY not set — using zero key (INSECURE, for demo only)");
-        // 64 zeros = insecure demo key
-        "0000000000000000000000000000000000000000000000000000000000000000".to_string()
-    });
+    let key_val = std::env::var("VARTA_KEY").map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            "VARTA_KEY environment variable not set — generate one with: openssl rand -hex 32",
+        )
+    })?;
 
     let key = varta_vlp::crypto::Key::from_hex(&key_val)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("invalid key: {e}")))?;

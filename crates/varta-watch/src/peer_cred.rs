@@ -319,22 +319,35 @@ pub(crate) fn recv_authenticated(fd: i32) -> RecvResult {
         iov_len: 32,
     };
 
-    let mut mhdr = plat::Msghdr {
-        msg_name: core::ptr::null_mut(),
-        msg_namelen: 0,
-        msg_iov: &mut iov,
-        msg_iovlen: 1,
-        msg_control: anc.0.as_mut_ptr() as *mut core::ffi::c_void,
-        msg_controllen: plat::ANCILLARY_BUFFER_SIZE as _,
-        msg_flags: 0,
+    let mut mhdr = {
         #[cfg(target_os = "linux")]
-        _pad1: 0,
-        #[cfg(target_os = "linux")]
-        _pad2: 0,
+        {
+            plat::Msghdr {
+                msg_name: core::ptr::null_mut(),
+                msg_namelen: 0,
+                _pad1: 0,
+                msg_iov: &mut iov,
+                msg_iovlen: 1,
+                msg_control: anc.0.as_mut_ptr() as *mut core::ffi::c_void,
+                msg_controllen: plat::ANCILLARY_BUFFER_SIZE as _,
+                msg_flags: 0,
+                _pad2: 0,
+            }
+        }
         #[cfg(target_os = "macos")]
-        _pad1: 0,
-        #[cfg(target_os = "macos")]
-        _pad2: 0,
+        {
+            plat::Msghdr {
+                msg_name: core::ptr::null_mut(),
+                msg_namelen: 0,
+                _pad1: 0,
+                msg_iov: &mut iov,
+                msg_iovlen: 1,
+                _pad2: 0,
+                msg_control: anc.0.as_mut_ptr() as *mut core::ffi::c_void,
+                msg_controllen: plat::ANCILLARY_BUFFER_SIZE as _,
+                msg_flags: 0,
+            }
+        }
     };
 
     let n = loop {

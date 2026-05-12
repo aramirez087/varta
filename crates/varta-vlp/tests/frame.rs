@@ -5,21 +5,13 @@
 //! `varta-vlp` exists; the RED capture in the Session 01 handoff is the
 //! compile failure these references produce.
 
-use varta_vlp::{DecodeError, Frame, Status, MAGIC, NONCE_TERMINAL, VERSION};
+use varta_vlp::{DecodeError, Frame, Status, NONCE_TERMINAL};
 
 /// A canonical frame whose encoding is hand-computed in
 /// `frame_round_trip_matches_golden_bytes`. Centralised so every round-trip
 /// test starts from the same fixture.
 fn fixture_frame() -> Frame {
-    Frame {
-        magic: MAGIC,
-        version: VERSION,
-        status: Status::Ok,
-        pid: 0xDEAD_BEEF,
-        timestamp: 0x0123_4567_89AB_CDEF,
-        nonce: 1,
-        payload: 0x0042,
-    }
+    Frame::new(Status::Ok, 0xDEAD_BEEF, 0x0123_4567_89AB_CDEF, 1, 0x0042)
 }
 
 /// Golden encoding of `fixture_frame()` — little-endian, 32 bytes, no padding.
@@ -99,15 +91,13 @@ fn every_status_variant_round_trips() {
 
 #[test]
 fn payload_preserved_at_u64_max() {
-    let frame = Frame {
-        magic: MAGIC,
-        version: VERSION,
-        status: Status::Critical,
-        pid: u32::MAX,
-        timestamp: u64::MAX,
-        nonce: NONCE_TERMINAL,
-        payload: u64::MAX,
-    };
+    let frame = Frame::new(
+        Status::Critical,
+        u32::MAX,
+        u64::MAX,
+        NONCE_TERMINAL,
+        u64::MAX,
+    );
     let mut buf = [0u8; 32];
     frame.encode(&mut buf);
     let decoded = Frame::decode(&buf).expect("u64::MAX frame must decode");

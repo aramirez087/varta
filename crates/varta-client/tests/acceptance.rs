@@ -5,36 +5,11 @@
 //! authoritative — see `docs/acceptance/varta-v0-1-0.md` §S02.
 
 use std::os::unix::net::UnixDatagram;
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+
+mod common;
+use common::TempSocket;
 
 use varta_client::{BeatOutcome, Frame, Status, Varta};
-
-/// RAII socket-path holder. `Drop` unlinks the file (best-effort).
-struct TempSocket {
-    path: PathBuf,
-}
-
-impl TempSocket {
-    fn new(tag: &str) -> Self {
-        let pid = std::process::id();
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        static N: AtomicU64 = AtomicU64::new(0);
-        let n = N.fetch_add(1, Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!("varta-{tag}-{pid}-{nanos}-{n}.sock"));
-        let _ = std::fs::remove_file(&path);
-        TempSocket { path }
-    }
-}
-
-impl Drop for TempSocket {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
-    }
-}
 
 #[test]
 fn connect_succeeds_when_observer_socket_exists() {

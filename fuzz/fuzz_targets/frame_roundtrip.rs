@@ -13,49 +13,46 @@ fuzz_target!(|data: &[u8]| {
     let version = data[2];
     let status_byte = data[3];
 
-    let mut pid_bytes = [0u8; 4];
-    pid_bytes.copy_from_slice(&data[4..8]);
-    let pid = u32::from_le_bytes(pid_bytes);
+    let pid = u32::from_le_bytes([data[4], data[5], data[6], data[7]]);
 
-    let mut ts_bytes = [0u8; 8];
-    ts_bytes.copy_from_slice(&data[8..16]);
-    let timestamp = u64::from_le_bytes(ts_bytes);
+    let timestamp = u64::from_le_bytes([
+        data[8], data[9], data[10], data[11], data[12], data[13], data[14], data[15],
+    ]);
 
-    let mut nonce_bytes = [0u8; 8];
-    nonce_bytes.copy_from_slice(&data[16..24]);
-    let nonce = u64::from_le_bytes(nonce_bytes);
+    let nonce = u64::from_le_bytes([
+        data[16], data[17], data[18], data[19], data[20], data[21], data[22], data[23],
+    ]);
 
-    let mut payload_bytes = [0u8; 8];
-    payload_bytes.copy_from_slice(&data[24..32]);
-    let payload = u64::from_le_bytes(payload_bytes);
+    let payload = u64::from_le_bytes([
+        data[24], data[25], data[26], data[27], data[28], data[29], data[30], data[31],
+    ]);
 
     let status = match varta_vlp::Status::try_from_u8(status_byte) {
         Ok(s) => s,
         Err(_) => return,
     };
 
-    let frame = varta_vlp::Frame {
-        magic,
-        version,
-        status,
-        pid,
-        timestamp,
-        nonce,
-        payload,
-    };
-
+    // Build the raw 32-byte frame via encode-equivalent byte writes
+    // (same layout Frame::encode produces) so we can test decode round-tripping
+    // without constructing a non_exhaustive Frame from outside the crate.
     let mut buf = [0u8; 32];
-    frame.encode(&mut buf);
+    buf[0..2].copy_from_slice(&magic);
+    buf[2] = version;
+    buf[3] = status_byte;
+    buf[4..8].copy_from_slice(&pid.to_le_bytes());
+    buf[8..16].copy_from_slice(&timestamp.to_le_bytes());
+    buf[16..24].copy_from_slice(&nonce.to_le_bytes());
+    buf[24..32].copy_from_slice(&payload.to_le_bytes());
 
     match varta_vlp::Frame::decode(&buf) {
         Ok(decoded) => {
-            assert_eq!(decoded.magic, frame.magic, "magic mismatch");
-            assert_eq!(decoded.version, frame.version, "version mismatch");
-            assert_eq!(decoded.status, frame.status, "status mismatch");
-            assert_eq!(decoded.pid, frame.pid, "pid mismatch");
-            assert_eq!(decoded.timestamp, frame.timestamp, "timestamp mismatch");
-            assert_eq!(decoded.nonce, frame.nonce, "nonce mismatch");
-            assert_eq!(decoded.payload, frame.payload, "payload mismatch");
+            assert_eq!(decoded.magic, magic, "magic mismatch");
+            assert_eq!(decoded.version, version, "version mismatch");
+            assert_eq!(decoded.status, status, "status mismatch");
+            assert_eq!(decoded.pid, pid, "pid mismatch");
+            assert_eq!(decoded.timestamp, timestamp, "timestamp mismatch");
+            assert_eq!(decoded.nonce, nonce, "nonce mismatch");
+            assert_eq!(decoded.payload, payload, "payload mismatch");
         }
         Err(_) => {
             // Decode rejected a frame whose magic/version/status we allowed

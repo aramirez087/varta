@@ -137,19 +137,31 @@ impl FileExporter {
     /// up to [`MAX_ROTATION_GENERATIONS`]. The oldest generation is deleted.
     fn rotate(path: &Path) -> io::Result<()> {
         let path_str = path.to_string_lossy();
-        // Remove the oldest generation first.
         let oldest = format!("{path_str}.{MAX_ROTATION_GENERATIONS}");
-        let _ = std::fs::remove_file(&oldest);
-        // Shift remaining generations.
+        match std::fs::remove_file(&oldest) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+        }
         for gen in (1..MAX_ROTATION_GENERATIONS).rev() {
             let src = format!("{path_str}.{gen}");
             let dst = format!("{path_str}.{}", gen + 1);
-            let _ = std::fs::rename(&src, &dst);
+            match std::fs::rename(&src, &dst) {
+                Ok(()) => {}
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e),
+            }
         }
         let first = format!("{path_str}.1");
-        // If the rename fails (file doesn't exist), that's fine — the first
-        // rotation of a fresh file has nothing to shift.
-        let _ = std::fs::rename(path, &first);
+        match std::fs::rename(path, &first) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) if e.kind() == io::ErrorKind::CrossesDevices => {
+                std::fs::copy(path, &first)?;
+                std::fs::remove_file(path)?;
+            }
+            Err(e) => return Err(e),
+        }
         Ok(())
     }
 }
@@ -232,13 +244,14 @@ fn status_label(s: Status) -> &'static str {
 /// Prometheus `kind` label values for `varta_decode_errors_total`. Indexed
 /// by [`decode_kind_index`]; the array doubles as the canonical ordering
 /// for the exposition output, so series remain stable across scrapes.
-const DECODE_KIND_LABELS: [&str; 3] = ["bad_magic", "bad_version", "bad_status"];
+const DECODE_KIND_LABELS: [&str; 4] = ["bad_magic", "bad_version", "bad_status", "unknown"];
 
 fn decode_kind_index(err: &DecodeError) -> usize {
     match err {
         DecodeError::BadMagic => 0,
         DecodeError::BadVersion => 1,
         DecodeError::BadStatus(_) => 2,
+        _ => 3,
     }
 }
 
@@ -441,7 +454,7 @@ impl PromExporter {
                 Ok(n) => {
                     total += n;
                     let preview = &buf[..n];
-                    if contains_subsequence(preview, b"\r\n\r\n") || total >= PROM_REQUEST_CAP {
+                    if preview.windows(4).any(|w| w == b"\r\n\r\n") || total >= PROM_REQUEST_CAP {
                         break;
                     }
                 }
@@ -655,25 +668,6 @@ impl Exporter for PromExporter {
     }
 }
 
-fn contains_subsequence(haystack: &[u8], needle: &[u8]) -> bool {
-    if needle.is_empty() {
-        return true;
-    }
-    if needle.len() > haystack.len() {
-        return false;
-    }
-    let end = haystack.len() - needle.len();
-    'outer: for i in 0..=end {
-        for j in 0..needle.len() {
-            if haystack[i + j] != needle[j] {
-                continue 'outer;
-            }
-        }
-        return true;
-    }
-    false
-}
-
 /// Write the HTTP 200 response line and headers (including Content-Length)
 /// into `stream` using a stack buffer so no heap allocation occurs on the
 /// `/metrics` scrape path.
@@ -699,7 +693,7 @@ fn write_headers_with_len(
 /// ensure `buf` is large enough; the debug assertion catches undersized
 /// buffers at test time and has zero overhead in release builds.
 fn write_usize(buf: &mut [u8], mut n: usize) -> usize {
-    debug_assert!(
+    assert!(
         buf.len() >= 20,
         "write_usize: buffer too small ({})",
         buf.len()

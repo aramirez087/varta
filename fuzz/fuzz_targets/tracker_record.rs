@@ -45,15 +45,7 @@ fuzz_target!(|data: &[u8]| {
 
         wall = wall.wrapping_add(1).max(now_ns);
 
-        let frame = varta_vlp::Frame {
-            magic: varta_vlp::MAGIC,
-            version: varta_vlp::VERSION,
-            status,
-            pid,
-            timestamp,
-            nonce,
-            payload: 0,
-        };
+        let frame = varta_vlp::Frame::new(status, pid, timestamp, nonce, 0);
 
         let _update = tracker.record(&frame, wall, threshold_ns);
 

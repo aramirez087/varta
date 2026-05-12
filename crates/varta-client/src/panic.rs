@@ -9,17 +9,11 @@ use std::os::unix::net::UnixDatagram;
 use std::path::PathBuf;
 use std::time::Instant;
 
+#[cfg(any(feature = "udp", feature = "secure-udp"))]
+use crate::transport::bind_ephemeral;
 #[cfg(all(feature = "panic-handler", feature = "secure-udp"))]
 use varta_vlp::crypto::Key;
 use varta_vlp::{Frame, Status, NONCE_TERMINAL};
-
-#[cfg(feature = "udp")]
-fn bind_udp_any_for(addr: std::net::SocketAddr) -> std::io::Result<std::net::UdpSocket> {
-    match addr {
-        std::net::SocketAddr::V4(_) => std::net::UdpSocket::bind("0.0.0.0:0"),
-        std::net::SocketAddr::V6(_) => std::net::UdpSocket::bind("[::]:0"),
-    }
-}
 
 /// Register a panic hook that emits a [`Status::Critical`] VLP frame on the
 /// Unix Domain Socket at `socket_path` before resuming normal unwinding.
@@ -58,7 +52,7 @@ pub fn install(socket_path: impl Into<PathBuf>) {
         let _ = (|| {
             let sock = UnixDatagram::unbound().ok()?;
             sock.connect(&path).ok()?;
-            let timestamp = start.elapsed().as_nanos() as u64;
+            let timestamp = start.elapsed().as_nanos().min(u64::MAX as u128) as u64;
             let frame = Frame::new(
                 Status::Critical,
                 std::process::id(),
@@ -102,9 +96,9 @@ pub fn install_panic_handler_udp(addr: std::net::SocketAddr) {
     let prev = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         let _ = (|| {
-            let sock = bind_udp_any_for(addr).ok()?;
+            let sock = bind_ephemeral(&addr).ok()?;
             sock.connect(addr).ok()?;
-            let timestamp = start.elapsed().as_nanos() as u64;
+            let timestamp = start.elapsed().as_nanos().min(u64::MAX as u128) as u64;
             let frame = Frame::new(
                 Status::Critical,
                 std::process::id(),
@@ -145,9 +139,9 @@ pub fn install_panic_handler_secure_udp(addr: std::net::SocketAddr, key: Key) {
     let prev = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         let _ = (|| {
-            let sock = bind_udp_any_for(addr).ok()?;
+            let sock = bind_ephemeral(&addr).ok()?;
             sock.connect(addr).ok()?;
-            let timestamp = start.elapsed().as_nanos() as u64;
+            let timestamp = start.elapsed().as_nanos().min(u64::MAX as u128) as u64;
             let frame = Frame::new(
                 Status::Critical,
                 std::process::id(),
