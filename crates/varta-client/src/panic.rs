@@ -52,6 +52,7 @@ pub fn install(socket_path: impl Into<PathBuf>) {
         let _ = (|| {
             let sock = UnixDatagram::unbound().ok()?;
             sock.connect(&path).ok()?;
+            sock.set_nonblocking(true).ok()?;
             let timestamp = start.elapsed().as_nanos().min(u64::MAX as u128) as u64;
             let frame = Frame::new(
                 Status::Critical,
@@ -98,6 +99,7 @@ pub fn install_panic_handler_udp(addr: std::net::SocketAddr) {
         let _ = (|| {
             let sock = bind_ephemeral(&addr).ok()?;
             sock.connect(addr).ok()?;
+            sock.set_nonblocking(true).ok()?;
             let timestamp = start.elapsed().as_nanos().min(u64::MAX as u128) as u64;
             let frame = Frame::new(
                 Status::Critical,
@@ -141,6 +143,7 @@ pub fn install_panic_handler_secure_udp(addr: std::net::SocketAddr, key: Key) {
         let _ = (|| {
             let sock = bind_ephemeral(&addr).ok()?;
             sock.connect(addr).ok()?;
+            sock.set_nonblocking(true).ok()?;
             let timestamp = start.elapsed().as_nanos().min(u64::MAX as u128) as u64;
             let frame = Frame::new(
                 Status::Critical,

@@ -96,6 +96,7 @@ fn observer_emits_beat_per_received_frame() {
         0o600,
         Duration::from_millis(100),
         64,
+        None,
     )
     .expect("bind observer");
     let client = client_socket(path.as_path());
@@ -161,6 +162,7 @@ fn observer_emits_stall_after_threshold_elapses() {
         0o600,
         Duration::from_millis(100),
         64,
+        None,
     )
     .expect("bind observer");
     let client = client_socket(path.as_path());
@@ -208,6 +210,7 @@ fn observer_reports_decode_error_for_bad_magic() {
         0o600,
         Duration::from_millis(100),
         64,
+        None,
     )
     .expect("bind observer");
     let client = client_socket(path.as_path());
@@ -256,6 +259,7 @@ fn observer_rejects_spoofed_pid_frame() {
         0o600,
         Duration::from_millis(100),
         64,
+        None,
     )
     .expect("bind observer");
     let client = client_socket(path.as_path());

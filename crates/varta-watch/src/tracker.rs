@@ -258,6 +258,15 @@ impl Tracker {
         self.len
     }
 
+    /// Return the `last_ns` timestamp for a tracked pid, if present.
+    /// Used by the observer for per-pid rate limiting without exposing
+    /// internal slot layout.
+    pub fn last_ns_of(&self, pid: u32) -> Option<u64> {
+        self.pid_to_index
+            .get(&pid)
+            .map(|&idx| self.entries[idx].last_ns)
+    }
+
     /// True iff no pids are tracked.
     pub fn is_empty(&self) -> bool {
         self.len == 0

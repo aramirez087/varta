@@ -81,6 +81,11 @@ pub struct Config {
     /// Environment variable name to read the primary key from (default
     /// `VARTA_KEY`). Ignored when `--key-file` is set.
     pub key_env: String,
+    /// Optional per-pid maximum beat rate in beats per second.
+    /// `None` (the default) means no rate limiting. Beats arriving
+    /// faster than this rate from the same pid are dropped and counted
+    /// via `varta_rate_limited_total`.
+    pub max_beat_rate: Option<u32>,
 }
 
 /// Failure modes for [`Config::from_args`].
@@ -206,6 +211,10 @@ OPTIONAL:
                                      --features secure-udp).
     --key-env <NAME>               Environment variable to read the primary
                                      key from (default VARTA_KEY).
+    --max-beat-rate <N>            Per-pid maximum beat rate in beats/sec.
+                                     Beats arriving faster than this rate
+                                     from the same pid are dropped.
+                                     Default: unlimited.
 
     -h, --help                     Print this message and exit.
 ";
@@ -229,6 +238,7 @@ OPTIONAL:
         let mut secure_key_file: Option<PathBuf> = None;
         let mut accepted_key_file: Option<PathBuf> = None;
         let mut key_env: String = String::from("VARTA_KEY");
+        let mut max_beat_rate: Option<u32> = None;
 
         let mut iter = args.into_iter();
         while let Some(tok) = iter.next() {
@@ -337,6 +347,16 @@ OPTIONAL:
                 "--key-env" => {
                     key_env = iter.next().ok_or(ConfigError::MissingValue("--key-env"))?;
                 }
+                "--max-beat-rate" => {
+                    let v = iter
+                        .next()
+                        .ok_or(ConfigError::MissingValue("--max-beat-rate"))?;
+                    max_beat_rate =
+                        Some(v.parse::<u32>().map_err(|_| ConfigError::BadInteger {
+                            flag: "--max-beat-rate",
+                            raw: v,
+                        })?);
+                }
                 other => return Err(ConfigError::UnknownFlag(other.to_string())),
             }
         }
@@ -372,6 +392,7 @@ OPTIONAL:
             secure_key_file,
             accepted_key_file,
             key_env,
+            max_beat_rate,
         })
     }
 
@@ -574,6 +595,7 @@ mod tests {
             "--key-file",
             "--accepted-key-file",
             "--key-env",
+            "--max-beat-rate",
             "--help",
         ] {
             assert!(

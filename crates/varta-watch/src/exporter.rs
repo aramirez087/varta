@@ -92,20 +92,29 @@ impl FileExporter {
             self.pending_err = Some(e);
         } else {
             self.pending_err = None;
-            self.after_write();
+            let line_len = decimal_digits(observer_ns) as u64
+                + 1  // \t
+                + 8  // "eviction"
+                + 1  // \t
+                + decimal_digits(pid as u64) as u64
+                + 1  // \t
+                + 1  // -
+                + 1  // \t
+                + 1  // -
+                + 1  // \t
+                + 1  // -
+                + 1; // \n
+            self.after_write(line_len);
         }
     }
 
     /// Called after every successful write. When `max_bytes` is set and
     /// exceeded, rotates the file.
-    fn after_write(&mut self) {
+    fn after_write(&mut self, line_len: u64) {
         let Some(max) = self.max_bytes else {
             return;
         };
-        // Estimate: unable to get precise byte count from BufWriter without
-        // flushing, which would defeat the purpose of buffering. Track a
-        // conservative lower bound from the line length instead.
-        self.bytes_written = self.bytes_written.saturating_add(64);
+        self.bytes_written = self.bytes_written.saturating_add(line_len);
         if self.bytes_written < max {
             return;
         }
@@ -168,6 +177,69 @@ impl FileExporter {
 
 impl Exporter for FileExporter {
     fn record(&mut self, ev: &Event) -> io::Result<()> {
+        let line_len: u64 = match ev {
+            Event::Beat {
+                pid,
+                status,
+                payload,
+                nonce,
+                observer_ns,
+            } => {
+                let label = status_label(*status);
+                decimal_digits(*observer_ns) as u64
+                    + 1  // \t
+                    + 4  // "beat"
+                    + 1  // \t
+                    + decimal_digits(*pid as u64) as u64
+                    + 1  // \t
+                    + decimal_digits(*nonce) as u64
+                    + 1  // \t
+                    + label.len() as u64
+                    + 1  // \t
+                    + decimal_digits(*payload) as u64
+                    + 1 // \n
+            }
+            Event::Stall {
+                pid,
+                last_nonce,
+                observer_ns,
+                ..
+            } => {
+                decimal_digits(*observer_ns) as u64
+                + 1  // \t
+                + 5  // "stall"
+                + 1  // \t
+                + decimal_digits(*pid as u64) as u64
+                + 1  // \t
+                + decimal_digits(*last_nonce) as u64
+                + 1  // \t
+                + 5  // "stall"
+                + 1  // \t
+                + 1  // "-"
+                + 1
+            } // \n
+            // Error events with variable-length messages: use a
+            // conservative estimate of 256 bytes.  These are rare
+            // relative to beats and stalls so the drift is negligible.
+            Event::Decode(_, _) | Event::Io(_, _) | Event::CtrlTruncated(_, _) => 256,
+            Event::AuthFailure {
+                claimed_pid,
+                observer_ns,
+            } => {
+                decimal_digits(*observer_ns) as u64
+                + 1  // \t
+                + 8  // "mismatch"
+                + 1  // \t
+                + decimal_digits(*claimed_pid as u64) as u64
+                + 1  // \t
+                + 1  // "-"
+                + 1  // \t
+                + 1  // "-"
+                + 1  // \t
+                + 13 // "auth_failure"
+                + 1
+            } // \n
+        };
         let result = match ev {
             Event::Beat {
                 pid,
@@ -215,7 +287,7 @@ impl Exporter for FileExporter {
             Err(e) => Err(e),
             Ok(()) => {
                 self.pending_err = None;
-                self.after_write();
+                self.after_write(line_len);
                 Ok(())
             }
         }
@@ -229,6 +301,19 @@ impl Exporter for FileExporter {
             (None, Ok(())) => Ok(()),
         }
     }
+}
+
+/// Return the number of decimal digits needed to represent `n`.
+fn decimal_digits(mut n: u64) -> usize {
+    if n == 0 {
+        return 1;
+    }
+    let mut digits = 0;
+    while n > 0 {
+        n /= 10;
+        digits += 1;
+    }
+    digits
 }
 
 fn status_label(s: Status) -> &'static str {
@@ -321,6 +406,7 @@ pub struct PromExporter {
     decrypt_failures_total: u64,
     truncated_total: u64,
     sender_state_full_total: u64,
+    rate_limited_total: u64,
 }
 
 impl PromExporter {
@@ -342,6 +428,7 @@ impl PromExporter {
             decrypt_failures_total: 0,
             truncated_total: 0,
             sender_state_full_total: 0,
+            rate_limited_total: 0,
         })
     }
 
@@ -382,6 +469,11 @@ impl PromExporter {
     /// forcing eviction of the oldest entry.
     pub fn record_sender_state_full(&mut self, count: u64) {
         self.sender_state_full_total = self.sender_state_full_total.saturating_add(count);
+    }
+
+    /// Record one or more beats dropped by per-pid rate limiting.
+    pub fn record_rate_limited(&mut self, count: u64) {
+        self.rate_limited_total = self.rate_limited_total.saturating_add(count);
     }
 
     /// Record one or more `MSG_CTRUNC` ancillary-data truncation events.
@@ -621,6 +713,16 @@ impl PromExporter {
             "varta_sender_state_full_total {}",
             self.sender_state_full_total
         );
+        self.body_buf.push_str(
+            "# HELP varta_rate_limited_total Total beats dropped by per-pid rate limiting.\n",
+        );
+        self.body_buf
+            .push_str("# TYPE varta_rate_limited_total counter\n");
+        let _ = writeln!(
+            self.body_buf,
+            "varta_rate_limited_total {}",
+            self.rate_limited_total
+        );
     }
 }
 
@@ -693,7 +795,7 @@ fn write_headers_with_len(
 /// ensure `buf` is large enough; the debug assertion catches undersized
 /// buffers at test time and has zero overhead in release builds.
 fn write_usize(buf: &mut [u8], mut n: usize) -> usize {
-    assert!(
+    debug_assert!(
         buf.len() >= 20,
         "write_usize: buffer too small ({})",
         buf.len()

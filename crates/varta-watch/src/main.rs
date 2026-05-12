@@ -222,6 +222,7 @@ fn run(cfg: Config) -> std::io::Result<()> {
         cfg.socket_mode,
         cfg.read_timeout,
         cfg.tracker_capacity,
+        cfg.max_beat_rate,
     )?;
 
     // On non-Linux platforms per-datagram PID verification is not available.
@@ -416,6 +417,13 @@ fn run(cfg: Config) -> std::io::Result<()> {
         if sender_state_full > 0 {
             if let Some(pe) = prom_export.as_mut() {
                 pe.record_sender_state_full(sender_state_full);
+            }
+        }
+
+        let rate_limited = observer.drain_rate_limited();
+        if rate_limited > 0 {
+            if let Some(pe) = prom_export.as_mut() {
+                pe.record_rate_limited(rate_limited);
             }
         }
 

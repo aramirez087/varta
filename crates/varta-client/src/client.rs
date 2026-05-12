@@ -154,6 +154,7 @@ pub struct Varta<T: BeatTransport = UdsTransport> {
     transport: T,
     buf: [u8; 32],
     start: Instant,
+    last_pid: u32,
     nonce: u64,
     consecutive_dropped: u32,
     reconnect_after: u32,
@@ -185,6 +186,7 @@ impl Varta<UdsTransport> {
             transport,
             buf: [0u8; 32],
             start: Instant::now(),
+            last_pid: std::process::id(),
             nonce: 0,
             consecutive_dropped: 0,
             reconnect_after: 0,
@@ -217,6 +219,7 @@ impl Varta<UdpTransport> {
             transport,
             buf: [0u8; 32],
             start: Instant::now(),
+            last_pid: std::process::id(),
             nonce: 0,
             consecutive_dropped: 0,
             reconnect_after: 0,
@@ -247,6 +250,7 @@ impl Varta<SecureUdpTransport> {
             transport,
             buf: [0u8; 32],
             start: Instant::now(),
+            last_pid: std::process::id(),
             nonce: 0,
             consecutive_dropped: 0,
             reconnect_after: 0,
@@ -287,8 +291,17 @@ impl<T: BeatTransport> Varta<T> {
             );
             self.nonce = 0;
         }
+        let pid = std::process::id();
+        if pid != self.last_pid {
+            self.start = Instant::now();
+            self.last_pid = pid;
+        }
         let timestamp = self.start.elapsed().as_nanos().min(u64::MAX as u128) as u64;
-        let frame = Frame::new(status, std::process::id(), timestamp, self.nonce, payload);
+        debug_assert!(
+            self.nonce != NONCE_TERMINAL,
+            "regular beat nonce must not equal NONCE_TERMINAL sentinel"
+        );
+        let frame = Frame::new(status, pid, timestamp, self.nonce, payload);
         frame.encode(&mut self.buf);
         let outcome = self.send_frame();
         match &outcome {

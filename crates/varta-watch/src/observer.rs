@@ -90,6 +90,11 @@ pub struct Observer {
     stall_cursor: usize,
     /// Next index to start polling from for fair round-robin across listeners.
     next_listener_start: usize,
+    /// Minimum inter-beat interval applied per pid, in nanoseconds.
+    /// `None` means no rate limiting (the default).
+    rate_limit_interval_ns: Option<u64>,
+    /// Total beats dropped by the rate limiter since the last drain.
+    rate_limited_total: u64,
 }
 
 impl Observer {
@@ -101,8 +106,23 @@ impl Observer {
     /// tracked concurrently. Beats for new pids beyond this limit are
     /// dropped with [`Update::CapacityExceeded`] (the counter is surfaced
     /// via `varta_tracker_capacity_exceeded_total`).
-    pub fn new(threshold: Duration, tracker_capacity: usize) -> Self {
+    ///
+    /// `max_beat_rate` is an optional per-pid rate limit in beats per
+    /// second.  When set, beats arriving faster than this rate from the
+    /// same pid are dropped and counted via [`Observer::drain_rate_limited`].
+    /// `None` (the default) disables rate limiting.
+    pub fn new(threshold: Duration, tracker_capacity: usize, max_beat_rate: Option<u32>) -> Self {
         let threshold_ns = threshold.as_nanos().min(u64::MAX as u128) as u64;
+        let rate_limit_interval_ns = max_beat_rate.and_then(|rps| {
+            if rps == 0 {
+                None
+            } else {
+                // Convert beats/sec to nanosecond interval.
+                // Saturate at 1 ns (1 GHz rate) to avoid overflow.
+                let interval_ns = 1_000_000_000u64.checked_div(rps as u64).unwrap_or(1);
+                Some(interval_ns)
+            }
+        });
         Observer {
             listeners: Vec::new(),
             tracker: Tracker::new(tracker_capacity),
@@ -111,6 +131,8 @@ impl Observer {
             stall_queue: Vec::with_capacity(tracker_capacity),
             stall_cursor: 0,
             next_listener_start: 0,
+            rate_limit_interval_ns,
+            rate_limited_total: 0,
         }
     }
 
@@ -119,8 +141,9 @@ impl Observer {
         listener: L,
         threshold: Duration,
         tracker_capacity: usize,
+        max_beat_rate: Option<u32>,
     ) -> Self {
-        let mut obs = Self::new(threshold, tracker_capacity);
+        let mut obs = Self::new(threshold, tracker_capacity, max_beat_rate);
         obs.add_listener(Box::new(listener));
         obs
     }
@@ -137,9 +160,15 @@ impl Observer {
         socket_mode: u32,
         read_timeout: Duration,
         tracker_capacity: usize,
+        max_beat_rate: Option<u32>,
     ) -> io::Result<Self> {
         let listener = UdsListener::bind(path, socket_mode, read_timeout)?;
-        Ok(Self::from_listener(listener, threshold, tracker_capacity))
+        Ok(Self::from_listener(
+            listener,
+            threshold,
+            tracker_capacity,
+            max_beat_rate,
+        ))
     }
 
     /// Add a listener to the observer. The listener is polled in round-robin
@@ -184,6 +213,18 @@ impl Observer {
                             #[cfg(not(target_os = "linux"))]
                             {
                                 let _ = peer_pid;
+                            }
+                            // Per-pid rate limiting: if a minimum inter-beat
+                            // interval is configured, skip frames that arrive
+                            // too soon from the same pid.
+                            if let Some(interval_ns) = self.rate_limit_interval_ns {
+                                if let Some(last_ns) = self.tracker.last_ns_of(frame.pid) {
+                                    if now_ns.saturating_sub(last_ns) < interval_ns {
+                                        self.rate_limited_total =
+                                            self.rate_limited_total.saturating_add(1);
+                                        continue;
+                                    }
+                                }
                             }
                             match self.tracker.record(&frame, now_ns, self.threshold_ns) {
                                 Update::Inserted | Update::Refreshed => {
@@ -281,6 +322,13 @@ impl Observer {
         self.tracker.take_capacity_exceeded()
     }
 
+    /// Drain and reset the rate-limited counter.
+    pub fn drain_rate_limited(&mut self) -> u64 {
+        let n = self.rate_limited_total;
+        self.rate_limited_total = 0;
+        n
+    }
+
     /// Drain and reset the AEAD decryption failure counter across all
     /// listeners.
     pub fn drain_decrypt_failures(&mut self) -> u64 {
@@ -333,6 +381,7 @@ mod tests {
             0o600,
             Duration::from_millis(100),
             64,
+            None,
         )
         .expect("bind should succeed on a clean temp path");
         assert!(path.exists(), "socket file must exist after bind");
