@@ -141,7 +141,8 @@ pub fn poly1305_mac(otk: &[u8; 32], msg: &[u8]) -> [u8; 16] {
 
     let r = bytes_to_limbs_26(&r_bytes, false);
 
-    let s_bytes: [u8; 16] = otk[16..32].try_into().unwrap();
+    let mut s_bytes = [0u8; 16];
+    s_bytes.copy_from_slice(&otk[16..32]);
     let s = bytes_to_limbs_26(&s_bytes, false);
 
     let mut h = [0u64; 5];
@@ -150,7 +151,8 @@ pub fn poly1305_mac(otk: &[u8; 32], msg: &[u8]) -> [u8; 16] {
     let full_blocks = msg.len() / 16;
     let mut offset = 0;
     for _ in 0..full_blocks {
-        let block: [u8; 16] = msg[offset..offset + 16].try_into().unwrap();
+        let mut block = [0u8; 16];
+        block.copy_from_slice(&msg[offset..offset + 16]);
         h = process_block(h, r, &block);
         offset += 16;
     }

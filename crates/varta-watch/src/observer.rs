@@ -326,6 +326,11 @@ impl Observer {
         self.tracker.take_capacity_exceeded()
     }
 
+    /// Drain and reset the nonce-wrap counter.
+    pub fn drain_nonce_wraps(&mut self) -> u64 {
+        self.tracker.take_nonce_wraps()
+    }
+
     /// Drain and reset the rate-limited counter.
     pub fn drain_rate_limited(&mut self) -> u64 {
         let n = self.rate_limited_total;

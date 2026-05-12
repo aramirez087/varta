@@ -99,6 +99,7 @@ pub struct Tracker {
     pid_to_index: HashMap<u32, usize>,
     evictions: u64,
     capacity_exceeded: u64,
+    nonce_wraps: u64,
     last_evicted_pid: Option<u32>,
 }
 
@@ -122,6 +123,7 @@ impl Tracker {
             pid_to_index: HashMap::with_capacity(cap),
             evictions: 0,
             capacity_exceeded: 0,
+            nonce_wraps: 0,
             last_evicted_pid: None,
         }
     }
@@ -148,16 +150,11 @@ impl Tracker {
                     let wrap_lo = NONCE_WRAP_THRESHOLD;
                     let wrap_hi = u64::MAX.saturating_sub(NONCE_WRAP_THRESHOLD);
                     if slot.last_nonce >= wrap_hi && frame.nonce < wrap_lo {
-                        let old = slot.last_nonce;
                         slot.last_nonce = frame.nonce;
                         slot.last_ns = now_ns;
                         slot.status = status;
                         slot.stall_emitted = false;
-                        eprintln!(
-                            "[varta-watch] nonce wrap detected for pid={}: \
-                             last_nonce={old} -> new_nonce={}",
-                            frame.pid, frame.nonce
-                        );
+                        self.nonce_wraps = self.nonce_wraps.saturating_add(1);
                         return Update::Refreshed;
                     }
                     return Update::OutOfOrder;
@@ -243,6 +240,14 @@ impl Tracker {
     /// have been evicted since the last call.
     pub fn take_evicted_pid(&mut self) -> Option<u32> {
         self.last_evicted_pid.take()
+    }
+
+    /// Take and reset the nonce-wrap counter. Returns the number of
+    /// nonce-space wraps detected since the last call.
+    pub fn take_nonce_wraps(&mut self) -> u64 {
+        let count = self.nonce_wraps;
+        self.nonce_wraps = 0;
+        count
     }
 
     /// Take and reset the capacity-exceeded counter. Returns the number of

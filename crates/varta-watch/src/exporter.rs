@@ -407,6 +407,7 @@ pub struct PromExporter {
     truncated_total: u64,
     sender_state_full_total: u64,
     rate_limited_total: u64,
+    nonce_wrap_total: u64,
 }
 
 impl PromExporter {
@@ -429,6 +430,7 @@ impl PromExporter {
             truncated_total: 0,
             sender_state_full_total: 0,
             rate_limited_total: 0,
+            nonce_wrap_total: 0,
         })
     }
 
@@ -474,6 +476,12 @@ impl PromExporter {
     /// Record one or more beats dropped by per-pid rate limiting.
     pub fn record_rate_limited(&mut self, count: u64) {
         self.rate_limited_total = self.rate_limited_total.saturating_add(count);
+    }
+
+    /// Record one or more nonce-space wrap events (agent exhausted u64 nonce
+    /// space and looped to 0).
+    pub fn record_nonce_wraps(&mut self, count: u64) {
+        self.nonce_wrap_total = self.nonce_wrap_total.saturating_add(count);
     }
 
     /// Record one or more `MSG_CTRUNC` ancillary-data truncation events.
@@ -722,6 +730,16 @@ impl PromExporter {
             self.body_buf,
             "varta_rate_limited_total {}",
             self.rate_limited_total
+        );
+        self.body_buf.push_str(
+            "# HELP varta_nonce_wrap_total Total nonce-space wrap events detected (agent exhausted u64 nonces).\n",
+        );
+        self.body_buf
+            .push_str("# TYPE varta_nonce_wrap_total counter\n");
+        let _ = writeln!(
+            self.body_buf,
+            "varta_nonce_wrap_total {}",
+            self.nonce_wrap_total
         );
     }
 }
