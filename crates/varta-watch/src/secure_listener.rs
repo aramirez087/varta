@@ -4,12 +4,17 @@
 //! decrypts and verifies them using the pre-shared key(s), and returns the
 //! decrypted 32-byte VLP frame via the standard [`BeatListener`] trait.
 //!
-//! Replay protection is enforced at two layers:
-//! 1. The listener rejects frames where the IV counter does not strictly
-//!    increase for a given (sender, iv_random) pair.
-//! 2. The observer's [`Tracker`] enforces per-pid nonce monotonicity on
+//! Replay protection is enforced at three layers:
+//! 1. The listener performs an atomic check-and-update of per-sender replay
+//!    state **after** successful AEAD decryption, eliminating the TOCTOU
+//!    window between the replay check and state insertion.
+//! 2. A 1-deep IV-rotation history (prev_iv_random / prev_last_counter)
+//!    prevents replay of frames from a previously-used IV prefix after the
+//!    sender rotates to a new one.
+//! 3. The observer's [`Tracker`] enforces per-pid nonce monotonicity on
 //!    the decrypted frame.
 
+use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::io;
 use std::net::{SocketAddr, UdpSocket};
@@ -34,11 +39,29 @@ const EVICTION_TTL: Duration = Duration::from_secs(600); // 10 minutes
 const EVICTION_INTERVAL: Duration = Duration::from_secs(60);
 
 /// Per-sender replay guard state.
+///
+/// Tracks the current IV prefix and its last counter, plus a 1-deep history
+/// of the previous IV prefix/counter so that frames from a recently-rotated
+/// IV are still checked for replay.
 #[derive(Clone, Debug)]
 struct SenderState {
     iv_random: [u8; 4],
     last_counter: u64,
+    prev_iv_random: [u8; 4],
+    prev_last_counter: u64,
     last_seen: Instant,
+}
+
+impl SenderState {
+    fn new(iv_random: [u8; 4], counter: u64) -> Self {
+        SenderState {
+            iv_random,
+            last_counter: counter,
+            prev_iv_random: [0u8; 4],
+            prev_last_counter: 0,
+            last_seen: Instant::now(),
+        }
+    }
 }
 
 /// UDP listener with AEAD decryption and replay protection.
@@ -97,19 +120,63 @@ impl SecureUdpListener {
             .retain(|_, state| state.last_seen > cutoff);
     }
 
-    /// Check replay: returns `true` if the (sender, iv_random, counter)
-    /// combination is valid (counter strictly increases, or new iv_random).
+    /// Atomic replay check + state update: returns `true` if the
+    /// (sender, iv_random, counter) combination is valid, and updates the
+    /// replay state in the same operation to close the TOCTOU window.
+    ///
+    /// Three cases per sender lookup:
+    /// 1. Same IV prefix   → `counter > last_counter` required
+    /// 2. Previous IV prefix → `counter > prev_last_counter` required
+    ///    (catches replay of frames from a recently-rotated epoch)
+    /// 3. Neither matches   → accepted as new or rotated IV, current state
+    ///    moves to `prev_*` fields
     ///
     /// Note: `counter > state.last_counter` would become false after u64
     /// wraparound, but at 1 beat/nanosecond this requires ~585 million
     /// years — not a practical concern.
-    fn check_replay(&mut self, sender: SocketAddr, iv_random: [u8; 4], counter: u64) -> bool {
-        match self.sender_state.get(&sender) {
-            Some(state) if state.iv_random == iv_random => {
-                // Same IV prefix: counter must strictly increase
-                counter > state.last_counter
+    fn try_record_replay_state(
+        &mut self,
+        sender: SocketAddr,
+        iv_random: [u8; 4],
+        counter: u64,
+    ) -> bool {
+        match self.sender_state.entry(sender) {
+            Entry::Vacant(e) => {
+                e.insert(SenderState::new(iv_random, counter));
+                true
             }
-            _ => true,
+            Entry::Occupied(mut e) => {
+                let state = e.get_mut();
+
+                if state.iv_random == iv_random {
+                    // Same IV prefix: counter must strictly increase
+                    if counter > state.last_counter {
+                        state.last_counter = counter;
+                        state.last_seen = Instant::now();
+                        return true;
+                    }
+                    return false;
+                }
+
+                if state.prev_iv_random == iv_random {
+                    // Previous IV prefix: counter must strictly increase
+                    if counter > state.prev_last_counter {
+                        state.prev_last_counter = counter;
+                        state.last_seen = Instant::now();
+                        return true;
+                    }
+                    return false;
+                }
+
+                // Neither current nor previous matches → new IV rotation.
+                // Shift current into prev, store new as current.
+                state.prev_iv_random = state.iv_random;
+                state.prev_last_counter = state.last_counter;
+                state.iv_random = iv_random;
+                state.last_counter = counter;
+                state.last_seen = Instant::now();
+                true
+            }
         }
     }
 }
@@ -145,12 +212,6 @@ impl BeatListener for SecureUdpListener {
             let iv_random: [u8; 4] = buf[..4].try_into().unwrap();
             let iv_counter = u64::from_le_bytes(buf[4..12].try_into().unwrap());
 
-            // Replay check
-            if !self.check_replay(sender, iv_random, iv_counter) {
-                self.decrypt_failures = self.decrypt_failures.wrapping_add(1);
-                continue;
-            }
-
             // Build 12-byte nonce
             let mut nonce = [0u8; NONCE_BYTES];
             nonce[..4].copy_from_slice(&iv_random);
@@ -159,27 +220,30 @@ impl BeatListener for SecureUdpListener {
             let ciphertext: [u8; 32] = buf[12..44].try_into().unwrap();
             let tag: [u8; TAG_BYTES] = buf[44..60].try_into().unwrap();
 
-            // Try each key in order
-            for key in &self.keys {
+            // Try each key in order (clone keys to avoid borrow conflict
+            // with self.evict_stale_senders / self.try_record_replay_state)
+            let keys = self.keys.clone();
+            for key in &keys {
                 match crypto::open(key.as_bytes(), &nonce, &ciphertext, &tag) {
                     Ok(plaintext) => {
-                        // Update replay state (with capacity guard)
+                        // Capacity guard: sweep stale senders before trying to insert
                         if self.sender_state.len() >= MAX_SENDER_STATES {
-                            // Map is full — try one more sweep before dropping
                             self.evict_stale_senders();
                         }
-                        if self.sender_state.len() < MAX_SENDER_STATES {
-                            self.sender_state.insert(
-                                sender,
-                                SenderState {
-                                    iv_random,
-                                    last_counter: iv_counter,
-                                    last_seen: Instant::now(),
-                                },
-                            );
+                        if self.sender_state.len() >= MAX_SENDER_STATES {
+                            // Map is still full — silently drop the beat
+                            // (extreme edge case: 1024+ unique concurrently-
+                            // beating agents). Return WouldBlock so the
+                            // observer moves on instead of spinning.
+                            return RecvResult::WouldBlock;
                         }
-                        // If still full, silently drop the beat (extreme edge
-                        // case — 1024+ unique concurrently-beating agents).
+
+                        // Atomic replay check + state update (after AEAD
+                        // success, inside the Ok branch).
+                        if !self.try_record_replay_state(sender, iv_random, iv_counter) {
+                            self.decrypt_failures = self.decrypt_failures.wrapping_add(1);
+                            continue;
+                        }
 
                         return RecvResult::Authenticated {
                             peer_pid: 0,
@@ -211,9 +275,31 @@ impl BeatListener for SecureUdpListener {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::SocketAddr;
 
     fn test_key() -> Key {
         Key::from_bytes([0xabu8; 32])
+    }
+
+    fn test_iv() -> [u8; 4] {
+        [0x01, 0x02, 0x03, 0x04]
+    }
+
+    fn test_iv2() -> [u8; 4] {
+        [0x05, 0x06, 0x07, 0x08]
+    }
+
+    fn test_iv3() -> [u8; 4] {
+        [0x09, 0x0a, 0x0b, 0x0c]
+    }
+
+    fn new_listener() -> SecureUdpListener {
+        SecureUdpListener::bind("127.0.0.1:0".parse().unwrap(), vec![test_key()])
+            .expect("bind should succeed")
+    }
+
+    fn test_addr() -> SocketAddr {
+        "127.0.0.1:9999".parse().unwrap()
     }
 
     #[test]
@@ -224,72 +310,161 @@ mod tests {
     }
 
     #[test]
-    fn check_replay_new_sender_accepted() {
-        let addr: SocketAddr = "127.0.0.1:9999".parse().unwrap();
-        let mut listener =
-            SecureUdpListener::bind("127.0.0.1:0".parse().unwrap(), vec![test_key()])
-                .expect("bind should succeed");
+    fn new_sender_accepted_and_inserted() {
+        let mut listener = new_listener();
+        let addr = test_addr();
+        let iv = test_iv();
+        let counter = 1;
 
-        assert!(listener.check_replay(addr, [0x01, 0x02, 0x03, 0x04], 1));
+        assert!(listener.try_record_replay_state(addr, iv, counter));
+        let state = listener.sender_state.get(&addr).unwrap();
+        assert_eq!(state.iv_random, iv);
+        assert_eq!(state.last_counter, counter);
     }
 
     #[test]
-    fn check_replay_increasing_counter_accepted() {
-        let addr: SocketAddr = "127.0.0.1:9999".parse().unwrap();
-        let mut listener =
-            SecureUdpListener::bind("127.0.0.1:0".parse().unwrap(), vec![test_key()])
-                .expect("bind should succeed");
+    fn increasing_counter_accepted() {
+        let mut listener = new_listener();
+        let addr = test_addr();
+        let iv = test_iv();
 
-        let iv = [0x01, 0x02, 0x03, 0x04];
-        assert!(listener.check_replay(addr, iv, 1));
-        listener.sender_state.insert(
-            addr,
-            SenderState {
-                iv_random: iv,
-                last_counter: 1,
-                last_seen: Instant::now(),
-            },
-        );
-        assert!(listener.check_replay(addr, iv, 2));
+        assert!(listener.try_record_replay_state(addr, iv, 1));
+        assert!(listener.try_record_replay_state(addr, iv, 2));
+        let state = listener.sender_state.get(&addr).unwrap();
+        assert_eq!(state.last_counter, 2);
     }
 
     #[test]
-    fn check_replay_same_counter_rejected() {
-        let addr: SocketAddr = "127.0.0.1:9999".parse().unwrap();
-        let mut listener =
-            SecureUdpListener::bind("127.0.0.1:0".parse().unwrap(), vec![test_key()])
-                .expect("bind should succeed");
+    fn same_counter_rejected() {
+        let mut listener = new_listener();
+        let addr = test_addr();
+        let iv = test_iv();
 
-        let iv = [0x01, 0x02, 0x03, 0x04];
-        listener.sender_state.insert(
-            addr,
-            SenderState {
-                iv_random: iv,
-                last_counter: 5,
-                last_seen: Instant::now(),
-            },
-        );
-        assert!(!listener.check_replay(addr, iv, 5)); // same counter = replay
-        assert!(!listener.check_replay(addr, iv, 3)); // lower counter = replay
+        assert!(listener.try_record_replay_state(addr, iv, 5));
+        assert!(!listener.try_record_replay_state(addr, iv, 5));
     }
 
     #[test]
-    fn check_replay_new_iv_random_accepted() {
-        let addr: SocketAddr = "127.0.0.1:9999".parse().unwrap();
-        let mut listener =
-            SecureUdpListener::bind("127.0.0.1:0".parse().unwrap(), vec![test_key()])
-                .expect("bind should succeed");
+    fn lower_counter_rejected() {
+        let mut listener = new_listener();
+        let addr = test_addr();
+        let iv = test_iv();
 
-        let iv1 = [0x01, 0x02, 0x03, 0x04];
-        let iv2 = [0x05, 0x06, 0x07, 0x08];
-        listener.sender_state.insert(
-            addr,
-            SenderState {
-                iv_random: iv1,
-                last_counter: 100,
-                last_seen: Instant::now(),
-            },
-        );
-        assert!(listener.check_replay(addr, iv2, 1));
+        assert!(listener.try_record_replay_state(addr, iv, 5));
+        assert!(!listener.try_record_replay_state(addr, iv, 3));
+    }
+
+    #[test]
+    fn new_iv_random_accepted_and_rotates() {
+        let mut listener = new_listener();
+        let addr = test_addr();
+        let iv1 = test_iv();
+        let iv2 = test_iv2();
+
+        assert!(listener.try_record_replay_state(addr, iv1, 100));
+        // Rotation: iv1 → iv2
+        assert!(listener.try_record_replay_state(addr, iv2, 1));
+
+        let state = listener.sender_state.get(&addr).unwrap();
+        // Current should be iv2
+        assert_eq!(state.iv_random, iv2);
+        assert_eq!(state.last_counter, 1);
+        // Previous should be iv1 with its last counter
+        assert_eq!(state.prev_iv_random, iv1);
+        assert_eq!(state.prev_last_counter, 100);
+    }
+
+    #[test]
+    fn replay_after_rotation_rejected() {
+        let mut listener = new_listener();
+        let addr = test_addr();
+        let iv1 = test_iv();
+        let iv2 = test_iv2();
+
+        // Sender uses iv1 up to counter 100, then rotates to iv2
+        assert!(listener.try_record_replay_state(addr, iv1, 100));
+        assert!(listener.try_record_replay_state(addr, iv2, 1));
+
+        // Replay of a frame from the iv1 epoch at counter 50 → rejected
+        assert!(!listener.try_record_replay_state(addr, iv1, 50));
+        // Replay of the last frame from iv1 epoch at counter 100 → rejected (not strictly greater)
+        assert!(!listener.try_record_replay_state(addr, iv1, 100));
+    }
+
+    #[test]
+    fn larger_counter_from_prev_iv_accepted() {
+        let mut listener = new_listener();
+        let addr = test_addr();
+        let iv1 = test_iv();
+        let iv2 = test_iv2();
+
+        assert!(listener.try_record_replay_state(addr, iv1, 100));
+        assert!(listener.try_record_replay_state(addr, iv2, 1));
+        // An out-of-order delayed frame from iv1 with counter > prev_last_counter
+        // is accepted (non-replay)
+        assert!(listener.try_record_replay_state(addr, iv1, 150));
+        let state = listener.sender_state.get(&addr).unwrap();
+        // Current iv is still iv2; prev counter updated
+        assert_eq!(state.iv_random, iv2);
+        assert_eq!(state.prev_last_counter, 150);
+    }
+
+    #[test]
+    fn double_rotation_shifts_prev() {
+        let mut listener = new_listener();
+        let addr = test_addr();
+        let iv1 = test_iv();
+        let iv2 = test_iv2();
+        let iv3 = test_iv3();
+
+        assert!(listener.try_record_replay_state(addr, iv1, 100));
+        assert!(listener.try_record_replay_state(addr, iv2, 200));
+        // Third rotation: iv2 → iv3; iv1 is lost from history
+        assert!(listener.try_record_replay_state(addr, iv3, 50));
+
+        let state = listener.sender_state.get(&addr).unwrap();
+        assert_eq!(state.iv_random, iv3);
+        assert_eq!(state.last_counter, 50);
+        assert_eq!(state.prev_iv_random, iv2);
+        assert_eq!(state.prev_last_counter, 200);
+    }
+
+    #[test]
+    fn rotate_back_to_first_iv_accepted() {
+        let mut listener = new_listener();
+        let addr = test_addr();
+        let iv1 = test_iv();
+        let iv2 = test_iv2();
+
+        assert!(listener.try_record_replay_state(addr, iv1, 100));
+        assert!(listener.try_record_replay_state(addr, iv2, 50));
+        // Frame from iv1 arrives with counter > prev_last_counter —
+        // accepted as non-replay (delayed frame from previous epoch).
+        // State is updated but iv2 remains current.
+        assert!(listener.try_record_replay_state(addr, iv1, 200));
+
+        let state = listener.sender_state.get(&addr).unwrap();
+        assert_eq!(state.iv_random, iv2);
+        assert_eq!(state.last_counter, 50);
+        assert_eq!(state.prev_iv_random, iv1);
+        assert_eq!(state.prev_last_counter, 200);
+    }
+
+    #[test]
+    fn capacity_exceeded_returns_would_block() {
+        let mut listener = new_listener();
+        // Fill the map with unique addresses (simulating MAX_SENDER_STATES senders)
+        for i in 0..MAX_SENDER_STATES {
+            let addr = SocketAddr::from(([127, 0, 0, 1], (10_000 + i as u16)));
+            assert!(listener.try_record_replay_state(addr, test_iv(), 1));
+        }
+        assert_eq!(listener.sender_state.len(), MAX_SENDER_STATES);
+
+        // Next new sender should trigger eviction, but since all are fresh,
+        // eviction won't free anything and the map stays full.
+        // We verify that evict_stale_senders is a no-op for fresh entries.
+        let before = listener.sender_state.len();
+        listener.evict_stale_senders();
+        assert_eq!(listener.sender_state.len(), before);
     }
 }

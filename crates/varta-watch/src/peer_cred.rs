@@ -141,6 +141,12 @@ mod plat {
     // target Rust supports.  A Rust-side field reorder or padding mistake
     // becomes a hard compile error instead of UB at recvmsg time.
     const _: () = assert!(mem::size_of::<Msghdr>() == 56);
+
+    // Field-level offset guards catch layout divergence that same-size
+    // asserts miss (e.g. wrong padding on musl or new architectures).
+    const _: () = assert!(mem::offset_of!(Msghdr, msg_control) == 32);
+    const _: () = assert!(mem::offset_of!(Msghdr, msg_controllen) == 40);
+    const _: () = assert!(mem::offset_of!(Msghdr, msg_flags) == 48);
 }
 
 #[cfg(target_os = "macos")]
@@ -196,6 +202,12 @@ mod plat {
 
     // Compile-time invariant: macOS msghdr is 48 bytes on x86_64 + aarch64.
     const _: () = assert!(mem::size_of::<Msghdr>() == 48);
+
+    // Field-level offset guards catch layout divergence that same-size
+    // asserts miss (e.g. future macOS SDK changes, new architectures).
+    const _: () = assert!(mem::offset_of!(Msghdr, msg_control) == 32);
+    const _: () = assert!(mem::offset_of!(Msghdr, msg_controllen) == 40);
+    const _: () = assert!(mem::offset_of!(Msghdr, msg_flags) == 44);
 }
 
 // ---------------------------------------------------------------------------
