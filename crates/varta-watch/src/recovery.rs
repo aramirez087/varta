@@ -62,6 +62,7 @@ pub struct Recovery {
     last_fired: HashMap<u32, Instant>,
     timeout: Option<Duration>,
     outstanding: HashMap<u32, Outstanding>,
+    pending_outcomes: Vec<RecoveryOutcome>,
 }
 
 impl Recovery {
@@ -86,15 +87,33 @@ impl Recovery {
             last_fired: HashMap::new(),
             timeout,
             outstanding: HashMap::new(),
+            pending_outcomes: Vec::new(),
+        }
+    }
+
+    fn reap_finished_child(&mut self, pid: u32) -> Option<RecoveryOutcome> {
+        let entry = self.outstanding.get_mut(&pid)?;
+        match entry.child.try_wait() {
+            Ok(Some(status)) => {
+                let child_pid = entry.child.id();
+                self.outstanding.remove(&pid);
+                Some(RecoveryOutcome::Reaped { child_pid, status })
+            }
+            Ok(None) => None,
+            Err(e) => {
+                self.outstanding.remove(&pid);
+                Some(RecoveryOutcome::ReapFailed(e))
+            }
         }
     }
 
     /// Substitute `{pid}` and spawn `/bin/sh -c <rendered>` non-blockingly.
     ///
     /// Returns [`RecoveryOutcome::Debounced`] if the previous invocation
-    /// for `pid` is still inside the debounce window. The debounce is
-    /// per-pid and monotonic — distinct pids may fire within a single
-    /// window without suppressing one another.
+    /// for `pid` is still inside the debounce window or if that pid already
+    /// has an outstanding recovery child. The debounce is per-pid and
+    /// monotonic — distinct pids may fire within a single window without
+    /// suppressing one another.
     pub fn on_stall(&mut self, pid: u32) -> RecoveryOutcome {
         let now = Instant::now();
 
@@ -104,6 +123,14 @@ impl Recovery {
 
         if let Some(prev) = self.last_fired.get(&pid) {
             if now.duration_since(*prev) < self.debounce {
+                return RecoveryOutcome::Debounced;
+            }
+        }
+
+        if self.outstanding.contains_key(&pid) {
+            if let Some(outcome) = self.reap_finished_child(pid) {
+                self.pending_outcomes.push(outcome);
+            } else {
                 return RecoveryOutcome::Debounced;
             }
         }
@@ -135,74 +162,54 @@ impl Recovery {
     /// transitioned since the last tick.
     pub fn try_reap(&mut self) -> Vec<RecoveryOutcome> {
         let mut outcomes = Vec::new();
+        outcomes.append(&mut self.pending_outcomes);
 
         // Collect keys first, then process each entry to avoid borrow issues.
         let pids: Vec<u32> = self.outstanding.keys().copied().collect();
 
         for pid in pids {
+            if let Some(outcome) = self.reap_finished_child(pid) {
+                outcomes.push(outcome);
+                continue;
+            }
+
             let entry = match self.outstanding.get_mut(&pid) {
                 Some(e) => e,
                 None => continue,
             };
 
-            match entry.child.try_wait() {
-                Ok(Some(status)) => {
-                    // Child has exited; remove and report.
+            // Still running — check timeout.
+            if let Some(to) = self.timeout {
+                if entry.spawned_at.elapsed() >= to {
+                    if entry.killed {
+                        continue;
+                    }
+
                     let child_pid = entry.child.id();
-                    self.outstanding.remove(&pid);
-                    outcomes.push(RecoveryOutcome::Reaped { child_pid, status });
-                }
+                    match entry.child.kill() {
+                        Ok(()) => {
+                            // Do not wait here; the observer poll loop must remain
+                            // non-blocking. A later try_wait call will reap the child.
+                            entry.killed = true;
+                            outcomes.push(RecoveryOutcome::Killed { child_pid });
+                        }
 
-                Ok(None) => {
-                    // Still running — check timeout.
-                    if let Some(to) = self.timeout {
-                        if entry.spawned_at.elapsed() >= to {
-                            if entry.killed {
-                                continue;
-                            }
-
-                            let child_pid = entry.child.id();
-                            match entry.child.kill() {
-                                Ok(()) => {
-                                    // Do not wait here; the observer poll loop must remain
-                                    // non-blocking. A later try_wait call will reap the child.
-                                    entry.killed = true;
-                                    outcomes.push(RecoveryOutcome::Killed { child_pid });
-                                }
-
-                                Err(e) if e.kind() == std::io::ErrorKind::InvalidInput => {
-                                    // Child already exited between our try_wait and kill.
-                                    // Retry try_wait once to reap.
-                                    match entry.child.try_wait() {
-                                        Ok(Some(status)) => {
-                                            let child_pid = entry.child.id();
-                                            self.outstanding.remove(&pid);
-                                            outcomes.push(RecoveryOutcome::Reaped {
-                                                child_pid,
-                                                status,
-                                            });
-                                        }
-                                        _ => {
-                                            // Still not reaped; leave in place.
-                                        }
-                                    }
-                                }
-
-                                Err(e) => {
-                                    self.outstanding.remove(&pid);
-                                    outcomes.push(RecoveryOutcome::ReapFailed(e));
-                                }
+                        Err(e) if e.kind() == std::io::ErrorKind::InvalidInput => {
+                            // Child already exited between our try_wait and kill.
+                            // Retry try_wait once to reap.
+                            if let Some(outcome) = self.reap_finished_child(pid) {
+                                outcomes.push(outcome);
                             }
                         }
-                    }
-                    // No timeout or not yet exceeded — leave in place.
-                }
 
-                Err(e) => {
-                    self.outstanding.remove(&pid);
-                    outcomes.push(RecoveryOutcome::ReapFailed(e));
+                        Err(e) => {
+                            self.outstanding.remove(&pid);
+                            outcomes.push(RecoveryOutcome::ReapFailed(e));
+                        }
+                    }
                 }
             }
+            // No timeout or not yet exceeded — leave in place.
         }
 
         outcomes
@@ -239,6 +246,39 @@ mod tests {
         let b = rec.on_stall(2);
         assert!(matches!(a, RecoveryOutcome::Spawned { .. }));
         assert!(matches!(b, RecoveryOutcome::Spawned { .. }));
+    }
+
+    #[test]
+    fn does_not_replace_outstanding_child_for_same_pid() {
+        let mut rec = Recovery::with_timeout(
+            "sleep 5".to_string(),
+            Duration::ZERO,
+            Some(Duration::from_millis(50)),
+        );
+        let first_child_pid = match rec.on_stall(7) {
+            RecoveryOutcome::Spawned { child_pid } => child_pid,
+            other => panic!("expected first stall to spawn, got {other:?}"),
+        };
+
+        let second = rec.on_stall(7);
+        assert!(
+            matches!(second, RecoveryOutcome::Debounced),
+            "same-pid recovery must not replace outstanding child; got {second:?}"
+        );
+
+        let deadline = Instant::now() + Duration::from_millis(1_000);
+        loop {
+            if Instant::now() >= deadline {
+                panic!("timed out waiting for original child to be killed");
+            }
+            let outcomes = rec.try_reap();
+            if outcomes.iter().any(
+                |o| matches!(o, RecoveryOutcome::Killed { child_pid } if *child_pid == first_child_pid),
+            ) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
     }
 
     #[test]

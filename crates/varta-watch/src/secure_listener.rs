@@ -263,45 +263,41 @@ impl BeatListener for SecureUdpListener {
             let ciphertext: [u8; 32] = buf[12..44].try_into().unwrap();
             let tag: [u8; TAG_BYTES] = buf[44..60].try_into().unwrap();
 
-            // Try each key in order (clone keys to avoid borrow conflict
-            // with self.evict_stale_senders / self.try_record_replay_state)
-            let keys = self.keys.clone();
-            for key in &keys {
-                match crypto::open(key.as_bytes(), &nonce, &ciphertext, &tag) {
-                    Ok(plaintext) => {
-                        // Capacity guard: sweep stale senders before trying to insert
-                        if self.sender_state.len() >= MAX_SENDER_STATES {
-                            self.evict_stale_senders();
-                        }
-                        if self.sender_state.len() >= MAX_SENDER_STATES {
-                            // Map is still full after stale-sender sweep — force-evict
-                            // the oldest entry to maintain replay protection.
-                            self.force_evict_oldest_sender();
-                            self.sender_state_full = self.sender_state_full.saturating_add(1);
-                            debug_assert!(
-                                self.sender_state.len() < MAX_SENDER_STATES,
-                                "force_evict_oldest_sender should have freed a slot"
-                            );
-                        }
+            let plaintext = self
+                .keys
+                .iter()
+                .find_map(|key| crypto::open(key.as_bytes(), &nonce, &ciphertext, &tag).ok());
 
-                        // Atomic replay check + state update (after AEAD
-                        // success, inside the Ok branch).
-                        if !self.try_record_replay_state(sender, iv_random, iv_counter) {
-                            self.decrypt_failures = self.decrypt_failures.wrapping_add(1);
-                            continue;
-                        }
+            let Some(plaintext) = plaintext else {
+                self.decrypt_failures = self.decrypt_failures.wrapping_add(1);
+                continue;
+            };
 
-                        return RecvResult::Authenticated {
-                            peer_pid: 0,
-                            data: plaintext,
-                        };
-                    }
-                    Err(_) => continue, // try next key
-                }
+            // Capacity guard: sweep stale senders before trying to insert
+            if self.sender_state.len() >= MAX_SENDER_STATES {
+                self.evict_stale_senders();
+            }
+            if self.sender_state.len() >= MAX_SENDER_STATES {
+                // Map is still full after stale-sender sweep — force-evict
+                // the oldest entry to maintain replay protection.
+                self.force_evict_oldest_sender();
+                self.sender_state_full = self.sender_state_full.saturating_add(1);
+                debug_assert!(
+                    self.sender_state.len() < MAX_SENDER_STATES,
+                    "force_evict_oldest_sender should have freed a slot"
+                );
             }
 
-            // No key matched — authentication failure
-            self.decrypt_failures = self.decrypt_failures.wrapping_add(1);
+            // Atomic replay check + state update after AEAD success.
+            if !self.try_record_replay_state(sender, iv_random, iv_counter) {
+                self.decrypt_failures = self.decrypt_failures.wrapping_add(1);
+                continue;
+            }
+
+            return RecvResult::Authenticated {
+                peer_pid: 0,
+                data: plaintext,
+            };
         }
     }
 
