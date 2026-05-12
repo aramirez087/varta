@@ -94,20 +94,30 @@ mod udp_impl {
     impl UdpTransport {
         /// Create a non-blocking UDP socket connected to `addr`.
         ///
-        /// The socket is bound to an ephemeral source port. On a connected UDP
-        /// socket, `send` writes to the fixed peer address and ICMP errors
-        /// (e.g. port-unreachable) are surfaced as [`io::Error`].
+        /// The socket is bound to an ephemeral source port on the wildcard
+        /// address matching the target's address family (IPv4 or IPv6). On a
+        /// connected UDP socket, `send` writes to the fixed peer address and
+        /// ICMP errors (e.g. port-unreachable) are surfaced as [`io::Error`].
         ///
         /// # Errors
         ///
         /// Returns an [`io::Error`] if the socket cannot be created,
         /// connected, or switched to non-blocking mode.
         pub fn connect(addr: SocketAddr) -> io::Result<Self> {
-            let sock = UdpSocket::bind("0.0.0.0:0")?;
+            let sock = bind_ephemeral(&addr)?;
             sock.connect(addr)?;
             sock.set_nonblocking(true)?;
             Ok(UdpTransport { sock, addr })
         }
+    }
+
+    fn bind_ephemeral(addr: &SocketAddr) -> io::Result<UdpSocket> {
+        let bind_addr = if addr.is_ipv4() {
+            "0.0.0.0:0"
+        } else {
+            "[::]:0"
+        };
+        UdpSocket::bind(bind_addr)
     }
 
     impl BeatTransport for UdpTransport {
@@ -116,7 +126,7 @@ mod udp_impl {
         }
 
         fn reconnect(&mut self) -> io::Result<()> {
-            let sock = UdpSocket::bind("0.0.0.0:0")?;
+            let sock = bind_ephemeral(&self.addr)?;
             sock.connect(self.addr)?;
             sock.set_nonblocking(true)?;
             self.sock = sock;

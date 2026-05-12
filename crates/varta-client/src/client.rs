@@ -77,12 +77,14 @@ pub fn classify_send_error(e: &io::Error) -> BeatOutcome {
         | io::ErrorKind::OutOfMemory
         | io::ErrorKind::StorageFull => BeatOutcome::Dropped,
 
-        // (d) Unexpected error: clone heap-free and escalate.
+        // (d) Unexpected error: clone and escalate.
+        //     This is on the Failed path (not steady-state), so a possible
+        //     allocation inside io::Error is acceptable.
         _ => {
             let cloned = match e.raw_os_error() {
-                // Repr::Os(i32) — no heap allocation.
+                // Repr::Os(i32) — platform-alloc-free.
                 Some(code) => io::Error::from_raw_os_error(code),
-                // Repr::Simple(kind) — no heap allocation.
+                // Repr::Simple(kind) or Repr::Custom — may allocate.
                 None => io::Error::from(e.kind()),
             };
             BeatOutcome::Failed(cloned)
@@ -260,8 +262,9 @@ impl<T: BeatTransport> Varta<T> {
     /// The nonce increments first (capping at `NONCE_TERMINAL - 1`), so the
     /// very first beat after `connect` carries `nonce == 1`. The frame is
     /// constructed on the stack, encoded into the owned scratch buffer, and
-    /// handed to `send(2)`. This call neither blocks nor allocates on the
-    /// heap on the steady-state path.
+    /// handed to `send(2)`. The steady-state path (`Sent` / `Dropped`) neither
+    /// blocks nor allocates; the rare `Failed` path may allocate when cloning
+    /// the underlying [`io::Error`].
     ///
     /// When [`set_reconnect_after`](Self::set_reconnect_after) is enabled and
     /// the consecutive-dropped threshold is crossed, `beat` will internally
@@ -270,7 +273,7 @@ impl<T: BeatTransport> Varta<T> {
     /// restarts are rare and the steady-state path remains allocation-free.
     pub fn beat(&mut self, status: Status, payload: u64) -> BeatOutcome {
         self.nonce = self.nonce.saturating_add(1).min(NONCE_TERMINAL - 1);
-        let timestamp = self.start.elapsed().as_nanos() as u64;
+        let timestamp = self.start.elapsed().as_nanos().min(u64::MAX as u128) as u64;
         let frame = Frame::new(status, std::process::id(), timestamp, self.nonce, payload);
         frame.encode(&mut self.buf);
         let outcome = self.send_frame();

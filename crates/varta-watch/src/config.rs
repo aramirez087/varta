@@ -24,6 +24,11 @@ pub const DEFAULT_SOCKET_MODE: u32 = 0o600;
 /// cannot hold the observer poll loop indefinitely.
 pub const DEFAULT_READ_TIMEOUT_MS: u64 = 100;
 
+/// Minimum allowed value for `--threshold-ms`. A threshold of 0 ms would
+/// cause every agent to be perpetually stalled, triggering recovery commands
+/// on every poll cycle.
+pub const MIN_THRESHOLD_MS: u64 = 10;
+
 /// Parsed daemon configuration.
 #[derive(Clone, Debug)]
 pub struct Config {
@@ -98,6 +103,13 @@ pub enum ConfigError {
     /// The user passed `--help` / `-h`. Not a true error; `main` prints
     /// [`Config::HELP`] and exits 0.
     HelpRequested,
+    /// `--threshold-ms` value is below [`MIN_THRESHOLD_MS`].
+    ThresholdTooLow {
+        /// The value that was provided.
+        value: u64,
+        /// The minimum allowed value.
+        min: u64,
+    },
 }
 
 impl core::fmt::Display for ConfigError {
@@ -119,6 +131,12 @@ impl core::fmt::Display for ConfigError {
                 write!(f, "--prom-addr: not a valid socket address: {raw:?}")
             }
             ConfigError::HelpRequested => f.write_str("--help"),
+            ConfigError::ThresholdTooLow { value, min } => {
+                write!(
+                    f,
+                    "--threshold-ms: {value} is below the minimum allowed value ({min} ms)"
+                )
+            }
         }
     }
 }
@@ -311,6 +329,13 @@ OPTIONAL:
 
         let socket = socket.ok_or(ConfigError::MissingRequired("--socket"))?;
         let threshold_ms = threshold_ms.ok_or(ConfigError::MissingRequired("--threshold-ms"))?;
+
+        if threshold_ms < MIN_THRESHOLD_MS {
+            return Err(ConfigError::ThresholdTooLow {
+                value: threshold_ms,
+                min: MIN_THRESHOLD_MS,
+            });
+        }
 
         let recovery_debounce =
             Duration::from_millis(recovery_debounce_ms.unwrap_or(DEFAULT_RECOVERY_DEBOUNCE_MS));
@@ -684,5 +709,36 @@ mod tests {
             Err(ConfigError::BadInteger { flag, .. }) => assert_eq!(flag, "--read-timeout-ms"),
             other => panic!("expected BadInteger, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn threshold_zero_is_rejected() {
+        match Config::from_args(args(&["--socket", "/s", "--threshold-ms", "0"])) {
+            Err(ConfigError::ThresholdTooLow { value, min }) => {
+                assert_eq!(value, 0);
+                assert_eq!(min, MIN_THRESHOLD_MS);
+            }
+            other => panic!("expected ThresholdTooLow, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn threshold_below_min_is_rejected() {
+        match Config::from_args(args(&["--socket", "/s", "--threshold-ms", "5"])) {
+            Err(ConfigError::ThresholdTooLow { value, .. }) => assert_eq!(value, 5),
+            other => panic!("expected ThresholdTooLow, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn threshold_at_min_is_accepted() {
+        let cfg = Config::from_args(args(&[
+            "--socket",
+            "/s",
+            "--threshold-ms",
+            &MIN_THRESHOLD_MS.to_string(),
+        ]))
+        .expect("parse");
+        assert_eq!(cfg.threshold, Duration::from_millis(MIN_THRESHOLD_MS));
     }
 }

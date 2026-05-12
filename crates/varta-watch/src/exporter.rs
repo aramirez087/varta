@@ -526,10 +526,22 @@ impl Exporter for PromExporter {
 }
 
 fn contains_subsequence(haystack: &[u8], needle: &[u8]) -> bool {
-    if needle.is_empty() || needle.len() > haystack.len() {
-        return needle.is_empty();
+    if needle.is_empty() {
+        return true;
     }
-    haystack.windows(needle.len()).any(|w| w == needle)
+    if needle.len() > haystack.len() {
+        return false;
+    }
+    let end = haystack.len() - needle.len();
+    'outer: for i in 0..=end {
+        for j in 0..needle.len() {
+            if haystack[i + j] != needle[j] {
+                continue 'outer;
+            }
+        }
+        return true;
+    }
+    false
 }
 
 /// Write the HTTP 200 response line and headers (including Content-Length)
