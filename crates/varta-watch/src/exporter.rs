@@ -408,6 +408,10 @@ pub struct PromExporter {
     sender_state_full_total: u64,
     rate_limited_total: u64,
     nonce_wrap_total: u64,
+    /// Number of `/metrics` scrapes served from cache because
+    /// [`PROM_MIN_SCRAPE_INTERVAL`] had not elapsed since the last fresh
+    /// render.  Operators can alert on this to detect scrape pressure.
+    scrape_skipped_total: u64,
     /// Observer startup instant (monotonic). Used to emit
     /// `varta_watch_uptime_seconds`.
     started_at: Instant,
@@ -438,6 +442,7 @@ impl PromExporter {
             sender_state_full_total: 0,
             rate_limited_total: 0,
             nonce_wrap_total: 0,
+            scrape_skipped_total: 0,
             started_at: Instant::now(),
             last_loop_system: SystemTime::now(),
         })
@@ -493,6 +498,12 @@ impl PromExporter {
         self.nonce_wrap_total = self.nonce_wrap_total.saturating_add(count);
     }
 
+    /// Record one or more scrapes served from cache (scrape arrived before
+    /// [`PROM_MIN_SCRAPE_INTERVAL`] elapsed since the last fresh render).
+    pub fn record_scrape_skipped(&mut self, count: u64) {
+        self.scrape_skipped_total = self.scrape_skipped_total.saturating_add(count);
+    }
+
     /// Record that the observer poll loop has completed another tick.
     /// Called once per outer loop iteration so that
     /// `varta_watch_last_poll_loop_timestamp_seconds` stays fresh.
@@ -540,6 +551,9 @@ impl PromExporter {
                 Ok((stream, _)) => {
                     self.serve_one(stream, render_fresh)?;
                     served += 1;
+                    if !render_fresh {
+                        self.scrape_skipped_total = self.scrape_skipped_total.saturating_add(1);
+                    }
                 }
                 Err(e) if e.kind() == ErrorKind::WouldBlock => break Ok(()),
                 Err(e) => break Err(e),
@@ -746,6 +760,16 @@ impl PromExporter {
             self.body_buf,
             "varta_rate_limited_total {}",
             self.rate_limited_total
+        );
+        self.body_buf.push_str(
+            "# HELP varta_scrape_skipped_total Number of /metrics scrapes served from cache (rate-limited).\n",
+        );
+        self.body_buf
+            .push_str("# TYPE varta_scrape_skipped_total counter\n");
+        let _ = writeln!(
+            self.body_buf,
+            "varta_scrape_skipped_total {}",
+            self.scrape_skipped_total
         );
         self.body_buf.push_str(
             "# HELP varta_nonce_wrap_total Total nonce-space wrap events detected (agent exhausted u64 nonces).\n",

@@ -30,7 +30,7 @@ fn bytes_to_limbs_26(bytes: &[u8; 16], has_padding: bool) -> [u64; 5] {
 ///
 /// The 0x01 byte is placed at the end of the input per RFC 8439 §2.5.1.
 fn partial_block_to_limbs(bytes: &[u8]) -> [u64; 5] {
-    debug_assert!(bytes.len() < 16, "partial block must be < 16 bytes");
+    assert!(bytes.len() < 16, "partial block must be < 16 bytes");
     let len = bytes.len().min(15);
     let mut buf = [0u8; 16];
     buf[..len].copy_from_slice(&bytes[..len]);

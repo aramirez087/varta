@@ -1,7 +1,7 @@
 //! Agent surface — `Varta` connects to the observer over a configured
 //! transport and `beat()` emits one fire-and-forget 32-byte VLP frame per call.
 
-use std::io;
+use std::io::{self, Write};
 use std::path::Path;
 use std::time::Instant;
 
@@ -289,6 +289,17 @@ impl Varta<SecureUdpTransport> {
     }
 }
 
+/// Nonce-wraparound warning emitted once per connection lifetime.
+///
+/// Writes a static message to stderr without heap allocation — no
+/// [`format!`] and no [`eprintln!`].  Practically unreachable under
+/// any realistic beat rate (hundreds of millions of years), but kept
+/// as a diagnostic signal for correctness audits.
+#[cold]
+fn warn_nonce_wrapping() {
+    let _ = io::stderr().write_all(b"[varta-client] nonce exhausted; wrapping to 0\n");
+}
+
 impl<T: BeatTransport> Varta<T> {
     fn send_frame(&mut self) -> BeatOutcome {
         match self.transport.send(&self.buf) {
@@ -316,10 +327,7 @@ impl<T: BeatTransport> Varta<T> {
         if self.nonce < NONCE_TERMINAL - 1 {
             self.nonce += 1;
         } else {
-            eprintln!(
-                "[varta-client] nonce exhausted after ~{} beats; wrapping to 0",
-                NONCE_TERMINAL
-            );
+            warn_nonce_wrapping();
             self.nonce = 0;
         }
         let pid = std::process::id();
@@ -383,7 +391,12 @@ impl<T: BeatTransport> Varta<T> {
     /// internally and retries the send before returning. The counter resets
     /// to zero on any `Sent` or `Failed` outcome, and after a successful
     /// reconnect.
+    ///
+    /// Resets the internal consecutive-dropped counter to zero so that the
+    /// new threshold gates future drops rather than immediately triggering
+    /// on a past-saturated counter.
     pub fn set_reconnect_after(&mut self, n: u32) {
         self.reconnect_after = n;
+        self.consecutive_dropped = 0;
     }
 }

@@ -19,8 +19,10 @@
 //!   or `reconnect`) provides uniqueness.
 //! * **Counter capacity**: The 32-bit counter allows ~4 billion beats per
 //!   connection before wraparound (at 1000 Hz this is ~50 days; at 1 Hz
-//!   this is ~136 years). Wraparound triggers an observer-side replay
-//!   rejection, forcing a reconnect which derives a fresh IV prefix.
+//!   this is ~136 years). On wraparound `send()` automatically reconnects,
+//!   deriving a fresh IV prefix and resetting the counter — observer-side
+//!   replay rejection is avoided because the new IV prefix creates a
+//!   distinct session.
 //!
 //! **This transport is designed for trusted local networks.**
 
@@ -141,10 +143,14 @@ impl BeatTransport for SecureUdpTransport {
         self.iv_counter = match self.iv_counter.checked_add(1) {
             Some(n) => n,
             None => {
-                return Err(io::Error::new(
-                    io::ErrorKind::Other,
-                    "iv_counter exhausted; reconnect required to derive fresh iv_random",
-                ));
+                // Counter exhausted — derive a fresh session.
+                // reconnect() opens a new ephemeral socket, reads a fresh
+                // iv_random from /dev/urandom, and resets iv_counter to 0.
+                // We then set iv_counter to 1, giving this beat a unique
+                // nonce in a brand-new session from the observer's
+                // perspective.
+                self.reconnect()?;
+                1
             }
         };
 
@@ -210,9 +216,20 @@ fn read_iv_random_prefix_4() -> io::Result<[u8; 4]> {
     })?;
     Ok(buf)
 }
+/// Deterministic 8-byte IV prefix for non-cryptographic use.
 ///
-/// Produces a deterministic 8-byte prefix.  Used only when `/dev/urandom`
-/// is unavailable (e.g. inside a panic handler, where file I/O is not safe).
+/// Produces a deterministic 8-byte prefix via a linear congruential
+/// generator — **not cryptographically secure**.  Used only when
+/// `/dev/urandom` is unavailable (e.g. inside a panic handler, where
+/// file I/O is not safe).
+///
+/// # Security warning
+///
+/// This fallback produces **predictable IVs**. Deployments that rely on
+/// secure-UDP confidentiality or replay resistance **must** ensure
+/// `/dev/urandom` is available at panic-handler installation time.
+/// Without `/dev/urandom`, panic-fired frames may be forged by any local
+/// observer that can guess the PID and sequence counter.
 #[allow(dead_code)]
 pub(crate) fn lcg_iv_random() -> [u8; 8] {
     static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
