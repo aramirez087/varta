@@ -317,47 +317,54 @@ OPTIONAL:
     ///
     /// # Errors
     ///
-    /// Returns an `io::Error` if the file cannot be read or the key(s) cannot
-    /// be parsed as 64-character hex strings.
+    /// Returns an `io::Error` if the file cannot be read, the key(s) cannot
+    /// be parsed as 64-character hex strings, or the primary key file contains
+    /// more than one key.
     #[cfg(feature = "secure-udp")]
     pub fn load_secure_keys(
         &self,
-    ) -> std::io::Result<Option<(Vec<varta_vlp::crypto::Key>, Vec<varta_vlp::crypto::Key>)>> {
+    ) -> std::io::Result<Option<(varta_vlp::crypto::Key, Vec<varta_vlp::crypto::Key>)>> {
         use std::io;
         use varta_vlp::crypto::Key;
 
-        let mut primary = Vec::new();
-
-        // Load primary key(s)
-        if let Some(ref path) = self.secure_key_file {
+        // Load primary key
+        let primary = if let Some(ref path) = self.secure_key_file {
             let content = std::fs::read_to_string(path)?;
+            let mut key: Option<Key> = None;
             for line in content.lines() {
                 let line = line.trim();
                 if line.is_empty() || line.starts_with('#') {
                     continue;
                 }
-                let key = Key::from_hex(line).map_err(|e| {
+                if key.is_some() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "{}: multiple primary keys found (expected exactly one)",
+                            path.display()
+                        ),
+                    ));
+                }
+                key = Some(Key::from_hex(line).map_err(|e| {
                     io::Error::new(
                         io::ErrorKind::InvalidData,
                         format!("{}: {e}", path.display()),
                     )
-                })?;
-                primary.push(key);
+                })?);
             }
+            key
         } else {
-            // Try env var
             match Key::from_env(&self.key_env) {
-                Ok(key) => primary.push(key),
-                Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                    return Ok(None); // No key configured
-                }
+                Ok(key) => Some(key),
+                Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
                 Err(e) => return Err(e),
             }
-        }
+        };
 
-        if primary.is_empty() {
-            return Ok(None);
-        }
+        let primary = match primary {
+            Some(k) => k,
+            None => return Ok(None),
+        };
 
         // Load accepted (rotation) keys
         let mut accepted = Vec::new();

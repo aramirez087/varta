@@ -131,13 +131,13 @@ fn run(cfg: Config) -> std::io::Result<()> {
 
     // --- secure UDP listener (AEAD) ---
     #[cfg(feature = "secure-udp")]
-    if let Some((keys, accepted_keys)) = cfg.load_secure_keys()? {
+    if let Some((primary_key, accepted_keys)) = cfg.load_secure_keys()? {
         if let Some(port) = cfg.udp_port {
             let bind_addr = cfg
                 .udp_bind_addr
                 .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
             let addr = std::net::SocketAddr::new(bind_addr, port);
-            let mut all_keys = keys;
+            let mut all_keys = vec![primary_key];
             all_keys.extend(accepted_keys);
             let secure = varta_watch::SecureUdpListener::bind(addr, all_keys).map_err(|e| {
                 std::io::Error::new(e.kind(), format!("secure UDP bind {}: {e}", addr))

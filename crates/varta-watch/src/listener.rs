@@ -200,6 +200,7 @@ mod udp_impl {
     /// [`Observer::from_listener`]: crate::Observer::from_listener
     pub struct UdpListener {
         sock: UdpSocket,
+        truncated_count: u64,
     }
 
     impl UdpListener {
@@ -212,7 +213,10 @@ mod udp_impl {
         pub fn bind(addr: SocketAddr) -> io::Result<Self> {
             let sock = UdpSocket::bind(addr)?;
             sock.set_nonblocking(true)?;
-            Ok(UdpListener { sock })
+            Ok(UdpListener {
+                sock,
+                truncated_count: 0,
+            })
         }
     }
 
@@ -227,7 +231,10 @@ mod udp_impl {
                             data: buf,
                         };
                     }
-                    Ok(_) => return RecvResult::ShortRead,
+                    Ok(_) => {
+                        self.truncated_count = self.truncated_count.wrapping_add(1);
+                        continue;
+                    }
                     Err(e) => match e.kind() {
                         io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut => {
                             return RecvResult::WouldBlock;
@@ -237,6 +244,12 @@ mod udp_impl {
                     },
                 }
             }
+        }
+
+        fn drain_truncated(&mut self) -> u64 {
+            let n = self.truncated_count;
+            self.truncated_count = 0;
+            n
         }
     }
 }

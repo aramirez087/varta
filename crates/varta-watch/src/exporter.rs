@@ -71,37 +71,44 @@ impl Exporter for FileExporter {
         if self.pending_err.is_some() {
             return;
         }
-        let line = match ev {
+        let result = match ev {
             Event::Beat {
                 pid,
                 status,
                 payload,
                 nonce,
                 observer_ns,
-            } => format!(
-                "{observer_ns}\tbeat\t{pid}\t{nonce}\t{status}\t{payload}\n",
-                status = status_label(*status),
+            } => writeln!(
+                self.sink,
+                "{observer_ns}\tbeat\t{pid}\t{nonce}\t{}\t{payload}",
+                status_label(*status),
             ),
             Event::Stall {
                 pid,
                 last_nonce,
                 last_ns: _,
                 observer_ns,
-            } => format!("{observer_ns}\tstall\t{pid}\t{last_nonce}\tstall\t-\n"),
+            } => writeln!(
+                self.sink,
+                "{observer_ns}\tstall\t{pid}\t{last_nonce}\tstall\t-",
+            ),
             Event::Decode(err, observer_ns) => {
-                format!("{observer_ns}\tdecode\t-\t-\t-\t{err:?}\n")
+                writeln!(self.sink, "{observer_ns}\tdecode\t-\t-\t-\t{err:?}")
             }
             Event::Io(err, observer_ns) => {
-                format!("{observer_ns}\tio\t-\t-\t-\t{err}\n")
+                writeln!(self.sink, "{observer_ns}\tio\t-\t-\t-\t{err}")
             }
             Event::AuthFailure {
                 claimed_pid,
                 observer_ns,
             } => {
-                format!("{observer_ns}\tmismatch\t{claimed_pid}\t-\t-\tauth_failure\n")
+                writeln!(
+                    self.sink,
+                    "{observer_ns}\tmismatch\t{claimed_pid}\t-\t-\tauth_failure",
+                )
             }
         };
-        if let Err(e) = self.sink.write_all(line.as_bytes()) {
+        if let Err(e) = result {
             self.pending_err = Some(e);
         }
     }
@@ -179,6 +186,8 @@ const PROM_REQUEST_CAP: usize = 4096;
 pub struct PromExporter {
     listener: TcpListener,
     rows: HashMap<u32, GaugeRow>,
+    /// Reused across `/metrics` scrapes to avoid per-scrape allocation.
+    pub(crate) body_buf: String,
     evicted_total: u64,
     auth_failures_total: u64,
     /// Per-kind decode failure counters, indexed by [`decode_kind_index`].
@@ -201,6 +210,7 @@ impl PromExporter {
         Ok(PromExporter {
             listener,
             rows: HashMap::new(),
+            body_buf: String::new(),
             evicted_total: 0,
             auth_failures_total: 0,
             decode_errors_total: [0; 3],
@@ -274,7 +284,7 @@ impl PromExporter {
         }
     }
 
-    fn serve_one(&self, mut stream: TcpStream) -> io::Result<()> {
+    fn serve_one(&mut self, mut stream: TcpStream) -> io::Result<()> {
         // Accepted streams inherit the listener's non-blocking flag on both
         // Linux (via `accept4(SOCK_NONBLOCK)` in libstd) and macOS (libstd
         // calls `fcntl(F_SETFL, O_NONBLOCK)` post-accept). We intentionally
@@ -312,123 +322,141 @@ impl PromExporter {
             return Ok(());
         }
 
-        let body = self.render_body();
-        let response = format!(
-            "HTTP/1.0 200 OK\r\n\
-             Content-Type: text/plain; version=0.0.4\r\n\
-             Content-Length: {len}\r\n\
-             Connection: close\r\n\
-             \r\n\
-             {body}",
-            len = body.len(),
-        );
-        let buf = response.as_bytes();
-        let _ = write_all_nonblocking(&mut stream, buf, Instant::now() + PROM_WRITE_TIMEOUT);
+        self.render_body();
+        let body_len = self.body_buf.len();
+        let write_deadline = Instant::now() + PROM_WRITE_TIMEOUT;
+        // Write headers and body in two parts to avoid allocating a
+        // combined response String.
+        let _ = write_headers_with_len(&mut stream, body_len, write_deadline);
+        let _ = write_all_nonblocking(&mut stream, self.body_buf.as_bytes(), write_deadline);
         let _ = stream.shutdown(Shutdown::Both);
         Ok(())
     }
 
-    fn render_body(&self) -> String {
+    fn render_body(&mut self) {
+        self.body_buf.clear();
+
         let mut pids: Vec<u32> = self.rows.keys().copied().collect();
         pids.sort_unstable();
 
-        let mut out = String::with_capacity(256 + pids.len() * 96);
-        out.push_str("# HELP varta_beats_total Total accepted beats per agent pid.\n");
-        out.push_str("# TYPE varta_beats_total counter\n");
+        self.body_buf
+            .push_str("# HELP varta_beats_total Total accepted beats per agent pid.\n");
+        self.body_buf.push_str("# TYPE varta_beats_total counter\n");
         for pid in &pids {
             let row = &self.rows[pid];
             let _ = writeln!(
-                out,
+                self.body_buf,
                 "varta_beats_total{{pid=\"{pid}\"}} {}",
                 row.beats_total
             );
         }
-        out.push_str("# HELP varta_stalls_total Total observer-detected stalls per agent pid.\n");
-        out.push_str("# TYPE varta_stalls_total counter\n");
+        self.body_buf
+            .push_str("# HELP varta_stalls_total Total observer-detected stalls per agent pid.\n");
+        self.body_buf
+            .push_str("# TYPE varta_stalls_total counter\n");
         for pid in &pids {
             let row = &self.rows[pid];
             let _ = writeln!(
-                out,
+                self.body_buf,
                 "varta_stalls_total{{pid=\"{pid}\"}} {}",
                 row.stalls_total
             );
         }
-        out.push_str("# HELP varta_status Last reported status code per agent pid (0=ok,1=degraded,2=critical,3=stall).\n");
-        out.push_str("# TYPE varta_status gauge\n");
+        self.body_buf.push_str("# HELP varta_status Last reported status code per agent pid (0=ok,1=degraded,2=critical,3=stall).\n");
+        self.body_buf.push_str("# TYPE varta_status gauge\n");
         for pid in &pids {
             let row = &self.rows[pid];
             if let Some(code) = row.last_status {
-                let _ = writeln!(out, "varta_status{{pid=\"{pid}\"}} {code}");
+                let _ = writeln!(self.body_buf, "varta_status{{pid=\"{pid}\"}} {code}");
             }
         }
         if self.evicted_total > 0 {
-            out.push_str("# HELP varta_tracker_evicted_total Total tracker slots reclaimed from dead agents.\n");
-            out.push_str("# TYPE varta_tracker_evicted_total counter\n");
-            let _ = writeln!(out, "varta_tracker_evicted_total {}", self.evicted_total);
+            self.body_buf.push_str("# HELP varta_tracker_evicted_total Total tracker slots reclaimed from dead agents.\n");
+            self.body_buf
+                .push_str("# TYPE varta_tracker_evicted_total counter\n");
+            let _ = writeln!(
+                self.body_buf,
+                "varta_tracker_evicted_total {}",
+                self.evicted_total
+            );
         }
         // Security counter — always emitted, even at 0.  Otherwise dashboards
         // and `absent()` alert rules silently produce no series until the
         // first spoof attempt, which defeats the purpose of an alert.
-        out.push_str(
+        self.body_buf.push_str(
             "# HELP varta_frame_auth_failures_total Frames rejected due to PID spoofing or authentication failure.\n",
         );
-        out.push_str("# TYPE varta_frame_auth_failures_total counter\n");
+        self.body_buf
+            .push_str("# TYPE varta_frame_auth_failures_total counter\n");
         let _ = writeln!(
-            out,
+            self.body_buf,
             "varta_frame_auth_failures_total {}",
             self.auth_failures_total
         );
         // Always emit one series per kind so dashboards and `absent()` rules
         // stay green-on-green instead of disappearing until the first incident.
-        out.push_str("# HELP varta_decode_errors_total Total VLP decode failures by kind.\n");
-        out.push_str("# TYPE varta_decode_errors_total counter\n");
+        self.body_buf
+            .push_str("# HELP varta_decode_errors_total Total VLP decode failures by kind.\n");
+        self.body_buf
+            .push_str("# TYPE varta_decode_errors_total counter\n");
         for (idx, kind) in DECODE_KIND_LABELS.iter().enumerate() {
             let _ = writeln!(
-                out,
+                self.body_buf,
                 "varta_decode_errors_total{{kind=\"{kind}\"}} {}",
                 self.decode_errors_total[idx]
             );
         }
-        out.push_str("# HELP varta_io_errors_total Total socket receive errors.\n");
-        out.push_str("# TYPE varta_io_errors_total counter\n");
-        let _ = writeln!(out, "varta_io_errors_total {}", self.io_errors_total);
+        self.body_buf
+            .push_str("# HELP varta_io_errors_total Total socket receive errors.\n");
+        self.body_buf
+            .push_str("# TYPE varta_io_errors_total counter\n");
+        let _ = writeln!(
+            self.body_buf,
+            "varta_io_errors_total {}",
+            self.io_errors_total
+        );
         if self.capacity_exceeded_total > 0 {
-            out.push_str("# HELP varta_tracker_capacity_exceeded_total Total beats dropped because tracker is full.\n");
-            out.push_str("# TYPE varta_tracker_capacity_exceeded_total counter\n");
+            self.body_buf.push_str("# HELP varta_tracker_capacity_exceeded_total Total beats dropped because tracker is full.\n");
+            self.body_buf
+                .push_str("# TYPE varta_tracker_capacity_exceeded_total counter\n");
             let _ = writeln!(
-                out,
+                self.body_buf,
                 "varta_tracker_capacity_exceeded_total {}",
                 self.capacity_exceeded_total
             );
         }
-        out.push_str("# HELP varta_frame_decrypt_failures_total Total AEAD decryption/tag-verification failures.\n");
-        out.push_str("# TYPE varta_frame_decrypt_failures_total counter\n");
+        self.body_buf.push_str(
+            "# HELP varta_frame_decrypt_failures_total Total AEAD decryption/tag-verification failures.\n",
+        );
+        self.body_buf
+            .push_str("# TYPE varta_frame_decrypt_failures_total counter\n");
         let _ = writeln!(
-            out,
+            self.body_buf,
             "varta_frame_decrypt_failures_total {}",
             self.decrypt_failures_total
         );
-        out.push_str(
+        self.body_buf.push_str(
             "# HELP varta_truncated_datagrams_total Total datagrams received with wrong size.\n",
         );
-        out.push_str("# TYPE varta_truncated_datagrams_total counter\n");
+        self.body_buf
+            .push_str("# TYPE varta_truncated_datagrams_total counter\n");
         let _ = writeln!(
-            out,
+            self.body_buf,
             "varta_truncated_datagrams_total {}",
             self.truncated_total
         );
         if self.sender_state_full_total > 0 {
-            out.push_str(
+            self.body_buf.push_str(
                 "# HELP varta_sender_state_full_total Total times the sender-state map was full and an entry was force-evicted.\n",
             );
-            out.push_str("# TYPE varta_sender_state_full_total counter\n");
+            self.body_buf
+                .push_str("# TYPE varta_sender_state_full_total counter\n");
             let _ = writeln!(
-                out,
+                self.body_buf,
                 "varta_sender_state_full_total {}",
                 self.sender_state_full_total
             );
         }
-        out
     }
 }
 
@@ -477,6 +505,43 @@ fn contains_subsequence(haystack: &[u8], needle: &[u8]) -> bool {
         return needle.is_empty();
     }
     haystack.windows(needle.len()).any(|w| w == needle)
+}
+
+/// Write the HTTP 200 response line and headers (including Content-Length)
+/// into `stream` using a stack buffer so no heap allocation occurs on the
+/// `/metrics` scrape path.
+fn write_headers_with_len(
+    stream: &mut TcpStream,
+    body_len: usize,
+    deadline: Instant,
+) -> io::Result<()> {
+    let mut buf = [0u8; 128];
+    let prefix = b"HTTP/1.0 200 OK\r\nContent-Type: text/plain; version=0.0.4\r\nContent-Length: ";
+    let suffix = b"\r\nConnection: close\r\n\r\n";
+    let len_str_len = write_usize(&mut buf[prefix.len()..], body_len);
+    let total = prefix.len() + len_str_len + suffix.len();
+    buf[..prefix.len()].copy_from_slice(prefix);
+    buf[prefix.len() + len_str_len..total].copy_from_slice(suffix);
+    write_all_nonblocking(stream, &buf[..total], deadline)
+}
+
+/// Write `n` as decimal ASCII into `buf` and return the number of bytes
+/// written. Panics if `buf` is too small (10 digits max for u32 fits in
+/// any reasonable buffer).
+fn write_usize(buf: &mut [u8], mut n: usize) -> usize {
+    if n == 0 {
+        buf[0] = b'0';
+        return 1;
+    }
+    let mut pos = buf.len();
+    while n > 0 {
+        pos -= 1;
+        buf[pos] = (n % 10) as u8 + b'0';
+        n /= 10;
+    }
+    let len = buf.len() - pos;
+    buf.copy_within(pos.., 0);
+    len
 }
 
 /// Non-blocking `write_all` with a wall-clock deadline. Returns `Ok(())`
@@ -534,7 +599,8 @@ mod tests {
             payload: 0,
             observer_ns: 0,
         });
-        let body = prom.render_body();
+        prom.render_body();
+        let body = &prom.body_buf;
         let pos2 = body.find("pid=\"2\"").expect("pid 2");
         let pos11 = body.find("pid=\"11\"").expect("pid 11");
         let pos30 = body.find("pid=\"30\"").expect("pid 30");
@@ -557,7 +623,8 @@ mod tests {
         prom.record(&Event::Decode(DecodeError::BadMagic, 0));
         prom.record(&Event::Decode(DecodeError::BadStatus(0xff), 0));
 
-        let body = prom.render_body();
+        prom.render_body();
+        let body = &prom.body_buf;
         // All three kind series must be present so `absent()` rules don't
         // silently disappear before the first incident of that kind.
         assert!(
