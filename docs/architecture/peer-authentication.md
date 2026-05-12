@@ -40,6 +40,14 @@ On macOS, per-datagram PID verification is therefore **not performed** — the o
 accepts any well-formed frame from a process that can reach the socket.
 The primary defence on macOS is **Layer 1** (`--socket-mode 0600`).
 
+> **Warning:** On non-Linux platforms (macOS, FreeBSD, NetBSD, OpenBSD, DragonFly,
+> Solaris, illumos, etc.), `varta-watch` emits a startup warning via stderr:
+> `"per-datagram PID verification is unavailable. The only defence is
+> --socket-mode (default 0600); any process under the same UID can impersonate
+> any PID."`  This is by design — the kernel does not expose per-datagram peer
+> credentials for unconnected `SOCK_DGRAM` on these platforms.  Containers that
+> run multiple processes under the same UID should be aware of this limitation.
+
 #### Future work: macOS
 
 Apple's recommended approach for inter-process identity verification is

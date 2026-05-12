@@ -137,10 +137,17 @@ mod plat {
     //   = 16                      + 16
     //   = 32 bytes
     //
-    // 64 bytes provides 2× headroom — safe for a single credential message
-    // with alignment padding. Bumped to 96 would cover SCM_CREDENTIALS +
-    // SCM_SECURITY, but that's unnecessary for v0.1.0.
-    pub(super) const ANCILLARY_BUFFER_SIZE: usize = 64;
+    // On SELinux-enabled kernels (RHEL, CentOS, Fedora enforcing mode),
+    // the kernel additionally attaches SCM_SECURITY with the process's
+    // SELinux context string (~50-100 bytes).  64 bytes is insufficient
+    // for SCM_CREDENTIALS + SCM_SECURITY, causing MSG_CTRUNC on every
+    // datagram and silently dropping all frames.
+    //
+    // 256 bytes covers:
+    //   SCM_CREDENTIALS:           ~32 bytes (CMSG_SPACE)
+    //   SCM_SECURITY context:      up to ~128 bytes (CMSG_SPACE with label)
+    //   + generous headroom for future kernel ancillary-data extensions.
+    pub(super) const ANCILLARY_BUFFER_SIZE: usize = 256;
 
     // Compile-time guard: the ancillary buffer must fit at least one
     // SCM_CREDENTIALS message (aligned cmsghdr + struct ucred).

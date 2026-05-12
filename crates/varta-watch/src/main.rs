@@ -61,7 +61,8 @@ unsafe fn install_signal_handlers() {
 
     // Platform-specific sigaction struct: layout differs between Linux,
     // macOS, and FreeBSD (sigset_t size, field ordering, presence of
-    // sa_restorer).
+    // sa_restorer).  Each layout is matched against the platform C ABI
+    // and guarded by compile-time size / offset assertions.
     #[cfg(target_os = "linux")]
     #[repr(C)]
     struct SigAction {
@@ -76,7 +77,12 @@ unsafe fn install_signal_handlers() {
     #[repr(C)]
     struct SigAction {
         sa_handler: *const (),
-        sa_mask: [u8; 32],
+        /// sigset_t on macOS / XNU is `__uint32_t` (4 bytes), not 32 bytes.
+        /// Defined in `<sys/_types/_sigset_t.h>`; verified against xnu
+        /// sources (xnu-8792.81.2, xnu-11215.1.10).  Passing a 32-byte mask
+        /// here would write past the kernel-expected field and corrupt the
+        /// caller's stack frame on ARM64 / Apple Silicon.
+        sa_mask: u32,
         sa_flags: i32,
     }
 
@@ -85,8 +91,43 @@ unsafe fn install_signal_handlers() {
     struct SigAction {
         sa_handler: *const (),
         sa_flags: i32,
+        /// sigset_t on FreeBSD is `__uint32_t[4]` (16 bytes).  Verified
+        /// against `<sys/_sigset.h>` (FreeBSD 14.2).
         sa_mask: [u8; 16],
     }
+
+    // Compile-time size assertions — guard against ABI drift across kernel /
+    // libc versions.  A mismatch here becomes a hard compile error instead of
+    // stack corruption at signal-install time.
+    #[cfg(target_os = "linux")]
+    const _: () = assert!(core::mem::size_of::<SigAction>() == 152);
+    #[cfg(target_os = "macos")]
+    const _: () = assert!(core::mem::size_of::<SigAction>() == 16);
+    #[cfg(target_os = "freebsd")]
+    const _: () = assert!(core::mem::size_of::<SigAction>() == 32);
+
+    #[cfg(target_os = "linux")]
+    const _: () = assert!(core::mem::offset_of!(SigAction, sa_handler) == 0);
+    #[cfg(target_os = "linux")]
+    const _: () = assert!(core::mem::offset_of!(SigAction, sa_mask) == 8);
+    #[cfg(target_os = "linux")]
+    const _: () = assert!(core::mem::offset_of!(SigAction, sa_flags) == 136);
+    #[cfg(target_os = "linux")]
+    const _: () = assert!(core::mem::offset_of!(SigAction, sa_restorer) == 144);
+
+    #[cfg(target_os = "macos")]
+    const _: () = assert!(core::mem::offset_of!(SigAction, sa_handler) == 0);
+    #[cfg(target_os = "macos")]
+    const _: () = assert!(core::mem::offset_of!(SigAction, sa_mask) == 8);
+    #[cfg(target_os = "macos")]
+    const _: () = assert!(core::mem::offset_of!(SigAction, sa_flags) == 12);
+
+    #[cfg(target_os = "freebsd")]
+    const _: () = assert!(core::mem::offset_of!(SigAction, sa_handler) == 0);
+    #[cfg(target_os = "freebsd")]
+    const _: () = assert!(core::mem::offset_of!(SigAction, sa_flags) == 8);
+    #[cfg(target_os = "freebsd")]
+    const _: () = assert!(core::mem::offset_of!(SigAction, sa_mask) == 12);
 
     extern "C" {
         fn sigaction(signum: i32, act: *const SigAction, oldact: *mut SigAction) -> i32;
@@ -182,6 +223,18 @@ fn run(cfg: Config) -> std::io::Result<()> {
         cfg.read_timeout,
         cfg.tracker_capacity,
     )?;
+
+    // On non-Linux platforms per-datagram PID verification is not available.
+    // The only defence is --socket-mode (default 0600), which restricts the
+    // trust boundary to processes running under the same UID.  Emit a one-shot
+    // warning so operators are aware of the reduced isolation model.
+    #[cfg(not(target_os = "linux"))]
+    eprintln!(
+        "varta-watch: running on {} — per-datagram PID verification is unavailable. \
+         The only defence is --socket-mode (default 0600); any process under the same \
+         UID can impersonate any PID.",
+        std::env::consts::OS,
+    );
 
     #[cfg(feature = "secure-udp")]
     let secure_udp_keys = cfg.load_secure_keys()?;
