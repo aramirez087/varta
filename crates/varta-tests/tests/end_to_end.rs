@@ -71,34 +71,16 @@ fn main() -> ExitCode {
         "recovery_exec_mode_touch_marker_file",
         recovery_exec_mode_touch_marker_file,
     );
-    failed += run_one(
-        "recovery_cmd_file_mode",
-        recovery_cmd_file_mode,
-    );
-    failed += run_one(
-        "recovery_exec_file_mode",
-        recovery_exec_file_mode,
-    );
-    failed += run_one(
-        "recovery_timeout_kill_after",
-        recovery_timeout_kill_after,
-    );
-    failed += run_one(
-        "recovery_env_isolation",
-        recovery_env_isolation,
-    );
+    failed += run_one("recovery_cmd_file_mode", recovery_cmd_file_mode);
+    failed += run_one("recovery_exec_file_mode", recovery_exec_file_mode);
+    failed += run_one("recovery_timeout_kill_after", recovery_timeout_kill_after);
+    failed += run_one("recovery_env_isolation", recovery_env_isolation);
     failed += run_one(
         "max_beat_rate_limits_and_reports_metric",
         max_beat_rate_limits_and_reports_metric,
     );
-    failed += run_one(
-        "file_export_writes_tsv",
-        file_export_writes_tsv,
-    );
-    failed += run_one(
-        "file_export_rotation",
-        file_export_rotation,
-    );
+    failed += run_one("file_export_writes_tsv", file_export_writes_tsv);
+    failed += run_one("file_export_rotation", file_export_rotation);
     failed += run_one(
         "tracker_capacity_exceeded_reports_eviction_metric",
         tracker_capacity_exceeded_reports_eviction_metric,
@@ -991,21 +973,21 @@ fn file_export_writes_tsv() {
     let socket = tmp.path().join("varta.sock");
     let export = tmp.path().join("events.tsv");
 
-    let (mut child, _prom_addr) = spawn_watch(&[
-        "--socket",
-        socket.to_str().unwrap(),
-        "--threshold-ms",
-        "200",
-        "--export-file",
-        export.to_str().unwrap(),
-        "--export-file-max-bytes",
-        "50", // tiny limit forces rotation + flush after every event
-        "--prom-addr",
-        "127.0.0.1:0",
-        "--shutdown-after-secs",
-        "10",
-    ]);
-    let _guard = ChildGuard(&mut child);
+    let mut child = Command::new(&locate_watch_binary())
+        .args([
+            "--socket",
+            socket.to_str().unwrap(),
+            "--threshold-ms",
+            "200",
+            "--export-file",
+            export.to_str().unwrap(),
+            "--shutdown-after-secs",
+            "10",
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn varta-watch");
 
     assert!(
         wait_until(|| socket.exists(), Duration::from_secs(3)),
@@ -1035,36 +1017,38 @@ fn file_export_writes_tsv() {
 
     // Spawn a second agent (different PID) via child process
     let me = std::env::current_exe().expect("current_exe");
-    let mut child = Command::new(&me)
+    let mut agent2 = Command::new(&me)
         .env(AGENT_CHILD_ENV, socket.to_str().unwrap())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
         .expect("spawn agent child");
-    let child_pid = child.id();
-    let _ = child.wait().expect("wait agent child");
+    let child_pid = agent2.id();
+    let _ = agent2.wait().expect("wait agent child");
 
-    // Wait past threshold so stalls are surfaced and rotation flushes file.
-    // The BufWriter-backed file exporter flushes on rotation; with
-    // --export-file-max-bytes 50, every event triggers a rotation+flush.
-    std::thread::sleep(Duration::from_millis(500));
+    // Wait past threshold so stalls are surfaced
+    std::thread::sleep(Duration::from_millis(400));
 
-    // Read all export files (content is spread across rotation generations)
-    let mut content = String::new();
-    for gen_suffix in &["", ".1", ".2", ".3", ".4", ".5"] {
-        let path = tmp.path().join(format!("events.tsv{gen_suffix}"));
-        if let Ok(c) = std::fs::read_to_string(&path) {
-            content.push_str(&c);
-        }
-    }
+    // Gracefully shut down the observer so fe.flush() runs
+    Command::new("kill")
+        .arg("-TERM")
+        .arg(child.id().to_string())
+        .status()
+        .expect("kill -TERM");
+    let _ = child.wait().expect("wait observer");
+
+    // Read the export file
+    let content = std::fs::read_to_string(&export).unwrap_or_default();
     assert!(
         !content.is_empty(),
-        "export file should contain event lines"
+        "export file should contain event lines (got {content:?})"
     );
 
     // Verify beats from agent 1
     assert!(
-        content.lines().any(|l| l.contains("\tbeat\t") && l.contains(&agent_pid_1.to_string())),
+        content
+            .lines()
+            .any(|l| l.contains("\tbeat\t") && l.contains(&agent_pid_1.to_string())),
         "export file missing beat lines for pid {agent_pid_1}:\n{content}"
     );
 
@@ -1514,10 +1498,8 @@ fn signal_handling_graceful_shutdown() {
         assert!(kill_status.success(), "kill -TERM command failed");
 
         // Wait for graceful exit with timeout
-        let status = wait_until_with_timeout(
-            || child.try_wait().ok().flatten(),
-            Duration::from_secs(5),
-        );
+        let status =
+            wait_until_with_timeout(|| child.try_wait().ok().flatten(), Duration::from_secs(5));
         match status {
             Some(exit_status) => {
                 assert!(
@@ -1793,10 +1775,7 @@ fn wait_until<F: FnMut() -> bool>(mut f: F, timeout: Duration) -> bool {
 
 /// Like `wait_until`, but returns the value produced by the closure rather
 /// than a boolean. Returns `None` if the deadline expires.
-fn wait_until_with_timeout<F: FnMut() -> Option<T>, T>(
-    mut f: F,
-    timeout: Duration,
-) -> Option<T> {
+fn wait_until_with_timeout<F: FnMut() -> Option<T>, T>(mut f: F, timeout: Duration) -> Option<T> {
     let deadline = Instant::now() + timeout;
     loop {
         if let Some(v) = f() {
