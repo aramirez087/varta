@@ -341,6 +341,13 @@ impl PromExporter {
         self.evicted_total = self.evicted_total.saturating_add(count);
     }
 
+    /// Remove the GaugeRow for a pid that was evicted from the tracker.
+    /// Prevents unbounded memory growth in the rows HashMap over long-running
+    /// deployments with ephemeral processes (CI runners, cron jobs, containers).
+    pub fn record_evicted_pid(&mut self, pid: u32) {
+        self.rows.remove(&pid);
+    }
+
     /// Record one or more beats dropped due to tracker capacity exceeded.
     pub fn record_capacity_exceeded(&mut self, count: u64) {
         self.capacity_exceeded_total = self.capacity_exceeded_total.saturating_add(count);
@@ -841,5 +848,32 @@ mod tests {
             response.contains("Allow: GET"),
             "missing Allow header: {response}"
         );
+    }
+
+    #[test]
+    fn record_evicted_pid_removes_row() {
+        let mut prom = PromExporter::bind("127.0.0.1:0".parse().unwrap()).expect("bind");
+        prom.record(&Event::Beat {
+            pid: 42,
+            status: Status::Ok,
+            nonce: 1,
+            payload: 0,
+            observer_ns: 0,
+        });
+        assert!(prom.rows.contains_key(&42), "row should exist after beat");
+        prom.record_evicted_pid(42);
+        assert!(
+            !prom.rows.contains_key(&42),
+            "row should be removed after eviction"
+        );
+    }
+
+    #[test]
+    fn record_evicted_pid_ignores_unknown_pid() {
+        let mut prom = PromExporter::bind("127.0.0.1:0".parse().unwrap()).expect("bind");
+        // Should not panic when called for a pid that was never tracked.
+        prom.record_evicted_pid(99);
+        // Verify rows is still empty.
+        assert!(prom.rows.is_empty());
     }
 }

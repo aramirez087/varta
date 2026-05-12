@@ -306,6 +306,9 @@ fn run(cfg: Config) -> std::io::Result<()> {
             if let Some(fe) = file_export.as_mut() {
                 fe.record_eviction_pid(evicted_pid, observer.now_ns());
             }
+            if let Some(pe) = prom_export.as_mut() {
+                pe.record_evicted_pid(evicted_pid);
+            }
         }
 
         let capacity_exceeded = observer.drain_capacity_exceeded();

@@ -5,6 +5,7 @@
 //! alternative transports (e.g. UDP) are available behind feature flags.
 
 use std::io;
+use std::net::{SocketAddr, UdpSocket};
 use std::os::unix::net::UnixDatagram;
 use std::path::{Path, PathBuf};
 
@@ -70,6 +71,21 @@ impl BeatTransport for UdsTransport {
 }
 
 // ---------------------------------------------------------------------------
+// Ephemeral UDP bind helper (shared across UDP transports)
+// ---------------------------------------------------------------------------
+
+/// Bind a UDP socket to an ephemeral port on the wildcard address matching
+/// the target's address family (IPv4 or IPv6).
+pub(crate) fn bind_ephemeral(addr: &SocketAddr) -> io::Result<UdpSocket> {
+    let bind_addr = if addr.is_ipv4() {
+        "0.0.0.0:0"
+    } else {
+        "[::]:0"
+    };
+    UdpSocket::bind(bind_addr)
+}
+
+// ---------------------------------------------------------------------------
 // UDP transport (feature-gated)
 // ---------------------------------------------------------------------------
 
@@ -78,6 +94,7 @@ mod udp_impl {
     use std::io;
     use std::net::{SocketAddr, UdpSocket};
 
+    use super::bind_ephemeral;
     use super::BeatTransport;
 
     /// UDP transport for network-based agents.
@@ -109,15 +126,6 @@ mod udp_impl {
             sock.set_nonblocking(true)?;
             Ok(UdpTransport { sock, addr })
         }
-    }
-
-    fn bind_ephemeral(addr: &SocketAddr) -> io::Result<UdpSocket> {
-        let bind_addr = if addr.is_ipv4() {
-            "0.0.0.0:0"
-        } else {
-            "[::]:0"
-        };
-        UdpSocket::bind(bind_addr)
     }
 
     impl BeatTransport for UdpTransport {

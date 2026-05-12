@@ -29,7 +29,7 @@ use std::net::{SocketAddr, UdpSocket};
 
 use varta_vlp::crypto::{self, Key, NONCE_BYTES};
 
-use crate::transport::BeatTransport;
+use crate::transport::{bind_ephemeral, BeatTransport};
 
 /// Total length of an encrypted frame on the wire.
 const SECURE_FRAME_LEN: usize = crypto::SECURE_FRAME_BYTES;
@@ -79,7 +79,7 @@ impl SecureUdpTransport {
     /// Returns an [`io::Error`] if the socket cannot be created, connected,
     /// or switched to non-blocking mode.
     pub fn connect(addr: SocketAddr, key: Key) -> io::Result<Self> {
-        let sock = UdpSocket::bind("0.0.0.0:0")?;
+        let sock = bind_ephemeral(&addr)?;
         sock.connect(addr)?;
         sock.set_nonblocking(true)?;
 
@@ -121,7 +121,7 @@ impl BeatTransport for SecureUdpTransport {
     }
 
     fn reconnect(&mut self) -> io::Result<()> {
-        let sock = UdpSocket::bind("0.0.0.0:0")?;
+        let sock = bind_ephemeral(&self.addr)?;
         sock.connect(self.addr)?;
         sock.set_nonblocking(true)?;
         self.sock = sock;
@@ -167,4 +167,18 @@ pub(crate) fn lcg_iv_random() -> [u8; 8] {
                 .as_nanos() as u64,
         );
     raw.to_le_bytes()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::{Ipv6Addr, SocketAddrV6};
+
+    #[test]
+    fn ipv6_connect_does_not_fail_with_einval() {
+        let addr = SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::LOCALHOST, 9876, 0, 0));
+        let key = Key::from_bytes([0x42; 32]);
+        let result = SecureUdpTransport::connect(addr, key);
+        assert!(result.is_ok(), "IPv6 connect failed: {:?}", result.err());
+    }
 }
