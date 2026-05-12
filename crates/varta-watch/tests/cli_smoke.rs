@@ -66,6 +66,7 @@ fn cli_help_lists_every_documented_flag() {
         "--threshold-ms",
         "--recovery-cmd",
         "--recovery-debounce-ms",
+        "--recovery-env",
         "--recovery-timeout-ms",
         "--socket-mode",
         "--export-file",

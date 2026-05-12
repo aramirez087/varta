@@ -57,12 +57,12 @@ a `UdpListener` is added alongside the UDS listener.
 ## Transport comparison
 
 | | UDS (default) | UDP (feature = "udp") | Secure UDP (feature = "secure-udp") |
-|---|---|---|---|
+|---|---|---|---|---|
 | **Addressing** | Filesystem path | `IP:PORT` | `IP:PORT` |
 | **Encryption** | None (kernel isolation) | None | ChaCha20-Poly1305 AEAD |
-| **Authentication** | Kernel PID via `SO_PASSCRED` (Linux) | None | Poly1305 tag verification |
+| **Authentication** | Kernel PID + UID via `SO_PASSCRED` (Linux) / `LOCAL_PEERTOKEN` (macOS) | None | Poly1305 tag + PID in IV prefix (master-key mode) |
 | **Replay protection** | None (local IPC) | None | Per-sender IV counter monotonicity |
-| **Trust model** | Filesystem permissions | Network segmentation | 256-bit pre-shared key |
+| **Trust model** | Filesystem permissions + kernel credential attestation | Network segmentation | 256-bit pre-shared or per-agent derived key |
 | **Frame size** | 32 bytes | 32 bytes | 60 bytes (AEAD overhead) |
 | **Socket cleanup** | `UdsListener::drop` unlinks socket | Kernel reclaims port | Kernel reclaims port |
 | **Use case** | Local IPC, process monitoring | IoT/edge, microservices | Anything crossing untrusted networks |
@@ -97,6 +97,14 @@ varta-watch --socket /tmp/varta.sock --threshold-ms 500 \
 # Key from environment variable (default: VARTA_KEY)
 export VARTA_KEY=$(openssl rand -hex 32)
 varta-watch --socket /tmp/varta.sock --threshold-ms 500 --udp-port 9000
+
+# Per-agent key derivation from master key
+# The observer derives agent-specific keys from the PID embedded in
+# each frame's iv_random prefix. Compromise of one agent's key does
+# not reveal other agents' keys or the master key.
+openssl rand -hex 32 > /tmp/varta-master.key
+varta-watch --socket /tmp/varta.sock --threshold-ms 500 \
+            --udp-port 9000 --master-key-file /tmp/varta-master.key
 ```
 
 ## Feature flags
@@ -113,20 +121,33 @@ varta-watch --socket /tmp/varta.sock --threshold-ms 500 --udp-port 9000
 
 ## Security
 
-- **UDS**: On Linux, the kernel attests the sender's PID via `SCM_CREDENTIALS`.
-  The observer rejects frames where `frame.pid != peer_pid`. On macOS, this
-  mechanism is unavailable for unconnected `SOCK_DGRAM`; the trust boundary is
-  restricted by `--socket-mode 0600` (owner-only access).
+- **UDS**: On Linux, the kernel attests the sender's PID and UID via
+  `SCM_CREDENTIALS`. The observer rejects frames where `frame.pid != peer_pid`
+  or `peer_uid != observer_uid`. On macOS, `getsockopt(LOCAL_PEERTOKEN)` is
+  attempted for the same verification, falling back to `--socket-mode 0600`.
+  On other platforms, the only defence is `--socket-mode`.
 
 - **UDP (plaintext)**: No kernel credential mechanism exists. `peer_pid` is
   always 0, which causes the observer to skip PID verification. Trust must be
   established at the network layer — firewall rules, VPC boundaries.
 
 - **UDP (secure)**: Every frame is encrypted with ChaCha20-Poly1305 (RFC 8439)
-  using a 256-bit pre-shared key. The 60-byte wire format adds a 4-byte random
-  IV prefix, an 8-byte monotonic counter, and a 16-byte Poly1305 tag. Replay
-  attacks are blocked by enforcing monotonic IV counters per sender. Key
-  rotation is supported via `--accepted-key-file` (no downtime required).
+  using a 256-bit key. Two key modes are available:
+  - **Shared key**: A single pre-shared key for all agents (`--key-file`).
+  - **Master key**: Per-agent keys derived from the agent's PID via ChaCha20-based
+    KDF (`--master-key-file`). The PID is embedded in the `iv_random` prefix so
+    the observer can derive the correct agent key before decryption. Compromise
+    of one agent's key does not reveal other agents' keys or the master key.
+  - Replay attacks are blocked by enforcing monotonic IV counters per sender.
+    Key rotation is supported via `--accepted-key-file` (no downtime required).
+
+- **Recovery commands**: Two execution modes:
+  - `--recovery-cmd`: Shell mode — templates executed via `/bin/sh -c` with
+    the PID as `$1` (positional argument, never string-interpolated).
+  - `--recovery-exec`: Exec mode — commands executed directly via `execvp(2)`
+    with `{pid}` replaced in arguments. No shell is involved.
+  - `--recovery-cmd-file` / `--recovery-exec-file`: Read templates from files
+    with mandatory ownership/permission checks (UID match, mode ≤ 0600).
 
 ## Future transports
 

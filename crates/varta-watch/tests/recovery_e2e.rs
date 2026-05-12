@@ -149,7 +149,7 @@ fn recovery_spawn_returns_within_50ms_for_slow_template() {
 /// for this transition.
 #[test]
 fn recovery_try_reap_yields_reaped_for_completed_child() {
-    let mut rec = Recovery::with_timeout("true".to_string(), Duration::ZERO, None);
+    let mut rec = Recovery::with_template_and_timeout("true".to_string(), Duration::ZERO, None);
     let _ = rec.on_stall(99);
 
     // Allow up to 500 ms for the child to exit and a subsequent
@@ -182,7 +182,7 @@ fn recovery_try_reap_yields_reaped_for_completed_child() {
 /// child's pid.
 #[test]
 fn recovery_try_reap_kills_after_timeout() {
-    let mut rec = Recovery::with_timeout(
+    let mut rec = Recovery::with_template_and_timeout(
         "sleep 1".to_string(),
         Duration::ZERO,
         Some(Duration::from_millis(50)),

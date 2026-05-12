@@ -225,11 +225,18 @@ fn run(cfg: Config) -> std::io::Result<()> {
         cfg.max_beat_rate,
     )?;
 
-    // On non-Linux platforms per-datagram PID verification is not available.
-    // The only defence is --socket-mode (default 0600), which restricts the
-    // trust boundary to processes running under the same UID.  Emit a one-shot
-    // warning so operators are aware of the reduced isolation model.
-    #[cfg(not(target_os = "linux"))]
+    // On platforms lacking kernel-level per-datagram credential passing
+    // (OpenBSD, Solaris, illumos, and other exotic Unixen) the observer
+    // relies solely on --socket-mode (default 0600) as the trust boundary.
+    // Linux, macOS, FreeBSD, DragonFly, and NetBSD all have per-datagram
+    // credential mechanisms — the observer enforces them automatically.
+    #[cfg(not(any(
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "freebsd",
+        target_os = "dragonfly",
+        target_os = "netbsd",
+    )))]
     eprintln!(
         "varta-watch: running on {} — per-datagram PID verification is unavailable. \
          The only defence is --socket-mode (default 0600); any process under the same \
@@ -240,6 +247,9 @@ fn run(cfg: Config) -> std::io::Result<()> {
     #[cfg(feature = "secure-udp")]
     let secure_udp_keys = cfg.load_secure_keys()?;
 
+    #[cfg(feature = "secure-udp")]
+    let master_key = cfg.load_master_key()?;
+
     #[cfg(feature = "udp")]
     if let Some(port) = cfg.udp_port {
         let bind_addr = cfg
@@ -248,17 +258,38 @@ fn run(cfg: Config) -> std::io::Result<()> {
         let addr = std::net::SocketAddr::new(bind_addr, port);
 
         #[cfg(feature = "secure-udp")]
-        if let Some((primary_key, accepted_keys)) = secure_udp_keys {
-            let mut all_keys = vec![primary_key];
-            all_keys.extend(accepted_keys);
-            let secure = varta_watch::SecureUdpListener::bind(addr, all_keys).map_err(|e| {
-                std::io::Error::new(e.kind(), format!("secure UDP bind {}: {e}", addr))
-            })?;
-            observer.add_listener(Box::new(secure));
-        } else {
-            let udp = varta_watch::UdpListener::bind(addr)
-                .map_err(|e| std::io::Error::new(e.kind(), format!("UDP bind {}: {e}", addr)))?;
-            observer.add_listener(Box::new(udp));
+        {
+            let has_shared_keys = secure_udp_keys.is_some();
+            let has_master = master_key.is_some();
+
+            if has_shared_keys || has_master {
+                let mut all_keys: Vec<varta_vlp::crypto::Key> = Vec::new();
+                if let Some((primary, accepted)) = secure_udp_keys {
+                    all_keys.push(primary);
+                    all_keys.extend(accepted);
+                }
+
+                let secure = if let Some(mk) = master_key {
+                    varta_watch::SecureUdpListener::bind_with_master(addr, all_keys, mk).map_err(
+                        |e| {
+                            std::io::Error::new(
+                                e.kind(),
+                                format!("secure UDP bind (master key) {}: {e}", addr),
+                            )
+                        },
+                    )?
+                } else {
+                    varta_watch::SecureUdpListener::bind(addr, all_keys).map_err(|e| {
+                        std::io::Error::new(e.kind(), format!("secure UDP bind {}: {e}", addr))
+                    })?
+                };
+                observer.add_listener(Box::new(secure));
+            } else {
+                let udp = varta_watch::UdpListener::bind(addr).map_err(|e| {
+                    std::io::Error::new(e.kind(), format!("UDP bind {}: {e}", addr))
+                })?;
+                observer.add_listener(Box::new(udp));
+            }
         }
 
         #[cfg(not(feature = "secure-udp"))]
@@ -281,11 +312,12 @@ fn run(cfg: Config) -> std::io::Result<()> {
     #[cfg(not(feature = "secure-udp"))]
     if cfg.secure_key_file.is_some()
         || cfg.accepted_key_file.is_some()
+        || cfg.master_key_file.is_some()
         || cfg.key_env != "VARTA_KEY"
     {
         eprintln!(
-            "varta-watch: --key-file / --accepted-key-file / --key-env require secure UDP support \
-             (rebuild with --features secure-udp)"
+            "varta-watch: --key-file / --accepted-key-file / --master-key-file / --key-env \
+             require secure UDP support (rebuild with --features secure-udp)"
         );
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -293,8 +325,19 @@ fn run(cfg: Config) -> std::io::Result<()> {
         ));
     }
 
-    let mut recovery = cfg.recovery_cmd.as_ref().map(|tpl| {
-        Recovery::with_timeout(tpl.clone(), cfg.recovery_debounce, cfg.recovery_timeout)
+    let recovery_mode = cfg.resolve_recovery_mode()?;
+
+    if cfg.recovery_cmd.is_some() {
+        eprintln!(
+            "varta-watch: --recovery-cmd passes the template directly to /bin/sh -c. \
+             Prefer --recovery-cmd-file (with restrictive file permissions) or \
+             --recovery-exec (no shell) for production deployments."
+        );
+    }
+
+    let mut recovery = recovery_mode.map(|mode| {
+        Recovery::with_timeout(mode, cfg.recovery_debounce, cfg.recovery_timeout)
+            .with_recovery_env(cfg.recovery_env.clone())
     });
     let mut file_export: Option<FileExporter> = match cfg.file_export.as_ref() {
         Some(path) => Some(FileExporter::create(path, cfg.export_file_max_bytes)?),

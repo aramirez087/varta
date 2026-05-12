@@ -72,9 +72,18 @@ impl SenderState {
 /// Supports key rotation: `keys[0]` is the primary key, and `keys[1..]` are
 /// accepted keys for incoming frames during rotation windows. Decryption is
 /// attempted with each key in order until one succeeds.
+///
+/// When a master key is provided (via
+/// [`SecureUdpListener::bind_with_master`]), the observer additionally derives
+/// per-agent keys on the fly. The agent PID is extracted from `iv_random[0..4]`
+/// in the wire frame, and the agent key is derived via
+/// [`varta_vlp::crypto::kdf::derive_agent_key`]. This provides per-agent key
+/// isolation: compromise of one agent's derived key does not reveal other
+/// agents' keys or the master key.
 pub struct SecureUdpListener {
     sock: UdpSocket,
     keys: Vec<Key>,
+    master_key: Option<Key>,
     sender_state: HashMap<SocketAddr, SenderState>,
     next_eviction_check: Instant,
     decrypt_failures: u64,
@@ -106,6 +115,36 @@ impl SecureUdpListener {
         Ok(SecureUdpListener {
             sock,
             keys,
+            master_key: None,
+            sender_state: HashMap::with_capacity(64),
+            next_eviction_check: Instant::now() + EVICTION_INTERVAL,
+            decrypt_failures: 0,
+            truncated_count: 0,
+            sender_state_full: 0,
+            last_evicted: None,
+        })
+    }
+
+    /// Bind a non-blocking UDP socket with a master key for per-agent key
+    /// derivation.
+    ///
+    /// `keys` are the shared keys tried first (may be empty when using only
+    /// the master key). `master_key` is used to derive per-agent keys from
+    /// the PID embedded in `iv_random[0..4]` of each incoming frame.
+    ///
+    /// # Security
+    ///
+    /// Per-agent key derivation means that compromise of one agent's derived
+    /// key does not reveal other agents' keys or the master key. The PID
+    /// in `iv_random[0..4]` is verified against the decrypted frame's `pid`
+    /// field to prevent PID spoofing at the transport layer.
+    pub fn bind_with_master(addr: SocketAddr, keys: Vec<Key>, master_key: Key) -> io::Result<Self> {
+        let sock = UdpSocket::bind(addr)?;
+        sock.set_nonblocking(true)?;
+        Ok(SecureUdpListener {
+            sock,
+            keys,
+            master_key: Some(master_key),
             sender_state: HashMap::with_capacity(64),
             next_eviction_check: Instant::now() + EVICTION_INTERVAL,
             decrypt_failures: 0,
@@ -167,6 +206,37 @@ impl SecureUdpListener {
             state.last_counter = counter;
         }
         state.last_seen = Instant::now();
+    }
+
+    /// Derive a per-agent key from the master key using the PID embedded in
+    /// `iv_random[0..4]` and attempt AEAD decryption.
+    ///
+    /// Returns `None` if no master key is configured, or if the derived key
+    /// fails to decrypt the frame.
+    fn try_master_key_decrypt(
+        &self,
+        iv_random: &[u8; 8],
+        nonce: &[u8; 12],
+        ciphertext: &[u8; 32],
+        tag: &[u8; 16],
+    ) -> Option<[u8; 32]> {
+        let master = self.master_key.as_ref()?;
+        let claimed_pid =
+            u32::from_le_bytes([iv_random[0], iv_random[1], iv_random[2], iv_random[3]]);
+
+        use varta_vlp::crypto::kdf;
+        let agent_key = kdf::derive_agent_key(master, claimed_pid);
+        let plaintext = crypto::open(agent_key.as_bytes(), nonce, ciphertext, tag).ok()?;
+
+        // Verify that the decrypted frame's PID matches the PID from
+        // iv_random to prevent PID spoofing at the transport layer.
+        let frame_pid =
+            u32::from_le_bytes([plaintext[4], plaintext[5], plaintext[6], plaintext[7]]);
+        if frame_pid != claimed_pid {
+            return None;
+        }
+
+        Some(plaintext)
     }
 
     /// Atomic replay check + state update: returns `true` if the
@@ -310,7 +380,8 @@ impl BeatListener for SecureUdpListener {
             let plaintext = self
                 .keys
                 .iter()
-                .find_map(|key| crypto::open(key.as_bytes(), &nonce, &ciphertext, &tag).ok());
+                .find_map(|key| crypto::open(key.as_bytes(), &nonce, &ciphertext, &tag).ok())
+                .or_else(|| self.try_master_key_decrypt(&iv_random, &nonce, &ciphertext, &tag));
 
             let Some(plaintext) = plaintext else {
                 self.decrypt_failures = self.decrypt_failures.wrapping_add(1);
@@ -340,6 +411,7 @@ impl BeatListener for SecureUdpListener {
 
             return RecvResult::Authenticated {
                 peer_pid: 0,
+                peer_uid: 0,
                 data: plaintext,
             };
         }

@@ -6,7 +6,7 @@
 //! `cli_help_lists_every_documented_flag` acceptance test.
 
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::tracker::DEFAULT_CAPACITY;
@@ -39,8 +39,24 @@ pub struct Config {
     /// Optional shell-fragment template invoked on each unique stall. The
     /// stalled pid is passed as `$1` (positional argument, not string-replaced).
     pub recovery_cmd: Option<String>,
+    /// Optional exec command line invoked on each unique stall. `{pid}` in
+    /// any argument is replaced with the numeric PID. No shell is spawned.
+    pub recovery_exec_cmd: Option<String>,
+    /// Optional path to a file containing the `--recovery-cmd` shell template.
+    /// The file must be owned by the observer's UID and have mode 0600 or
+    /// stricter. Mutually exclusive with `recovery_cmd`.
+    pub recovery_cmd_file: Option<PathBuf>,
+    /// Optional path to a file containing the `--recovery-exec` command line.
+    /// Same permission requirements as `recovery_cmd_file`. Mutually
+    /// exclusive with `recovery_exec_cmd`.
+    pub recovery_exec_file: Option<PathBuf>,
     /// Per-pid debounce window for `recovery_cmd` invocations.
     pub recovery_debounce: Duration,
+    /// Environment variables passed to recovery child processes. Each entry
+    /// is in `KEY=VALUE` format. When set, the child's environment is cleared
+    /// to `PATH=/usr/bin:/bin` plus these explicit variables. When empty,
+    /// no environment variables are set (child inherits the observer's env).
+    pub recovery_env: Vec<String>,
     /// Optional path the file exporter appends one event-line per record to.
     pub file_export: Option<PathBuf>,
     /// Optional byte limit for the file export. When exceeded, the current
@@ -78,6 +94,11 @@ pub struct Config {
     /// Path to a file with one hex key per line for zero-downtime key
     /// rotation (requires `--features secure-udp`).
     pub accepted_key_file: Option<PathBuf>,
+    /// Path to a file containing a 64-character hex master key for
+    /// per-agent key derivation (requires `--features secure-udp`).
+    /// The observer derives agent-specific keys from the PID in each
+    /// frame's `iv_random` prefix.
+    pub master_key_file: Option<PathBuf>,
     /// Environment variable name to read the primary key from (default
     /// `VARTA_KEY`). Ignored when `--key-file` is set.
     pub key_env: String,
@@ -118,6 +139,13 @@ pub enum ConfigError {
         /// The minimum allowed value.
         min: u64,
     },
+    /// Two or more mutually exclusive recovery flags were specified.
+    MutuallyExclusive {
+        /// The pair of conflicting flags (e.g. `("--recovery-cmd", "--recovery-exec")`).
+        a: &'static str,
+        /// Second conflicting flag.
+        b: &'static str,
+    },
 }
 
 impl core::fmt::Display for ConfigError {
@@ -144,6 +172,9 @@ impl core::fmt::Display for ConfigError {
                     f,
                     "--threshold-ms: {value} is below the minimum allowed value ({min} ms)"
                 )
+            }
+            ConfigError::MutuallyExclusive { a, b } => {
+                write!(f, "{a} and {b} are mutually exclusive")
             }
         }
     }
@@ -172,8 +203,28 @@ OPTIONAL:
                                      body is under full operator control;
                                      never accept it from an untrusted
                                      source.
+    --recovery-exec <CMD>          Command and arguments invoked via execvp
+                                     on each unique stall. Split on
+                                     whitespace into argv; {pid} in any
+                                     argument is replaced with the numeric
+                                     PID. No shell — metacharacters have
+                                     no effect. Mutually exclusive with
+                                     --recovery-cmd.
+    --recovery-cmd-file <PATH>     Read --recovery-cmd template from a file.
+                                     File must be owned by the observer's
+                                     UID and mode 0600 or stricter.
+    --recovery-exec-file <PATH>    Read --recovery-exec command from a file
+                                     with the same permission requirements
+                                     as --recovery-cmd-file.
     --recovery-debounce-ms <MS>    Per-pid debounce window for recovery
                                      invocations (default 1000).
+    --recovery-env <KEY=VALUE>     Repeatable. Pass an environment variable
+                                     to recovery child processes. When set,
+                                     the child's environment is cleared and
+                                     only PATH=/usr/bin:/bin plus these
+                                     explicit variables are set. Without this
+                                     flag the child inherits the observer's
+                                     environment.
     --socket-mode <OCTAL>           File mode for the observer socket
                                      (default 0600 — owner-only r/w).
     --export-file <PATH>            Append one tab-separated event line per
@@ -209,6 +260,9 @@ OPTIONAL:
     --accepted-key-file <PATH>     Path to a file with one hex key per line
                                      for zero-downtime rotation (requires
                                      --features secure-udp).
+    --master-key-file <PATH>       Path to a file containing a 64-hex-char
+                                     master key for per-agent key derivation
+                                     (requires --features secure-udp).
     --key-env <NAME>               Environment variable to read the primary
                                      key from (default VARTA_KEY).
     --max-beat-rate <N>            Per-pid maximum beat rate in beats/sec.
@@ -224,7 +278,11 @@ OPTIONAL:
         let mut socket: Option<PathBuf> = None;
         let mut threshold_ms: Option<u64> = None;
         let mut recovery_cmd: Option<String> = None;
+        let mut recovery_exec_cmd: Option<String> = None;
+        let mut recovery_cmd_file: Option<PathBuf> = None;
+        let mut recovery_exec_file: Option<PathBuf> = None;
         let mut recovery_debounce_ms: Option<u64> = None;
+        let mut recovery_env: Vec<String> = Vec::new();
         let mut file_export: Option<PathBuf> = None;
         let mut export_file_max_bytes: Option<u64> = None;
         let mut prom_addr: Option<SocketAddr> = None;
@@ -237,6 +295,7 @@ OPTIONAL:
         let mut udp_bind_addr: Option<std::net::IpAddr> = None;
         let mut secure_key_file: Option<PathBuf> = None;
         let mut accepted_key_file: Option<PathBuf> = None;
+        let mut master_key_file: Option<PathBuf> = None;
         let mut key_env: String = String::from("VARTA_KEY");
         let mut max_beat_rate: Option<u32> = None;
 
@@ -260,11 +319,35 @@ OPTIONAL:
                         .ok_or(ConfigError::MissingValue("--recovery-cmd"))?;
                     recovery_cmd = Some(v);
                 }
+                "--recovery-exec" => {
+                    let v = iter
+                        .next()
+                        .ok_or(ConfigError::MissingValue("--recovery-exec"))?;
+                    recovery_exec_cmd = Some(v);
+                }
+                "--recovery-cmd-file" => {
+                    let v = iter
+                        .next()
+                        .ok_or(ConfigError::MissingValue("--recovery-cmd-file"))?;
+                    recovery_cmd_file = Some(PathBuf::from(v));
+                }
+                "--recovery-exec-file" => {
+                    let v = iter
+                        .next()
+                        .ok_or(ConfigError::MissingValue("--recovery-exec-file"))?;
+                    recovery_exec_file = Some(PathBuf::from(v));
+                }
                 "--recovery-debounce-ms" => {
                     let v = iter
                         .next()
                         .ok_or(ConfigError::MissingValue("--recovery-debounce-ms"))?;
                     recovery_debounce_ms = Some(parse_u64("--recovery-debounce-ms", &v)?);
+                }
+                "--recovery-env" => {
+                    let v = iter
+                        .next()
+                        .ok_or(ConfigError::MissingValue("--recovery-env"))?;
+                    recovery_env.push(v);
                 }
                 "--socket-mode" => {
                     let v = iter
@@ -344,6 +427,12 @@ OPTIONAL:
                         .ok_or(ConfigError::MissingValue("--accepted-key-file"))?;
                     accepted_key_file = Some(PathBuf::from(v));
                 }
+                "--master-key-file" => {
+                    let v = iter
+                        .next()
+                        .ok_or(ConfigError::MissingValue("--master-key-file"))?;
+                    master_key_file = Some(PathBuf::from(v));
+                }
                 "--key-env" => {
                     key_env = iter.next().ok_or(ConfigError::MissingValue("--key-env"))?;
                 }
@@ -378,7 +467,11 @@ OPTIONAL:
             socket,
             threshold: Duration::from_millis(threshold_ms),
             recovery_cmd,
+            recovery_exec_cmd,
+            recovery_cmd_file,
+            recovery_exec_file,
             recovery_debounce,
+            recovery_env,
             file_export,
             export_file_max_bytes,
             prom_addr,
@@ -391,9 +484,107 @@ OPTIONAL:
             udp_bind_addr,
             secure_key_file,
             accepted_key_file,
+            master_key_file,
             key_env,
             max_beat_rate,
         })
+    }
+
+    /// Resolve recovery mode from CLI flags, enforcing mutual exclusion
+    /// and loading/validating any file-based templates.
+    ///
+    /// Returns `Ok(None)` when no recovery is configured. Returns
+    /// `Ok(Some(RecoveryMode::Shell(_)))` when `--recovery-cmd` or
+    /// `--recovery-cmd-file` is set. Returns `Ok(Some(RecoveryMode::Exec{..}))`
+    /// when `--recovery-exec` or `--recovery-exec-file` is set.
+    ///
+    /// # Errors
+    ///
+    /// Returns an `io::Error` if a file cannot be read, its permissions are
+    /// too open, or mutually exclusive flags are specified.
+    pub fn resolve_recovery_mode(&self) -> std::io::Result<Option<crate::recovery::RecoveryMode>> {
+        use crate::recovery::RecoveryMode;
+
+        // Collect which sources are configured
+        let has_cmd = self.recovery_cmd.is_some();
+        let has_exec = self.recovery_exec_cmd.is_some();
+        let has_cmd_file = self.recovery_cmd_file.is_some();
+        let has_exec_file = self.recovery_exec_file.is_some();
+
+        let shell_any = has_cmd || has_cmd_file;
+        let exec_any = has_exec || has_exec_file;
+
+        // Shell and exec are mutually exclusive
+        if shell_any && exec_any {
+            let shell_flag = if has_cmd {
+                "--recovery-cmd"
+            } else {
+                "--recovery-cmd-file"
+            };
+            let exec_flag = if has_exec {
+                "--recovery-exec"
+            } else {
+                "--recovery-exec-file"
+            };
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("{shell_flag} and {exec_flag} are mutually exclusive"),
+            ));
+        }
+
+        // --recovery-cmd and --recovery-cmd-file are mutually exclusive
+        if has_cmd && has_cmd_file {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "--recovery-cmd and --recovery-cmd-file are mutually exclusive",
+            ));
+        }
+
+        // --recovery-exec and --recovery-exec-file are mutually exclusive
+        if has_exec && has_exec_file {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "--recovery-exec and --recovery-exec-file are mutually exclusive",
+            ));
+        }
+
+        // Shell mode
+        if let Some(ref tpl) = self.recovery_cmd {
+            return Ok(Some(RecoveryMode::Shell(tpl.clone())));
+        }
+        if let Some(ref path) = self.recovery_cmd_file {
+            let template = validate_recovery_file(path)?;
+            return Ok(Some(RecoveryMode::Shell(template)));
+        }
+
+        // Exec mode
+        if let Some(ref cmd) = self.recovery_exec_cmd {
+            let mut parts: Vec<&str> = cmd.split_whitespace().collect();
+            if parts.is_empty() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "--recovery-exec: command must not be empty",
+                ));
+            }
+            let program = parts.remove(0).to_string();
+            let args: Vec<String> = parts.into_iter().map(|s| s.to_string()).collect();
+            return Ok(Some(RecoveryMode::Exec { program, args }));
+        }
+        if let Some(ref path) = self.recovery_exec_file {
+            let cmd = validate_recovery_file(path)?;
+            let mut parts: Vec<&str> = cmd.split_whitespace().collect();
+            if parts.is_empty() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("{}: file is empty", path.display()),
+                ));
+            }
+            let program = parts.remove(0).to_string();
+            let args: Vec<String> = parts.into_iter().map(|s| s.to_string()).collect();
+            return Ok(Some(RecoveryMode::Exec { program, args }));
+        }
+
+        Ok(None)
     }
 
     /// Load the primary and accepted secure keys for AEAD transport.
@@ -473,6 +664,24 @@ OPTIONAL:
 
         Ok(Some((primary, accepted)))
     }
+
+    /// Load the master key for per-agent key derivation.
+    ///
+    /// Returns `Ok(None)` when `--master-key-file` is not set.
+    ///
+    /// # Errors
+    ///
+    /// Returns an `io::Error` if the file cannot be read or the key cannot
+    /// be parsed as a 64-character hex string.
+    #[cfg(feature = "secure-udp")]
+    pub fn load_master_key(&self) -> std::io::Result<Option<varta_vlp::crypto::Key>> {
+        use varta_vlp::crypto::Key;
+
+        match self.master_key_file {
+            Some(ref path) => Key::from_file(path).map(Some),
+            None => Ok(None),
+        }
+    }
 }
 
 fn parse_u64(flag: &'static str, raw: &str) -> Result<u64, ConfigError> {
@@ -501,6 +710,73 @@ fn parse_octal(raw: &str) -> Result<u32, ConfigError> {
         return Err(ConfigError::BadSocketMode(raw.to_string()));
     }
     u32::from_str_radix(digits, 8).map_err(|_| ConfigError::BadSocketMode(raw.to_string()))
+}
+
+/// Validate that a recovery command file meets security requirements.
+///
+/// Checks:
+/// 1. The file is a regular file (not a symlink, directory, or device).
+/// 2. The file is owned by the current process's UID.
+/// 3. The file has no group or other permissions (mode `0o600` or stricter).
+///
+/// Returns the trimmed file contents on success.
+fn validate_recovery_file(path: &Path) -> std::io::Result<String> {
+    use std::os::unix::fs::MetadataExt;
+
+    extern "C" {
+        fn getuid() -> u32;
+    }
+
+    let meta = std::fs::metadata(path)?;
+    if !meta.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("{}: must be a regular file", path.display()),
+        ));
+    }
+
+    let mode = meta.mode() & 0o777;
+    if mode & 0o077 != 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!(
+                "{}: insecure permissions {:03o} (must be 0600 or stricter)",
+                path.display(),
+                mode
+            ),
+        ));
+    }
+
+    let my_uid = unsafe { getuid() };
+    let file_uid = meta.uid();
+    if file_uid != my_uid {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!(
+                "{}: owned by uid {file_uid}, expected uid {my_uid}",
+                path.display()
+            ),
+        ));
+    }
+
+    let content = std::fs::read_to_string(path)?;
+    Ok(content.trim().to_string())
+}
+
+/// Parse a recovery command line into (program, args).
+///
+/// Splits on whitespace. Returns an error if the command line is empty.
+pub fn parse_exec_cmd(cmd: &str) -> std::io::Result<(String, Vec<String>)> {
+    let mut parts: Vec<&str> = cmd.split_whitespace().collect();
+    if parts.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "recovery command must not be empty",
+        ));
+    }
+    let program = parts.remove(0).to_string();
+    let args: Vec<String> = parts.into_iter().map(|s| s.to_string()).collect();
+    Ok((program, args))
 }
 
 #[cfg(test)]
@@ -582,7 +858,11 @@ mod tests {
             "--socket",
             "--threshold-ms",
             "--recovery-cmd",
+            "--recovery-exec",
+            "--recovery-cmd-file",
+            "--recovery-exec-file",
             "--recovery-debounce-ms",
+            "--recovery-env",
             "--recovery-timeout-ms",
             "--read-timeout-ms",
             "--tracker-capacity",
@@ -594,6 +874,7 @@ mod tests {
             "--udp-bind-addr",
             "--key-file",
             "--accepted-key-file",
+            "--master-key-file",
             "--key-env",
             "--max-beat-rate",
             "--help",
@@ -777,5 +1058,132 @@ mod tests {
         ]))
         .expect("parse");
         assert_eq!(cfg.threshold, Duration::from_millis(MIN_THRESHOLD_MS));
+    }
+
+    #[test]
+    fn parses_recovery_exec_cmd() {
+        let cfg = Config::from_args(args(&[
+            "--socket",
+            "/s",
+            "--threshold-ms",
+            "100",
+            "--recovery-exec",
+            "/usr/bin/kill -HUP {pid}",
+        ]))
+        .expect("parse");
+        assert!(cfg.recovery_exec_cmd.is_some());
+        assert!(cfg.recovery_cmd.is_none());
+        let mode = cfg.resolve_recovery_mode().expect("resolve").expect("some");
+        match mode {
+            crate::recovery::RecoveryMode::Exec { program, args } => {
+                assert_eq!(program, "/usr/bin/kill");
+                assert_eq!(args, vec!["-HUP", "{pid}"]);
+            }
+            other => panic!("expected Exec mode, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn recovery_exec_and_recovery_cmd_are_mutually_exclusive() {
+        let cfg = Config::from_args(args(&[
+            "--socket",
+            "/s",
+            "--threshold-ms",
+            "100",
+            "--recovery-cmd",
+            "echo $1",
+            "--recovery-exec",
+            "true",
+        ]))
+        .expect("parse");
+        let err = cfg.resolve_recovery_mode().unwrap_err();
+        assert!(
+            err.to_string().contains("mutually exclusive"),
+            "expected mutual exclusion error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn recovery_cmd_and_cmd_file_are_mutually_exclusive() {
+        let cfg = Config::from_args(args(&[
+            "--socket",
+            "/s",
+            "--threshold-ms",
+            "100",
+            "--recovery-cmd",
+            "echo $1",
+            "--recovery-cmd-file",
+            "/nonexistent",
+        ]))
+        .expect("parse");
+        let err = cfg.resolve_recovery_mode().unwrap_err();
+        assert!(
+            err.to_string().contains("mutually exclusive"),
+            "expected mutual exclusion error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn resolve_shell_mode_from_cmd_flag() {
+        let cfg = Config::from_args(args(&[
+            "--socket",
+            "/s",
+            "--threshold-ms",
+            "100",
+            "--recovery-cmd",
+            "echo $1",
+        ]))
+        .expect("parse");
+        let mode = cfg.resolve_recovery_mode().expect("resolve").expect("some");
+        match mode {
+            crate::recovery::RecoveryMode::Shell(tpl) => assert_eq!(tpl, "echo $1"),
+            other => panic!("expected Shell mode, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn no_recovery_flags_yields_none() {
+        let cfg =
+            Config::from_args(args(&["--socket", "/s", "--threshold-ms", "100"])).expect("parse");
+        let mode = cfg.resolve_recovery_mode().expect("resolve");
+        assert!(mode.is_none());
+    }
+
+    #[test]
+    fn parse_exec_cmd_splits_whitespace() {
+        let (program, args) = super::parse_exec_cmd("kill -HUP {pid}").expect("parse");
+        assert_eq!(program, "kill");
+        assert_eq!(args, vec!["-HUP", "{pid}"]);
+    }
+
+    #[test]
+    fn parse_exec_cmd_rejects_empty() {
+        assert!(super::parse_exec_cmd("").is_err());
+        assert!(super::parse_exec_cmd("   ").is_err());
+    }
+
+    #[test]
+    fn parses_recovery_env_repeatable() {
+        let cfg = Config::from_args(args(&[
+            "--socket",
+            "/s",
+            "--threshold-ms",
+            "100",
+            "--recovery-cmd",
+            "echo $1",
+            "--recovery-env",
+            "FOO=bar",
+            "--recovery-env",
+            "BAZ=qux",
+        ]))
+        .expect("parse");
+        assert_eq!(cfg.recovery_env, vec!["FOO=bar", "BAZ=qux"]);
+    }
+
+    #[test]
+    fn recovery_env_defaults_to_empty() {
+        let cfg =
+            Config::from_args(args(&["--socket", "/s", "--threshold-ms", "100"])).expect("parse");
+        assert!(cfg.recovery_env.is_empty());
     }
 }

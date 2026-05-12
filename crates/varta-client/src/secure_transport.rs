@@ -83,16 +83,53 @@ impl SecureUdpTransport {
         sock.connect(addr)?;
         sock.set_nonblocking(true)?;
 
-        // Read a cryptographically-random IV prefix from /dev/urandom.
-        // This read happens once at connect time (not on the beat path)
-        // and is consistent with the project's file-I/O-at-startup policy
-        // (key files, config files).
         let iv_random = read_iv_random()?;
 
         Ok(SecureUdpTransport {
             sock,
             addr,
             key,
+            iv_counter: 0,
+            iv_random,
+        })
+    }
+
+    /// Create a secure UDP socket using a master key with per-agent key
+    /// derivation.
+    ///
+    /// The agent key is derived from the master key and the calling
+    /// process's PID using [`varta_vlp::crypto::kdf::derive_agent_key`].
+    /// The PID is also embedded in `iv_random[0..4]` so the observer can
+    /// derive the same agent key before decrypting the frame.
+    ///
+    /// `iv_random[4..8]` is filled with 4 random bytes from `/dev/urandom`
+    /// to ensure nonce uniqueness across connections.
+    ///
+    /// # Security
+    ///
+    /// Per-agent key derivation means compromising one agent's derived key
+    /// does not reveal other agents' keys or the master key.
+    pub fn connect_with_master(addr: SocketAddr, master_key: Key) -> io::Result<Self> {
+        use varta_vlp::crypto::kdf;
+
+        let peer_pid = std::process::id();
+        let agent_key = kdf::derive_agent_key(&master_key, peer_pid);
+
+        let sock = bind_ephemeral(&addr)?;
+        sock.connect(addr)?;
+        sock.set_nonblocking(true)?;
+
+        // Encode PID in iv_random[0..4] so the observer can derive the
+        // agent key before decryption. Fill iv_random[4..8] with random
+        // bytes for nonce uniqueness across reconnects.
+        let mut iv_random = [0u8; 8];
+        iv_random[..4].copy_from_slice(&(peer_pid as u32).to_le_bytes());
+        iv_random[4..].copy_from_slice(&read_iv_random_prefix_4()?);
+
+        Ok(SecureUdpTransport {
+            sock,
+            addr,
+            key: agent_key,
             iv_counter: 0,
             iv_random,
         })
@@ -161,7 +198,18 @@ pub(crate) fn read_iv_random() -> io::Result<[u8; 8]> {
     Ok(buf)
 }
 
-/// Fallback IV derivation using an LCG (pid * prime + timestamp).
+/// Read 4 cryptographically-random bytes from `/dev/urandom`.
+///
+/// Used for the random component of the IV prefix in master-key mode,
+/// alongside the 4-byte PID prefix.
+fn read_iv_random_prefix_4() -> io::Result<[u8; 4]> {
+    let mut buf = [0u8; 4];
+    std::fs::File::open("/dev/urandom").and_then(|mut f| {
+        use std::io::Read;
+        f.read_exact(&mut buf)
+    })?;
+    Ok(buf)
+}
 ///
 /// Produces a deterministic 8-byte prefix.  Used only when `/dev/urandom`
 /// is unavailable (e.g. inside a panic handler, where file I/O is not safe).

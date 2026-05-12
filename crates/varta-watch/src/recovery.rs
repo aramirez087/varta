@@ -1,29 +1,67 @@
 //! Per-pid debounced recovery command runner (non-blocking).
 //!
 //! Recovery is the daemon's cold path: it fires only when an agent has
-//! crossed its silence threshold. The runner shells out via `/bin/sh -c`
-//! with the pid passed as positional argument `$1`. A per-pid debounce
-//! window suppresses repeat invocations during a single silence run.
+//! crossed its silence threshold. Two execution modes are available:
 //!
-//! Children are spawned asynchronously; they never block the observer's
-//! poll loop. On each tick, [`Recovery::try_reap`] drains completed or
-//! deadline-exceeded children and returns outcomes for logging.
+//! * **Shell mode** ([`RecoveryMode::Shell`]) — `/bin/sh -c <template>`
+//!   with the pid passed as positional argument `$1`. The template
+//!   body is under full operator control; treat it as a trusted shell
+//!   fragment.
+//! * **Exec mode** ([`RecoveryMode::Exec`]) — `execvp(argv[0], argv[1..])`
+//!   with `{pid}` replaced by the numeric PID in each argument. No shell
+//!   is involved, eliminating shell injection risk entirely.
+//!
+//! A per-pid debounce window suppresses repeat invocations during a single
+//! silence run. Children are spawned asynchronously; they never block the
+//! observer's poll loop. On each tick, [`Recovery::try_reap`] drains
+//! completed or deadline-exceeded children and returns outcomes for
+//! logging.
 //!
 //! # Security
 //!
-//! The `recovery_cmd` template is executed verbatim by `/bin/sh -c` with
-//! the stalling pid passed as `$1`. The pid is always numeric and never
-//! string-interpolated into the script body, eliminating shell injection
-//! risk. **The template body is under full operator control** — anyone who
-//! can pass `--recovery-cmd` to `varta-watch` already has arbitrary code
-//! execution by launching their own subprocess. Treat the template as a
-//! trusted shell fragment and never accept it from an untrusted source
+//! In shell mode the pid is always numeric and never string-interpolated
+//! into the script body. In exec mode no shell is spawned — arguments are
+//! passed directly to `execvp(2)`, so metacharacters have no effect.
+//! **The recovery command source is under full operator control** — anyone
+//! who can pass `--recovery-cmd` / `--recovery-exec` to `varta-watch`
+//! already has arbitrary code execution capability. Treat the template
+//! as a trusted fragment and never derive it from an untrusted source
 //! (e.g. a network request or environment variable from a less-privileged
-//! context).
+//! context). Use `--recovery-cmd-file` / `--recovery-exec-file` with
+//! restrictive file permissions for an additional trust check.
 
 use std::collections::HashMap;
 use std::process::{Child, Command};
 use std::time::{Duration, Instant};
+
+/// How the recovery command is executed when an agent stalls.
+///
+/// Two modes are available:
+///
+/// * [`RecoveryMode::Shell`] — `/bin/sh -c <template>` with the pid
+///   passed as `$1`. Backward compatible; the template body is under
+///   full operator control.
+/// * [`RecoveryMode::Exec`] — `execvp(argv[0], argv[1..])`. `{pid}` in
+///   any argument is replaced with the numeric PID. No shell is
+///   involved, so shell metacharacters have no effect.
+#[derive(Clone, Debug)]
+pub enum RecoveryMode {
+    /// Execute via `/bin/sh -c <template>`. The stalled pid is passed
+    /// as positional argument `$1` (appended after the template and
+    /// the `$0` sentinel `"varta-recovery"`).
+    Shell(String),
+    /// Execute a command directly via `execvp(2)` — no shell is spawned,
+    /// so shell injection is structurally impossible. Any argument
+    /// containing the literal `{pid}` is substituted with the decimal
+    /// representation of the stalled PID.
+    Exec {
+        /// `argv[0]` — the executable to invoke.
+        program: String,
+        /// `argv[1..]` — additional arguments. `{pid}` is replaced in
+        /// each argument with the stalled PID.
+        args: Vec<String>,
+    },
+}
 
 /// Outcome of [`Recovery::on_stall`] or [`Recovery::try_reap`].
 #[derive(Debug)]
@@ -73,21 +111,40 @@ const MAX_LAST_FIRED_CAPACITY: usize = 256;
 
 /// Per-pid debounced runner of a `recovery_cmd` template.
 pub struct Recovery {
-    template: String,
+    mode: RecoveryMode,
     debounce: Duration,
     last_fired: HashMap<u32, Instant>,
     timeout: Option<Duration>,
     outstanding: HashMap<u32, Outstanding>,
     pending_outcomes: Vec<RecoveryOutcome>,
+    /// Explicit environment variables for child processes in `KEY=VALUE`
+    /// format. When non-empty, the child's environment is cleared to
+    /// `PATH=/usr/bin:/bin` plus these variables. When empty, the child
+    /// inherits the observer's environment (backward compatible).
+    recovery_env: Vec<String>,
 }
 
 impl Recovery {
-    /// Create a new runner with the given `template` and `debounce`
-    /// window.
+    /// Create a new runner in shell mode with the given `template` and
+    /// `debounce` window.
     ///
     /// Equivalent to [`Recovery::with_timeout(template, debounce, None)`].
     pub fn new(template: String, debounce: Duration) -> Self {
-        Self::with_timeout(template, debounce, None)
+        Self::with_timeout(RecoveryMode::Shell(template), debounce, None)
+    }
+
+    /// Create a new runner in exec mode.
+    ///
+    /// `program` is the executable to invoke (`argv[0]`). `args` are
+    /// additional arguments. `{pid}` is replaced in each argument with
+    /// the stalled PID.
+    pub fn new_exec(program: String, args: Vec<String>, debounce: Duration) -> Self {
+        Self::with_timeout(RecoveryMode::Exec { program, args }, debounce, None)
+    }
+
+    /// Create a new runner with an explicit [`RecoveryMode`].
+    pub fn with_mode(mode: RecoveryMode, debounce: Duration) -> Self {
+        Self::with_timeout(mode, debounce, None)
     }
 
     /// Create a new runner with an optional kill-after deadline.
@@ -96,15 +153,40 @@ impl Recovery {
     /// are reaped on completion but are never killed. `timeout = Some(d)`
     /// asks `try_reap` to issue `kill(2)` once a child has been
     /// outstanding longer than `d`.
-    pub fn with_timeout(template: String, debounce: Duration, timeout: Option<Duration>) -> Self {
+    pub fn with_timeout(mode: RecoveryMode, debounce: Duration, timeout: Option<Duration>) -> Self {
         Recovery {
-            template,
+            mode,
             debounce,
             last_fired: HashMap::new(),
             timeout,
             outstanding: HashMap::new(),
             pending_outcomes: Vec::new(),
+            recovery_env: Vec::new(),
         }
+    }
+
+    /// Set explicit environment variables for child processes.
+    ///
+    /// Each entry is in `KEY=VALUE` format. When non-empty, the child's
+    /// environment is cleared to `PATH=/usr/bin:/bin` plus these variables.
+    /// When empty, the child inherits the observer's environment (backward
+    /// compatible default).
+    pub fn with_recovery_env(mut self, env: Vec<String>) -> Self {
+        self.recovery_env = env;
+        self
+    }
+
+    /// Create a legacy runner from a shell template string.
+    ///
+    /// Kept for backward compatibility with callers that hold a
+    /// `template: String`.
+    #[doc(hidden)]
+    pub fn with_template_and_timeout(
+        template: String,
+        debounce: Duration,
+        timeout: Option<Duration>,
+    ) -> Self {
+        Self::with_timeout(RecoveryMode::Shell(template), debounce, timeout)
     }
 
     fn reap_finished_child(&mut self, pid: u32) -> Option<RecoveryOutcome> {
@@ -123,13 +205,12 @@ impl Recovery {
         }
     }
 
-    /// Spawn `/bin/sh -c <template> varta-recovery <pid>` non-blockingly.
+    /// Spawn `/bin/sh -c <template> varta-recovery <pid>` (shell mode) or
+    /// `execvp <program> <args...>` (exec mode), both non-blockingly.
     ///
-    /// The template receives the stalling pid as `$1`.
-    /// for `pid` is still inside the debounce window or if that pid already
-    /// has an outstanding recovery child. The debounce is per-pid and
-    /// monotonic — distinct pids may fire within a single window without
-    /// suppressing one another.
+    /// In shell mode the template receives the stalling pid as `$1`. In exec
+    /// mode `{pid}` in any argument is replaced with the numeric PID.
+    /// A per-pid debounce window suppresses repeat invocations.
     pub fn on_stall(&mut self, pid: u32) -> RecoveryOutcome {
         let now = Instant::now();
 
@@ -163,26 +244,77 @@ impl Recovery {
             self.last_fired.insert(pid, now);
         }
 
-        match Command::new("/bin/sh")
-            .arg("-c")
-            .arg(&self.template)
-            .arg("varta-recovery")
-            .arg(pid.to_string())
-            .spawn()
-        {
-            Ok(child) => {
-                let child_pid = child.id();
-                self.outstanding.insert(
-                    pid,
-                    Outstanding {
-                        child,
-                        spawned_at: now,
-                        killed: false,
-                    },
-                );
-                RecoveryOutcome::Spawned { child_pid }
+        match &self.mode {
+            RecoveryMode::Shell(template) => {
+                let mut cmd = Command::new("/bin/sh");
+                self.apply_env(&mut cmd);
+                match cmd
+                    .arg("-c")
+                    .arg(template)
+                    .arg("varta-recovery")
+                    .arg(pid.to_string())
+                    .spawn()
+                {
+                    Ok(child) => {
+                        let child_pid = child.id();
+                        self.outstanding.insert(
+                            pid,
+                            Outstanding {
+                                child,
+                                spawned_at: now,
+                                killed: false,
+                            },
+                        );
+                        RecoveryOutcome::Spawned { child_pid }
+                    }
+                    Err(e) => RecoveryOutcome::SpawnFailed(e),
+                }
             }
-            Err(e) => RecoveryOutcome::SpawnFailed(e),
+            RecoveryMode::Exec { program, args } => {
+                let pid_str = pid.to_string();
+                let substituted: Vec<String> = std::iter::once(program.clone())
+                    .chain(args.iter().map(|a| a.replace("{pid}", &pid_str)))
+                    .collect();
+                let mut cmd = Command::new(&substituted[0]);
+                self.apply_env(&mut cmd);
+                for arg in &substituted[1..] {
+                    cmd.arg(arg);
+                }
+                match cmd.spawn() {
+                    Ok(child) => {
+                        let child_pid = child.id();
+                        self.outstanding.insert(
+                            pid,
+                            Outstanding {
+                                child,
+                                spawned_at: now,
+                                killed: false,
+                            },
+                        );
+                        RecoveryOutcome::Spawned { child_pid }
+                    }
+                    Err(e) => RecoveryOutcome::SpawnFailed(e),
+                }
+            }
+        }
+    }
+
+    /// Apply environment isolation to a child [`Command`].
+    ///
+    /// When [`Self::recovery_env`] is non-empty, clears the environment to
+    /// `PATH=/usr/bin:/bin` plus the explicitly configured variables.  When
+    /// empty, does nothing (child inherits the observer's environment,
+    /// preserving backward compatibility).
+    fn apply_env(&self, cmd: &mut Command) {
+        if self.recovery_env.is_empty() {
+            return;
+        }
+        cmd.env_clear();
+        cmd.env("PATH", "/usr/bin:/bin");
+        for entry in &self.recovery_env {
+            if let Some((key, value)) = entry.split_once('=') {
+                cmd.env(key, value);
+            }
         }
     }
 
@@ -316,7 +448,7 @@ mod tests {
 
     #[test]
     fn does_not_replace_outstanding_child_for_same_pid() {
-        let mut rec = Recovery::with_timeout(
+        let mut rec = Recovery::with_template_and_timeout(
             "sleep 5".to_string(),
             Duration::ZERO,
             Some(Duration::from_millis(50)),
@@ -415,7 +547,7 @@ mod tests {
 
     #[test]
     fn try_reap_kills_after_timeout() {
-        let mut rec = Recovery::with_timeout(
+        let mut rec = Recovery::with_template_and_timeout(
             "sleep 5".to_string(),
             Duration::ZERO,
             Some(Duration::from_millis(100)),
@@ -471,8 +603,8 @@ mod tests {
 
     #[test]
     fn with_timeout_constructor_accepts_optional_duration() {
-        let _none = Recovery::with_timeout("true".to_string(), Duration::ZERO, None);
-        let _some = Recovery::with_timeout(
+        let _none = Recovery::with_template_and_timeout("true".to_string(), Duration::ZERO, None);
+        let _some = Recovery::with_template_and_timeout(
             "true".to_string(),
             Duration::ZERO,
             Some(Duration::from_millis(50)),
@@ -491,5 +623,194 @@ mod tests {
         std::thread::sleep(prune_threshold + Duration::from_millis(40));
 
         assert!(matches!(rec.on_stall(1), RecoveryOutcome::Spawned { .. }));
+    }
+
+    #[test]
+    fn exec_mode_spawns_command_via_execvp() {
+        let mut rec = Recovery::with_mode(
+            RecoveryMode::Exec {
+                program: "true".to_string(),
+                args: vec![],
+            },
+            Duration::ZERO,
+        );
+        match rec.on_stall(42) {
+            RecoveryOutcome::Spawned { .. } => {
+                std::thread::sleep(Duration::from_millis(50));
+                let outcomes = rec.try_reap();
+                let reaped = outcomes.into_iter().find_map(|o| match o {
+                    RecoveryOutcome::Reaped { status, .. } => Some(status),
+                    _ => None,
+                });
+                assert!(
+                    matches!(reaped, Some(s) if s.success()),
+                    "expected exec mode to spawn and reap true; got {reaped:?}"
+                );
+            }
+            other => panic!("expected Spawned in exec mode, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn exec_mode_substitutes_pid_in_args() {
+        let mut rec = Recovery::with_mode(
+            RecoveryMode::Exec {
+                program: "sh".to_string(),
+                args: vec![
+                    "-c".to_string(),
+                    "test \"$1\" = \"42\"".to_string(),
+                    "varta-recovery".to_string(),
+                    "{pid}".to_string(),
+                ],
+            },
+            Duration::ZERO,
+        );
+        match rec.on_stall(42) {
+            RecoveryOutcome::Spawned { .. } => {
+                std::thread::sleep(Duration::from_millis(100));
+                let outcomes = rec.try_reap();
+                let reaped = outcomes.into_iter().find_map(|o| match o {
+                    RecoveryOutcome::Reaped { status, .. } => Some(status),
+                    _ => None,
+                });
+                assert!(
+                    matches!(reaped, Some(s) if s.success()),
+                    "expected {{pid}} substitution in exec mode; got {reaped:?}"
+                );
+            }
+            other => panic!("expected Spawned, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn exec_mode_no_shell_injection_via_pid_substitution() {
+        let mut rec = Recovery::with_mode(
+            RecoveryMode::Exec {
+                program: "true".to_string(),
+                args: vec!["{pid}".to_string()],
+            },
+            Duration::ZERO,
+        );
+        match rec.on_stall(42) {
+            RecoveryOutcome::Spawned { .. } => {
+                std::thread::sleep(Duration::from_millis(50));
+                let outcomes = rec.try_reap();
+                assert!(
+                    outcomes.iter().any(
+                        |o| matches!(o, RecoveryOutcome::Reaped { status, .. } if status.success())
+                    ),
+                    "exec mode with {{pid}} in args should succeed: {outcomes:?}"
+                );
+            }
+            other => panic!("expected Spawned, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn env_isolation_clears_inherited_environment() {
+        let mut rec = Recovery::with_timeout(
+            RecoveryMode::Shell("test -z \"$HOME\"".to_string()),
+            Duration::ZERO,
+            None,
+        )
+        .with_recovery_env(vec!["FOO=bar".to_string()]);
+        match rec.on_stall(1) {
+            RecoveryOutcome::Spawned { .. } => {
+                std::thread::sleep(Duration::from_millis(100));
+                let outcomes = rec.try_reap();
+                let reaped = outcomes.into_iter().find_map(|o| match o {
+                    RecoveryOutcome::Reaped { status, .. } => Some(status),
+                    _ => None,
+                });
+                assert!(
+                    matches!(reaped, Some(s) if s.success()),
+                    "HOME should not be set when recovery_env is non-empty; got {reaped:?}"
+                );
+            }
+            other => panic!("expected Spawned, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn env_isolation_passes_explicit_variables() {
+        let mut rec = Recovery::with_timeout(
+            RecoveryMode::Shell(
+                "test \"$MYVAR\" = \"hello\" && test \"$OTHER\" = \"world\"".to_string(),
+            ),
+            Duration::ZERO,
+            None,
+        )
+        .with_recovery_env(vec!["MYVAR=hello".to_string(), "OTHER=world".to_string()]);
+        match rec.on_stall(1) {
+            RecoveryOutcome::Spawned { .. } => {
+                std::thread::sleep(Duration::from_millis(100));
+                let outcomes = rec.try_reap();
+                let reaped = outcomes.into_iter().find_map(|o| match o {
+                    RecoveryOutcome::Reaped { status, .. } => Some(status),
+                    _ => None,
+                });
+                assert!(
+                    matches!(reaped, Some(s) if s.success()),
+                    "explicit env vars should be visible to child; got {reaped:?}"
+                );
+            }
+            other => panic!("expected Spawned, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn no_env_isolation_preserves_inherited_env() {
+        let mut rec = Recovery::with_timeout(
+            RecoveryMode::Shell("test -n \"$HOME\"".to_string()),
+            Duration::ZERO,
+            None,
+        );
+        // Default: recovery_env is empty → inherits observer's environment.
+        match rec.on_stall(1) {
+            RecoveryOutcome::Spawned { .. } => {
+                std::thread::sleep(Duration::from_millis(100));
+                let outcomes = rec.try_reap();
+                let reaped = outcomes.into_iter().find_map(|o| match o {
+                    RecoveryOutcome::Reaped { status, .. } => Some(status),
+                    _ => None,
+                });
+                assert!(
+                    matches!(reaped, Some(s) if s.success()),
+                    "HOME should be inherited when recovery_env is empty; got {reaped:?}"
+                );
+            }
+            other => panic!("expected Spawned, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn exec_mode_env_isolation_clears_environment() {
+        let mut rec = Recovery::with_timeout(
+            RecoveryMode::Exec {
+                program: "sh".to_string(),
+                args: vec![
+                    "-c".to_string(),
+                    "test -z \"$HOME\" && test \"$E1\" = \"a\" && test \"$E2\" = \"b\"".to_string(),
+                ],
+            },
+            Duration::ZERO,
+            None,
+        )
+        .with_recovery_env(vec!["E1=a".to_string(), "E2=b".to_string()]);
+        match rec.on_stall(1) {
+            RecoveryOutcome::Spawned { .. } => {
+                std::thread::sleep(Duration::from_millis(100));
+                let outcomes = rec.try_reap();
+                let reaped = outcomes.into_iter().find_map(|o| match o {
+                    RecoveryOutcome::Reaped { status, .. } => Some(status),
+                    _ => None,
+                });
+                assert!(
+                    matches!(reaped, Some(s) if s.success()),
+                    "exec mode env isolation failed; got {reaped:?}"
+                );
+            }
+            other => panic!("expected Spawned, got {other:?}"),
+        }
     }
 }

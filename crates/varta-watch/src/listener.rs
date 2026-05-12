@@ -317,6 +317,7 @@ mod udp_impl {
                     Ok(32) => {
                         return RecvResult::Authenticated {
                             peer_pid: 0,
+                            peer_uid: 0,
                             data: buf,
                         };
                     }

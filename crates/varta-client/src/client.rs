@@ -256,6 +256,37 @@ impl Varta<SecureUdpTransport> {
             reconnect_after: 0,
         })
     }
+
+    /// Connect via ChaCha20-Poly1305 AEAD over UDP using a master key.
+    ///
+    /// The per-agent key is derived via
+    /// [`varta_vlp::crypto::kdf::derive_agent_key`] from the master key
+    /// and the calling process's PID. The PID is also embedded in the
+    /// `iv_random` prefix so the observer can derive the same agent key
+    /// before decrypting the frame.
+    ///
+    /// Per-agent keys mean that compromise of one agent's derived key
+    /// does not reveal other agents' keys or the master key.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`io::Error`] if the socket cannot be created, connected,
+    /// or switched to non-blocking mode.
+    pub fn connect_secure_udp_with_master(
+        addr: std::net::SocketAddr,
+        master_key: Key,
+    ) -> io::Result<Self> {
+        let transport = SecureUdpTransport::connect_with_master(addr, master_key)?;
+        Ok(Self {
+            transport,
+            buf: [0u8; 32],
+            start: Instant::now(),
+            last_pid: std::process::id(),
+            nonce: 0,
+            consecutive_dropped: 0,
+            reconnect_after: 0,
+        })
+    }
 }
 
 impl<T: BeatTransport> Varta<T> {

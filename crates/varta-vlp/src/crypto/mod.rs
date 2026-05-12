@@ -16,6 +16,7 @@
 
 pub mod aead;
 pub mod chacha20;
+pub mod kdf;
 pub mod poly1305;
 
 pub use aead::{open, seal, AuthError};

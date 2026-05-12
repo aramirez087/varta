@@ -30,33 +30,59 @@ fail-safe if a permission bypass is ever discovered.
 
 ### macOS
 
-Apple's `AF_UNIX` `SOCK_DGRAM` implementation does not expose a reliable
-per-datagram PID on the server side of an unconnected socket.
-`LOCAL_CREDS` (`setsockopt`) is not supported for `SOCK_DGRAM` on
-current macOS versions, and `LOCAL_PEERPID` (`getsockopt`) is only
-available for connected sockets.
+On macOS, the observer attempts `getsockopt(LOCAL_PEERTOKEN)` immediately
+after each `recvmsg(2)`. `LOCAL_PEERTOKEN` returns an `audit_token_t`
+containing the sender's PID, UID, GID, and audit information. Because the
+observer is single-threaded and calls `getsockopt` immediately after
+`recvmsg`, no other datagram can arrive between the two syscalls.
 
-On macOS, per-datagram PID verification is therefore **not performed** — the observer
-accepts any well-formed frame from a process that can reach the socket.
-The primary defence on macOS is **Layer 1** (`--socket-mode 0600`).
+When `LOCAL_PEERTOKEN` succeeds, the observer performs the same PID + UID
+verification as on Linux. When it fails (e.g. on older macOS versions or
+when the kernel does not expose per-datagram credentials for unconnected
+`SOCK_DGRAM`), the observer falls back to the sentinel PID 0 — relying
+on `--socket-mode 0600` as the primary defence.
 
-> **Warning:** On non-Linux platforms (macOS, FreeBSD, NetBSD, OpenBSD, DragonFly,
-> Solaris, illumos, etc.), `varta-watch` emits a startup warning via stderr:
+### FreeBSD, DragonFly BSD, NetBSD
+
+On FreeBSD-family platforms, the observer sets `LOCAL_CREDS` on the
+socket (value `0x0002` on FreeBSD/DragonFly, `0x0001` on NetBSD).  Every
+`recvmsg(2)` then receives a `SCM_CREDS` ancillary message containing a
+`struct cmsgcred { cmcred_pid, cmcred_uid, cmcred_euid, cmcred_gid, ... }`
+populated by the kernel.  The observer extracts `cmcred_pid` and
+`cmcred_euid` and performs the same PID + UID verification as on Linux.
+
+The ancillary buffer is sized at 256 bytes — sufficient for the 84-byte
+`cmsgcred` with generous headroom for future kernel extensions.
+
+> **Note:** On platforms other than Linux, macOS, FreeBSD, DragonFly, and
+> NetBSD (OpenBSD, Solaris, illumos, etc.), `varta-watch` emits a startup
+> warning via stderr:
 > `"per-datagram PID verification is unavailable. The only defence is
-> --socket-mode (default 0600); any process under the same UID can impersonate
-> any PID."`  This is by design — the kernel does not expose per-datagram peer
-> credentials for unconnected `SOCK_DGRAM` on these platforms.  Containers that
-> run multiple processes under the same UID should be aware of this limitation.
+> --socket-mode (default 0600); any process under the same UID can
+> impersonate any PID."` This is by design — the kernel does not expose
+> per-datagram peer credentials for unconnected `SOCK_DGRAM` on these
+> platforms. Containers that run multiple processes under the same UID
+> should be aware of this limitation.
 
-#### Future work: macOS
+## Recovery command environment isolation
 
-Apple's recommended approach for inter-process identity verification is
-App Sandbox entitlements (`com.apple.security.temporary-exception.mach`),
-not raw credential passing over `AF_UNIX`.  For a cross-platform Rust
-tool with a zero-registry-dependency constraint, `--socket-mode 0600`
-is the most pragmatic and reliable option.  If `LOCAL_CREDS` gains
-stable `SOCK_DGRAM` support in a future macOS release, the observer
-could adopt the same `recvmsg` + credential-parse path used on Linux.
+When `--recovery-env KEY=VALUE` is specified (repeatable), the recovery
+child process runs with a sanitized environment:
+
+1. The child's environment is cleared entirely.
+2. `PATH` is set to `/usr/bin:/bin` (sufficient to locate common tools).
+3. Only the explicitly-listed `KEY=VALUE` pairs are exported.
+
+Without `--recovery-env`, the child inherits the observer's full
+environment (backward compatible).  This flag provides defense-in-depth
+against environment-variable-based injection vectors (e.g. a malicious
+`LD_PRELOAD` or `IFS` in the observer's environment that could affect
+`/bin/sh -c` behaviour).
+
+When `--recovery-cmd` (inline shell template) is used, the observer
+emits a stderr warning recommending `--recovery-cmd-file` (with
+restrictive file permissions) or `--recovery-exec` (no shell) for
+production deployments.
 
 ## Template safety
 
@@ -76,17 +102,23 @@ metacharacters (`;`, `|`, `&`, `$`, `` ` ``, etc.).
 
 ```
  Process ── connect(2) to UDS ──┐
-                                  ├─ [FAIL]  Kernel blocks (Layer 1: --socket-mode 0600, wrong UID)
-                                  ├─ [PASS]  Layer 2: SO_PASSCRED → ucred.pid (Linux only)
-                                  │          ├─ [PID MISMATCH] → Drop frame + bump counter
-                                  │          └─ [PID MATCH]    →
-                                  ↓
-                             [SUCCESS]  Observer trusts the PID → tracks,
-                                        surfaces stalls, triggers --recovery-cmd
-                                        with {pid} substitution.
+                                   ├─ [FAIL]  Kernel blocks (Layer 1: --socket-mode 0600, wrong UID)
+                                   ├─ [PASS]  Layer 2: SO_PASSCRED → ucred.pid (Linux)
+                                   │          Layer 2: LOCAL_PEERTOKEN → audit_token.pid (macOS, best-effort)
+                                   │          Layer 2: LOCAL_CREDS → cmsgcred.pid (FreeBSD, DragonFly, NetBSD)
+                                   │          ├─ [PID MISMATCH] → Drop frame + bump counter
+                                   │          ├─ [UID MISMATCH] → Drop frame as IoError
+                                   │          └─ [PID MATCH + UID MATCH] →
+                                   ↓
+                              [SUCCESS]  Observer trusts the PID → tracks,
+                                         surfaces stalls, triggers --recovery-cmd
+                                         with {pid} substitution.
 ```
 
 The trust boundary is the kernel: a frame is only accepted if the kernel
 attests that the sending process's PID matches the one encoded in the
-VLP frame.  On Linux this is enforced per-datagram; on macOS the same
-UID is trusted by process isolation.
+VLP frame and that the sending process runs under the observer's UID.
+On Linux this is enforced per-datagram via `SO_PASSCRED`; on macOS via
+`getsockopt(LOCAL_PEERTOKEN)` when available; on FreeBSD / DragonFly /
+NetBSD via `LOCAL_CREDS` + `SCM_CREDS`.  Platforms without kernel-level
+credential passing fall back to `--socket-mode 0600`.

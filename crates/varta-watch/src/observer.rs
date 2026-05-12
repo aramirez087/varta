@@ -193,14 +193,22 @@ impl Observer {
             let i = (start + round) % len;
             round += 1;
             match self.listeners[i].recv() {
-                RecvResult::Authenticated { peer_pid, data } => {
+                RecvResult::Authenticated {
+                    peer_pid,
+                    peer_uid: _,
+                    data,
+                } => {
                     let now_ns = self.now_ns();
                     if first_event.is_none() {
                         self.next_listener_start = (i + 1) % len;
                     }
                     match Frame::decode(&data) {
                         Ok(frame) => {
-                            #[cfg(target_os = "linux")]
+                            // Per-datagram PID verification — works on Linux
+                            // (SCM_CREDENTIALS via SO_PASSCRED) and macOS
+                            // (LOCAL_PEERTOKEN via getsockopt). For transports
+                            // without kernel credential support, peer_pid is 0
+                            // and this check is a no-op.
                             if peer_pid != 0 && frame.pid != peer_pid {
                                 if first_event.is_none() {
                                     first_event = Some(Event::AuthFailure {
@@ -209,10 +217,6 @@ impl Observer {
                                     });
                                 }
                                 continue;
-                            }
-                            #[cfg(not(target_os = "linux"))]
-                            {
-                                let _ = peer_pid;
                             }
                             // Per-pid rate limiting: if a minimum inter-beat
                             // interval is configured, skip frames that arrive

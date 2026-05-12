@@ -2,13 +2,14 @@
 //!
 //! On Linux the observer calls `recvmsg(2)` with `SO_PASSCRED` enabled so
 //! the kernel attaches `SCM_CREDENTIALS` (containing `struct ucred`) to each
-//! datagram.
+//! datagram. Both PID and UID are verified against the VLP frame and the
+//! observer's own identity.
 //!
-//! On macOS per-datagram peer PID is not available for unconnected
-//! `SOCK_DGRAM` (`LOCAL_CREDS` is not supported and `LOCAL_PEERPID` only
-//! works on connected sockets), so the observer falls back to a sentinel
-//! PID and relies on `--socket-mode 0600` to restrict the trust boundary
-//! to the owning UID.  See `docs/architecture/peer-authentication.md`.
+//! On macOS per-datagram peer credentials are obtained via `getsockopt(2)`
+//! with `LOCAL_PEERTOKEN`, which returns an `audit_token_t` containing the
+//! sender's PID, UID, GID, etc. Because the observer is single-threaded and
+//! calls `getsockopt(LOCAL_PEERTOKEN)` immediately after `recvmsg(2)`, no
+//! other datagram can arrive between the two syscalls.
 //!
 //! The module uses only inline `extern "C"` FFI — no `libc` crate — to
 //! satisfy the workspace's zero-registry-dependency constraint.
@@ -21,14 +22,15 @@ use std::io;
 
 /// Outcome of a single `recvmsg(2)` call with credential extraction.
 pub enum RecvResult {
-    /// A full 32-byte frame was received along with credentials; `peer_pid`
-    /// is the PID the kernel attributes the datagram to. On Linux this is
-    /// derived from SCM_CREDENTIALS (SO_PASSCRED); on macOS it's a sentinel
-    /// since per-datagram PIDs are not available for unconnected SOCK_DGRAM.
+    /// A full 32-byte frame was received along with credentials. `peer_pid`
+    /// is the PID the kernel attributes the datagram to and `peer_uid` is
+    /// the effective UID. On Linux this is derived from SCM_CREDENTIALS
+    /// (SO_PASSCRED); on macOS it's obtained via `getsockopt(LOCAL_PEERTOKEN)`.
     Authenticated {
-        /// Kernel-attested PID of the sending process (Linux) or sentinel 0
-        /// (macOS — no per-datagram credential support).
+        /// Kernel-attested PID of the sending process.
         peer_pid: u32,
+        /// Kernel-attested effective UID of the sending process.
+        peer_uid: u32,
         /// Received frame payload (always 32 bytes).
         data: [u8; 32],
     },
@@ -49,16 +51,28 @@ pub enum RecvResult {
 }
 
 // ---------------------------------------------------------------------------
-// Linux-specific CMSG helpers
+// CMSG alignment helpers (shared by all CMSG-using platforms)
 // ---------------------------------------------------------------------------
 
-#[cfg(target_os = "linux")]
+#[cfg(any(
+    target_os = "linux",
+    target_os = "freebsd",
+    target_os = "dragonfly",
+    target_os = "netbsd",
+))]
 const fn cmsg_align(len: usize) -> usize {
+    // On all supported 64-bit platforms, sizeof(size_t) == sizeof(long) == 8,
+    // which matches CMSG_ALIGN.  On 32-bit both are 4.
     let align = core::mem::size_of::<usize>();
     (len + align - 1) & !(align - 1)
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(
+    target_os = "linux",
+    target_os = "freebsd",
+    target_os = "dragonfly",
+    target_os = "netbsd",
+))]
 const fn cmsg_hdr_size() -> usize {
     cmsg_align(core::mem::size_of::<plat::Cmsghdr>())
 }
@@ -154,9 +168,13 @@ mod plat {
     const _: () =
         assert!(ANCILLARY_BUFFER_SIZE >= super::cmsg_hdr_size() + core::mem::size_of::<Ucred>());
 
-    /// Extract peer PID after a successful `recvmsg` — on Linux this is
+    /// Extract peer PID and UID after a successful `recvmsg` — on Linux this is
     /// done via ancillary-data parsing.
-    pub(super) fn peer_pid_after_recv(_fd: i32, mhdr: &Msghdr, anc_base: *const u8) -> Option<u32> {
+    pub(super) fn peer_pid_after_recv(
+        _fd: i32,
+        mhdr: &Msghdr,
+        anc_base: *const u8,
+    ) -> Option<(u32, u32)> {
         debug_assert_eq!(
             mhdr.msg_control as *const u8, anc_base,
             "msg_control and ancillary buffer base must be the same address"
@@ -222,33 +240,82 @@ mod plat {
         pub msg_flags: i32,
     }
 
+    // audit_token_t: 8 × u32 (32 bytes), fields from <security/audit/audit.h>
+    //   at_auid: [0], at_euid: [1], at_egid: [2], at_ruid: [3]
+    //   at_rgid: [4], at_pid:  [5], at_asid: [6], at_tid:  [7]
+    #[repr(C)]
+    pub(super) struct AuditToken {
+        pub val: [u32; 8],
+    }
+
+    // --- constants --------------------------------------------------------
+
+    // SOL_SOCKET on macOS / XNU = 0xffff (<sys/socket.h>)
+    pub(super) const SOL_SOCKET: i32 = 0xffff;
+    // LOCAL_PEERTOKEN = 0x0021 (<sys/un.h>) — get the peer's audit token
+    pub(super) const LOCAL_PEERTOKEN: i32 = 0x0021;
+
     // --- FFI --------------------------------------------------------------
 
     extern "C" {
         pub(super) fn recvmsg(fd: i32, msg: *mut Msghdr, flags: i32) -> isize;
+        pub(super) fn getsockopt(
+            fd: i32,
+            level: i32,
+            optname: i32,
+            optval: *mut c_void,
+            optlen: *mut u32,
+        ) -> i32;
     }
 
     // --- ancillary buffer sizing ------------------------------------------
 
     pub(super) const ANCILLARY_BUFFER_SIZE: usize = 16;
 
-    /// Extract peer PID after a successful `recvmsg` on macOS.
+    /// Extract peer PID and UID after a successful `recvmsg` on macOS.
     ///
-    /// macOS does not expose a reliable per-datagram PID on the server side
-    /// of an unconnected `SOCK_DGRAM` socket (LOCAL_PEERPID works for connected
-    /// sockets only).  We return a sentinel so the observer can proceed — the
-    /// primary defence on macOS is `--socket-mode 0600` which restricts access
-    /// to the owning UID.
+    /// Attempts `getsockopt(LOCAL_PEERTOKEN)` which returns an `audit_token_t`
+    /// containing the sender's identity. Because the observer is
+    /// single-threaded and this is called immediately after `recvmsg(2)`, no
+    /// other datagram can arrive between the two syscalls.
+    ///
+    /// Falls back to sentinel (0, 0) if `getsockopt` fails (e.g. on older
+    /// macOS versions or unconnected `SOCK_DGRAM` where the kernel doesn't
+    /// expose per-datagram credentials). In that case the primary defence
+    /// remains `--socket-mode 0600`.
     pub(super) fn peer_pid_after_recv(
-        _fd: i32,
+        fd: i32,
         _mhdr: &Msghdr,
         _anc_base: *const u8,
-    ) -> Option<u32> {
-        Some(0)
+    ) -> Option<(u32, u32)> {
+        let mut token = AuditToken { val: [0u32; 8] };
+        let mut optlen: u32 = mem::size_of::<AuditToken>() as u32;
+        let ret = unsafe {
+            getsockopt(
+                fd,
+                SOL_SOCKET,
+                LOCAL_PEERTOKEN,
+                &mut token as *mut AuditToken as *mut c_void,
+                &mut optlen,
+            )
+        };
+        if ret != 0 {
+            // Fall back to sentinel — the kernel may not support
+            // per-datagram LOCAL_PEERTOKEN on unconnected SOCK_DGRAM.
+            return Some((0, 0));
+        }
+        if (optlen as usize) < mem::size_of::<AuditToken>() {
+            return Some((0, 0));
+        }
+        // at_pid is at index 5, at_euid is at index 1
+        Some((token.val[5], token.val[1]))
     }
 
     // Compile-time invariant: macOS msghdr is 48 bytes on x86_64 + aarch64.
     const _: () = assert!(mem::size_of::<Msghdr>() == 48);
+
+    // Compile-time invariant: audit_token_t is 8 × u32 = 32 bytes.
+    const _: () = assert!(mem::size_of::<AuditToken>() == 32);
 
     // Compile-time offset-of assertions for every field the recvmsg path
     // touches.  Manual layouts are a tradeoff: we avoid the libc crate to
@@ -269,6 +336,161 @@ mod plat {
 }
 
 // ---------------------------------------------------------------------------
+// FreeBSD / DragonFly / NetBSD — SCM_CREDS via LOCAL_CREDS
+// ---------------------------------------------------------------------------
+
+#[cfg(any(target_os = "freebsd", target_os = "dragonfly", target_os = "netbsd"))]
+mod plat {
+    use core::ffi::c_void;
+    use core::mem;
+
+    // --- structs ----------------------------------------------------------
+
+    #[repr(C)]
+    pub(super) struct Iovec {
+        pub iov_base: *mut c_void,
+        pub iov_len: usize,
+    }
+
+    #[repr(C)]
+    pub(super) struct Msghdr {
+        pub msg_name: *mut c_void,
+        pub msg_namelen: u32,
+        pub _pad1: u32,
+        pub msg_iov: *mut Iovec,
+        pub msg_iovlen: i32,
+        pub _pad2: u32,
+        pub msg_control: *mut c_void,
+        pub msg_controllen: u32,
+        pub msg_flags: i32,
+    }
+
+    #[repr(C)]
+    pub(super) struct Cmsghdr {
+        pub cmsg_len: u32,
+        pub cmsg_level: i32,
+        pub cmsg_type: i32,
+    }
+
+    /// `struct cmsgcred` — FreeBSD/NetBSD peer credentials ancillary message.
+    ///
+    /// Attached by the kernel to every recvmsg(2) datagram when `LOCAL_CREDS`
+    /// is enabled on the socket. Contains the sending process's PID, real and
+    /// effective UID/GID, and group list.
+    ///
+    /// Layout (64-bit, `<sys/socket.h>`):
+    ///   offset  0: cmcred_pid      (pid_t  = i32,  4 bytes)
+    ///   offset  4: cmcred_uid      (uid_t  = u32,  4 bytes)
+    ///   offset  8: cmcred_euid     (uid_t  = u32,  4 bytes)
+    ///   offset 12: cmcred_gid      (gid_t  = u32,  4 bytes)
+    ///   offset 16: cmcred_ngroups  (short  = i16,  2 bytes)
+    ///   offset 18: (padding, 2 bytes)
+    ///   offset 20: cmcred_groups   (gid_t[CMGROUP_MAX], 16 × 4 = 64 bytes)
+    ///   total: 84 bytes
+    #[repr(C)]
+    pub(super) struct Cmsgcred {
+        pub cmcred_pid: i32,
+        pub cmcred_uid: u32,
+        pub cmcred_euid: u32,
+        pub cmcred_gid: u32,
+        pub cmcred_ngroups: i16,
+        /// Padding inserted by the compiler to maintain 4-byte alignment for
+        /// `cmcred_groups`.  Not accessed directly — we just need the correct
+        /// struct size and offset for `cmcred_groups`.
+        _pad: i16,
+        pub cmcred_groups: [u32; 16],
+    }
+
+    // --- constants --------------------------------------------------------
+
+    /// `SOL_SOCKET` on FreeBSD / XNU derivatives = `0xffff` (`<sys/socket.h>`).
+    pub(super) const SOL_SOCKET: i32 = 0xffff;
+    /// `LOCAL_CREDS` enables SCM_CREDS ancillary data on received datagrams.
+    /// Value: 0x0002 on FreeBSD/DragonFly (`<sys/un.h>`),
+    ///        0x0001 on NetBSD.
+    #[cfg(any(target_os = "freebsd", target_os = "dragonfly"))]
+    pub(super) const LOCAL_CREDS: i32 = 0x0002;
+    #[cfg(target_os = "netbsd")]
+    pub(super) const LOCAL_CREDS: i32 = 0x0001;
+    /// `SCM_CREDS` — the CMSG type for cmsgcred ancillary data.
+    pub(super) const SCM_CREDS: i32 = 0x03;
+
+    // --- FFI --------------------------------------------------------------
+
+    extern "C" {
+        pub(super) fn setsockopt(
+            fd: i32,
+            level: i32,
+            optname: i32,
+            optval: *const c_void,
+            optlen: u32,
+        ) -> i32;
+
+        pub(super) fn recvmsg(fd: i32, msg: *mut Msghdr, flags: i32) -> isize;
+    }
+
+    // --- ancillary buffer sizing ------------------------------------------
+
+    // CMSG_SPACE(sizeof(struct cmsgcred)) on 64-bit BSD:
+    //   cmsg_align(sizeof(Cmsghdr)) + cmsg_align(sizeof(Cmsgcred))
+    //   = cmsg_align(12)           + cmsg_align(84)
+    //   = 16                       + 88
+    //   = 104 bytes
+    //
+    // 256 bytes provides generous headroom for kernel ancillary-data
+    // extensions (e.g. future security labels) — same sizing as Linux.
+    pub(super) const ANCILLARY_BUFFER_SIZE: usize = 256;
+
+    const _: () =
+        assert!(ANCILLARY_BUFFER_SIZE >= super::cmsg_hdr_size() + core::mem::size_of::<Cmsgcred>());
+
+    /// Extract peer PID and effective UID after a successful `recvmsg` on BSD.
+    ///
+    /// Iterates ancillary data looking for an `SCM_CREDS` message containing
+    /// a `struct cmsgcred`.  Returns `(cmcred_pid, cmcred_euid)`.
+    pub(super) fn peer_pid_after_recv(
+        _fd: i32,
+        mhdr: &Msghdr,
+        anc_base: *const u8,
+    ) -> Option<(u32, u32)> {
+        debug_assert_eq!(
+            mhdr.msg_control as *const u8, anc_base,
+            "msg_control and ancillary buffer base must be the same address"
+        );
+        let hdr = unsafe { super::cmsg_firsthdr(mhdr) };
+        unsafe { super::find_credential_pid(hdr, mhdr, anc_base) }
+    }
+
+    // --- compile-time layout guards ---------------------------------------
+
+    const _: () = assert!(mem::size_of::<Msghdr>() == 48);
+    const _: () = assert!(mem::size_of::<Cmsgcred>() == 84);
+    const _: () = assert!(mem::size_of::<Iovec>() == 16);
+
+    const _: () = assert!(mem::offset_of!(Msghdr, msg_name) == 0);
+    const _: () = assert!(mem::offset_of!(Msghdr, msg_namelen) == 8);
+    const _: () = assert!(mem::offset_of!(Msghdr, msg_iov) == 16);
+    const _: () = assert!(mem::offset_of!(Msghdr, msg_iovlen) == 24);
+    const _: () = assert!(mem::offset_of!(Msghdr, msg_control) == 32);
+    const _: () = assert!(mem::offset_of!(Msghdr, msg_controllen) == 40);
+    const _: () = assert!(mem::offset_of!(Msghdr, msg_flags) == 44);
+
+    const _: () = assert!(mem::offset_of!(Iovec, iov_base) == 0);
+    const _: () = assert!(mem::offset_of!(Iovec, iov_len) == 8);
+
+    const _: () = assert!(mem::offset_of!(Cmsghdr, cmsg_len) == 0);
+    const _: () = assert!(mem::offset_of!(Cmsghdr, cmsg_level) == 4);
+    const _: () = assert!(mem::offset_of!(Cmsghdr, cmsg_type) == 8);
+
+    const _: () = assert!(mem::offset_of!(Cmsgcred, cmcred_pid) == 0);
+    const _: () = assert!(mem::offset_of!(Cmsgcred, cmcred_uid) == 4);
+    const _: () = assert!(mem::offset_of!(Cmsgcred, cmcred_euid) == 8);
+    const _: () = assert!(mem::offset_of!(Cmsgcred, cmcred_gid) == 12);
+    const _: () = assert!(mem::offset_of!(Cmsgcred, cmcred_ngroups) == 16);
+    const _: () = assert!(mem::offset_of!(Cmsgcred, cmcred_groups) == 20);
+}
+
+// ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
 
@@ -278,16 +500,11 @@ mod plat {
 /// first call to [`recv_authenticated`].
 ///
 /// On Linux this sets `SO_PASSCRED` so the kernel includes `SCM_CREDENTIALS`
-/// ancillary data on every datagram.  On macOS this is a no-op — per-datagram
-/// peer PID is not exposed for unconnected `SOCK_DGRAM`, so the observer
-/// relies on `--socket-mode 0600` to restrict the trust boundary by UID.
+/// ancillary data on every datagram.  On FreeBSD / DragonFly / NetBSD this
+/// sets `LOCAL_CREDS` so the kernel includes `SCM_CREDS` ancillary data
+/// (struct cmsgcred).  On macOS this is a no-op — per-datagram peer PID is
+/// obtained via `getsockopt(LOCAL_PEERTOKEN)` after each recvmsg.
 pub(crate) fn enable_credential_passing(fd: i32) -> io::Result<()> {
-    #[cfg(target_os = "macos")]
-    {
-        let _ = fd;
-        Ok(())
-    }
-
     #[cfg(target_os = "linux")]
     {
         let (level, optname) = (plat::SOL_SOCKET, plat::SO_PASSCRED);
@@ -304,6 +521,36 @@ pub(crate) fn enable_credential_passing(fd: i32) -> io::Result<()> {
         if ret != 0 {
             return Err(io::Error::last_os_error());
         }
+        Ok(())
+    }
+
+    #[cfg(any(target_os = "freebsd", target_os = "dragonfly", target_os = "netbsd"))]
+    {
+        let (level, optname) = (plat::SOL_SOCKET, plat::LOCAL_CREDS);
+        let one: i32 = 1;
+        let ret = unsafe {
+            plat::setsockopt(
+                fd,
+                level,
+                optname,
+                core::ptr::addr_of!(one) as *const core::ffi::c_void,
+                core::mem::size_of::<i32>() as u32,
+            )
+        };
+        if ret != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    #[cfg(not(any(
+        target_os = "linux",
+        target_os = "freebsd",
+        target_os = "dragonfly",
+        target_os = "netbsd",
+    )))]
+    {
+        let _ = fd;
         Ok(())
     }
 }
@@ -355,6 +602,20 @@ pub(crate) fn recv_authenticated(fd: i32) -> RecvResult {
                 msg_flags: 0,
             }
         }
+        #[cfg(any(target_os = "freebsd", target_os = "dragonfly", target_os = "netbsd"))]
+        {
+            plat::Msghdr {
+                msg_name: core::ptr::null_mut(),
+                msg_namelen: 0,
+                _pad1: 0,
+                msg_iov: &mut iov,
+                msg_iovlen: 1,
+                _pad2: 0,
+                msg_control: anc.0.as_mut_ptr() as *mut core::ffi::c_void,
+                msg_controllen: plat::ANCILLARY_BUFFER_SIZE as _,
+                msg_flags: 0,
+            }
+        }
     };
 
     let n = loop {
@@ -385,17 +646,34 @@ pub(crate) fn recv_authenticated(fd: i32) -> RecvResult {
         return RecvResult::ShortRead;
     }
 
-    let peer_pid = match plat::peer_pid_after_recv(fd, &mhdr, anc.0.as_ptr()) {
-        Some(pid) => pid,
+    let (peer_pid, peer_uid) = match plat::peer_pid_after_recv(fd, &mhdr, anc.0.as_ptr()) {
+        Some((pid, uid)) => (pid, uid),
         None => {
             return RecvResult::IoError(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "kernel did not attach SCM_CREDENTIALS ancillary data",
+                "kernel did not attach peer credentials",
             ));
         }
     };
 
-    RecvResult::Authenticated { peer_pid, data }
+    extern "C" {
+        fn getuid() -> u32;
+    }
+    let my_uid = unsafe { getuid() };
+    if peer_pid != 0 && peer_uid != my_uid {
+        return RecvResult::IoError(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "peer credential UID mismatch: kernel reports uid {peer_uid}, expected uid {my_uid}"
+            ),
+        ));
+    }
+
+    RecvResult::Authenticated {
+        peer_pid,
+        peer_uid,
+        data,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -446,12 +724,9 @@ unsafe fn find_credential_pid(
     mut hdr: Option<&plat::Cmsghdr>,
     mhdr: &plat::Msghdr,
     base: *const u8,
-) -> Option<u32> {
+) -> Option<(u32, u32)> {
     let target_level = plat::SOL_SOCKET;
     let target_type = plat::SCM_CREDENTIALS;
-    // Minimum bytes a SCM_CREDENTIALS message must contain: aligned cmsghdr
-    // followed by a struct ucred.  Anything shorter is malformed and would
-    // cause an OOB read of the ancillary buffer if dereferenced.
     let needed = cmsg_hdr_size() + core::mem::size_of::<plat::Ucred>();
 
     while let Some(cmsg) = hdr {
@@ -461,7 +736,76 @@ unsafe fn find_credential_pid(
             }
             let data_ptr = unsafe { cmsg_data(cmsg) };
             let ucred = unsafe { &*(data_ptr as *const plat::Ucred) };
-            return Some(ucred.pid as u32);
+            return Some((ucred.pid as u32, ucred.uid));
+        }
+        hdr = unsafe { cmsg_nxthdr(mhdr, cmsg, base) };
+    }
+    None
+}
+
+// ---------------------------------------------------------------------------
+// BSD-specific CMSG helpers
+// ---------------------------------------------------------------------------
+
+#[cfg(any(target_os = "freebsd", target_os = "dragonfly", target_os = "netbsd"))]
+unsafe fn cmsg_firsthdr(mhdr: &plat::Msghdr) -> Option<&plat::Cmsghdr> {
+    let control = mhdr.msg_control;
+    if control.is_null() {
+        return None;
+    }
+    if (mhdr.msg_controllen as usize) < cmsg_hdr_size() {
+        return None;
+    }
+    unsafe { Some(&*(control as *const plat::Cmsghdr)) }
+}
+
+#[cfg(any(target_os = "freebsd", target_os = "dragonfly", target_os = "netbsd"))]
+unsafe fn cmsg_nxthdr<'a>(
+    mhdr: &plat::Msghdr,
+    cmsg: &'a plat::Cmsghdr,
+    base: *const u8,
+) -> Option<&'a plat::Cmsghdr> {
+    let cur = (cmsg as *const plat::Cmsghdr) as *const u8;
+    let offset = unsafe { cur.offset_from(base) } as usize;
+    // cmsg_len is u32 on BSD — cast to usize for alignment math.
+    let advance = cmsg_align(cmsg.cmsg_len as usize);
+    let next_offset = offset + advance;
+
+    if next_offset + cmsg_hdr_size() > mhdr.msg_controllen as usize {
+        return None;
+    }
+    let next = unsafe { &*(base.add(next_offset) as *const plat::Cmsghdr) };
+    let remaining = mhdr.msg_controllen as usize - next_offset;
+    if next.cmsg_len as usize > remaining {
+        return None;
+    }
+    Some(next)
+}
+
+#[cfg(any(target_os = "freebsd", target_os = "dragonfly", target_os = "netbsd"))]
+unsafe fn cmsg_data(cmsg: &plat::Cmsghdr) -> *const u8 {
+    unsafe { (cmsg as *const plat::Cmsghdr as *const u8).add(cmsg_hdr_size()) }
+}
+
+#[cfg(any(target_os = "freebsd", target_os = "dragonfly", target_os = "netbsd"))]
+unsafe fn find_credential_pid(
+    mut hdr: Option<&plat::Cmsghdr>,
+    mhdr: &plat::Msghdr,
+    base: *const u8,
+) -> Option<(u32, u32)> {
+    let target_level = plat::SOL_SOCKET;
+    let target_type = plat::SCM_CREDS;
+    let needed = cmsg_hdr_size() + core::mem::size_of::<plat::Cmsgcred>();
+
+    while let Some(cmsg) = hdr {
+        if cmsg.cmsg_level == target_level && cmsg.cmsg_type == target_type {
+            // cmsg_len is u32 on BSD — compare as usize to match `needed`.
+            if (cmsg.cmsg_len as usize) < needed {
+                return None;
+            }
+            let data_ptr = unsafe { cmsg_data(cmsg) };
+            let cred = unsafe { &*(data_ptr as *const plat::Cmsgcred) };
+            return Some((cred.cmcred_pid as u32, cred.cmcred_euid));
         }
         hdr = unsafe { cmsg_nxthdr(mhdr, cmsg, base) };
     }
