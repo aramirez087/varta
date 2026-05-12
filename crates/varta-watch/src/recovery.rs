@@ -1,10 +1,9 @@
 //! Per-pid debounced recovery command runner (non-blocking).
 //!
 //! Recovery is the daemon's cold path: it fires only when an agent has
-//! crossed its silence threshold. The runner substitutes the literal
-//! `{pid}` token in a user-supplied template and shells out via
-//! `/bin/sh -c <rendered>`. A per-pid debounce window suppresses repeat
-//! invocations during a single silence run.
+//! crossed its silence threshold. The runner shells out via `/bin/sh -c`
+//! with the pid passed as positional argument `$1`. A per-pid debounce
+//! window suppresses repeat invocations during a single silence run.
 //!
 //! Children are spawned asynchronously; they never block the observer's
 //! poll loop. On each tick, [`Recovery::try_reap`] drains completed or
@@ -12,13 +11,15 @@
 //!
 //! # Security
 //!
-//! The `recovery_cmd` template is executed verbatim by `/bin/sh -c`.
-//! The `{pid}` substitution is numeric and safe, but **the template body
-//! is under full operator control** — anyone who can pass `--recovery-cmd`
-//! to `varta-watch` already has arbitrary code execution by launching
-//! their own subprocess.  Treat the template as a trusted shell fragment
-//! and never accept it from an untrusted source (e.g. a network request
-//! or environment variable from a less-privileged context).
+//! The `recovery_cmd` template is executed verbatim by `/bin/sh -c` with
+//! the stalling pid passed as `$1`. The pid is always numeric and never
+//! string-interpolated into the script body, eliminating shell injection
+//! risk. **The template body is under full operator control** — anyone who
+//! can pass `--recovery-cmd` to `varta-watch` already has arbitrary code
+//! execution by launching their own subprocess. Treat the template as a
+//! trusted shell fragment and never accept it from an untrusted source
+//! (e.g. a network request or environment variable from a less-privileged
+//! context).
 
 use std::collections::HashMap;
 use std::process::{Child, Command};
@@ -117,9 +118,9 @@ impl Recovery {
         }
     }
 
-    /// Substitute `{pid}` and spawn `/bin/sh -c <rendered>` non-blockingly.
+    /// Spawn `/bin/sh -c <template> varta-recovery <pid>` non-blockingly.
     ///
-    /// Returns [`RecoveryOutcome::Debounced`] if the previous invocation
+    /// The template receives the stalling pid as `$1`.
     /// for `pid` is still inside the debounce window or if that pid already
     /// has an outstanding recovery child. The debounce is per-pid and
     /// monotonic — distinct pids may fire within a single window without
@@ -145,10 +146,14 @@ impl Recovery {
             }
         }
 
-        let rendered = self.template.replace("{pid}", &pid.to_string());
         self.last_fired.insert(pid, now);
 
-        match Command::new("/bin/sh").arg("-c").arg(&rendered).spawn() {
+        match Command::new("/bin/sh")
+            .arg("-c")
+            .arg(&self.template)
+            .arg("varta-recovery")
+            .arg(pid.to_string())
+            .spawn() {
             Ok(child) => {
                 let child_pid = child.id();
                 self.outstanding.insert(
@@ -292,9 +297,9 @@ mod tests {
     }
 
     #[test]
-    fn template_substitutes_every_pid_token() {
+    fn template_receives_pid_as_dollar_one() {
         let mut rec = Recovery::new(
-            "test \"{pid}-{pid}\" = \"7-7\"".to_string(),
+            "test \"$1-$1\" = \"7-7\"".to_string(),
             Duration::from_secs(0),
         );
         match rec.on_stall(7) {

@@ -37,7 +37,7 @@ pub struct Config {
     /// Per-pid silence window before the observer surfaces `Event::Stall`.
     pub threshold: Duration,
     /// Optional shell-fragment template invoked on each unique stall. The
-    /// literal `{pid}` substring is replaced with the stalled pid.
+    /// stalled pid is passed as `$1` (positional argument, not string-replaced).
     pub recovery_cmd: Option<String>,
     /// Per-pid debounce window for `recovery_cmd` invocations.
     pub recovery_debounce: Duration,
@@ -159,10 +159,10 @@ REQUIRED:
 
 OPTIONAL:
     --recovery-cmd <TEMPLATE>      Shell fragment run on each unique stall
-                                     via /bin/sh -c. The literal {pid} is
-                                     replaced with the stalled pid. SECURITY:
-                                     the template body is under full operator
-                                     control; never accept it from an untrusted
+                                     via /bin/sh -c with the stalled pid
+                                     passed as $1. SECURITY: the template
+                                     body is under full operator control;
+                                     never accept it from an untrusted
                                      source.
     --recovery-debounce-ms <MS>    Per-pid debounce window for recovery
                                      invocations (default 1000).
@@ -495,7 +495,7 @@ mod tests {
             "--threshold-ms",
             "100",
             "--recovery-cmd",
-            "echo {pid}",
+            "echo $1",
             "--recovery-debounce-ms",
             "750",
             "--export-file",
@@ -506,7 +506,7 @@ mod tests {
             "3",
         ]))
         .expect("parse");
-        assert_eq!(cfg.recovery_cmd.as_deref(), Some("echo {pid}"));
+        assert_eq!(cfg.recovery_cmd.as_deref(), Some("echo $1"));
         assert_eq!(cfg.recovery_debounce, Duration::from_millis(750));
         assert_eq!(cfg.file_export, Some(PathBuf::from("/tmp/e.log")));
         assert_eq!(

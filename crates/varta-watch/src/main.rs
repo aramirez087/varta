@@ -28,7 +28,11 @@ use varta_watch::{
 /// when this becomes `true`.
 static SHUTDOWN: AtomicBool = AtomicBool::new(false);
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(
+    target_os = "linux",
+    target_os = "macos",
+    target_os = "freebsd",
+))]
 unsafe fn install_signal_handlers() {
     const SIGINT: i32 = 2;
     const SIGTERM: i32 = 15;
@@ -37,8 +41,9 @@ unsafe fn install_signal_handlers() {
         SHUTDOWN.store(true, Ordering::Release);
     }
 
-    // Platform-specific sigaction struct: layout differs between Linux and
-    // macOS (sigset_t size, presence of sa_restorer).
+    // Platform-specific sigaction struct: layout differs between Linux,
+    // macOS, and FreeBSD (sigset_t size, field ordering, presence of
+    // sa_restorer).
     #[cfg(target_os = "linux")]
     #[repr(C)]
     struct SigAction {
@@ -55,6 +60,14 @@ unsafe fn install_signal_handlers() {
         sa_handler: *const (),
         sa_mask: [u8; 32],
         sa_flags: i32,
+    }
+
+    #[cfg(target_os = "freebsd")]
+    #[repr(C)]
+    struct SigAction {
+        sa_handler: *const (),
+        sa_flags: i32,
+        sa_mask: [u8; 16],
     }
 
     extern "C" {
@@ -79,7 +92,14 @@ unsafe fn install_signal_handlers() {
     }
 }
 
-#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
+#[cfg(all(
+    unix,
+    not(any(
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "freebsd",
+    )),
+))]
 unsafe fn install_signal_handlers() {
     const SIGINT: i32 = 2;
     const SIGTERM: i32 = 15;
@@ -92,11 +112,12 @@ unsafe fn install_signal_handlers() {
         SHUTDOWN.store(true, Ordering::Release);
     }
 
-    // SAFETY: signal(2) fallback for non-Linux/macOS Unix. sigaction(2)
-    // is POSIX-preferred but its struct layout is platform-specific.
-    // Shutdown-latch semantics make handler reset harmless: the latch
-    // stays set after the first signal even if the kernel resets the
-    // handler to SIG_DFL.
+    // SAFETY: signal(2) fallback for exotic Unix targets whose sigaction(2)
+    // struct layout is unknown (NetBSD, OpenBSD, illumos, etc.). On SysV
+    // systems signal(2) may reset the handler to SIG_DFL after delivery,
+    // but the shutdown latch stays set after the first signal — a repeated
+    // signal becomes a SIG_DFL termination, which is acceptable during
+    // shutdown.
     unsafe {
         let _ = signal(SIGINT, handle);
         let _ = signal(SIGTERM, handle);

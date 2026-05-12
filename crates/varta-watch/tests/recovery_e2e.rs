@@ -87,9 +87,9 @@ fn recovery_cmd_fires_once_per_stall_within_debounce() {
 }
 
 #[test]
-fn recovery_cmd_template_substitutes_pid() {
+fn recovery_cmd_template_receives_pid_as_dollar_one() {
     let log = unique_tmp("log");
-    let template = format!("echo $$:{{pid}} >> {}", log.as_path().display());
+    let template = format!("echo $$:$1 >> {}", log.as_path().display());
     let mut rec = Recovery::new(template, Duration::from_secs(0));
 
     let outcome = rec.on_stall(12345);
@@ -119,7 +119,7 @@ fn recovery_cmd_template_substitutes_pid() {
     let trimmed = body.trim_end_matches('\n');
     assert!(
         trimmed.ends_with(":12345"),
-        "log line did not end with substituted pid: {body:?}"
+        "log line did not end with pid: {body:?}"
     );
 }
 

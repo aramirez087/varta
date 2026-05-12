@@ -14,7 +14,7 @@ signal handler dependency.
 varta-watch \
   --socket /tmp/varta.sock \
   --threshold-ms 2000 \
-  --recovery-cmd "systemctl restart myapp-{pid}" \
+  --recovery-cmd "systemctl restart myapp-\$1" \
   --recovery-debounce-ms 5000 \
   --recovery-timeout-ms 3000 \
   --export-file /var/log/varta/events.tsv \
@@ -27,7 +27,7 @@ varta-watch \
 |------|------|---------|-------------|
 | `--socket <PATH>` | path | **required** | Bind the observer's UDS at this path. |
 | `--threshold-ms <MS>` | u64 ms | **required** | Per-pid silence window before a stall is surfaced. |
-| `--recovery-cmd <TEMPLATE>` | string | — | Shell fragment run via `/bin/sh -c` on each unique stall. The literal `{pid}` is replaced with the stalled pid. |
+| `--recovery-cmd <TEMPLATE>` | string | — | Shell fragment run via `/bin/sh -c` on each unique stall. The stalled pid is available as `$1`. |
 | `--recovery-debounce-ms <MS>` | u64 ms | `1000` | Per-pid debounce window for `recovery-cmd` invocations. |
 | `--recovery-timeout-ms <MS>` | u64 ms | — | Kill-after deadline for recovery children; if a child runs longer than this it is killed via kill(2). Without this flag the child is allowed to run until completion. |
 | `--socket-mode <OCTAL>` | octal | `0600` | File mode for the observer socket (default 0600 — owner-only r/w). |
@@ -81,16 +81,16 @@ Example:
 
 ## `recovery_cmd` template syntax
 
-The `--recovery-cmd` value is a shell fragment. The literal string `{pid}` is
-replaced with the stalled pid's decimal representation before the fragment is
-passed to `/bin/sh -c`. No other substitution tokens exist.
+The `--recovery-cmd` value is a shell fragment executed via `/bin/sh -c`.
+The stalled pid is passed as positional argument `$1` — it is never
+string-interpolated into the script body.
 
 ```sh
 # Restart a systemd unit whose name includes the pid:
---recovery-cmd "systemctl restart myapp-{pid}"
+--recovery-cmd "systemctl restart myapp-\$1"
 
 # Log the stall and attempt a graceful kill:
---recovery-cmd "echo stall {pid} >> /var/log/varta.log && kill -TERM {pid}"
+--recovery-cmd "echo stall \$1 >> /var/log/varta.log && kill -TERM \$1"
 ```
 
 Recovery invocations are debounced per pid. A second stall for the same pid
