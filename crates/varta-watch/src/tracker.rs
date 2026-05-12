@@ -29,6 +29,15 @@ pub const MAX_CAPACITY: usize = 4096;
 /// `stall_emitted` on every beat.
 const EVICTION_MULTIPLIER: u32 = 10;
 
+/// Threshold for nonce wrap detection. When the tracker's `last_nonce` for a
+/// pid is within this distance of `u64::MAX` and an incoming frame carries a
+/// nonce below this threshold, the tracker treats the gap as a nonce-space
+/// wrap (agent exhausted u64 nonces and looped to 0) rather than an
+/// out-of-order beat. The threshold is 2^20 (~1M); at 1M beats/sec the agent
+/// would take days to exhaust the nonce space, so a genuine gap this large
+/// can only be a wrap.
+const NONCE_WRAP_THRESHOLD: u64 = 1_048_576;
+
 /// Liveness slot for a single agent pid.
 ///
 /// `Slot` is internal to the observer and never crosses the wire, so it uses
@@ -127,6 +136,25 @@ impl Tracker {
             }
             if slot.pid == frame.pid {
                 if frame.nonce <= slot.last_nonce {
+                    // Detect nonce wrap: agent exhausted u64 nonce space
+                    // and looped to 0.  last_nonce is near u64::MAX and
+                    // the incoming nonce is near 0 — a gap this large
+                    // cannot be a genuine out-of-order beat.
+                    let wrap_lo = NONCE_WRAP_THRESHOLD;
+                    let wrap_hi = u64::MAX.saturating_sub(NONCE_WRAP_THRESHOLD);
+                    if slot.last_nonce >= wrap_hi && frame.nonce < wrap_lo {
+                        let old = slot.last_nonce;
+                        slot.last_nonce = frame.nonce;
+                        slot.last_ns = now_ns;
+                        slot.status = status;
+                        slot.stall_emitted = false;
+                        eprintln!(
+                            "[varta-watch] nonce wrap detected for pid={}: \
+                             last_nonce={old} -> new_nonce={}",
+                            frame.pid, frame.nonce
+                        );
+                        return Update::Refreshed;
+                    }
                     return Update::OutOfOrder;
                 }
                 slot.last_nonce = frame.nonce;

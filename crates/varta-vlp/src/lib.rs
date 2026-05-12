@@ -26,9 +26,9 @@ pub const VERSION: u8 = 0x01;
 
 /// Sentinel nonce value reserved for terminal panic frames.
 ///
-/// Regular beats from `varta_client::Varta::beat` cap their nonce at
-/// `NONCE_TERMINAL - 1` so that observers can unambiguously identify a
-/// panic-fired critical frame by its nonce alone.
+/// Regular beats from `varta_client::Varta::beat` wrap to 0 on exhaustion
+/// so that observers can unambiguously identify a panic-fired critical frame
+/// by its nonce alone.
 pub const NONCE_TERMINAL: u64 = u64::MAX;
 
 /// Health status reported by an agent in a single VLP frame.
@@ -95,7 +95,7 @@ pub struct Frame {
     pub timestamp: u64,
     /// Strictly increasing counter, starting at 1 on the first beat after
     /// `Varta::connect`. The panic hook pins this to [`NONCE_TERMINAL`] to
-    /// mark a final critical frame. Regular beats cap at `NONCE_TERMINAL - 1`.
+    /// mark a final critical frame. Regular beats wrap to 0 on exhaustion.
     pub nonce: u64,
     /// Free-form 8-byte payload — application-defined health context (queue
     /// depth, error code, etc.). Carried opaquely by the protocol.

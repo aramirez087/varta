@@ -401,14 +401,15 @@ impl PromExporter {
     /// exist to prevent a storm of slow scrapers from starving the
     /// observer poll loop (stall detection, I/O polling, reaping).
     pub fn serve_pending(&mut self) -> io::Result<()> {
-        // Rate-limit: skip serving if a scrape was already handled within
-        // PROM_MIN_SCRAPE_INTERVAL.  This prevents a fast / misconfigured
-        // scraper from starving the single-threaded poll loop.
-        if let Some(last) = self.last_scrape {
-            if last.elapsed() < PROM_MIN_SCRAPE_INTERVAL {
-                return Ok(());
-            }
-        }
+        // Rate-limit: if a scrape was already served within
+        // PROM_MIN_SCRAPE_INTERVAL, additional scrapes still receive a
+        // response (the cached body from the last fresh render) but
+        // render_body() is skipped.  This prevents a fast / misconfigured
+        // scraper from starving the single-threaded poll loop while keeping
+        // all Prometheus scrapes successful.
+        let render_fresh = self
+            .last_scrape
+            .is_none_or(|last| last.elapsed() >= PROM_MIN_SCRAPE_INTERVAL);
         let serve_deadline = Instant::now() + Duration::from_millis(100);
         let mut served = 0;
         let result = loop {
@@ -420,20 +421,20 @@ impl PromExporter {
             }
             match self.listener.accept() {
                 Ok((stream, _)) => {
-                    self.serve_one(stream)?;
+                    self.serve_one(stream, render_fresh)?;
                     served += 1;
                 }
                 Err(e) if e.kind() == ErrorKind::WouldBlock => break Ok(()),
                 Err(e) => break Err(e),
             }
         };
-        if served > 0 {
+        if served > 0 && render_fresh {
             self.last_scrape = Some(Instant::now());
         }
         result
     }
 
-    fn serve_one(&mut self, mut stream: TcpStream) -> io::Result<()> {
+    fn serve_one(&mut self, mut stream: TcpStream, render_fresh: bool) -> io::Result<()> {
         // Accepted streams inherit the listener's non-blocking flag on both
         // Linux (via `accept4(SOCK_NONBLOCK)` in libstd) and macOS (libstd
         // calls `fcntl(F_SETFL, O_NONBLOCK)` post-accept). We intentionally
@@ -472,7 +473,9 @@ impl PromExporter {
             return Ok(());
         }
 
-        self.render_body();
+        if render_fresh {
+            self.render_body();
+        }
         let body_len = self.body_buf.len();
         let write_deadline = Instant::now() + PROM_WRITE_TIMEOUT;
         // Write headers and body in two parts to avoid allocating a

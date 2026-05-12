@@ -265,8 +265,8 @@ impl<T: BeatTransport> Varta<T> {
     /// Emit a single VLP frame carrying `status` and an opaque 8-byte
     /// `payload`.
     ///
-    /// The nonce increments first (capping at `NONCE_TERMINAL - 1`), so the
-    /// very first beat after `connect` carries `nonce == 1`. The frame is
+    /// The nonce increments first (starting from 1) and wraps to 0 on
+    /// exhaustion; the very first beat after `connect` carries `nonce == 1`. The frame is
     /// constructed on the stack, encoded into the owned scratch buffer, and
     /// handed to `send(2)`. The steady-state path (`Sent` / `Dropped`) neither
     /// blocks nor allocates; the rare `Failed` path may allocate when cloning
@@ -280,6 +280,12 @@ impl<T: BeatTransport> Varta<T> {
     pub fn beat(&mut self, status: Status, payload: u64) -> BeatOutcome {
         if self.nonce < NONCE_TERMINAL - 1 {
             self.nonce += 1;
+        } else {
+            eprintln!(
+                "[varta-client] nonce exhausted after ~{} beats; wrapping to 0",
+                NONCE_TERMINAL
+            );
+            self.nonce = 0;
         }
         let timestamp = self.start.elapsed().as_nanos().min(u64::MAX as u128) as u64;
         let frame = Frame::new(status, std::process::id(), timestamp, self.nonce, payload);

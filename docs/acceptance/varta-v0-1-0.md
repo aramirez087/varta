@@ -16,7 +16,7 @@ benchmark assertion) in its declared file.
 |---|---|---|
 | `connect_succeeds_when_observer_socket_exists` | `crates/varta-client/tests/acceptance.rs` | `Varta::connect(path)` returns `Ok` when the observer's UDS is bound and reachable. |
 | `beat_emits_canonical_32_byte_frame` | `crates/varta-client/tests/acceptance.rs` | `beat()` writes a 32-byte VLP frame whose decoded fields match the agent state (pid, monotonically increasing nonce, status, payload). |
-| `beat_increments_nonce_monotonically` | `crates/varta-client/tests/acceptance.rs` | Successive `beat()` calls produce strictly increasing nonces (starting from 1, saturating at `u64::MAX`). |
+| `beat_increments_nonce_monotonically` | `crates/varta-client/tests/acceptance.rs` | Successive `beat()` calls produce strictly increasing nonces (starting from 1, wrapping to 0 on exhaustion). |
 | `beat_returns_dropped_when_observer_absent` | `crates/varta-client/tests/acceptance.rs` | When the observer is not listening, `beat()` returns `BeatOutcome::Dropped` (no panic, no block). |
 | `beat_makes_zero_heap_allocations_after_init` | `crates/varta-client/tests/zero_alloc.rs` | A guard allocator armed after `connect()` panics on any heap allocation; 10 000 successive beats run without tripping it. |
 
