@@ -166,7 +166,10 @@ impl Observer {
                                     observer_ns: now_ns,
                                 });
                             }
-                            let _ = peer_pid;
+                            #[cfg(not(target_os = "linux"))]
+                            {
+                                let _ = peer_pid;
+                            }
                             match self.tracker.record(&frame, now_ns, self.threshold_ns) {
                                 Update::Inserted | Update::Refreshed => {
                                     return Some(Event::Beat {

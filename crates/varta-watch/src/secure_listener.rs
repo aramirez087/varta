@@ -197,6 +197,31 @@ impl SecureUdpListener {
             }
         }
     }
+
+    #[cfg(test)]
+    fn sender_iv_random(&self, addr: &SocketAddr) -> Option<[u8; 4]> {
+        self.sender_state.get(addr).map(|s| s.iv_random)
+    }
+
+    #[cfg(test)]
+    fn sender_last_counter(&self, addr: &SocketAddr) -> Option<u64> {
+        self.sender_state.get(addr).map(|s| s.last_counter)
+    }
+
+    #[cfg(test)]
+    fn sender_prev_iv_random(&self, addr: &SocketAddr) -> Option<[u8; 4]> {
+        self.sender_state.get(addr).map(|s| s.prev_iv_random)
+    }
+
+    #[cfg(test)]
+    fn sender_prev_last_counter(&self, addr: &SocketAddr) -> Option<u64> {
+        self.sender_state.get(addr).map(|s| s.prev_last_counter)
+    }
+
+    #[cfg(test)]
+    fn sender_state_len(&self) -> usize {
+        self.sender_state.len()
+    }
 }
 
 impl BeatListener for SecureUdpListener {
@@ -344,9 +369,8 @@ mod tests {
         let counter = 1;
 
         assert!(listener.try_record_replay_state(addr, iv, counter));
-        let state = listener.sender_state.get(&addr).unwrap();
-        assert_eq!(state.iv_random, iv);
-        assert_eq!(state.last_counter, counter);
+        assert_eq!(listener.sender_iv_random(&addr), Some(iv));
+        assert_eq!(listener.sender_last_counter(&addr), Some(counter));
     }
 
     #[test]
@@ -357,8 +381,7 @@ mod tests {
 
         assert!(listener.try_record_replay_state(addr, iv, 1));
         assert!(listener.try_record_replay_state(addr, iv, 2));
-        let state = listener.sender_state.get(&addr).unwrap();
-        assert_eq!(state.last_counter, 2);
+        assert_eq!(listener.sender_last_counter(&addr), Some(2));
     }
 
     #[test]
@@ -392,13 +415,10 @@ mod tests {
         // Rotation: iv1 → iv2
         assert!(listener.try_record_replay_state(addr, iv2, 1));
 
-        let state = listener.sender_state.get(&addr).unwrap();
-        // Current should be iv2
-        assert_eq!(state.iv_random, iv2);
-        assert_eq!(state.last_counter, 1);
-        // Previous should be iv1 with its last counter
-        assert_eq!(state.prev_iv_random, iv1);
-        assert_eq!(state.prev_last_counter, 100);
+        assert_eq!(listener.sender_iv_random(&addr), Some(iv2));
+        assert_eq!(listener.sender_last_counter(&addr), Some(1));
+        assert_eq!(listener.sender_prev_iv_random(&addr), Some(iv1));
+        assert_eq!(listener.sender_prev_last_counter(&addr), Some(100));
     }
 
     #[test]
@@ -430,10 +450,8 @@ mod tests {
         // An out-of-order delayed frame from iv1 with counter > prev_last_counter
         // is accepted (non-replay)
         assert!(listener.try_record_replay_state(addr, iv1, 150));
-        let state = listener.sender_state.get(&addr).unwrap();
-        // Current iv is still iv2; prev counter updated
-        assert_eq!(state.iv_random, iv2);
-        assert_eq!(state.prev_last_counter, 150);
+        assert_eq!(listener.sender_iv_random(&addr), Some(iv2));
+        assert_eq!(listener.sender_prev_last_counter(&addr), Some(150));
     }
 
     #[test]
@@ -449,11 +467,10 @@ mod tests {
         // Third rotation: iv2 → iv3; iv1 is lost from history
         assert!(listener.try_record_replay_state(addr, iv3, 50));
 
-        let state = listener.sender_state.get(&addr).unwrap();
-        assert_eq!(state.iv_random, iv3);
-        assert_eq!(state.last_counter, 50);
-        assert_eq!(state.prev_iv_random, iv2);
-        assert_eq!(state.prev_last_counter, 200);
+        assert_eq!(listener.sender_iv_random(&addr), Some(iv3));
+        assert_eq!(listener.sender_last_counter(&addr), Some(50));
+        assert_eq!(listener.sender_prev_iv_random(&addr), Some(iv2));
+        assert_eq!(listener.sender_prev_last_counter(&addr), Some(200));
     }
 
     #[test]
@@ -470,11 +487,10 @@ mod tests {
         // State is updated but iv2 remains current.
         assert!(listener.try_record_replay_state(addr, iv1, 200));
 
-        let state = listener.sender_state.get(&addr).unwrap();
-        assert_eq!(state.iv_random, iv2);
-        assert_eq!(state.last_counter, 50);
-        assert_eq!(state.prev_iv_random, iv1);
-        assert_eq!(state.prev_last_counter, 200);
+        assert_eq!(listener.sender_iv_random(&addr), Some(iv2));
+        assert_eq!(listener.sender_last_counter(&addr), Some(50));
+        assert_eq!(listener.sender_prev_iv_random(&addr), Some(iv1));
+        assert_eq!(listener.sender_prev_last_counter(&addr), Some(200));
     }
 
     #[test]
@@ -485,14 +501,14 @@ mod tests {
             let addr = SocketAddr::from(([127, 0, 0, 1], (10_000 + i as u16)));
             assert!(listener.try_record_replay_state(addr, test_iv(), 1));
         }
-        assert_eq!(listener.sender_state.len(), MAX_SENDER_STATES);
+        assert_eq!(listener.sender_state_len(), MAX_SENDER_STATES);
 
         // Eviction before force-evict is a no-op for fresh entries.
         listener.evict_stale_senders();
-        assert_eq!(listener.sender_state.len(), MAX_SENDER_STATES);
+        assert_eq!(listener.sender_state_len(), MAX_SENDER_STATES);
 
         // Force-evict should remove one entry.
         listener.force_evict_oldest_sender();
-        assert_eq!(listener.sender_state.len(), MAX_SENDER_STATES - 1);
+        assert_eq!(listener.sender_state_len(), MAX_SENDER_STATES - 1);
     }
 }

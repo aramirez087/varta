@@ -552,6 +552,10 @@ fn write_usize(buf: &mut [u8], mut n: usize) -> usize {
 /// than busy-spinning.  Spinning for the full write deadline (up to
 /// [`PROM_WRITE_TIMEOUT`]) would burn a core with zero progress on
 /// stall detection or I/O in the single-threaded observer loop.
+///
+/// `yield_now()` can be surprisingly long on macOS (~100 µs).  With the
+/// 50 ms [`PROM_WRITE_TIMEOUT`] this allows at most ~500 iterations, which
+/// is safe.
 fn write_all_nonblocking(stream: &mut TcpStream, buf: &[u8], deadline: Instant) -> io::Result<()> {
     let mut written = 0;
     while written < buf.len() {

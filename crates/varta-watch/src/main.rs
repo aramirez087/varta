@@ -28,7 +28,53 @@ use varta_watch::{
 /// when this becomes `true`.
 static SHUTDOWN: AtomicBool = AtomicBool::new(false);
 
-#[cfg(unix)]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+unsafe fn install_signal_handlers() {
+    const SIGINT: i32 = 2;
+    const SIGTERM: i32 = 15;
+
+    extern "C" fn handle(_sig: i32) {
+        SHUTDOWN.store(true, Ordering::Release);
+    }
+
+    // Platform-specific sigaction struct: layout differs between Linux and
+    // macOS (sigset_t size, presence of sa_restorer).
+    #[cfg(target_os = "linux")]
+    #[repr(C)]
+    struct SigAction {
+        sa_handler: *const (),
+        sa_mask: [u8; 128],
+        sa_flags: i32,
+        _pad: i32,
+        sa_restorer: *const (),
+    }
+
+    #[cfg(target_os = "macos")]
+    #[repr(C)]
+    struct SigAction {
+        sa_handler: *const (),
+        sa_mask: [u8; 32],
+        sa_flags: i32,
+    }
+
+    extern "C" {
+        fn sigaction(signum: i32, act: *const SigAction, oldact: *mut SigAction) -> i32;
+    }
+
+    // SAFETY: std::mem::zeroed is safe for *const () pointers; we
+    // immediately overwrite sa_handler with a valid handler. sa_mask of
+    // all zeros and sa_flags of 0 are correct defaults (no blocked
+    // signals, SA_RESETHAND not set). The handler is async-signal-safe:
+    // it writes to a lock-free AtomicBool only.
+    let mut act: SigAction = unsafe { std::mem::zeroed() };
+    act.sa_handler = handle as *const ();
+    unsafe {
+        let _ = sigaction(SIGINT, &act, std::ptr::null_mut());
+        let _ = sigaction(SIGTERM, &act, std::ptr::null_mut());
+    }
+}
+
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
 unsafe fn install_signal_handlers() {
     const SIGINT: i32 = 2;
     const SIGTERM: i32 = 15;
@@ -41,10 +87,11 @@ unsafe fn install_signal_handlers() {
         SHUTDOWN.store(true, Ordering::Release);
     }
 
-    // SAFETY: We are the only caller of signal() in this binary; no other
-    // library or thread installs competing handlers. The handler itself is
-    // async-signal-safe: it writes to a lock-free AtomicBool and performs no
-    // allocation, I/O, or non-reentrant calls.
+    // SAFETY: signal(2) fallback for non-Linux/macOS Unix. sigaction(2)
+    // is POSIX-preferred but its struct layout is platform-specific.
+    // Shutdown-latch semantics make handler reset harmless: the latch
+    // stays set after the first signal even if the kernel resets the
+    // handler to SIG_DFL.
     unsafe {
         let _ = signal(SIGINT, handle);
         let _ = signal(SIGTERM, handle);
