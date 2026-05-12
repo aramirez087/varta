@@ -312,8 +312,9 @@ pub struct PromExporter {
     /// Per-kind decode failure counters, indexed by [`decode_kind_index`].
     /// Always emitted in full (even at zero) so `absent()` alert rules and
     /// dashboards stay green-on-green instead of disappearing until the
-    /// first incident.
-    decode_errors_total: [u64; 3],
+    /// first incident. Size is derived from [`DECODE_KIND_LABELS`] so
+    /// adding a label forces the array to grow.
+    decode_errors_total: [u64; DECODE_KIND_LABELS.len()],
     io_errors_total: u64,
     ctrl_truncated_total: u64,
     capacity_exceeded_total: u64,
@@ -334,7 +335,7 @@ impl PromExporter {
             last_scrape: None,
             evicted_total: 0,
             auth_failures_total: 0,
-            decode_errors_total: [0; 3],
+            decode_errors_total: [0; DECODE_KIND_LABELS.len()],
             io_errors_total: 0,
             ctrl_truncated_total: 0,
             capacity_exceeded_total: 0,
@@ -528,16 +529,16 @@ impl PromExporter {
                 let _ = writeln!(self.body_buf, "varta_status{{pid=\"{pid}\"}} {code}");
             }
         }
-        if self.evicted_total > 0 {
-            self.body_buf.push_str("# HELP varta_tracker_evicted_total Total tracker slots reclaimed from dead agents.\n");
-            self.body_buf
-                .push_str("# TYPE varta_tracker_evicted_total counter\n");
-            let _ = writeln!(
-                self.body_buf,
-                "varta_tracker_evicted_total {}",
-                self.evicted_total
-            );
-        }
+        self.body_buf.push_str(
+            "# HELP varta_tracker_evicted_total Total tracker slots reclaimed from dead agents.\n",
+        );
+        self.body_buf
+            .push_str("# TYPE varta_tracker_evicted_total counter\n");
+        let _ = writeln!(
+            self.body_buf,
+            "varta_tracker_evicted_total {}",
+            self.evicted_total
+        );
         // Security counter — always emitted, even at 0.  Otherwise dashboards
         // and `absent()` alert rules silently produce no series until the
         // first spoof attempt, which defeats the purpose of an alert.
@@ -582,16 +583,14 @@ impl PromExporter {
             "varta_ctrl_truncated_total {}",
             self.ctrl_truncated_total
         );
-        if self.capacity_exceeded_total > 0 {
-            self.body_buf.push_str("# HELP varta_tracker_capacity_exceeded_total Total beats dropped because tracker is full.\n");
-            self.body_buf
-                .push_str("# TYPE varta_tracker_capacity_exceeded_total counter\n");
-            let _ = writeln!(
-                self.body_buf,
-                "varta_tracker_capacity_exceeded_total {}",
-                self.capacity_exceeded_total
-            );
-        }
+        self.body_buf.push_str("# HELP varta_tracker_capacity_exceeded_total Total beats dropped because tracker is full.\n");
+        self.body_buf
+            .push_str("# TYPE varta_tracker_capacity_exceeded_total counter\n");
+        let _ = writeln!(
+            self.body_buf,
+            "varta_tracker_capacity_exceeded_total {}",
+            self.capacity_exceeded_total
+        );
         self.body_buf.push_str(
             "# HELP varta_frame_decrypt_failures_total Total AEAD decryption/tag-verification failures.\n",
         );
@@ -612,18 +611,16 @@ impl PromExporter {
             "varta_truncated_datagrams_total {}",
             self.truncated_total
         );
-        if self.sender_state_full_total > 0 {
-            self.body_buf.push_str(
-                "# HELP varta_sender_state_full_total Total times the sender-state map was full and an entry was force-evicted.\n",
-            );
-            self.body_buf
-                .push_str("# TYPE varta_sender_state_full_total counter\n");
-            let _ = writeln!(
-                self.body_buf,
-                "varta_sender_state_full_total {}",
-                self.sender_state_full_total
-            );
-        }
+        self.body_buf.push_str(
+            "# HELP varta_sender_state_full_total Total times the sender-state map was full and an entry was force-evicted.\n",
+        );
+        self.body_buf
+            .push_str("# TYPE varta_sender_state_full_total counter\n");
+        let _ = writeln!(
+            self.body_buf,
+            "varta_sender_state_full_total {}",
+            self.sender_state_full_total
+        );
     }
 }
 

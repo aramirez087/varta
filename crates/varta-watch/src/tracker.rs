@@ -1,9 +1,12 @@
-//! Per-pid liveness tracker backed by a fixed `[Slot; 64]` array.
+//! Per-pid liveness tracker backed by a fixed `[Slot; 64]` array with
+//! O(1) pid lookup via `HashMap<u32, usize>`.
 //!
 //! The tracker is the in-memory ledger the observer consults each time a
 //! frame arrives or the read timeout expires. It never reallocates: capacity
 //! is a compile-time constant and an exhausted tracker yields
 //! [`Update::CapacityExceeded`] rather than growing.
+
+use std::collections::HashMap;
 
 use varta_vlp::{Frame, Status};
 
@@ -86,12 +89,14 @@ pub enum Update {
 ///
 /// The slot table is a `Vec<Slot>` pre-allocated at construction to the
 /// configured capacity; subsequent inserts push into that pre-allocated
-/// space without reallocation. Lookups are linear scans. At typical
-/// capacities (≤ 256 entries) the linear scan beats hashing on branch
-/// predictability and zero allocation overhead after setup.
+/// space without reallocation.  Lookups use a `HashMap<u32, usize>` for
+/// O(1) pid-to-index mapping — the linear scan was replaced because at
+/// MAX_CAPACITY (4096) every frame arrival triggered a scan of up to
+/// 4096 slots, competing with I/O polling and Prometheus serving.
 pub struct Tracker {
     entries: Vec<Slot>,
     len: usize,
+    pid_to_index: HashMap<u32, usize>,
     evictions: u64,
     capacity_exceeded: u64,
     last_evicted_pid: Option<u32>,
@@ -114,6 +119,7 @@ impl Tracker {
         Tracker {
             entries: Vec::with_capacity(cap),
             len: 0,
+            pid_to_index: HashMap::with_capacity(cap),
             evictions: 0,
             capacity_exceeded: 0,
             last_evicted_pid: None,
@@ -122,6 +128,7 @@ impl Tracker {
 
     /// Record a frame against the tracker.
     ///
+    /// Uses O(1) HashMap pid lookup to find the slot for `frame.pid`.
     /// Returns [`Update::Inserted`] for a brand-new pid, [`Update::Refreshed`]
     /// for an existing pid whose nonce moved forward, [`Update::OutOfOrder`]
     /// if the nonce did not strictly increase, or [`Update::CapacityExceeded`]
@@ -130,11 +137,9 @@ impl Tracker {
     pub fn record(&mut self, frame: &Frame, now_ns: u64, threshold_ns: u64) -> Update {
         let status = frame.status;
 
-        for slot in &mut self.entries[..self.len] {
-            if !slot.used {
-                continue;
-            }
-            if slot.pid == frame.pid {
+        if let Some(&idx) = self.pid_to_index.get(&frame.pid) {
+            let slot = &mut self.entries[idx];
+            if slot.used {
                 if frame.nonce <= slot.last_nonce {
                     // Detect nonce wrap: agent exhausted u64 nonce space
                     // and looped to 0.  last_nonce is near u64::MAX and
@@ -168,6 +173,7 @@ impl Tracker {
         if self.len >= self.entries.capacity() {
             if let Some(evict_idx) = self.find_evictable_slot(now_ns, threshold_ns) {
                 let evicted_pid = self.entries[evict_idx].pid;
+                self.pid_to_index.remove(&evicted_pid);
                 self.entries[evict_idx] = Slot {
                     pid: frame.pid,
                     last_nonce: frame.nonce,
@@ -176,6 +182,7 @@ impl Tracker {
                     used: true,
                     stall_emitted: false,
                 };
+                self.pid_to_index.insert(frame.pid, evict_idx);
                 self.evictions = self.evictions.saturating_add(1);
                 self.last_evicted_pid = Some(evicted_pid);
                 return Update::Inserted;
@@ -183,6 +190,7 @@ impl Tracker {
             self.capacity_exceeded = self.capacity_exceeded.saturating_add(1);
             return Update::CapacityExceeded;
         }
+        let idx = self.len;
         self.entries.push(Slot {
             pid: frame.pid,
             last_nonce: frame.nonce,
@@ -191,6 +199,7 @@ impl Tracker {
             used: true,
             stall_emitted: false,
         });
+        self.pid_to_index.insert(frame.pid, idx);
         self.len += 1;
         Update::Inserted
     }

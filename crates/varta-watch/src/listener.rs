@@ -13,6 +13,10 @@ use std::os::unix::net::UnixDatagram;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+extern "C" {
+    fn umask(mode: u32) -> u32;
+}
+
 use crate::peer_cred::{self, RecvResult};
 
 /// Abstraction over a source that can receive 32-byte VLP frames.
@@ -61,6 +65,7 @@ pub struct UdsListener {
     path: PathBuf,
     bound_dev: u64,
     bound_ino: u64,
+    truncated_count: u64,
 }
 
 impl UdsListener {
@@ -86,7 +91,11 @@ impl UdsListener {
         let path = path.as_ref();
         let owned_path: PathBuf = path.to_path_buf();
 
-        let sock = match UnixDatagram::bind(path) {
+        let restrict_umask = !socket_mode & 0o777;
+        let old_umask = unsafe { umask(restrict_umask) };
+        let bind_result = UnixDatagram::bind(path);
+        unsafe { umask(old_umask) };
+        let sock = match bind_result {
             Ok(sock) => sock,
             Err(e) if e.kind() == ErrorKind::AddrInUse => {
                 let PathOccupant::Socket(stale_socket) = path_occupant(path)? else {
@@ -134,7 +143,9 @@ impl UdsListener {
                                 ));
                             }
                         }
+                        let old_umask = unsafe { umask(restrict_umask) };
                         let sock = UnixDatagram::bind(path)?;
+                        unsafe { umask(old_umask) };
                         std::fs::set_permissions(
                             path,
                             std::fs::Permissions::from_mode(socket_mode),
@@ -172,13 +183,26 @@ impl UdsListener {
             path,
             bound_dev,
             bound_ino,
+            truncated_count: 0,
         })
     }
 }
 
 impl BeatListener for UdsListener {
     fn recv(&mut self) -> RecvResult {
-        peer_cred::recv_authenticated(self.sock.as_raw_fd())
+        match peer_cred::recv_authenticated(self.sock.as_raw_fd()) {
+            RecvResult::ShortRead => {
+                self.truncated_count = self.truncated_count.wrapping_add(1);
+                RecvResult::ShortRead
+            }
+            other => other,
+        }
+    }
+
+    fn drain_truncated(&mut self) -> u64 {
+        let n = self.truncated_count;
+        self.truncated_count = 0;
+        n
     }
 }
 

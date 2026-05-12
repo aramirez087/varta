@@ -66,6 +66,11 @@ struct Outstanding {
     killed: bool,
 }
 
+/// Maximum number of pids tracked in `last_fired`. When the map is full and
+/// a new pid stalls, the debounce check is skipped and the recovery command
+/// fires. This prevents unbounded memory growth during a large stall burst.
+const MAX_LAST_FIRED_CAPACITY: usize = 256;
+
 /// Per-pid debounced runner of a `recovery_cmd` template.
 pub struct Recovery {
     template: String,
@@ -132,9 +137,17 @@ impl Recovery {
         self.last_fired
             .retain(|_, &mut fired_at| now.duration_since(fired_at) < prune_threshold);
 
-        if let Some(prev) = self.last_fired.get(&pid) {
-            if now.duration_since(*prev) < self.debounce {
-                return RecoveryOutcome::Debounced;
+        // If the map is at capacity and this pid is not already tracked,
+        // skip the debounce to prevent unbounded memory growth. The
+        // outstanding map still prevents double-spawning for the same pid.
+        let at_capacity =
+            self.last_fired.len() >= MAX_LAST_FIRED_CAPACITY && !self.last_fired.contains_key(&pid);
+
+        if !at_capacity {
+            if let Some(prev) = self.last_fired.get(&pid) {
+                if now.duration_since(*prev) < self.debounce {
+                    return RecoveryOutcome::Debounced;
+                }
             }
         }
 
@@ -146,7 +159,9 @@ impl Recovery {
             }
         }
 
-        self.last_fired.insert(pid, now);
+        if !at_capacity {
+            self.last_fired.insert(pid, now);
+        }
 
         match Command::new("/bin/sh")
             .arg("-c")
