@@ -12,9 +12,10 @@ udp = ["varta-client/udp", "varta-watch/udp"]
 secure-udp = ["varta-client/secure-udp", "varta-watch/secure-udp"]
 
 [dev-dependencies]
-varta-vlp = { path = "../varta-vlp" }
+varta-vlp = { path = "../varta-vlp", features = ["crypto"] }
 varta-client = { path = "../varta-client", features = ["panic-handler"] }
 varta-watch = { path = "../varta-watch" }
+proptest = "1"
 
 [[test]]
 name = "end_to_end"

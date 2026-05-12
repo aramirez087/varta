@@ -126,3 +126,6 @@ jobs:
 
       - name: fuzz config_from_args (30 s)
         run: cargo fuzz run config_from_args -- -max_total_time=30
+
+      - name: fuzz kdf_derive (30 s)
+        run: cargo fuzz run kdf_derive -- -max_total_time=30

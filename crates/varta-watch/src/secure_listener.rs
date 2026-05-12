@@ -377,13 +377,13 @@ impl BeatListener for SecureUdpListener {
             let ciphertext: [u8; 32] = buf[12..44].try_into().unwrap();
             let tag: [u8; TAG_BYTES] = buf[44..60].try_into().unwrap();
 
-            let plaintext = self
+            let decrypted = self
                 .keys
                 .iter()
                 .find_map(|key| crypto::open(key.as_bytes(), &nonce, &ciphertext, &tag).ok())
                 .or_else(|| self.try_master_key_decrypt(&iv_random, &nonce, &ciphertext, &tag));
 
-            let Some(plaintext) = plaintext else {
+            let Some(plaintext) = decrypted else {
                 self.decrypt_failures = self.decrypt_failures.wrapping_add(1);
                 continue;
             };

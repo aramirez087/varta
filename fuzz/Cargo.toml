@@ -47,3 +47,10 @@ path = "fuzz_targets/config_from_args.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "kdf_derive"
+path = "fuzz_targets/kdf_derive.rs"
+test = false
+doc = false
+bench = false

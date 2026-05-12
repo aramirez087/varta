@@ -11,6 +11,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use varta_vlp::{DecodeError, Frame, Status};
+use varta_watch::tracker::MAX_CAPACITY;
 use varta_watch::{Event, Observer, Tracker, Update};
 
 static UDS_COUNTER: AtomicU32 = AtomicU32::new(0);
@@ -297,4 +298,86 @@ fn observer_rejects_spoofed_pid_frame() {
             "on macOS spoofed frame should be accepted as a beat"
         );
     }
+}
+
+/// Send datagrams shorter than 32 bytes to the observer and verify they are
+/// silently counted as truncated without crashing or emitting beat events.
+#[test]
+fn observer_counts_truncated_datagrams() {
+    let path = unique_uds_path("trunc");
+    let mut observer = Observer::bind(
+        path.as_path(),
+        Duration::from_secs(60),
+        0o600,
+        Duration::from_millis(100),
+        64,
+        None,
+    )
+    .expect("bind observer");
+    let client = client_socket(path.as_path());
+
+    // Send 0-byte, 1-byte, 31-byte, and 33-byte datagrams.
+    // A correct UDS VLP frame is exactly 32 bytes; anything else is ShortRead.
+    client.send(b"").expect("send 0-byte");
+    client.send(b"\xAA").expect("send 1-byte");
+    client.send(&[0xBBu8; 31]).expect("send 31-byte");
+    client.send(&[0xCCu8; 33]).expect("send 33-byte");
+
+    // Poll to let the observer consume the datagrams. None of them should
+    // surface as events — they are silently skipped in the poll loop.
+    let deadline = Duration::from_secs(2);
+    let mut saw_beat = false;
+    let stop = Instant::now() + deadline;
+    while Instant::now() < stop {
+        if let Some(Event::Beat { .. } | Event::Stall { .. }) = observer.poll() {
+            saw_beat = true;
+        }
+        if observer.drain_truncated() >= 4 {
+            break;
+        }
+        thread::sleep(Duration::from_millis(1));
+    }
+
+    let truncated = observer.drain_truncated();
+    assert_eq!(
+        truncated, 0,
+        "all truncated should have been drained in loop"
+    );
+    assert!(!saw_beat, "truncated datagrams must not emit Beat events");
+}
+
+/// Verify that `Tracker::new(capacity)` clamps to [`MAX_CAPACITY`]
+/// and that the capacity bound is enforced exactly at that boundary.
+#[test]
+fn tracker_capacity_clamped_to_max_capacity() {
+    // Clamping: requests above MAX_CAPACITY are silently capped.
+    let mut over = Tracker::new(MAX_CAPACITY + 1000);
+    let now_ns: u64 = 1_000;
+    let threshold_ns: u64 = 100;
+
+    // Fill up to MAX_CAPACITY distinct pids. Every insert must succeed
+    // (Update::Inserted or Update::Replaced). At the boundary, the next
+    // pid must yield CapacityExceeded.
+    for pid in 1u32..=MAX_CAPACITY as u32 {
+        let f = make_frame(pid, 1, Status::Ok, 0);
+        let update = over.record(&f, now_ns, threshold_ns);
+        assert!(
+            update == Update::Inserted || update == Update::Refreshed,
+            "pid {pid} should fit within MAX_CAPACITY"
+        );
+    }
+    assert_eq!(
+        over.len(),
+        MAX_CAPACITY,
+        "tracker should be full at MAX_CAPACITY"
+    );
+
+    let overflow = make_frame(MAX_CAPACITY as u32 + 1, 1, Status::Ok, 0);
+    let result = over.record(&overflow, now_ns, threshold_ns);
+    assert_eq!(result, Update::CapacityExceeded);
+    assert_eq!(
+        over.len(),
+        MAX_CAPACITY,
+        "len must not grow past MAX_CAPACITY"
+    );
 }

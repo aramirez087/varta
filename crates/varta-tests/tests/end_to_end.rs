@@ -26,6 +26,13 @@ use std::time::{Duration, Instant};
 use varta_client::{install_panic_handler, BeatOutcome, Status, Varta};
 
 const PANIC_CHILD_ENV: &str = "VARTA_E2E_PANIC_CHILD";
+const AGENT_CHILD_ENV: &str = "VARTA_E2E_AGENT_CHILD";
+
+/// Number of concurrent agent processes spawned in the multi-agent test.
+const MULTI_AGENT_COUNT: usize = 10;
+
+/// Number of beats each agent process sends.
+const MULTI_AGENT_BEATS: usize = 20;
 
 /// Hand-rolled test runner. Runs as the panic child when the dispatch env
 /// var is set; otherwise executes both contract tests sequentially.
@@ -35,9 +42,13 @@ fn main() -> ExitCode {
         // run_panic_child panics; this is unreachable but kept for clarity.
         return ExitCode::SUCCESS;
     }
+    if let Ok(socket_path) = std::env::var(AGENT_CHILD_ENV) {
+        run_agent_child(&socket_path);
+        return ExitCode::SUCCESS;
+    }
 
     let mut failed = 0u32;
-    eprintln!("running 2 tests");
+    eprintln!("running 3 tests");
     failed += run_one(
         "client_to_observer_to_recovery_full_loop",
         client_to_observer_to_recovery_full_loop,
@@ -45,6 +56,10 @@ fn main() -> ExitCode {
     failed += run_one(
         "panic_handler_critical_beat_visible_in_metrics",
         panic_handler_critical_beat_visible_in_metrics,
+    );
+    failed += run_one(
+        "concurrent_multi_agent_beats_visible_in_metrics",
+        concurrent_multi_agent_beats_visible_in_metrics,
     );
     #[cfg(feature = "udp")]
     {
@@ -61,7 +76,7 @@ fn main() -> ExitCode {
         );
     }
 
-    let total = 2u32
+    let total = 3u32
         + if cfg!(feature = "udp") { 1 } else { 0 }
         + if cfg!(feature = "secure-udp") { 1 } else { 0 };
     let passed = total - failed;
@@ -271,6 +286,113 @@ fn panic_handler_critical_beat_visible_in_metrics() {
     );
 }
 
+/// `concurrent_multi_agent_beats_visible_in_metrics`.
+///
+/// Spawns `varta-watch` with a generous tracker capacity, then spawns
+/// [`MULTI_AGENT_COUNT`] concurrent agent child processes. Each child
+/// re-execs this test binary as `VARTA_E2E_AGENT_CHILD=<socket>`, sends
+/// [`MULTI_AGENT_BEATS`] beats, then exits. The parent waits for all
+/// children, then asserts every child's PID appears in `/metrics` with
+/// the expected beat count.
+fn concurrent_multi_agent_beats_visible_in_metrics() {
+    let tmp = TempDir::new("multi");
+    let socket = tmp.path().join("varta.sock");
+
+    let (mut watch_child, prom_addr) = spawn_watch(&[
+        "--socket",
+        socket.to_str().unwrap(),
+        "--threshold-ms",
+        "5000",
+        "--tracker-capacity",
+        "128",
+        "--prom-addr",
+        "127.0.0.1:0",
+        "--shutdown-after-secs",
+        "10",
+    ]);
+    let _guard = ChildGuard(&mut watch_child);
+
+    assert!(
+        wait_until(|| socket.exists(), Duration::from_secs(3)),
+        "varta-watch did not bind socket within 3s"
+    );
+    assert!(
+        wait_until(
+            || TcpStream::connect(prom_addr).is_ok(),
+            Duration::from_secs(3)
+        ),
+        "/metrics not reachable within 3s"
+    );
+
+    let me = std::env::current_exe().expect("current_exe");
+    let mut children: Vec<Child> = Vec::with_capacity(MULTI_AGENT_COUNT);
+
+    for _ in 0..MULTI_AGENT_COUNT {
+        let child = Command::new(&me)
+            .env(AGENT_CHILD_ENV, socket.to_str().unwrap())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn agent child");
+        children.push(child);
+    }
+
+    // Wait for all children with generous timeout — the observer is
+    // non-blocking and each child exits after its beats, but slow CI
+    // runners may take longer.
+    for child in &mut children {
+        let status = child.wait().expect("wait agent child");
+        assert!(status.success(), "agent child exited with {status}");
+    }
+
+    // The Prom exporter updates on every poll-loop tick. Poll until
+    // at least MULTI_AGENT_COUNT distinct PIDs appear in the beats counter,
+    // or the deadline expires.
+    let mut last_body = String::new();
+    let mut seen_pids = 0u32;
+    let mut max_claim = 0u64;
+    let satisfied = wait_until(
+        || match http_get(prom_addr, "/metrics") {
+            Ok((200, body)) => {
+                last_body = body.clone();
+                seen_pids = 0;
+                max_claim = 0;
+                for line in body.lines() {
+                    if let Some(rest) = line.strip_prefix("varta_beats_total{pid=\"") {
+                        if let Some(end) = rest.find('\"') {
+                            if let Some(val_start) = rest[end..].find(' ') {
+                                let count_str = rest[end + val_start..].trim();
+                                if let Ok(n) = count_str.parse::<u64>() {
+                                    max_claim = max_claim.max(n);
+                                    seen_pids += 1;
+                                }
+                            }
+                        }
+                    }
+                }
+                seen_pids >= MULTI_AGENT_COUNT as u32
+            }
+            _ => false,
+        },
+        Duration::from_secs(8),
+    );
+
+    assert!(
+        satisfied,
+        "/metrics shows {seen_pids} PIDs, expected at least {MULTI_AGENT_COUNT}; \
+         body:\n{last_body}"
+    );
+
+    // Each child sends exactly MULTI_AGENT_BEATS beats. Retry logic within
+    // each child may cause a few extra if Dropped beats are re-sent, but
+    // no single PID should claim more than a reasonable ceiling.
+    let ceiling = (MULTI_AGENT_BEATS * 2) as u64;
+    assert!(
+        max_claim <= ceiling,
+        "max beat count {max_claim} exceeds reasonable ceiling {ceiling}"
+    );
+}
+
 // --- panic-child entrypoint -------------------------------------------------
 
 /// Code path entered when this binary is re-spawned as a panic child via
@@ -290,6 +412,37 @@ fn run_panic_child(socket_path: &str) {
     // panic-fired Critical frame races process exit.
     std::thread::sleep(Duration::from_millis(150));
     panic!("VARTA_E2E_PANIC_CHILD: deliberate panic for hook coverage");
+}
+
+// --- agent-child entrypoint ------------------------------------------------
+
+/// Code path entered when this binary is re-spawned as a multi-agent child via
+/// `VARTA_E2E_AGENT_CHILD=<socket>`. Connects to the observer, sends
+/// [`MULTI_AGENT_BEATS`] beats, then exits cleanly.
+///
+/// This function must never write to stdout/stderr — the parent process
+/// spawns children with both streams set to `Stdio::null()`.
+fn run_agent_child(socket_path: &str) {
+    let mut agent = Varta::connect(socket_path).expect("agent child: connect");
+    for i in 0..MULTI_AGENT_BEATS {
+        let mut tries = 0u32;
+        loop {
+            match agent.beat(Status::Ok, i as u64) {
+                BeatOutcome::Sent => break,
+                BeatOutcome::Dropped => {
+                    tries += 1;
+                    if tries > 500 {
+                        std::process::exit(1);
+                    }
+                    std::thread::sleep(Duration::from_micros(500));
+                }
+                BeatOutcome::Failed(_) => std::process::exit(1),
+            }
+        }
+    }
+    // Brief delay so the last beats can reach the observer before the child
+    // process exits and the kernel closes the socket.
+    std::thread::sleep(Duration::from_millis(100));
 }
 
 // --- helpers ----------------------------------------------------------------

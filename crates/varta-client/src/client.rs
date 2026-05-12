@@ -81,7 +81,7 @@ pub fn classify_send_error(e: &io::Error) -> BeatOutcome {
         | io::ErrorKind::BrokenPipe
         | io::ErrorKind::StorageFull => BeatOutcome::Dropped,
 
-        // (d) Unexpected error: clone and escalate.
+        // (c) Unexpected error: clone and escalate.
         //     This is on the Failed path (not steady-state), so a possible
         //     allocation inside io::Error is acceptable.
         _ => {
