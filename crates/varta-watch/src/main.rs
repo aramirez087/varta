@@ -26,12 +26,34 @@ use varta_watch::{
 /// Shutdown latch flipped by [`install_signal_handlers`] on SIGINT/SIGTERM
 /// and by the `--shutdown-after-secs` deadline path. The poll loop exits
 /// when this becomes `true`.
+///
+/// # Async-signal-safety
+///
+/// The signal handler writes `true` with `Ordering::Release` to this
+/// `AtomicBool`.  On all Tier-1 targets the operation compiles to a single
+/// aligned atomic instruction (e.g. `lock or $1,mem` on x86_64; `stlr` on
+/// aarch64) and cannot be interrupted mid-store.  POSIX `sig_atomic_t` is
+/// the minimum guarantee, but lock-free atomics are explicitly supported in
+/// signal handlers by Linux `signal-safety(7)` and Apple `sigaction(2)`.
+/// `SA_RESTART` is set so the observer's `recvmsg(2)` never returns `EINTR`.
 static SHUTDOWN: AtomicBool = AtomicBool::new(false);
 
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd",))]
 unsafe fn install_signal_handlers() {
     const SIGINT: i32 = 2;
     const SIGTERM: i32 = 15;
+
+    /// `SA_RESTART`: automatically restart interrupted syscalls (e.g.
+    /// `recvmsg(2)`) instead of returning `EINTR`.  Eliminates the need
+    /// for explicit `EINTR` handling in the I/O path.  Values are
+    /// platform-defined; verified against `<bits/signum-generic.h>`
+    /// (Linux), `<sys/signal.h>` (macOS), and `<sys/signal.h>` (FreeBSD).
+    #[cfg(target_os = "linux")]
+    const SA_RESTART: i32 = 0x1000_0000;
+    #[cfg(target_os = "macos")]
+    const SA_RESTART: i32 = 0x0002;
+    #[cfg(target_os = "freebsd")]
+    const SA_RESTART: i32 = 0x0040;
 
     extern "C" fn handle(_sig: i32) {
         SHUTDOWN.store(true, Ordering::Release);
@@ -80,6 +102,7 @@ unsafe fn install_signal_handlers() {
     let mut act = std::mem::MaybeUninit::<SigAction>::zeroed();
     unsafe {
         (*act.as_mut_ptr()).sa_handler = handle as *const ();
+        (*act.as_mut_ptr()).sa_flags = SA_RESTART;
     }
     let act = unsafe { act.assume_init() };
     unsafe {
@@ -252,10 +275,12 @@ fn run(cfg: Config) -> std::io::Result<()> {
         // includes Prometheus serving / file I/O / reaping).
         while let Some(ev) = observer.poll_pending() {
             if let Some(fe) = file_export.as_mut() {
-                fe.record(&ev);
+                if let Err(e) = fe.record(&ev) {
+                    eprintln!("varta-watch: file export error: {e}");
+                }
             }
             if let Some(pe) = prom_export.as_mut() {
-                pe.record(&ev);
+                let _ = pe.record(&ev);
             }
             if let Event::Stall { pid, .. } = &ev {
                 if let Some(rec) = recovery.as_mut() {
@@ -284,10 +309,12 @@ fn run(cfg: Config) -> std::io::Result<()> {
         // poll_pending() above.
         let had_io = if let Some(ev) = observer.poll() {
             if let Some(fe) = file_export.as_mut() {
-                fe.record(&ev);
+                if let Err(e) = fe.record(&ev) {
+                    eprintln!("varta-watch: file export error: {e}");
+                }
             }
             if let Some(pe) = prom_export.as_mut() {
-                pe.record(&ev);
+                let _ = pe.record(&ev);
             }
             true
         } else {

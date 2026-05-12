@@ -101,7 +101,15 @@ impl SecureUdpTransport {
 
 impl BeatTransport for SecureUdpTransport {
     fn send(&mut self, buf: &[u8; 32]) -> io::Result<usize> {
-        self.iv_counter = self.iv_counter.wrapping_add(1);
+        self.iv_counter = match self.iv_counter.checked_add(1) {
+            Some(n) => n,
+            None => {
+                return Err(io::Error::new(
+                    io::ErrorKind::Other,
+                    "iv_counter exhausted; reconnect required to derive fresh iv_random",
+                ));
+            }
+        };
 
         // Build 12-byte nonce: iv_random (8) || iv_counter (4) LE
         let mut nonce = [0u8; NONCE_BYTES];

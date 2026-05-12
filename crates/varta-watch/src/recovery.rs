@@ -246,18 +246,33 @@ impl Recovery {
 impl Drop for Recovery {
     fn drop(&mut self) {
         const SHUTDOWN_DEADLINE: Duration = Duration::from_secs(5);
-        const POLL_INTERVAL: Duration = Duration::from_millis(50);
-        for (_agent_pid, mut entry) in self.outstanding.drain() {
-            let _ = entry.child.kill();
-            let deadline = Instant::now() + SHUTDOWN_DEADLINE;
-            loop {
-                match entry.child.try_wait() {
-                    Ok(Some(_)) | Err(_) => break,
-                    Ok(None) if Instant::now() >= deadline => break,
-                    Ok(None) => std::thread::sleep(POLL_INTERVAL),
-                }
+        const POLL_INTERVAL: Duration = Duration::from_millis(10);
+
+        // Phase 1: kill all outstanding children immediately (no waiting).
+        let mut children: Vec<std::process::Child> = self
+            .outstanding
+            .drain()
+            .map(|(_, mut entry)| {
+                let _ = entry.child.kill();
+                entry.child
+            })
+            .collect();
+
+        // Phase 2: wait for all children with a single shared deadline.
+        // Previously this was per-child (N × 5s), now it's total 5s max.
+        let deadline = Instant::now() + SHUTDOWN_DEADLINE;
+        while !children.is_empty() && Instant::now() < deadline {
+            children.retain_mut(|child| match child.try_wait() {
+                Ok(Some(_)) | Err(_) => false, // reaped or error — remove
+                Ok(None) => true,              // still running — keep polling
+            });
+            if !children.is_empty() {
+                std::thread::sleep(POLL_INTERVAL);
             }
         }
+        // Any children still alive after the deadline: they will be
+        // reparented to PID 1 which will reap them. Child's Drop does
+        // not wait, so we do not leak file descriptors.
     }
 }
 

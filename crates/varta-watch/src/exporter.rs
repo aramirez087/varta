@@ -14,7 +14,7 @@ use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufWriter, ErrorKind, Read, Write};
-use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -25,9 +25,9 @@ use crate::observer::Event;
 /// Sink for an [`Event`] stream.
 pub trait Exporter {
     /// Record a single observer event. Implementations should never panic
-    /// or block the caller for IO; transient failures are absorbed and
-    /// surfaced via [`Exporter::flush`].
-    fn record(&mut self, ev: &Event);
+    /// or block the caller for IO; transient failures are returned as
+    /// `Err` so the caller can react (log, retry, or fall back).
+    fn record(&mut self, ev: &Event) -> io::Result<()>;
     /// Flush any internally buffered output. For network exporters that
     /// hold no per-event buffer this is a no-op that returns `Ok(())`.
     fn flush(&mut self) -> io::Result<()>;
@@ -87,15 +87,13 @@ impl FileExporter {
     /// the main loop when a tracker slot is reclaimed, so the operator has
     /// a per-pid trace of eviction events.
     pub fn record_eviction_pid(&mut self, pid: u32, observer_ns: u64) {
-        if self.pending_err.is_some() {
-            return;
-        }
         let result = writeln!(self.sink, "{observer_ns}\teviction\t{pid}\t-\t-\t-",);
         if let Err(e) = result {
             self.pending_err = Some(e);
-            return;
+        } else {
+            self.pending_err = None;
+            self.after_write();
         }
-        self.after_write();
     }
 
     /// Called after every successful write. When `max_bytes` is set and
@@ -157,10 +155,7 @@ impl FileExporter {
 }
 
 impl Exporter for FileExporter {
-    fn record(&mut self, ev: &Event) {
-        if self.pending_err.is_some() {
-            return;
-        }
+    fn record(&mut self, ev: &Event) -> io::Result<()> {
         let result = match ev {
             Event::Beat {
                 pid,
@@ -201,10 +196,16 @@ impl Exporter for FileExporter {
                 writeln!(self.sink, "{observer_ns}\tctrunc\t-\t-\t-\t{err}")
             }
         };
-        if let Err(e) = result {
-            self.pending_err = Some(e);
-        } else {
-            self.after_write();
+        if let Err(ref e) = result {
+            self.pending_err = Some(io::Error::new(e.kind(), e.to_string()));
+        }
+        match result {
+            Err(e) => Err(e),
+            Ok(()) => {
+                self.pending_err = None;
+                self.after_write();
+                Ok(())
+            }
         }
     }
 
@@ -453,10 +454,8 @@ impl PromExporter {
             let response = b"HTTP/1.0 405 Method Not Allowed\r\nAllow: GET\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
             let _ =
                 write_all_nonblocking(&mut stream, response, Instant::now() + PROM_WRITE_TIMEOUT);
-            // Drop at scope exit closes the connection. Using close() with
-            // default SO_LINGER (l_onoff=0) flushes the send buffer in the
-            // background and sends FIN – avoiding the macOS RST quirk that
-            // shutdown(SHUT_WR) triggers on non-blocking sockets.
+            drain_read_to_would_block(&mut stream);
+            let _ = stream.shutdown(Shutdown::Write);
             return Ok(());
         }
 
@@ -467,7 +466,8 @@ impl PromExporter {
         // combined response String.
         let _ = write_headers_with_len(&mut stream, body_len, write_deadline);
         let _ = write_all_nonblocking(&mut stream, self.body_buf.as_bytes(), write_deadline);
-        // Drop at scope exit closes the connection (see 405 branch).
+        drain_read_to_would_block(&mut stream);
+        let _ = stream.shutdown(Shutdown::Write);
         Ok(())
     }
 
@@ -612,7 +612,7 @@ impl PromExporter {
 }
 
 impl Exporter for PromExporter {
-    fn record(&mut self, ev: &Event) {
+    fn record(&mut self, ev: &Event) -> io::Result<()> {
         match ev {
             Event::Beat {
                 pid,
@@ -647,6 +647,7 @@ impl Exporter for PromExporter {
                 self.ctrl_truncated_total = self.ctrl_truncated_total.saturating_add(1);
             }
         }
+        Ok(())
     }
 
     fn flush(&mut self) -> io::Result<()> {
@@ -759,6 +760,25 @@ fn write_all_nonblocking(stream: &mut TcpStream, buf: &[u8], deadline: Instant) 
     Ok(())
 }
 
+/// Drain any unread data from the peer's send buffer so that
+/// `shutdown(SHUT_WR)` sends a graceful FIN instead of RST.
+///
+/// On macOS, calling `shutdown(SHUT_WR)` on a non-blocking socket that has
+/// unread data in the receive buffer triggers an RST rather than a TCP FIN.
+/// This non-blocking drain empties the receive buffer, letting
+/// `shutdown(SHUT_WR)` complete cleanly on all platforms.
+fn drain_read_to_would_block(stream: &mut TcpStream) {
+    let mut buf = [0u8; 128];
+    loop {
+        match stream.read(&mut buf) {
+            Ok(0) => break,
+            Ok(_) => continue,
+            Err(ref e) if e.kind() == ErrorKind::WouldBlock => break,
+            Err(_) => break,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -772,21 +792,24 @@ mod tests {
             nonce: 1,
             payload: 0,
             observer_ns: 0,
-        });
+        })
+        .unwrap();
         prom.record(&Event::Beat {
             pid: 2,
             status: Status::Ok,
             nonce: 1,
             payload: 0,
             observer_ns: 0,
-        });
+        })
+        .unwrap();
         prom.record(&Event::Beat {
             pid: 11,
             status: Status::Ok,
             nonce: 1,
             payload: 0,
             observer_ns: 0,
-        });
+        })
+        .unwrap();
         prom.render_body();
         let body = &prom.body_buf;
         let pos2 = body.find("pid=\"2\"").expect("pid 2");
@@ -798,8 +821,9 @@ mod tests {
     #[test]
     fn decode_and_io_events_do_not_create_rows() {
         let mut prom = PromExporter::bind("127.0.0.1:0".parse().unwrap()).expect("bind");
-        prom.record(&Event::Decode(varta_vlp::DecodeError::BadMagic, 0));
-        prom.record(&Event::Io(io::Error::other("x"), 0));
+        prom.record(&Event::Decode(varta_vlp::DecodeError::BadMagic, 0))
+            .unwrap();
+        prom.record(&Event::Io(io::Error::other("x"), 0)).unwrap();
         assert!(prom.rows.is_empty());
     }
 
@@ -807,9 +831,12 @@ mod tests {
     fn decode_errors_emit_kind_label_for_every_variant_even_at_zero() {
         let mut prom = PromExporter::bind("127.0.0.1:0".parse().unwrap()).expect("bind");
         // Bump bad_magic twice, bad_status once, leave bad_version at zero.
-        prom.record(&Event::Decode(DecodeError::BadMagic, 0));
-        prom.record(&Event::Decode(DecodeError::BadMagic, 0));
-        prom.record(&Event::Decode(DecodeError::BadStatus(0xff), 0));
+        prom.record(&Event::Decode(DecodeError::BadMagic, 0))
+            .unwrap();
+        prom.record(&Event::Decode(DecodeError::BadMagic, 0))
+            .unwrap();
+        prom.record(&Event::Decode(DecodeError::BadStatus(0xff), 0))
+            .unwrap();
 
         prom.render_body();
         let body = &prom.body_buf;
@@ -835,6 +862,9 @@ mod tests {
         let addr = prom.local_addr().expect("local_addr");
         let mut stream = TcpStream::connect(addr).expect("connect");
         stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("read timeout");
+        stream
             .write_all(b"POST /metrics HTTP/1.0\r\n\r\n")
             .expect("write");
         prom.serve_pending().expect("serve_pending");
@@ -859,7 +889,8 @@ mod tests {
             nonce: 1,
             payload: 0,
             observer_ns: 0,
-        });
+        })
+        .unwrap();
         assert!(prom.rows.contains_key(&42), "row should exist after beat");
         prom.record_evicted_pid(42);
         assert!(

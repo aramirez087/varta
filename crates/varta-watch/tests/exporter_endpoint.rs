@@ -82,7 +82,8 @@ fn prom_exporter_reports_beats_total_per_pid() {
             payload: 0,
             nonce: n,
             observer_ns: 0,
-        });
+        })
+        .unwrap();
     }
     let body = http_get(&mut prom, addr, "/metrics");
     assert!(
@@ -101,13 +102,15 @@ fn prom_exporter_reports_stalls_total_per_pid() {
         payload: 0,
         nonce: 1,
         observer_ns: 0,
-    });
+    })
+    .unwrap();
     prom.record(&Event::Stall {
         pid: 9,
         last_nonce: 1,
         last_ns: 0,
         observer_ns: 0,
-    });
+    })
+    .unwrap();
     let body = http_get(&mut prom, addr, "/metrics");
     assert!(
         body.contains("varta_stalls_total{pid=\"9\"} 1"),
@@ -143,7 +146,7 @@ fn file_exporter_appends_one_line_per_event() {
         Event::Decode(DecodeError::BadMagic, 0),
     ];
     for ev in &events {
-        fe.record(ev);
+        fe.record(ev).unwrap();
     }
     fe.flush().expect("flush");
     let body = std::fs::read_to_string(path.as_path()).expect("read export file");

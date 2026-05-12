@@ -5,6 +5,7 @@
 //! alternative transports (e.g. UDP) are available behind feature flags.
 
 use std::io;
+#[cfg(any(feature = "udp", feature = "secure-udp"))]
 use std::net::{SocketAddr, UdpSocket};
 use std::os::unix::net::UnixDatagram;
 use std::path::{Path, PathBuf};
@@ -76,6 +77,7 @@ impl BeatTransport for UdsTransport {
 
 /// Bind a UDP socket to an ephemeral port on the wildcard address matching
 /// the target's address family (IPv4 or IPv6).
+#[cfg(any(feature = "udp", feature = "secure-udp"))]
 pub(crate) fn bind_ephemeral(addr: &SocketAddr) -> io::Result<UdpSocket> {
     let bind_addr = if addr.is_ipv4() {
         "0.0.0.0:0"
