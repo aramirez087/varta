@@ -180,10 +180,21 @@ impl Recovery {
         let mut outcomes = Vec::new();
         outcomes.append(&mut self.pending_outcomes);
 
-        // Collect keys first, then process each entry to avoid borrow issues.
-        let pids: Vec<u32> = self.outstanding.keys().copied().collect();
+        // Outstanding recovery children are rare (typically 0–2, bounded by
+        // the number of tracked agents).  Use stack storage to avoid a
+        // per-tick allocation.
+        let mut pids_buf = [0u32; 64];
+        let mut pid_count = 0;
+        for &pid in self.outstanding.keys() {
+            if pid_count >= pids_buf.len() {
+                break;
+            }
+            pids_buf[pid_count] = pid;
+            pid_count += 1;
+        }
+        let pids = &pids_buf[..pid_count];
 
-        for pid in pids {
+        for &pid in pids {
             if let Some(outcome) = self.reap_finished_child(pid) {
                 outcomes.push(outcome);
                 continue;

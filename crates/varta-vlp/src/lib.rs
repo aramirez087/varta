@@ -153,12 +153,19 @@ impl Frame {
         }
         let status = Status::try_from_u8(bytes[3])?;
 
-        // INVARIANT: `bytes` is `&[u8; 32]` by the function signature, so every
-        // range below is statically in-bounds and `try_into().unwrap()` never panics.
-        let pid = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
-        let timestamp = u64::from_le_bytes(bytes[8..16].try_into().unwrap());
-        let nonce = u64::from_le_bytes(bytes[16..24].try_into().unwrap());
-        let payload = u64::from_le_bytes(bytes[24..32].try_into().unwrap());
+        // Each integer field is decoded via explicit array indexing — the
+        // compiler statically proves every index is in-bounds against the
+        // `&[u8; 32]` reference, so there are no runtime panics.
+        let pid = u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
+        let timestamp = u64::from_le_bytes([
+            bytes[8], bytes[9], bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15],
+        ]);
+        let nonce = u64::from_le_bytes([
+            bytes[16], bytes[17], bytes[18], bytes[19], bytes[20], bytes[21], bytes[22], bytes[23],
+        ]);
+        let payload = u64::from_le_bytes([
+            bytes[24], bytes[25], bytes[26], bytes[27], bytes[28], bytes[29], bytes[30], bytes[31],
+        ]);
 
         Ok(Frame {
             magic,

@@ -220,7 +220,7 @@ fn run(cfg: Config) -> std::io::Result<()> {
         Recovery::with_timeout(tpl.clone(), cfg.recovery_debounce, cfg.recovery_timeout)
     });
     let mut file_export: Option<FileExporter> = match cfg.file_export.as_ref() {
-        Some(path) => Some(FileExporter::create(path)?),
+        Some(path) => Some(FileExporter::create(path, cfg.export_file_max_bytes)?),
         None => None,
     };
     let mut prom_export: Option<PromExporter> = match cfg.prom_addr {
@@ -299,6 +299,12 @@ fn run(cfg: Config) -> std::io::Result<()> {
         if evicted > 0 {
             if let Some(pe) = prom_export.as_mut() {
                 pe.record_eviction(evicted);
+            }
+        }
+
+        if let Some(evicted_pid) = observer.drain_evicted_pid() {
+            if let Some(fe) = file_export.as_mut() {
+                fe.record_eviction_pid(evicted_pid, observer.now_ns());
             }
         }
 

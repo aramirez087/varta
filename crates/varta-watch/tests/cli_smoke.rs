@@ -69,6 +69,7 @@ fn cli_help_lists_every_documented_flag() {
         "--recovery-timeout-ms",
         "--socket-mode",
         "--export-file",
+        "--export-file-max-bytes",
         "--prom-addr",
         "--shutdown-after-secs",
         "--help",

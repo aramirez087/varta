@@ -85,6 +85,7 @@ pub struct Tracker {
     len: usize,
     evictions: u64,
     capacity_exceeded: u64,
+    last_evicted_pid: Option<u32>,
 }
 
 impl Default for Tracker {
@@ -112,6 +113,7 @@ impl Tracker {
             len: 0,
             evictions: 0,
             capacity_exceeded: 0,
+            last_evicted_pid: None,
         }
     }
 
@@ -143,6 +145,7 @@ impl Tracker {
 
         if self.len >= self.entries.capacity() {
             if let Some(evict_idx) = self.find_evictable_slot(now_ns, threshold_ns) {
+                let evicted_pid = self.entries[evict_idx].pid;
                 self.entries[evict_idx] = Slot {
                     pid: frame.pid,
                     last_nonce: frame.nonce,
@@ -152,6 +155,7 @@ impl Tracker {
                     stall_emitted: false,
                 };
                 self.evictions = self.evictions.saturating_add(1);
+                self.last_evicted_pid = Some(evicted_pid);
                 return Update::Inserted;
             }
             self.capacity_exceeded = self.capacity_exceeded.saturating_add(1);
@@ -202,6 +206,12 @@ impl Tracker {
         let count = self.evictions;
         self.evictions = 0;
         count
+    }
+
+    /// Return the pid of the most recently evicted slot, if any slots
+    /// have been evicted since the last call.
+    pub fn take_evicted_pid(&mut self) -> Option<u32> {
+        self.last_evicted_pid.take()
     }
 
     /// Take and reset the capacity-exceeded counter. Returns the number of

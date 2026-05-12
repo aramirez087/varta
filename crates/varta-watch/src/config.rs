@@ -43,6 +43,9 @@ pub struct Config {
     pub recovery_debounce: Duration,
     /// Optional path the file exporter appends one event-line per record to.
     pub file_export: Option<PathBuf>,
+    /// Optional byte limit for the file export. When exceeded, the current
+    /// file is rotated (up to 5 generations) and a new one is opened.
+    pub export_file_max_bytes: Option<u64>,
     /// Optional listening address for the Prometheus exporter.
     pub prom_addr: Option<SocketAddr>,
     /// Optional deadline after which the daemon shuts itself down. Used by
@@ -170,6 +173,10 @@ OPTIONAL:
                                      (default 0600 — owner-only r/w).
     --export-file <PATH>            Append one tab-separated event line per
                                      observer event to this file.
+    --export-file-max-bytes <N>     Rotate export file when its size exceeds
+                                     N bytes (keeps up to 5 generations:
+                                     PATH.1 .. PATH.5).  Without this flag
+                                     the file grows without bound.
     --prom-addr <IP:PORT>          Bind a Prometheus text-format endpoint at
                                     GET /metrics on this address.
     --recovery-timeout-ms <MS>     Kill-after deadline for recovery children;
@@ -210,6 +217,7 @@ OPTIONAL:
         let mut recovery_cmd: Option<String> = None;
         let mut recovery_debounce_ms: Option<u64> = None;
         let mut file_export: Option<PathBuf> = None;
+        let mut export_file_max_bytes: Option<u64> = None;
         let mut prom_addr: Option<SocketAddr> = None;
         let mut shutdown_after_secs: Option<u64> = None;
         let mut recovery_timeout_ms: Option<u64> = None;
@@ -259,6 +267,12 @@ OPTIONAL:
                         .next()
                         .ok_or(ConfigError::MissingValue("--export-file"))?;
                     file_export = Some(PathBuf::from(v));
+                }
+                "--export-file-max-bytes" => {
+                    let v = iter
+                        .next()
+                        .ok_or(ConfigError::MissingValue("--export-file-max-bytes"))?;
+                    export_file_max_bytes = Some(parse_u64("--export-file-max-bytes", &v)?);
                 }
                 "--prom-addr" => {
                     let v = iter
@@ -346,6 +360,7 @@ OPTIONAL:
             recovery_cmd,
             recovery_debounce,
             file_export,
+            export_file_max_bytes,
             prom_addr,
             shutdown_after: shutdown_after_secs.map(Duration::from_secs),
             recovery_timeout: recovery_timeout_ms.map(Duration::from_millis),

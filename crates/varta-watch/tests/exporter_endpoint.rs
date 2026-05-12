@@ -118,7 +118,7 @@ fn prom_exporter_reports_stalls_total_per_pid() {
 #[test]
 fn file_exporter_appends_one_line_per_event() {
     let path = unique_tmp("export");
-    let mut fe = FileExporter::create(path.as_path()).expect("create file exporter");
+    let mut fe = FileExporter::create(path.as_path(), None).expect("create file exporter");
     let events = [
         Event::Beat {
             pid: 1,

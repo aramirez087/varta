@@ -6,9 +6,10 @@
 //! caller drives the loop — see `main.rs` for the daemon entrypoint.
 //!
 //! Multiple listeners (e.g. UDS + UDP) are polled round-robin. Each call to
-//! [`Observer::poll`] tries every listener in order; the first successful
-//! receive is returned immediately. If all listeners return `WouldBlock`,
-//! stalls are drained and `None` is returned.
+//! [`Observer::poll`] tries every listener once; the first non-`WouldBlock`
+//! event is returned but all remaining listeners are still tried, so a
+//! busy listener cannot starve co-located listeners. If all listeners return
+//! `WouldBlock`, stalls are drained and `None` is returned.
 
 use std::io;
 use std::path::Path;
@@ -149,20 +150,17 @@ impl Observer {
         self.listeners.push(listener);
     }
 
-    /// Attempt a single non-blocking read from each listener and return the
-    /// first I/O [`Event`] found.
-    ///
-    /// Listeners are polled round-robin: polling starts at the index after the
-    /// listener that produced the last non-`WouldBlock` event. Each listener
-    /// is tried exactly once per call; the first non-`WouldBlock` result
-    /// (beat, decode error, auth failure, or I/O error) is returned
-    /// immediately. Remaining listeners are not polled until the next call.
+    /// Poll every listener once round-robin and return the first
+    /// non-`WouldBlock` [`Event`] found. Each listener is tried exactly
+    /// once per call — a busy listener cannot starve others because the
+    /// round-robin advances past it on every successful receive.
     ///
     /// This method never returns [`Event::Stall`] — queued stall events must
     /// be retrieved via [`Observer::poll_pending`].
     pub fn poll(&mut self) -> Option<Event> {
         let len = self.listeners.len();
         let start = self.next_listener_start;
+        let mut first_event: Option<Event> = None;
         let mut round = 0;
         while round < len {
             let i = (start + round) % len;
@@ -170,15 +168,20 @@ impl Observer {
             match self.listeners[i].recv() {
                 RecvResult::Authenticated { peer_pid, data } => {
                     let now_ns = self.now_ns();
-                    self.next_listener_start = (i + 1) % len;
+                    if first_event.is_none() {
+                        self.next_listener_start = (i + 1) % len;
+                    }
                     match Frame::decode(&data) {
                         Ok(frame) => {
                             #[cfg(target_os = "linux")]
                             if peer_pid != 0 && frame.pid != peer_pid {
-                                return Some(Event::AuthFailure {
-                                    claimed_pid: frame.pid,
-                                    observer_ns: now_ns,
-                                });
+                                if first_event.is_none() {
+                                    first_event = Some(Event::AuthFailure {
+                                        claimed_pid: frame.pid,
+                                        observer_ns: now_ns,
+                                    });
+                                }
+                                continue;
                             }
                             #[cfg(not(target_os = "linux"))]
                             {
@@ -186,34 +189,44 @@ impl Observer {
                             }
                             match self.tracker.record(&frame, now_ns, self.threshold_ns) {
                                 Update::Inserted | Update::Refreshed => {
-                                    return Some(Event::Beat {
-                                        pid: frame.pid,
-                                        status: frame.status,
-                                        payload: frame.payload,
-                                        nonce: frame.nonce,
-                                        observer_ns: now_ns,
-                                    });
+                                    if first_event.is_none() {
+                                        first_event = Some(Event::Beat {
+                                            pid: frame.pid,
+                                            status: frame.status,
+                                            payload: frame.payload,
+                                            nonce: frame.nonce,
+                                            observer_ns: now_ns,
+                                        });
+                                    }
                                 }
-                                Update::OutOfOrder | Update::CapacityExceeded => continue,
+                                Update::OutOfOrder | Update::CapacityExceeded => {}
                             }
                         }
-                        Err(e) => return Some(Event::Decode(e, now_ns)),
+                        Err(e) => {
+                            if first_event.is_none() {
+                                first_event = Some(Event::Decode(e, now_ns));
+                            }
+                        }
                     }
                 }
                 RecvResult::WouldBlock => continue,
                 RecvResult::ShortRead => continue,
                 RecvResult::CtrlTruncated(e) => {
-                    self.next_listener_start = (i + 1) % len;
-                    return Some(Event::CtrlTruncated(e, self.now_ns()));
+                    if first_event.is_none() {
+                        self.next_listener_start = (i + 1) % len;
+                        first_event = Some(Event::CtrlTruncated(e, self.now_ns()));
+                    }
                 }
                 RecvResult::IoError(e) => {
-                    self.next_listener_start = (i + 1) % len;
-                    return Some(Event::Io(e, self.now_ns()));
+                    if first_event.is_none() {
+                        self.next_listener_start = (i + 1) % len;
+                        first_event = Some(Event::Io(e, self.now_ns()));
+                    }
                 }
             }
         }
         self.drain_stalls();
-        None
+        first_event
     }
 
     /// Return the next queued [`Event::Stall`], if any.
@@ -231,7 +244,8 @@ impl Observer {
         self.stall_cursor < self.stall_queue.len()
     }
 
-    fn now_ns(&self) -> u64 {
+    /// Observer-local nanosecond timestamp (ns since [`Observer`] start).
+    pub fn now_ns(&self) -> u64 {
         let elapsed = self.start.elapsed().as_nanos();
         elapsed.min(u64::MAX as u128) as u64
     }
@@ -267,6 +281,11 @@ impl Observer {
     /// Drain and reset the eviction counter.
     pub fn drain_evictions(&mut self) -> u64 {
         self.tracker.take_evictions()
+    }
+
+    /// Drain the pid of the most recently evicted slot, if any.
+    pub fn drain_evicted_pid(&mut self) -> Option<u32> {
+        self.tracker.take_evicted_pid()
     }
 
     /// Drain and reset the capacity-exceeded counter.

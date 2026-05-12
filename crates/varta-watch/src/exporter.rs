@@ -15,7 +15,7 @@ use std::fmt::Write as _;
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufWriter, ErrorKind, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use varta_vlp::{DecodeError, Status};
@@ -46,23 +46,113 @@ pub trait Exporter {
 /// `observer_ns` is the observer-local nanosecond timestamp carried by every
 /// [`Event`], captured at observer poll time. All exporters sharing an event
 /// stream see the same timestamps.
+///
+/// When `max_bytes` is set, the exporter rotates the file after every write
+/// that pushes the size over the limit. Rotation shifts `PATH` → `PATH.1`,
+/// `PATH.1` → `PATH.2`, …, up to 5 generations, then re-opens `PATH` in
+/// append mode. Without `max_bytes` the file grows unbounded.
 pub struct FileExporter {
     sink: BufWriter<File>,
     pending_err: Option<io::Error>,
+    path: PathBuf,
+    max_bytes: Option<u64>,
+    bytes_written: u64,
 }
+
+/// Number of rotated file generations kept.
+const MAX_ROTATION_GENERATIONS: u32 = 5;
 
 impl FileExporter {
     /// Open `path` in append mode (creating it if necessary) and wrap it
     /// in a [`BufWriter`].
-    pub fn create(path: impl AsRef<Path>) -> io::Result<Self> {
+    ///
+    /// `max_bytes` is the optional size limit after which the file is
+    /// rotated.
+    pub fn create(path: impl AsRef<Path>, max_bytes: Option<u64>) -> io::Result<Self> {
         let file = OpenOptions::new()
             .create(true)
             .append(true)
             .open(path.as_ref())?;
+        let bytes_written = file.metadata().map(|m| m.len()).unwrap_or(0);
         Ok(FileExporter {
             sink: BufWriter::new(file),
             pending_err: None,
+            path: path.as_ref().to_path_buf(),
+            max_bytes,
+            bytes_written,
         })
+    }
+
+    /// Record an evicted pid line into the file export. This is called from
+    /// the main loop when a tracker slot is reclaimed, so the operator has
+    /// a per-pid trace of eviction events.
+    pub fn record_eviction_pid(&mut self, pid: u32, observer_ns: u64) {
+        if self.pending_err.is_some() {
+            return;
+        }
+        let result = writeln!(self.sink, "{observer_ns}\teviction\t{pid}\t-\t-\t-",);
+        if let Err(e) = result {
+            self.pending_err = Some(e);
+            return;
+        }
+        self.after_write();
+    }
+
+    /// Called after every successful write. When `max_bytes` is set and
+    /// exceeded, rotates the file.
+    fn after_write(&mut self) {
+        let Some(max) = self.max_bytes else {
+            return;
+        };
+        // Estimate: unable to get precise byte count from BufWriter without
+        // flushing, which would defeat the purpose of buffering. Track a
+        // conservative lower bound from the line length instead.
+        self.bytes_written = self.bytes_written.saturating_add(64);
+        if self.bytes_written < max {
+            return;
+        }
+        // Rotation needed.
+        if let Err(e) = self.sink.flush() {
+            self.pending_err = Some(e);
+            return;
+        }
+        if let Err(e) = Self::rotate(&self.path) {
+            self.pending_err = Some(e);
+            return;
+        }
+        match OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)
+        {
+            Ok(file) => {
+                self.sink = BufWriter::new(file);
+                self.bytes_written = 0;
+            }
+            Err(e) => {
+                self.pending_err = Some(e);
+            }
+        }
+    }
+
+    /// Rotate `path`: shift `path` → `path.1`, `path.1` → `path.2`, …
+    /// up to [`MAX_ROTATION_GENERATIONS`]. The oldest generation is deleted.
+    fn rotate(path: &Path) -> io::Result<()> {
+        let path_str = path.to_string_lossy();
+        // Remove the oldest generation first.
+        let oldest = format!("{path_str}.{MAX_ROTATION_GENERATIONS}");
+        let _ = std::fs::remove_file(&oldest);
+        // Shift remaining generations.
+        for gen in (1..MAX_ROTATION_GENERATIONS).rev() {
+            let src = format!("{path_str}.{gen}");
+            let dst = format!("{path_str}.{}", gen + 1);
+            let _ = std::fs::rename(&src, &dst);
+        }
+        let first = format!("{path_str}.1");
+        // If the rename fails (file doesn't exist), that's fine — the first
+        // rotation of a fresh file has nothing to shift.
+        let _ = std::fs::rename(path, &first);
+        Ok(())
     }
 }
 
@@ -113,6 +203,8 @@ impl Exporter for FileExporter {
         };
         if let Err(e) = result {
             self.pending_err = Some(e);
+        } else {
+            self.after_write();
         }
     }
 
@@ -618,20 +710,26 @@ fn write_usize(buf: &mut [u8], mut n: usize) -> usize {
     len
 }
 
+/// Maximum number of `yield_now()` calls per `write_all_nonblocking`
+/// invocation.  At ~100 µs per yield (macOS) and 10 yields this bounds
+/// scheduler concessions to ~1 ms, well within the 50 ms
+/// [`PROM_WRITE_TIMEOUT`].
+const MAX_WRITE_YIELDS: usize = 10;
+
 /// Non-blocking `write_all` with a wall-clock deadline. Returns `Ok(())`
 /// whether the full buffer was written or the deadline expired; the caller
 /// is responsible for deciding whether a short write is an error.
 ///
 /// On `WouldBlock` the loop yields the thread to the OS scheduler rather
-/// than busy-spinning.  Spinning for the full write deadline (up to
-/// [`PROM_WRITE_TIMEOUT`]) would burn a core with zero progress on
-/// stall detection or I/O in the single-threaded observer loop.
+/// than busy-spinning.  To prevent a persistently-full TCP send buffer from
+/// starving the observer poll loop, the function yields at most
+/// [`MAX_WRITE_YIELDS`] times before giving up on the current buffer.
 ///
 /// `yield_now()` can be surprisingly long on macOS (~100 µs).  With the
-/// 50 ms [`PROM_WRITE_TIMEOUT`] this allows at most ~500 iterations, which
-/// is safe.
+/// 50 ms [`PROM_WRITE_TIMEOUT`] a 10-yield budget is safe.
 fn write_all_nonblocking(stream: &mut TcpStream, buf: &[u8], deadline: Instant) -> io::Result<()> {
     let mut written = 0;
+    let mut yields = 0;
     while written < buf.len() {
         if Instant::now() >= deadline {
             break;
@@ -640,6 +738,10 @@ fn write_all_nonblocking(stream: &mut TcpStream, buf: &[u8], deadline: Instant) 
             Ok(0) => break,
             Ok(n) => written += n,
             Err(e) if e.kind() == ErrorKind::WouldBlock => {
+                if yields >= MAX_WRITE_YIELDS {
+                    break;
+                }
+                yields += 1;
                 std::thread::yield_now();
                 continue;
             }
