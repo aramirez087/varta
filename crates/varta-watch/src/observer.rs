@@ -70,6 +70,10 @@ pub enum Event {
     /// Receiving from a listener failed with an error other than
     /// `WouldBlock` / `TimedOut`.
     Io(io::Error, u64),
+    /// Ancillary data truncated by the kernel (`MSG_CTRUNC` on Linux).
+    /// Indicates the kernel's ancillary-data buffer was too small for the
+    /// per-message metadata — a kernel-level buffer sizing issue.
+    CtrlTruncated(io::Error, u64),
 }
 
 /// Observer bound to one or more transport listeners.
@@ -198,6 +202,10 @@ impl Observer {
                 }
                 RecvResult::WouldBlock => continue,
                 RecvResult::ShortRead => continue,
+                RecvResult::CtrlTruncated(e) => {
+                    self.next_listener_start = (i + 1) % len;
+                    return Some(Event::CtrlTruncated(e, self.now_ns()));
+                }
                 RecvResult::IoError(e) => {
                     self.next_listener_start = (i + 1) % len;
                     return Some(Event::Io(e, self.now_ns()));

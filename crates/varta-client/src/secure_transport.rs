@@ -10,16 +10,17 @@
 //!
 //! The IV random prefix is read from `/dev/urandom` at `connect()` time
 //! (once, not on the beat path).  This gives a cryptographically random
-//! 4-byte (32-bit) IV prefix with a birthday bound of ~2^16 agents
-//! sharing the same key.
+//! 8-byte (64-bit) IV prefix with a birthday bound of ~2^32 agents
+//! sharing the same key — effectively unbounded for practical deployments.
 //!
 //! * **Nonce uniqueness guarantee**: Within a single connection the
-//!   monotonic 8-byte counter ensures unique nonces. Across connections the
-//!   4-byte `iv_random` prefix (fresh `/dev/urandom` read each `connect`
+//!   monotonic 4-byte counter ensures unique nonces. Across connections the
+//!   8-byte `iv_random` prefix (fresh `/dev/urandom` read each `connect`
 //!   or `reconnect`) provides uniqueness.
-//! * **Trusted local network**: The 32-bit IV space is sufficient for
-//!   local-network deployments.  Do not use this transport with more than
-//!   ~10^4 agents under a single key without auditing collision risk.
+//! * **Counter capacity**: The 32-bit counter allows ~4 billion beats per
+//!   connection before wraparound (at 1000 Hz this is ~50 days; at 1 Hz
+//!   this is ~136 years). Wraparound triggers an observer-side replay
+//!   rejection, forcing a reconnect which derives a fresh IV prefix.
 //!
 //! **This transport is designed for trusted local networks.**
 
@@ -39,7 +40,7 @@ const SECURE_FRAME_LEN: usize = crypto::SECURE_FRAME_BYTES;
 /// [`Varta::connect_secure_udp`].
 ///
 /// On each `send`, the 32-byte VLP frame is encrypted with a unique 96-bit
-/// nonce (4-byte random prefix + 8-byte monotonic counter). The resulting
+/// nonce (8-byte random prefix + 4-byte monotonic counter). The resulting
 /// 60-byte AEAD frame is sent over UDP.
 ///
 /// # Security properties
@@ -48,14 +49,14 @@ const SECURE_FRAME_LEN: usize = crypto::SECURE_FRAME_BYTES;
 /// * **Integrity**: Tampering is detected (Poly1305 authentication tag).
 /// * **Replay resistance**: Monotonic counter per connection; observer verifies
 ///   that counter values strictly increase for a given IV prefix.
-/// * **Nonce uniqueness**: The 4-byte random prefix (from `/dev/urandom` at
-///   connect time) plus the 8-byte counter ensures no nonce reuse within a
+/// * **Nonce uniqueness**: The 8-byte random prefix (from `/dev/urandom` at
+///   connect time) plus the 4-byte counter ensures no nonce reuse within a
 ///   connection lifetime.
 ///
 /// # Security
 ///
 /// See the [module-level security documentation](self) for important
-/// caveats about the 32-bit IV space.
+/// caveats about the 32-bit counter space.
 ///
 /// [`Varta::connect_secure_udp`]: crate::Varta::connect_secure_udp
 /// [module-level security documentation]: self#security
@@ -63,8 +64,8 @@ pub struct SecureUdpTransport {
     sock: UdpSocket,
     addr: SocketAddr,
     key: Key,
-    iv_counter: u64,
-    iv_random: [u8; 4],
+    iv_counter: u32,
+    iv_random: [u8; 8],
 }
 
 impl SecureUdpTransport {
@@ -102,17 +103,17 @@ impl BeatTransport for SecureUdpTransport {
     fn send(&mut self, buf: &[u8; 32]) -> io::Result<usize> {
         self.iv_counter = self.iv_counter.wrapping_add(1);
 
-        // Build 12-byte nonce: iv_random (4) || iv_counter (8) LE
+        // Build 12-byte nonce: iv_random (8) || iv_counter (4) LE
         let mut nonce = [0u8; NONCE_BYTES];
-        nonce[..4].copy_from_slice(&self.iv_random);
-        nonce[4..12].copy_from_slice(&self.iv_counter.to_le_bytes());
+        nonce[..8].copy_from_slice(&self.iv_random);
+        nonce[8..12].copy_from_slice(&self.iv_counter.to_le_bytes());
 
         let (ciphertext, tag) = crypto::seal(self.key.as_bytes(), &nonce, buf);
 
-        // Assemble wire frame: iv_random(4) || iv_counter(8) || ciphertext(32) || tag(16)
+        // Assemble wire frame: iv_random(8) || iv_counter(4) || ciphertext(32) || tag(16)
         let mut frame = [0u8; SECURE_FRAME_LEN];
-        frame[..4].copy_from_slice(&self.iv_random);
-        frame[4..12].copy_from_slice(&self.iv_counter.to_le_bytes());
+        frame[..8].copy_from_slice(&self.iv_random);
+        frame[8..12].copy_from_slice(&self.iv_counter.to_le_bytes());
         frame[12..44].copy_from_slice(&ciphertext);
         frame[44..60].copy_from_slice(&tag);
 
@@ -138,13 +139,13 @@ impl BeatTransport for SecureUdpTransport {
     }
 }
 
-/// Read a cryptographically-random 4-byte IV prefix from `/dev/urandom`.
+/// Read a cryptographically-random 8-byte IV prefix from `/dev/urandom`.
 ///
 /// Called once at `connect()` / `reconnect()` time — never on the beat path.
-/// The returned `[u8; 4]` is suitable as the `iv_random` prefix for ChaCha20-
+/// The returned `[u8; 8]` is suitable as the `iv_random` prefix for ChaCha20-
 /// Poly1305 AEAD nonce construction.
-pub(crate) fn read_iv_random() -> io::Result<[u8; 4]> {
-    let mut buf = [0u8; 4];
+pub(crate) fn read_iv_random() -> io::Result<[u8; 8]> {
+    let mut buf = [0u8; 8];
     std::fs::File::open("/dev/urandom").and_then(|mut f| {
         use std::io::Read;
         f.read_exact(&mut buf)
@@ -154,9 +155,9 @@ pub(crate) fn read_iv_random() -> io::Result<[u8; 4]> {
 
 /// Fallback IV derivation using an LCG (pid * prime + timestamp).
 ///
-/// Produces a deterministic 4-byte prefix.  Used only when `/dev/urandom`
+/// Produces a deterministic 8-byte prefix.  Used only when `/dev/urandom`
 /// is unavailable (e.g. inside a panic handler, where file I/O is not safe).
-pub(crate) fn lcg_iv_random() -> [u8; 4] {
+pub(crate) fn lcg_iv_random() -> [u8; 8] {
     let raw = (std::process::id() as u64)
         .wrapping_mul(6364136223846793005)
         .wrapping_add(
@@ -165,5 +166,5 @@ pub(crate) fn lcg_iv_random() -> [u8; 4] {
                 .unwrap_or_default()
                 .as_nanos() as u64,
         );
-    raw.to_le_bytes()[..4].try_into().unwrap()
+    raw.to_le_bytes()
 }

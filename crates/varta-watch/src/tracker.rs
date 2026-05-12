@@ -13,6 +13,11 @@ use varta_vlp::{Frame, Status};
 /// the CPU target (50 agents × 1 Hz). Override via `--tracker-capacity`.
 pub const DEFAULT_CAPACITY: usize = 64;
 
+/// Hard upper bound for `--tracker-capacity`. The tracker uses a linear scan
+/// over active slots; at capacities exceeding this value the scan becomes a
+/// latency spike risk in the observer poll loop.
+pub const MAX_CAPACITY: usize = 4096;
+
 /// Multiplier applied to the stall threshold when choosing eviction victims.
 ///
 /// A slot is only evictable if (a) the observer has already surfaced a stall
@@ -95,8 +100,15 @@ impl Tracker {
     /// beyond that boundary yields [`Update::CapacityExceeded`] rather
     /// than reallocating.
     pub fn new(capacity: usize) -> Self {
+        let cap = capacity.min(MAX_CAPACITY);
+        if capacity > MAX_CAPACITY {
+            eprintln!(
+                "varta-watch: tracker capacity {} exceeds maximum {}; clamping to {}",
+                capacity, MAX_CAPACITY, cap
+            );
+        }
         Tracker {
-            entries: Vec::with_capacity(capacity),
+            entries: Vec::with_capacity(cap),
             len: 0,
             evictions: 0,
             capacity_exceeded: 0,

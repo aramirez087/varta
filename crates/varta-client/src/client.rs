@@ -35,7 +35,12 @@ const ENOBUFS: i32 = 105;
 ))]
 const ENOBUFS: i32 = 55;
 
-/// Catch-all for unlisted Unix targets (Solaris/illumos, etc.).
+/// Solaris / illumos value of `ENOBUFS` from `<sys/errno.h>`. Hard-coded
+/// for the same reason.
+#[cfg(any(target_os = "solaris", target_os = "illumos"))]
+const ENOBUFS: i32 = 111;
+
+/// Catch-all for unlisted Unix targets.
 /// Cross-compilation to an unsupported target silently uses the wrong
 /// value; fail at compile time instead.
 #[cfg(not(any(
@@ -46,6 +51,8 @@ const ENOBUFS: i32 = 55;
     target_os = "netbsd",
     target_os = "openbsd",
     target_os = "dragonfly",
+    target_os = "solaris",
+    target_os = "illumos",
 )))]
 compile_error!("ENOBUFS value is unknown for this target — add it to the cfg gates above");
 

@@ -9,7 +9,7 @@
 //! Each secure frame is 60 bytes:
 //!
 //! ```text
-//! [iv_random: 4] [iv_counter: 8] [ciphertext: 32] [tag: 16]
+//! [iv_random: 8] [iv_counter: 4] [ciphertext: 32] [tag: 16]
 //! ```
 //!
 //! The 12-byte nonce for the AEAD construction is `iv_random || iv_counter`.
@@ -31,7 +31,7 @@ pub const TAG_BYTES: usize = 16;
 
 /// Total length of a secure frame on the wire.
 ///
-/// 4 (iv_random) + 8 (iv_counter) + 32 (ciphertext) + 16 (tag) = 60.
+/// 8 (iv_random) + 4 (iv_counter) + 32 (ciphertext) + 16 (tag) = 60.
 pub const SECURE_FRAME_BYTES: usize = 60;
 
 /// Error returned when a hex-encoded key fails to parse.

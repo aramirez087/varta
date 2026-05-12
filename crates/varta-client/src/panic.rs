@@ -141,7 +141,7 @@ pub fn install_panic_handler_secure_udp(addr: std::net::SocketAddr, key: Key) {
     // Pre-compute the IV random prefix at install time — /dev/urandom
     // reads are not async-signal-safe and must not happen inside the
     // panic hook.  Fall back to the LCG if /dev/urandom is unavailable.
-    let iv_random: [u8; 4] = read_iv_random().unwrap_or_else(|_| lcg_iv_random());
+    let iv_random: [u8; 8] = read_iv_random().unwrap_or_else(|_| lcg_iv_random());
     let prev = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         let _ = (|| {
@@ -160,17 +160,17 @@ pub fn install_panic_handler_secure_udp(addr: std::net::SocketAddr, key: Key) {
 
             // Use the pre-computed IV from install time (read_iv_random() or
             // LCG fallback).  File I/O inside a panic hook is not signal-safe.
-            let iv_counter = 1u64;
+            let iv_counter = 1u32;
 
             let mut nonce = [0u8; NONCE_BYTES];
-            nonce[..4].copy_from_slice(&iv_random);
-            nonce[4..12].copy_from_slice(&iv_counter.to_le_bytes());
+            nonce[..8].copy_from_slice(&iv_random);
+            nonce[8..12].copy_from_slice(&iv_counter.to_le_bytes());
 
             let (ciphertext, tag) = crypto::seal(key.as_bytes(), &nonce, &buf);
 
             let mut secure_frame = [0u8; crypto::SECURE_FRAME_BYTES];
-            secure_frame[..4].copy_from_slice(&iv_random);
-            secure_frame[4..12].copy_from_slice(&iv_counter.to_le_bytes());
+            secure_frame[..8].copy_from_slice(&iv_random);
+            secure_frame[8..12].copy_from_slice(&iv_counter.to_le_bytes());
             secure_frame[12..44].copy_from_slice(&ciphertext);
             secure_frame[44..60].copy_from_slice(&tag);
 

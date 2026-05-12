@@ -45,19 +45,19 @@ const EVICTION_INTERVAL: Duration = Duration::from_secs(60);
 /// IV are still checked for replay.
 #[derive(Clone, Debug)]
 struct SenderState {
-    iv_random: [u8; 4],
-    last_counter: u64,
-    prev_iv_random: [u8; 4],
-    prev_last_counter: u64,
+    iv_random: [u8; 8],
+    last_counter: u32,
+    prev_iv_random: [u8; 8],
+    prev_last_counter: u32,
     last_seen: Instant,
 }
 
 impl SenderState {
-    fn new(iv_random: [u8; 4], counter: u64) -> Self {
+    fn new(iv_random: [u8; 8], counter: u32) -> Self {
         SenderState {
             iv_random,
             last_counter: counter,
-            prev_iv_random: [0u8; 4],
+            prev_iv_random: [0u8; 8],
             prev_last_counter: 0,
             last_seen: Instant::now(),
         }
@@ -155,8 +155,8 @@ impl SecureUdpListener {
     fn try_record_replay_state(
         &mut self,
         sender: SocketAddr,
-        iv_random: [u8; 4],
-        counter: u64,
+        iv_random: [u8; 8],
+        counter: u32,
     ) -> bool {
         match self.sender_state.entry(sender) {
             Entry::Vacant(e) => {
@@ -199,22 +199,22 @@ impl SecureUdpListener {
     }
 
     #[cfg(test)]
-    fn sender_iv_random(&self, addr: &SocketAddr) -> Option<[u8; 4]> {
+    fn sender_iv_random(&self, addr: &SocketAddr) -> Option<[u8; 8]> {
         self.sender_state.get(addr).map(|s| s.iv_random)
     }
 
     #[cfg(test)]
-    fn sender_last_counter(&self, addr: &SocketAddr) -> Option<u64> {
+    fn sender_last_counter(&self, addr: &SocketAddr) -> Option<u32> {
         self.sender_state.get(addr).map(|s| s.last_counter)
     }
 
     #[cfg(test)]
-    fn sender_prev_iv_random(&self, addr: &SocketAddr) -> Option<[u8; 4]> {
+    fn sender_prev_iv_random(&self, addr: &SocketAddr) -> Option<[u8; 8]> {
         self.sender_state.get(addr).map(|s| s.prev_iv_random)
     }
 
     #[cfg(test)]
-    fn sender_prev_last_counter(&self, addr: &SocketAddr) -> Option<u64> {
+    fn sender_prev_last_counter(&self, addr: &SocketAddr) -> Option<u32> {
         self.sender_state.get(addr).map(|s| s.prev_last_counter)
     }
 
@@ -251,14 +251,14 @@ impl BeatListener for SecureUdpListener {
                 continue;
             }
 
-            // Parse wire format: iv_random(4) || iv_counter(8) || ciphertext(32) || tag(16)
-            let iv_random: [u8; 4] = buf[..4].try_into().unwrap();
-            let iv_counter = u64::from_le_bytes(buf[4..12].try_into().unwrap());
+            // Parse wire format: iv_random(8) || iv_counter(4) || ciphertext(32) || tag(16)
+            let iv_random: [u8; 8] = buf[..8].try_into().unwrap();
+            let iv_counter = u32::from_le_bytes(buf[8..12].try_into().unwrap());
 
             // Build 12-byte nonce
             let mut nonce = [0u8; NONCE_BYTES];
-            nonce[..4].copy_from_slice(&iv_random);
-            nonce[4..12].copy_from_slice(&iv_counter.to_le_bytes());
+            nonce[..8].copy_from_slice(&iv_random);
+            nonce[8..12].copy_from_slice(&iv_counter.to_le_bytes());
 
             let ciphertext: [u8; 32] = buf[12..44].try_into().unwrap();
             let tag: [u8; TAG_BYTES] = buf[44..60].try_into().unwrap();
@@ -329,16 +329,16 @@ mod tests {
         Key::from_bytes([0xabu8; 32])
     }
 
-    fn test_iv() -> [u8; 4] {
-        [0x01, 0x02, 0x03, 0x04]
+    fn test_iv() -> [u8; 8] {
+        [0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08]
     }
 
-    fn test_iv2() -> [u8; 4] {
-        [0x05, 0x06, 0x07, 0x08]
+    fn test_iv2() -> [u8; 8] {
+        [0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10]
     }
 
-    fn test_iv3() -> [u8; 4] {
-        [0x09, 0x0a, 0x0b, 0x0c]
+    fn test_iv3() -> [u8; 8] {
+        [0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18]
     }
 
     fn new_listener() -> SecureUdpListener {

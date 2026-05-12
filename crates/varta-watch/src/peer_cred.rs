@@ -41,6 +41,11 @@ pub enum RecvResult {
     /// observable as `Event::Io` rather than a silent drop so operators
     /// can detect kernel/socket misconfiguration.
     IoError(io::Error),
+    /// Ancillary data truncated by the kernel (`MSG_CTRUNC` on Linux).
+    /// Indicates `ANCILLARY_BUFFER_SIZE` is too small for the kernel's
+    /// per-message metadata — a kernel buffer sizing issue that operators
+    /// should monitor separately from generic I/O errors.
+    CtrlTruncated(io::Error),
 }
 
 // ---------------------------------------------------------------------------
@@ -349,7 +354,7 @@ pub(crate) fn recv_authenticated(fd: i32) -> RecvResult {
 
     #[cfg(target_os = "linux")]
     if mhdr.msg_flags & plat::MSG_CTRUNC != 0 {
-        return RecvResult::IoError(io::Error::new(
+        return RecvResult::CtrlTruncated(io::Error::new(
             io::ErrorKind::InvalidData,
             "ancillary data truncated by kernel (ANCILLARY_BUFFER_SIZE too small)",
         ));

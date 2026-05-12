@@ -205,6 +205,7 @@ pub struct PromExporter {
     /// first incident.
     decode_errors_total: [u64; 3],
     io_errors_total: u64,
+    ctrl_truncated_total: u64,
     capacity_exceeded_total: u64,
     decrypt_failures_total: u64,
     truncated_total: u64,
@@ -225,6 +226,7 @@ impl PromExporter {
             auth_failures_total: 0,
             decode_errors_total: [0; 3],
             io_errors_total: 0,
+            ctrl_truncated_total: 0,
             capacity_exceeded_total: 0,
             decrypt_failures_total: 0,
             truncated_total: 0,
@@ -262,6 +264,14 @@ impl PromExporter {
     /// forcing eviction of the oldest entry.
     pub fn record_sender_state_full(&mut self, count: u64) {
         self.sender_state_full_total = self.sender_state_full_total.saturating_add(count);
+    }
+
+    /// Record one or more `MSG_CTRUNC` ancillary-data truncation events.
+    /// Indicates the kernel's per-message metadata buffer is too small —
+    /// a separate signal from generic I/O errors so operators can size
+    /// `ANCILLARY_BUFFER_SIZE` appropriately.
+    pub fn record_ctrl_truncated(&mut self, count: u64) {
+        self.ctrl_truncated_total = self.ctrl_truncated_total.saturating_add(count);
     }
 
     /// Accept ready connections on the listener and write a metrics
@@ -360,6 +370,10 @@ impl PromExporter {
 
     fn render_body(&mut self) {
         self.body_buf.clear();
+        const BODY_BUF_MAX_CAPACITY: usize = 65_536;
+        if self.body_buf.capacity() > BODY_BUF_MAX_CAPACITY {
+            self.body_buf = String::with_capacity(BODY_BUF_MAX_CAPACITY);
+        }
 
         let mut pids: Vec<u32> = self.rows.keys().copied().collect();
         pids.sort_unstable();
@@ -440,6 +454,15 @@ impl PromExporter {
             "varta_io_errors_total {}",
             self.io_errors_total
         );
+        self.body_buf
+            .push_str("# HELP varta_ctrl_truncated_total Total ancillary-data truncation events (MSG_CTRUNC on Linux).\n");
+        self.body_buf
+            .push_str("# TYPE varta_ctrl_truncated_total counter\n");
+        let _ = writeln!(
+            self.body_buf,
+            "varta_ctrl_truncated_total {}",
+            self.ctrl_truncated_total
+        );
         if self.capacity_exceeded_total > 0 {
             self.body_buf.push_str("# HELP varta_tracker_capacity_exceeded_total Total beats dropped because tracker is full.\n");
             self.body_buf
@@ -516,6 +539,9 @@ impl Exporter for PromExporter {
             }
             Event::Io(_, _) => {
                 self.io_errors_total = self.io_errors_total.saturating_add(1);
+            }
+            Event::CtrlTruncated(_, _) => {
+                self.ctrl_truncated_total = self.ctrl_truncated_total.saturating_add(1);
             }
         }
     }

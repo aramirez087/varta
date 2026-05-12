@@ -17,10 +17,10 @@
 //!
 //! The [`seal`] function returns `(ciphertext, tag)`. The transport layer
 //! places these on the wire alongside the 12-byte nonce split into its
-//! two components — 4-byte `iv_random` and 8-byte `iv_counter`:
+//! two components — 8-byte `iv_random` and 4-byte `iv_counter`:
 //!
 //! ```text
-//! [iv_random: 4] [iv_counter: 8] [ciphertext: 32] [tag: 16]
+//! [iv_random: 8] [iv_counter: 4] [ciphertext: 32] [tag: 16]
 //! ```
 //!
 //! See [`varta_vlp::crypto`] for the wire format constant.
