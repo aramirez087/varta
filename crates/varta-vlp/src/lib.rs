@@ -24,6 +24,14 @@ pub const MAGIC: [u8; 2] = [0x56, 0x41];
 /// path.
 pub const VERSION: u8 = 0x01;
 
+// Compile-time guard: VLP frame layout is little-endian by specification
+// (see docs/architecture/vlp-frame.md). Building on a big-endian host would
+// silently produce broken frames.
+#[cfg(not(target_endian = "little"))]
+compile_error!(
+    "VLP frame protocol requires little-endian host (see docs/architecture/vlp-frame.md)"
+);
+
 /// Sentinel nonce value reserved for terminal panic frames.
 ///
 /// Regular beats from `varta_client::Varta::beat` wrap to 0 on exhaustion

@@ -1,6 +1,7 @@
 //! Agent surface — `Varta` connects to the observer over a configured
 //! transport and `beat()` emits one fire-and-forget 32-byte VLP frame per call.
 
+use std::fmt;
 use std::io::{self, Write};
 use std::path::Path;
 use std::time::Instant;
@@ -101,7 +102,6 @@ pub fn classify_send_error(e: &io::Error) -> BeatOutcome {
 /// `beat()` never blocks and never panics; the kernel's view of the send is
 /// translated into one of three steady-state outcomes. `Failed` carries the
 /// underlying error untouched for higher layers that wish to log or escalate.
-#[derive(Debug)]
 #[must_use]
 pub enum BeatOutcome {
     /// The 32-byte datagram was accepted by the kernel.
@@ -116,6 +116,26 @@ pub enum BeatOutcome {
     /// allocate on the heap. Callers must inspect the error rather than
     /// silently discarding it with `Failed(_)`.
     Failed(io::Error),
+}
+
+impl fmt::Debug for BeatOutcome {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Sent => write!(f, "Sent"),
+            Self::Dropped => write!(f, "Dropped"),
+            Self::Failed(_) => write!(f, "Failed(<io::Error>)"),
+        }
+    }
+}
+
+impl fmt::Display for BeatOutcome {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Sent => write!(f, "sent"),
+            Self::Dropped => write!(f, "dropped"),
+            Self::Failed(e) => write!(f, "failed: {e}"),
+        }
+    }
 }
 
 /// Agent-side handle that owns a configured [`BeatTransport`] and a 32-byte

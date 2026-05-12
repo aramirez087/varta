@@ -26,7 +26,7 @@ fn beat_emits_canonical_32_byte_frame() {
     let outcome = client.beat(Status::Ok, 0xCAFE);
     assert!(
         matches!(outcome, BeatOutcome::Sent),
-        "outcome was {outcome:?}"
+        "outcome was {outcome}"
     );
 
     let mut buf = [0u8; 32];
@@ -69,6 +69,6 @@ fn beat_returns_dropped_when_observer_absent() {
     let outcome = client.beat(Status::Ok, 0);
     assert!(
         matches!(outcome, BeatOutcome::Dropped),
-        "expected Dropped, got {outcome:?}"
+        "expected Dropped, got {outcome}"
     );
 }

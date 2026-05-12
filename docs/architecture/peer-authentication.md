@@ -30,17 +30,25 @@ fail-safe if a permission bypass is ever discovered.
 
 ### macOS
 
-On macOS, the observer attempts `getsockopt(LOCAL_PEERTOKEN)` immediately
-after each `recvmsg(2)`. `LOCAL_PEERTOKEN` returns an `audit_token_t`
-containing the sender's PID, UID, GID, and audit information. Because the
-observer is single-threaded and calls `getsockopt` immediately after
-`recvmsg`, no other datagram can arrive between the two syscalls.
+On macOS, the observer first attempts `getsockopt(LOCAL_PEERTOKEN)`
+immediately after each `recvmsg(2)`. `LOCAL_PEERTOKEN` returns an
+`audit_token_t` containing the sender's PID, UID, GID, and audit
+information. Because the observer is single-threaded and calls
+`getsockopt` immediately after `recvmsg`, no other datagram can arrive
+between the two syscalls.
 
-When `LOCAL_PEERTOKEN` succeeds, the observer performs the same PID + UID
-verification as on Linux. When it fails (e.g. on older macOS versions or
-when the kernel does not expose per-datagram credentials for unconnected
-`SOCK_DGRAM`), the observer falls back to the sentinel PID 0 — relying
-on `--socket-mode 0600` as the primary defence.
+When `LOCAL_PEERTOKEN` succeeds, the observer performs the same PID +
+UID verification as on Linux. When it fails (e.g. on older macOS
+versions or unconnected `SOCK_DGRAM` where the kernel doesn't expose
+per-datagram credentials), the observer falls back to two separate
+`getsockopt` calls:
+
+1. `LOCAL_PEERPID` (0x0002) — returns the peer's PID directly.
+2. `LOCAL_PEERCRED` (0x0001) — returns a `struct xucred` with the
+   peer's UID in `cr_uid`.
+
+If the fallback also fails, the observer falls back to the sentinel
+PID 0 — relying on `--socket-mode 0600` as the primary defence.
 
 ### FreeBSD, DragonFly BSD, NetBSD
 
@@ -119,6 +127,27 @@ The trust boundary is the kernel: a frame is only accepted if the kernel
 attests that the sending process's PID matches the one encoded in the
 VLP frame and that the sending process runs under the observer's UID.
 On Linux this is enforced per-datagram via `SO_PASSCRED`; on macOS via
-`getsockopt(LOCAL_PEERTOKEN)` when available; on FreeBSD / DragonFly /
-NetBSD via `LOCAL_CREDS` + `SCM_CREDS`.  Platforms without kernel-level
-credential passing fall back to `--socket-mode 0600`.
+`getsockopt(LOCAL_PEERTOKEN)` with `LOCAL_PEERPID`/`LOCAL_PEERCRED` fallback;
+on FreeBSD / DragonFly / NetBSD via `LOCAL_CREDS` + `SCM_CREDS`.  Platforms
+without kernel-level credential passing fall back to `--socket-mode 0600`.
+
+## Security limitations
+
+### No forward secrecy
+
+The KDF derives per-agent and per-epoch keys from a single master key.
+An epoch key can decrypt frames from past epochs if the agent key is
+compromised. True forward secrecy requires bidirectional ephemeral key
+exchange (e.g. X25519), which is incompatible with the connectionless,
+one-way heartbeat model.
+
+When the master key is rotated, all agents must be updated atomically.
+The observer can load a new master key via `SIGHUP` (see `--master-key-file`).
+
+### Little-endian only
+
+The VLP wire format uses little-endian integer encoding natively.
+Protocol correctness depends on the host being little-endian (all tier-1
+targets — x86_64 and aarch64 — satisfy this). Building on a big-endian
+host is a compile error. See `docs/architecture/vlp-frame.md` for design
+rationale.

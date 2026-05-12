@@ -109,6 +109,17 @@ fn run_latency() -> ExitCode {
         let _ = agent.beat(Status::Ok, 0);
     }
 
+    // Calibrate measurement overhead — Instant::now() + elapsed() cost
+    // without the beat() call, subtracted from samples below.
+    let mut overhead: Vec<u64> = Vec::with_capacity(1000);
+    for _ in 0..1000 {
+        let t0 = Instant::now();
+        let ns = t0.elapsed().as_nanos() as u64;
+        overhead.push(ns);
+    }
+    overhead.sort_unstable();
+    let overhead_median = percentile_pm(&overhead, 500);
+
     // Timed loop. Allocation outside the timing loop is harness scaffolding.
     const ITERS: usize = 1_000_000;
     let mut lats: Vec<u64> = Vec::with_capacity(ITERS);
@@ -116,6 +127,11 @@ fn run_latency() -> ExitCode {
         let t0 = Instant::now();
         let _ = agent.beat(Status::Ok, 0);
         lats.push(t0.elapsed().as_nanos() as u64);
+    }
+
+    // Subtract measurement overhead from each sample.
+    for ns in &mut lats {
+        *ns = ns.saturating_sub(overhead_median);
     }
 
     drop(agent);
@@ -602,6 +618,17 @@ fn run_udp_latency() -> ExitCode {
     for _ in 0..100_000 {
         let _ = agent.beat(Status::Ok, 0);
     }
+
+    // Calibrate measurement overhead.
+    let mut overhead: Vec<u64> = Vec::with_capacity(1000);
+    for _ in 0..1000 {
+        let t0 = Instant::now();
+        let ns = t0.elapsed().as_nanos() as u64;
+        overhead.push(ns);
+    }
+    overhead.sort_unstable();
+    let overhead_median = percentile_pm(&overhead, 500);
+
     let iterations = 500_000u64;
     let mut samples = Vec::with_capacity(iterations as usize);
     for _ in 0..iterations {
@@ -610,6 +637,12 @@ fn run_udp_latency() -> ExitCode {
         let ns = t0.elapsed().as_nanos() as u64;
         samples.push(ns);
     }
+
+    // Subtract measurement overhead from each sample.
+    for ns in &mut samples {
+        *ns = ns.saturating_sub(overhead_median);
+    }
+
     drop(agent);
     stop.store(true, Ordering::Relaxed);
     let _ = drainer_handle.join();
@@ -633,6 +666,6 @@ fn run_udp_latency() -> ExitCode {
             "udp-latency  WARN  (p99 {p99}ns > {}ns threshold — host-dependent)",
             LATENCY_P99_NS_THRESHOLD
         );
-        ExitCode::SUCCESS
+        ExitCode::from(1)
     }
 }

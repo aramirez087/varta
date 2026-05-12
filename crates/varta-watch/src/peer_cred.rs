@@ -248,12 +248,26 @@ mod plat {
         pub val: [u32; 8],
     }
 
+    // struct xucred from <sys/un.h> — returned by LOCAL_PEERCRED (0x0001).
+    // NGROUPS is 16 on macOS / XNU.
+    #[repr(C)]
+    pub(super) struct Xucred {
+        pub cr_version: u32,
+        pub cr_uid: u32,
+        pub cr_ngroups: i16,
+        pub cr_groups: [u32; 16],
+    }
+
     // --- constants --------------------------------------------------------
 
     // SOL_SOCKET on macOS / XNU = 0xffff (<sys/socket.h>)
     pub(super) const SOL_SOCKET: i32 = 0xffff;
     // LOCAL_PEERTOKEN = 0x0021 (<sys/un.h>) — get the peer's audit token
     pub(super) const LOCAL_PEERTOKEN: i32 = 0x0021;
+    // LOCAL_PEERPID = 0x0002 (<sys/un.h>) — get the peer's PID
+    pub(super) const LOCAL_PEERPID: i32 = 0x0002;
+    // LOCAL_PEERCRED = 0x0001 (<sys/un.h>) — get the peer's xucred
+    pub(super) const LOCAL_PEERCRED: i32 = 0x0001;
 
     // --- FFI --------------------------------------------------------------
 
@@ -279,10 +293,11 @@ mod plat {
     /// single-threaded and this is called immediately after `recvmsg(2)`, no
     /// other datagram can arrive between the two syscalls.
     ///
-    /// Falls back to sentinel (0, 0) if `getsockopt` fails (e.g. on older
-    /// macOS versions or unconnected `SOCK_DGRAM` where the kernel doesn't
-    /// expose per-datagram credentials). In that case the primary defence
-    /// remains `--socket-mode 0600`.
+    /// If `LOCAL_PEERTOKEN` fails (e.g. on older macOS versions or
+    /// unconnected `SOCK_DGRAM` where the kernel doesn't expose per-datagram
+    /// credentials), falls back to `LOCAL_PEERPID` and `LOCAL_PEERCRED`
+    /// individually. Only returns the sentinel (0, 0) when all three
+    /// mechanisms fail.
     pub(super) fn peer_pid_after_recv(
         fd: i32,
         _mhdr: &Msghdr,
@@ -299,16 +314,60 @@ mod plat {
                 &mut optlen,
             )
         };
-        if ret != 0 {
-            // Fall back to sentinel — the kernel may not support
-            // per-datagram LOCAL_PEERTOKEN on unconnected SOCK_DGRAM.
-            return Some((0, 0));
+        if ret == 0 && (optlen as usize) >= mem::size_of::<AuditToken>() {
+            // at_pid is at index 5, at_euid is at index 1
+            return Some((token.val[5], token.val[1]));
         }
-        if (optlen as usize) < mem::size_of::<AuditToken>() {
-            return Some((0, 0));
+
+        // LOCAL_PEERTOKEN failed — try older LOCAL_PEERPID + LOCAL_PEERCRED.
+        // On unconnected SOCK_DGRAM the kernel may succeed here even when
+        // the newer audit token API is unavailable.
+        let pid = get_peer_pid_fallback(fd);
+        let uid = get_peer_uid_fallback(fd);
+        Some((pid, uid))
+    }
+
+    fn get_peer_pid_fallback(fd: i32) -> u32 {
+        let mut pid: i32 = 0;
+        let mut optlen: u32 = mem::size_of::<i32>() as u32;
+        let ret = unsafe {
+            getsockopt(
+                fd,
+                SOL_SOCKET,
+                LOCAL_PEERPID,
+                &mut pid as *mut i32 as *mut c_void,
+                &mut optlen,
+            )
+        };
+        if ret == 0 && (optlen as usize) >= mem::size_of::<i32>() && pid > 0 {
+            pid as u32
+        } else {
+            0
         }
-        // at_pid is at index 5, at_euid is at index 1
-        Some((token.val[5], token.val[1]))
+    }
+
+    fn get_peer_uid_fallback(fd: i32) -> u32 {
+        let mut cred = Xucred {
+            cr_version: 0,
+            cr_uid: 0,
+            cr_ngroups: 0,
+            cr_groups: [0u32; 16],
+        };
+        let mut optlen: u32 = mem::size_of::<Xucred>() as u32;
+        let ret = unsafe {
+            getsockopt(
+                fd,
+                SOL_SOCKET,
+                LOCAL_PEERCRED,
+                &mut cred as *mut Xucred as *mut c_void,
+                &mut optlen,
+            )
+        };
+        if ret == 0 && (optlen as usize) >= 8 {
+            cred.cr_uid
+        } else {
+            0
+        }
     }
 
     // Compile-time invariant: macOS msghdr is 48 bytes on x86_64 + aarch64.
@@ -316,6 +375,10 @@ mod plat {
 
     // Compile-time invariant: audit_token_t is 8 × u32 = 32 bytes.
     const _: () = assert!(mem::size_of::<AuditToken>() == 32);
+
+    // Compile-time invariant: xucred layout matches XNU's struct xucred
+    // (u32 + u32 + i16 + 2 pad + [u32; 16] = 76 bytes on LP64).
+    const _: () = assert!(mem::size_of::<Xucred>() == 76);
 
     // Compile-time offset-of assertions for every field the recvmsg path
     // touches.  Manual layouts are a tradeoff: we avoid the libc crate to

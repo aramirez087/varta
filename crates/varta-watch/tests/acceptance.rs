@@ -249,8 +249,10 @@ fn tracker_capacity_bounded_to_64_pids() {
 
 /// A frame whose `pid` field does not match the kernel-attested sender
 /// PID must yield `Event::AuthFailure` on Linux.  On macOS the kernel
-/// does not expose per-datagram PIDs for unconnected `SOCK_DGRAM`, so
-/// the beat is accepted (defence relies on `--socket-mode 0600`).
+/// may or may not expose per-datagram credentials (depends on kernel
+/// version and whether `LOCAL_PEERTOKEN` / `LOCAL_PEERPID` succeeds),
+/// so the frame may be accepted as a beat or rejected — the test
+/// accepts either outcome.
 #[test]
 fn observer_rejects_spoofed_pid_frame() {
     let path = unique_uds_path("spoof");
@@ -289,13 +291,14 @@ fn observer_rejects_spoofed_pid_frame() {
 
     #[cfg(not(target_os = "linux"))]
     {
-        let accepted = poll_until_match(&mut observer, Duration::from_secs(5), |ev| match ev {
-            Event::Beat { pid, .. } if pid == spoofed_pid => Ok(pid),
+        let outcome = poll_until_match(&mut observer, Duration::from_secs(5), |ev| match ev {
+            Event::Beat { pid, .. } if pid == spoofed_pid => Ok(true),
+            Event::AuthFailure { claimed_pid, .. } if claimed_pid == spoofed_pid => Ok(false),
             _ => Err(()),
         });
         assert!(
-            accepted.is_some(),
-            "on macOS spoofed frame should be accepted as a beat"
+            outcome.is_some(),
+            "on macOS spoofed frame must produce either Beat or AuthFailure"
         );
     }
 }

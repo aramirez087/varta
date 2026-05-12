@@ -77,6 +77,15 @@ interpret.
 - **Zero heap allocation.** Every encode/decode path operates on `[u8; 32]` stack arrays.
 - **Layout-stable.** `#[repr(C, align(8))]` pins field order and alignment; the `const` assertions enforce size at compile time.
 
+## Security considerations
+
+- **No forward secrecy.** Epoch keys derived from the same agent key can decrypt
+  past epochs. This is an architectural tradeoff — true forward secrecy
+  requires bidirectional ephemeral key exchange (X25519), incompatible with
+  the one-way heartbeat model. Rotate the master key to mitigate.
+- **Little-endian only.** The wire format assumes little-endian integer encoding.
+  Building on a big-endian host is a compile error.
+
 ## See also
 
 - Architecture doc: [`docs/architecture/vlp-frame.md`](../../docs/architecture/vlp-frame.md)

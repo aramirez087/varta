@@ -133,15 +133,28 @@ fn main() -> ExitCode {
     }
 }
 
+const PER_TEST_TIMEOUT: Duration = Duration::from_secs(30);
+
 fn run_one(name: &str, f: fn()) -> u32 {
     eprintln!("test {name} ... starting");
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
-    match result {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+        let _ = tx.send(());
+    });
+    match rx.recv_timeout(PER_TEST_TIMEOUT) {
         Ok(()) => {
             eprintln!("test {name} ... ok");
             0
         }
-        Err(_) => {
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            eprintln!(
+                "test {name} ... TIMED OUT (>{}s)",
+                PER_TEST_TIMEOUT.as_secs()
+            );
+            1
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
             eprintln!("test {name} ... FAILED");
             1
         }
@@ -1753,7 +1766,8 @@ fn locate_watch_binary() -> PathBuf {
     if direct.exists() {
         return direct;
     }
-    // Fallback: scan deps dir for the most recent `varta-watch` artefact.
+    // The binary was not at the expected path. The user must build the
+    // workspace first (e.g. `cargo build --workspace`).
     panic!(
         "varta-watch binary not found at {} — \
          build the workspace before running these tests \
