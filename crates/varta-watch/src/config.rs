@@ -9,6 +9,8 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::Duration;
 
+use crate::tracker::DEFAULT_CAPACITY;
+
 /// Default per-pid debounce window applied when `--recovery-cmd` is set
 /// without an explicit `--recovery-debounce-ms`.
 pub const DEFAULT_RECOVERY_DEBOUNCE_MS: u64 = 1000;
@@ -52,6 +54,10 @@ pub struct Config {
     /// UDS read timeout for the bound socket. Defaults to
     /// [`DEFAULT_READ_TIMEOUT_MS`] milliseconds.
     pub read_timeout: Duration,
+    /// Maximum number of distinct agent pids tracked concurrently.
+    /// Defaults to [`crate::tracker::DEFAULT_CAPACITY`] (64). Beats for
+    /// new pids beyond this limit are dropped.
+    pub tracker_capacity: usize,
     /// Optional UDP port for network-based observers. When set, the observer
     /// also binds a UDP listener alongside the UDS socket.
     pub udp_port: Option<u16>,
@@ -153,8 +159,12 @@ OPTIONAL:
                                      killed via kill(2). Without this flag the
                                      child is allowed to run until completion.
     --read-timeout-ms <MS>         UDS read timeout per poll call
-                                    (default 100).  Bounded so a stalled peer
-                                    cannot hold the observer loop indefinitely.
+                                     (default 100).  Bounded so a stalled peer
+                                     cannot hold the observer loop indefinitely.
+    --tracker-capacity <N>          Maximum number of distinct agent pids
+                                     tracked concurrently (default 64).
+                                     Beats for new pids beyond this limit are
+                                     dropped.
     --shutdown-after-secs <SECS>   Exit cleanly after the given uptime
                                      (used by integration tests).
     --udp-port <PORT>              Bind a UDP listener on this port for
@@ -187,6 +197,7 @@ OPTIONAL:
         let mut recovery_timeout_ms: Option<u64> = None;
         let mut socket_mode: Option<u32> = None;
         let mut read_timeout_ms: Option<u64> = None;
+        let mut tracker_capacity: Option<usize> = None;
         let mut udp_port: Option<u16> = None;
         let mut udp_bind_addr: Option<std::net::IpAddr> = None;
         let mut secure_key_file: Option<PathBuf> = None;
@@ -252,6 +263,16 @@ OPTIONAL:
                         .ok_or(ConfigError::MissingValue("--read-timeout-ms"))?;
                     read_timeout_ms = Some(parse_u64("--read-timeout-ms", &v)?);
                 }
+                "--tracker-capacity" => {
+                    let v = iter
+                        .next()
+                        .ok_or(ConfigError::MissingValue("--tracker-capacity"))?;
+                    tracker_capacity =
+                        Some(v.parse::<usize>().map_err(|_| ConfigError::BadInteger {
+                            flag: "--tracker-capacity",
+                            raw: v,
+                        })?);
+                }
                 "--shutdown-after-secs" => {
                     let v = iter
                         .next()
@@ -305,6 +326,7 @@ OPTIONAL:
             recovery_timeout: recovery_timeout_ms.map(Duration::from_millis),
             socket_mode: socket_mode.unwrap_or(DEFAULT_SOCKET_MODE),
             read_timeout: Duration::from_millis(read_timeout_ms.unwrap_or(DEFAULT_READ_TIMEOUT_MS)),
+            tracker_capacity: tracker_capacity.unwrap_or(DEFAULT_CAPACITY),
             udp_port,
             udp_bind_addr,
             secure_key_file,
@@ -502,6 +524,7 @@ mod tests {
             "--recovery-debounce-ms",
             "--recovery-timeout-ms",
             "--read-timeout-ms",
+            "--tracker-capacity",
             "--export-file",
             "--prom-addr",
             "--socket-mode",

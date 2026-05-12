@@ -33,7 +33,7 @@ fn bind_succeeds_on_clean_path() {
     let path = unique_path("clean");
     assert!(!path.exists(), "path must not pre-exist");
 
-    let _obs = Observer::bind(&path, THRESHOLD, 0o600, Duration::from_millis(100))
+    let _obs = Observer::bind(&path, THRESHOLD, 0o600, Duration::from_millis(100), 64)
         .expect("bind on clean path should succeed");
 
     assert!(path.exists(), "socket file must exist after bind");
@@ -58,10 +58,10 @@ fn bind_succeeds_on_clean_path() {
 fn bind_fails_when_live_observer_present() {
     let path = unique_path("live");
 
-    let _first = Observer::bind(&path, THRESHOLD, 0o600, Duration::from_millis(100))
+    let _first = Observer::bind(&path, THRESHOLD, 0o600, Duration::from_millis(100), 64)
         .expect("first bind must succeed");
 
-    let err = Observer::bind(&path, THRESHOLD, 0o600, Duration::from_millis(100))
+    let err = Observer::bind(&path, THRESHOLD, 0o600, Duration::from_millis(100), 64)
         .err()
         .expect("second bind on live socket must fail");
 
@@ -92,7 +92,7 @@ fn bind_cleans_up_stale_socket_file() {
         "test setup must leave a stale socket inode"
     );
 
-    let _obs = Observer::bind(&path, THRESHOLD, 0o600, Duration::from_millis(100))
+    let _obs = Observer::bind(&path, THRESHOLD, 0o600, Duration::from_millis(100), 64)
         .expect("bind over stale socket must succeed");
 
     let meta = std::fs::metadata(&path).expect("metadata");
@@ -113,7 +113,7 @@ fn bind_preserves_non_socket_file_at_path() {
 
     std::fs::write(&path, b"do not delete").expect("create regular file");
 
-    let err = Observer::bind(&path, THRESHOLD, 0o600, Duration::from_millis(100))
+    let err = Observer::bind(&path, THRESHOLD, 0o600, Duration::from_millis(100), 64)
         .err()
         .expect("bind over regular file must fail");
 
@@ -136,7 +136,7 @@ fn bind_preserves_non_socket_file_at_path() {
 fn drop_unlinks_bound_socket() {
     let path = unique_path("drop-unlink");
 
-    let obs = Observer::bind(&path, THRESHOLD, 0o600, Duration::from_millis(100))
+    let obs = Observer::bind(&path, THRESHOLD, 0o600, Duration::from_millis(100), 64)
         .expect("bind must succeed");
 
     assert!(path.exists(), "socket must exist after bind");
@@ -151,7 +151,7 @@ fn drop_unlinks_bound_socket() {
 fn drop_swallows_missing_file() {
     let path = unique_path("drop-missing");
 
-    let obs = Observer::bind(&path, THRESHOLD, 0o600, Duration::from_millis(100))
+    let obs = Observer::bind(&path, THRESHOLD, 0o600, Duration::from_millis(100), 64)
         .expect("bind must succeed");
 
     std::fs::remove_file(&path).expect("manual remove");
@@ -166,12 +166,12 @@ fn drop_swallows_missing_file() {
 fn drop_preserves_foreign_inode() {
     let path = unique_path("drop-inode");
 
-    let obs_a = Observer::bind(&path, THRESHOLD, 0o600, Duration::from_millis(100))
+    let obs_a = Observer::bind(&path, THRESHOLD, 0o600, Duration::from_millis(100), 64)
         .expect("first bind must succeed");
 
     std::fs::remove_file(&path).expect("manual remove for inode swap");
 
-    let obs_b = Observer::bind(&path, THRESHOLD, 0o600, Duration::from_millis(100))
+    let obs_b = Observer::bind(&path, THRESHOLD, 0o600, Duration::from_millis(100), 64)
         .expect("second bind must succeed");
 
     drop(obs_a);

@@ -95,6 +95,7 @@ fn observer_emits_beat_per_received_frame() {
         Duration::from_secs(60),
         0o600,
         Duration::from_millis(100),
+        64,
     )
     .expect("bind observer");
     let client = client_socket(path.as_path());
@@ -153,8 +154,14 @@ fn observer_emits_beat_per_received_frame() {
 fn observer_emits_stall_after_threshold_elapses() {
     let path = unique_uds_path("stall");
     let threshold = Duration::from_millis(150);
-    let mut observer = Observer::bind(path.as_path(), threshold, 0o600, Duration::from_millis(100))
-        .expect("bind observer");
+    let mut observer = Observer::bind(
+        path.as_path(),
+        threshold,
+        0o600,
+        Duration::from_millis(100),
+        64,
+    )
+    .expect("bind observer");
     let client = client_socket(path.as_path());
 
     let pid = std::process::id();
@@ -199,6 +206,7 @@ fn observer_reports_decode_error_for_bad_magic() {
         Duration::from_secs(60),
         0o600,
         Duration::from_millis(100),
+        64,
     )
     .expect("bind observer");
     let client = client_socket(path.as_path());
@@ -216,7 +224,7 @@ fn observer_reports_decode_error_for_bad_magic() {
 
 #[test]
 fn tracker_capacity_bounded_to_64_pids() {
-    let mut tracker = Tracker::new();
+    let mut tracker = Tracker::new(64);
     let now_ns: u64 = 1_000;
     let threshold_ns: u64 = 100;
 
@@ -246,6 +254,7 @@ fn observer_rejects_spoofed_pid_frame() {
         Duration::from_secs(60),
         0o600,
         Duration::from_millis(100),
+        64,
     )
     .expect("bind observer");
     let client = client_socket(path.as_path());

@@ -144,6 +144,7 @@ fn run(cfg: Config) -> std::io::Result<()> {
         cfg.threshold,
         cfg.socket_mode,
         cfg.read_timeout,
+        cfg.tracker_capacity,
     )?;
 
     #[cfg(feature = "secure-udp")]

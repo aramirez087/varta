@@ -10,8 +10,8 @@ use varta_vlp::{Frame, Status};
 /// Maximum number of distinct agents the observer can track concurrently.
 ///
 /// v0.1.0 ships with a fixed budget; the bench session pins this number in
-/// the CPU target (50 agents × 1 Hz). Raising the cap is a v0.2 conversation.
-pub const CAPACITY: usize = 64;
+/// the CPU target (50 agents × 1 Hz). Override via `--tracker-capacity`.
+pub const DEFAULT_CAPACITY: usize = 64;
 
 /// Multiplier applied to the stall threshold when choosing eviction victims.
 ///
@@ -51,16 +51,7 @@ pub struct Slot {
     pub(crate) stall_emitted: bool,
 }
 
-impl Slot {
-    const EMPTY: Slot = Slot {
-        pid: 0,
-        last_nonce: 0,
-        last_ns: 0,
-        status: Status::Ok,
-        used: false,
-        stall_emitted: false,
-    };
-}
+impl Slot {}
 
 /// Result of [`Tracker::record`].
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -79,33 +70,33 @@ pub enum Update {
 
 /// Bounded per-pid liveness ledger.
 ///
-/// The slot table is a flat `[Slot; 64]` array; lookups are linear scans.
-/// At v0.1.0 capacities (≤ 64 entries) the linear scan beats hashing on
-/// branch predictability and zero allocation overhead.
+/// The slot table is a `Vec<Slot>` pre-allocated at construction to the
+/// configured capacity; subsequent inserts push into that pre-allocated
+/// space without reallocation. Lookups are linear scans. At typical
+/// capacities (≤ 256 entries) the linear scan beats hashing on branch
+/// predictability and zero allocation overhead after setup.
 pub struct Tracker {
-    entries: [Slot; CAPACITY],
+    entries: Vec<Slot>,
     len: usize,
     evictions: u64,
     capacity_exceeded: u64,
 }
 
-// Compile-time guard: the slot table must remain a fixed-size array. The
-// upper bound matches the prompt's rough budget (40 B per slot + small
-// header) and gives us headroom if `Slot` grows by a field; a breaching
-// change fails the build.
-const _: () = assert!(core::mem::size_of::<Tracker>() <= CAPACITY * 40 + 16);
-
 impl Default for Tracker {
     fn default() -> Self {
-        Self::new()
+        Self::new(DEFAULT_CAPACITY)
     }
 }
 
 impl Tracker {
-    /// Create an empty tracker with all slots zeroed.
-    pub const fn new() -> Self {
+    /// Create an empty tracker with capacity for `capacity` pids.
+    ///
+    /// The slot table is pre-allocated to `capacity` entries; pushing
+    /// beyond that boundary yields [`Update::CapacityExceeded`] rather
+    /// than reallocating.
+    pub fn new(capacity: usize) -> Self {
         Tracker {
-            entries: [Slot::EMPTY; CAPACITY],
+            entries: Vec::with_capacity(capacity),
             len: 0,
             evictions: 0,
             capacity_exceeded: 0,
@@ -138,7 +129,7 @@ impl Tracker {
             }
         }
 
-        if self.len >= CAPACITY {
+        if self.len >= self.entries.capacity() {
             if let Some(evict_idx) = self.find_evictable_slot(now_ns, threshold_ns) {
                 self.entries[evict_idx] = Slot {
                     pid: frame.pid,
@@ -154,14 +145,14 @@ impl Tracker {
             self.capacity_exceeded = self.capacity_exceeded.saturating_add(1);
             return Update::CapacityExceeded;
         }
-        self.entries[self.len] = Slot {
+        self.entries.push(Slot {
             pid: frame.pid,
             last_nonce: frame.nonce,
             last_ns: now_ns,
             status,
             used: true,
             stall_emitted: false,
-        };
+        });
         self.len += 1;
         Update::Inserted
     }

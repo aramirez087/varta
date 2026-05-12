@@ -18,7 +18,7 @@ use varta_vlp::{DecodeError, Frame, Status};
 
 use crate::listener::{BeatListener, UdsListener};
 use crate::peer_cred::RecvResult;
-use crate::tracker::{Tracker, Update, CAPACITY};
+use crate::tracker::{Tracker, Update};
 
 /// Event surfaced by [`Observer::poll`].
 ///
@@ -92,23 +92,32 @@ impl Observer {
     /// Create an empty observer with no listeners. Use
     /// [`Observer::add_listener`] to attach transports, or call
     /// [`Observer::bind`] for the common single-UDS case.
-    pub fn new(threshold: Duration) -> Self {
+    ///
+    /// `tracker_capacity` sets the maximum number of distinct agent pids
+    /// tracked concurrently. Beats for new pids beyond this limit are
+    /// dropped with [`Update::CapacityExceeded`] (the counter is surfaced
+    /// via `varta_tracker_capacity_exceeded_total`).
+    pub fn new(threshold: Duration, tracker_capacity: usize) -> Self {
         let threshold_ns = threshold.as_nanos().min(u64::MAX as u128) as u64;
         Observer {
             listeners: Vec::new(),
-            tracker: Tracker::new(),
+            tracker: Tracker::new(tracker_capacity),
             threshold_ns,
             start: Instant::now(),
-            stall_queue: Vec::with_capacity(CAPACITY),
-            stall_pending: Vec::with_capacity(CAPACITY),
+            stall_queue: Vec::with_capacity(tracker_capacity),
+            stall_pending: Vec::with_capacity(tracker_capacity),
             stall_cursor: 0,
             next_listener_start: 0,
         }
     }
 
     /// Create an observer from a single already-configured listener.
-    pub fn from_listener<L: BeatListener + 'static>(listener: L, threshold: Duration) -> Self {
-        let mut obs = Self::new(threshold);
+    pub fn from_listener<L: BeatListener + 'static>(
+        listener: L,
+        threshold: Duration,
+        tracker_capacity: usize,
+    ) -> Self {
+        let mut obs = Self::new(threshold, tracker_capacity);
         obs.add_listener(Box::new(listener));
         obs
     }
@@ -124,9 +133,10 @@ impl Observer {
         threshold: Duration,
         socket_mode: u32,
         read_timeout: Duration,
+        tracker_capacity: usize,
     ) -> io::Result<Self> {
         let listener = UdsListener::bind(path, socket_mode, read_timeout)?;
-        Ok(Self::from_listener(listener, threshold))
+        Ok(Self::from_listener(listener, threshold, tracker_capacity))
     }
 
     /// Add a listener to the observer. The listener is polled in round-robin
@@ -307,6 +317,7 @@ mod tests {
             Duration::from_secs(1),
             0o600,
             Duration::from_millis(100),
+            64,
         )
         .expect("bind should succeed on a clean temp path");
         assert!(path.exists(), "socket file must exist after bind");

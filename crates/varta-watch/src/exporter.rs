@@ -176,6 +176,11 @@ const PROM_MAX_CONNECTIONS_PER_SERVE: usize = 8;
 /// Cap on how many bytes [`PromExporter::serve_pending`] reads from a
 /// single request before responding (we discard the request line/headers).
 const PROM_REQUEST_CAP: usize = 4096;
+/// Minimum interval between accepted scrapes. A scraper hitting faster than
+/// once per second cannot starve stall detection in the single-threaded
+/// poll loop. Prometheus default scrape intervals are 15–60 s, so this only
+/// gates pathological or misconfigured scrapers.
+const PROM_MIN_SCRAPE_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Prometheus text-format exporter served over HTTP/1.0.
 ///
@@ -187,7 +192,11 @@ pub struct PromExporter {
     listener: TcpListener,
     rows: HashMap<u32, GaugeRow>,
     /// Reused across `/metrics` scrapes to avoid per-scrape allocation.
-    pub(crate) body_buf: String,
+    body_buf: String,
+    /// Timestamp of the most recent scrape served. Enforces
+    /// [`PROM_MIN_SCRAPE_INTERVAL`] to protect the single-threaded poll
+    /// loop from a fast scraper starving stall detection.
+    last_scrape: Option<Instant>,
     evicted_total: u64,
     auth_failures_total: u64,
     /// Per-kind decode failure counters, indexed by [`decode_kind_index`].
@@ -211,6 +220,7 @@ impl PromExporter {
             listener,
             rows: HashMap::new(),
             body_buf: String::new(),
+            last_scrape: None,
             evicted_total: 0,
             auth_failures_total: 0,
             decode_errors_total: [0; 3],
@@ -264,24 +274,36 @@ impl PromExporter {
     /// exist to prevent a storm of slow scrapers from starving the
     /// observer poll loop (stall detection, I/O polling, reaping).
     pub fn serve_pending(&mut self) -> io::Result<()> {
-        let serve_deadline = Instant::now() + Duration::from_millis(100);
-        let mut served = 0;
-        loop {
-            if Instant::now() >= serve_deadline {
+        // Rate-limit: skip serving if a scrape was already handled within
+        // PROM_MIN_SCRAPE_INTERVAL.  This prevents a fast / misconfigured
+        // scraper from starving the single-threaded poll loop.
+        if let Some(last) = self.last_scrape {
+            if last.elapsed() < PROM_MIN_SCRAPE_INTERVAL {
                 return Ok(());
             }
+        }
+        let serve_deadline = Instant::now() + Duration::from_millis(100);
+        let mut served = 0;
+        let result = loop {
+            if Instant::now() >= serve_deadline {
+                break Ok(());
+            }
             if served >= PROM_MAX_CONNECTIONS_PER_SERVE {
-                return Ok(());
+                break Ok(());
             }
             match self.listener.accept() {
                 Ok((stream, _)) => {
                     self.serve_one(stream)?;
                     served += 1;
                 }
-                Err(e) if e.kind() == ErrorKind::WouldBlock => return Ok(()),
-                Err(e) => return Err(e),
+                Err(e) if e.kind() == ErrorKind::WouldBlock => break Ok(()),
+                Err(e) => break Err(e),
             }
+        };
+        if served > 0 {
+            self.last_scrape = Some(Instant::now());
         }
+        result
     }
 
     fn serve_one(&mut self, mut stream: TcpStream) -> io::Result<()> {
@@ -529,9 +551,17 @@ fn write_headers_with_len(
 }
 
 /// Write `n` as decimal ASCII into `buf` and return the number of bytes
-/// written. Panics if `buf` is too small (10 digits max for u32 fits in
-/// any reasonable buffer).
+/// written.
+///
+/// `usize` on 64-bit can require up to 20 decimal digits.  The caller must
+/// ensure `buf` is large enough; the debug assertion catches undersized
+/// buffers at test time and has zero overhead in release builds.
 fn write_usize(buf: &mut [u8], mut n: usize) -> usize {
+    debug_assert!(
+        buf.len() >= 20,
+        "write_usize: buffer too small ({})",
+        buf.len()
+    );
     if n == 0 {
         buf[0] = b'0';
         return 1;
