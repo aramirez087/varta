@@ -6,6 +6,16 @@
 //!
 //! Internal representation uses 5 limbs of 26 bits for the 130-bit
 //! accumulator, with u128 for intermediate products to avoid overflow.
+//!
+//! # Constant-time guarantees
+//!
+//! The entire computation — carry propagation in `mul_mod`, the freeze step
+//! in `poly1305_mac`, and the `h + s` addition — uses only constant-time
+//! operations: right-shifts by compile-time constants, `wrapping_add`,
+//! `wrapping_neg`, and bitwise AND/OR. No data-dependent branches exist.
+//! This relies on the CPU providing constant-time integer arithmetic, which
+//! holds on every target Varta supports (x86-64 `SHR imm`, aarch64 `LSR imm`,
+//! RISC-V `SRLI`).
 
 /// Decompose 16 bytes into five 26-bit limbs.
 ///
@@ -172,6 +182,41 @@ pub fn poly1305_mac(otk: &[u8; 32], msg: &[u8]) -> [u8; 16] {
         h = mul_mod(h, r);
     }
 
+    // ── constant-time freeze: bring h into [0, p = 2^130 − 5) ──────────────
+    // After mul_mod the lazy accumulator h ∈ [0, 2^130).  For the tag to
+    // match the RFC 8439 definition exactly, h must be fully reduced mod p
+    // before adding s.  The five values in [p, 2^130) produce a tag shifted
+    // by −5 mod 2^128 without this step — a correctness bug, not just a
+    // timing concern.
+    //
+    // Strategy: compute g = h + 5 through the 26-bit limb chain.  If h ≥ p
+    // the addition overflows past bit 130; the overflow bit at t4 >> 26 is
+    // turned into an all-ones / all-zeros mask via wrapping_neg and used to
+    // select g (= h − p) over h without any branch.
+    //
+    // All operations — shift by compile-time constant, wrapping_add,
+    // wrapping_neg, bitwise AND/OR — have data-independent latency on every
+    // supported target (x86-64 SHR-imm, aarch64 LSR-imm, RISC-V SRLI).
+    {
+        let t0 = h[0].wrapping_add(5);
+        let g0 = t0 & 0x03ff_ffff;
+        let t1 = h[1].wrapping_add(t0 >> 26);
+        let g1 = t1 & 0x03ff_ffff;
+        let t2 = h[2].wrapping_add(t1 >> 26);
+        let g2 = t2 & 0x03ff_ffff;
+        let t3 = h[3].wrapping_add(t2 >> 26);
+        let g3 = t3 & 0x03ff_ffff;
+        let t4 = h[4].wrapping_add(t3 >> 26);
+        let g4 = t4 & 0x03ff_ffff;
+        // t4 >> 26 == 1 iff h ≥ p; wrapping_neg maps 1 → u64::MAX, 0 → 0
+        let sel = (t4 >> 26).wrapping_neg();
+        h[0] = (g0 & sel) | (h[0] & !sel);
+        h[1] = (g1 & sel) | (h[1] & !sel);
+        h[2] = (g2 & sel) | (h[2] & !sel);
+        h[3] = (g3 & sel) | (h[3] & !sel);
+        h[4] = (g4 & sel) | (h[4] & !sel);
+    }
+
     // h = h + s
     for i in 0..5 {
         h[i] = h[i].wrapping_add(s[i]);
@@ -233,6 +278,31 @@ mod tests {
         ];
 
         assert_eq!(tag, expected, "RFC 8439 Poly1305 test vector mismatch");
+    }
+
+    #[test]
+    fn poly1305_freeze_required_edge_case() {
+        // Analytically derived: r = 2 (after clamping), s = 0, msg = 0xff×16.
+        //
+        // After one block the lazy accumulator is:
+        //   h = 2^130 − 2 = p + 3  (lands in [p, 2^130))
+        //
+        // Without the freeze: (h + s) mod 2^128 = 2^128 − 2 → [0xfe, 0xff×15]
+        // With the freeze:    h mod p = 3         → [0x03, 0x00×15]
+        //
+        // This test fails against the pre-freeze code, confirming the bug.
+        let mut otk = [0u8; 32];
+        otk[0] = 0x02;
+        let msg = [0xffu8; 16];
+        let tag = poly1305_mac(&otk, &msg);
+        let expected: [u8; 16] = [
+            0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00,
+        ];
+        assert_eq!(
+            tag, expected,
+            "freeze must reduce h into [0,p) before adding s"
+        );
     }
 
     #[test]

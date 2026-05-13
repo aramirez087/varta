@@ -170,13 +170,14 @@ impl fmt::Display for BeatOutcome {
 /// ordering. To share across threads, wrap in a [`std::sync::Mutex`] or move
 /// the handle into a dedicated emitter thread or channel.
 ///
-/// The fork-safety contract (pid re-read per beat) is unaffected by the
-/// thread-safety choice.
+/// After `fork(2)` the child inherits this handle. For correctness —
+/// especially on secure-UDP transports where nonce reuse is a cryptographic
+/// failure — create a fresh [`Varta`] in the child (or call
+/// [`reconnect`](Self::reconnect)) before the first beat.
 pub struct Varta<T: BeatTransport = UdsTransport> {
     transport: T,
     buf: [u8; 32],
     start: Instant,
-    last_pid: u32,
     nonce: u64,
     consecutive_dropped: u32,
     reconnect_after: u32,
@@ -194,9 +195,8 @@ impl Varta<UdsTransport> {
     /// prepare the agent for non-blocking emission.
     ///
     /// Stores an `Instant` for per-frame elapsed-nanosecond timestamps. The
-    /// process ID is intentionally not cached here — it is read afresh on
-    /// every [`Varta::beat`] via [`std::process::id`] so a child that forks
-    /// after `connect` reports its own PID, not the parent's. Subsequent
+    /// process ID is read afresh on every [`Varta::beat`] via
+    /// [`std::process::id`] so each frame carries the current PID. Subsequent
     /// calls to [`Varta::beat`] do not allocate.
     ///
     /// # Errors
@@ -209,7 +209,6 @@ impl Varta<UdsTransport> {
             transport,
             buf: [0u8; 32],
             start: Instant::now(),
-            last_pid: std::process::id(),
             nonce: 0,
             consecutive_dropped: 0,
             reconnect_after: 0,
@@ -243,7 +242,6 @@ impl Varta<UdpTransport> {
             transport,
             buf: [0u8; 32],
             start: Instant::now(),
-            last_pid: std::process::id(),
             nonce: 0,
             consecutive_dropped: 0,
             reconnect_after: 0,
@@ -275,7 +273,6 @@ impl Varta<SecureUdpTransport> {
             transport,
             buf: [0u8; 32],
             start: Instant::now(),
-            last_pid: std::process::id(),
             nonce: 0,
             consecutive_dropped: 0,
             reconnect_after: 0,
@@ -307,7 +304,6 @@ impl Varta<SecureUdpTransport> {
             transport,
             buf: [0u8; 32],
             start: Instant::now(),
-            last_pid: std::process::id(),
             nonce: 0,
             consecutive_dropped: 0,
             reconnect_after: 0,
@@ -358,11 +354,6 @@ impl<T: BeatTransport> Varta<T> {
             self.nonce = 0;
         }
         let pid = std::process::id();
-        if pid != self.last_pid {
-            self.start = Instant::now();
-            self.last_pid = pid;
-            self.last_timestamp = 0;
-        }
         let raw_elapsed = self.start.elapsed().as_nanos().min(u64::MAX as u128) as u64;
         self.last_timestamp = self.last_timestamp.max(raw_elapsed);
         let timestamp = self.last_timestamp;
