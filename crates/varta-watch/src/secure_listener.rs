@@ -23,7 +23,7 @@ use std::time::{Duration, Instant};
 use varta_vlp::crypto::{self, Key, NONCE_BYTES, TAG_BYTES};
 
 use crate::listener::BeatListener;
-use crate::peer_cred::RecvResult;
+use crate::peer_cred::{BeatOrigin, RecvResult};
 
 /// Total wire size of a secure VLP frame.
 const SECURE_FRAME_LEN: usize = crypto::SECURE_FRAME_BYTES;
@@ -412,6 +412,7 @@ impl BeatListener for SecureUdpListener {
             return RecvResult::Authenticated {
                 peer_pid: 0,
                 peer_uid: 0,
+                origin: BeatOrigin::NetworkUnverified,
                 data: plaintext,
             };
         }

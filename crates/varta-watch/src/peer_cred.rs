@@ -33,17 +33,53 @@ pub(crate) fn observer_uid() -> u32 {
 // Platform-agnostic result type
 // ---------------------------------------------------------------------------
 
+/// Classification of a received beat's transport origin.
+///
+/// This is the structural distinction between **kernel-attested** transports
+/// (Unix Domain Sockets, where the kernel reports the sender's PID/UID per
+/// datagram) and **network-unverified** transports (any UDP variant, where
+/// the only authentication is cryptographic and the operator-controlled
+/// `frame.pid` field cannot be tied back to a specific sending process).
+///
+/// Recovery commands fire safety-critical actions (`kill -9 {pid}`,
+/// `systemctl restart agent@{pid}.service`) against the PID in the frame.
+/// They must NEVER fire for a pid whose beat lifetime is not
+/// kernel-attested — see `docs/architecture/peer-authentication.md`.
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
+pub enum BeatOrigin {
+    /// Beat arrived on a Unix Domain Socket with kernel credential passing
+    /// enabled (`SO_PASSCRED` / `LOCAL_PEERTOKEN` / `SCM_CREDS`). The kernel
+    /// attests the sender's PID and UID per-datagram; the observer has
+    /// already verified `frame.pid == peer_pid`.
+    KernelAttested,
+    /// Beat arrived on a UDP listener (plain or secure). The wire bytes may
+    /// be cryptographically authenticated (secure-udp), but the underlying
+    /// transport has no notion of "sending process" — the `frame.pid` field
+    /// is purely operator-controlled and cannot be tied back to a kernel
+    /// attestation. Any holder of a shared PSK, or a leaked master key, can
+    /// forge a beat for any pid.
+    NetworkUnverified,
+}
+
 /// Outcome of a single `recvmsg(2)` call with credential extraction.
 pub enum RecvResult {
     /// A full 32-byte frame was received along with credentials. `peer_pid`
     /// is the PID the kernel attributes the datagram to and `peer_uid` is
     /// the effective UID. On Linux this is derived from SCM_CREDENTIALS
     /// (SO_PASSCRED); on macOS it's obtained via `getsockopt(LOCAL_PEERTOKEN)`.
+    ///
+    /// `origin` is the transport-class classification: kernel-attested for
+    /// UDS, network-unverified for any UDP variant. Plumbed end-to-end to
+    /// gate recovery commands on transport trust — see [`BeatOrigin`].
     Authenticated {
-        /// Kernel-attested PID of the sending process.
+        /// Kernel-attested PID of the sending process. Zero for transports
+        /// without kernel credential passing (any UDP variant).
         peer_pid: u32,
-        /// Kernel-attested effective UID of the sending process.
+        /// Kernel-attested effective UID of the sending process. Zero for
+        /// transports without kernel credential passing.
         peer_uid: u32,
+        /// Transport-class classification of the beat.
+        origin: BeatOrigin,
         /// Received frame payload (always 32 bytes).
         data: [u8; 32],
     },
@@ -745,6 +781,7 @@ pub(crate) fn recv_authenticated(fd: i32) -> RecvResult {
     RecvResult::Authenticated {
         peer_pid,
         peer_uid,
+        origin: BeatOrigin::KernelAttested,
         data,
     }
 }

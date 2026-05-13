@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 use varta_vlp::{DecodeError, Frame, Status};
 
 use crate::listener::{BeatListener, UdsListener};
-use crate::peer_cred::RecvResult;
+use crate::peer_cred::{BeatOrigin, RecvResult};
 use crate::tracker::{EvictionPolicy, Tracker, Update};
 
 /// Event surfaced by [`Observer::poll`].
@@ -38,6 +38,9 @@ pub enum Event {
         payload: u64,
         /// Monotonic nonce of the beat.
         nonce: u64,
+        /// Transport-class classification of the beat (see [`BeatOrigin`]).
+        /// Recovery commands consult this to refuse firing on non-kernel-attested origins.
+        origin: BeatOrigin,
         /// Observer-local timestamp (ns since [`Observer`] start) when this
         /// event was produced.
         observer_ns: u64,
@@ -52,6 +55,11 @@ pub enum Event {
         /// Observer-local timestamp (ns since [`Observer`] start) of the
         /// last accepted beat for this pid.
         last_ns: u64,
+        /// Transport origin pinned by the slot's first beat. Recovery
+        /// refuses to spawn for `NetworkUnverified` unless the operator has
+        /// explicitly opted in via
+        /// `--i-accept-recovery-on-unauthenticated-transport`.
+        origin: BeatOrigin,
         /// Observer-local timestamp (ns since [`Observer`] start) when this
         /// stall event was produced.
         observer_ns: u64,
@@ -64,6 +72,22 @@ pub enum Event {
     AuthFailure {
         /// The pid the frame on the wire claimed to be.
         claimed_pid: u32,
+        /// Observer-local timestamp (ns since [`Observer`] start) when this
+        /// event was produced.
+        observer_ns: u64,
+    },
+    /// A beat arrived for an already-tracked pid, but its transport origin
+    /// disagreed with the origin pinned by the slot's first beat. The slot
+    /// was not mutated; the beat was dropped. First-origin-wins prevents an
+    /// attacker on an untrusted transport from "tainting" a slot that
+    /// legitimately belongs to a kernel-attested agent.
+    OriginConflict {
+        /// The pid claimed by the dropped beat (same as the existing slot's pid).
+        claimed_pid: u32,
+        /// Transport origin observed on this datagram.
+        observed_origin: BeatOrigin,
+        /// Origin pinned by the slot (the one that "won" the conflict).
+        slot_origin: BeatOrigin,
         /// Observer-local timestamp (ns since [`Observer`] start) when this
         /// event was produced.
         observer_ns: u64,
@@ -213,6 +237,7 @@ impl Observer {
                 RecvResult::Authenticated {
                     peer_pid,
                     peer_uid: _,
+                    origin,
                     data,
                 } => {
                     let now_ns = self.now_ns();
@@ -247,7 +272,16 @@ impl Observer {
                                     }
                                 }
                             }
-                            match self.tracker.record(&frame, now_ns, self.threshold_ns) {
+                            // Capture the slot's pre-record pinned origin (if
+                            // any) so an OriginConflict event can report what
+                            // the slot was pinned to without an extra lookup
+                            // afterwards.
+                            let slot_origin_before =
+                                self.tracker.origin_of(frame.pid);
+                            match self
+                                .tracker
+                                .record(&frame, now_ns, self.threshold_ns, origin)
+                            {
                                 Update::Inserted | Update::Refreshed => {
                                     if first_event.is_none() {
                                         first_event = Some(Event::Beat {
@@ -255,6 +289,18 @@ impl Observer {
                                             status: frame.status,
                                             payload: frame.payload,
                                             nonce: frame.nonce,
+                                            origin,
+                                            observer_ns: now_ns,
+                                        });
+                                    }
+                                }
+                                Update::OriginConflict => {
+                                    if first_event.is_none() {
+                                        first_event = Some(Event::OriginConflict {
+                                            claimed_pid: frame.pid,
+                                            observed_origin: origin,
+                                            slot_origin: slot_origin_before
+                                                .unwrap_or(origin),
                                             observer_ns: now_ns,
                                         });
                                     }
@@ -324,15 +370,19 @@ impl Observer {
         let now_ns = self.now_ns();
         self.stall_queue.clear();
         self.stall_cursor = 0;
-        self.tracker
-            .drain_stalled_slots(now_ns, self.threshold_ns, |pid, last_nonce, last_ns| {
+        self.tracker.drain_stalled_slots(
+            now_ns,
+            self.threshold_ns,
+            |pid, last_nonce, last_ns, origin| {
                 self.stall_queue.push(Some(Event::Stall {
                     pid,
                     last_nonce,
                     last_ns,
+                    origin,
                     observer_ns: now_ns,
                 }));
-            });
+            },
+        );
     }
 
     /// Drain and reset the eviction counter.
@@ -362,6 +412,14 @@ impl Observer {
     /// O(n) work per arriving frame.
     pub fn drain_eviction_scan_truncated(&mut self) -> u64 {
         self.tracker.take_eviction_scan_truncated()
+    }
+
+    /// Drain and reset the per-tracker origin-conflict counter — number of
+    /// beats dropped because their transport origin disagreed with the
+    /// slot's pinned origin (first-origin-wins). Surfaced as
+    /// `varta_origin_conflict_total` in the Prometheus exporter.
+    pub fn drain_origin_conflicts(&mut self) -> u64 {
+        self.tracker.take_origin_conflicts()
     }
 
     /// Drain and reset the rate-limited counter.

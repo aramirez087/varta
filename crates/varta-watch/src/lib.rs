@@ -31,6 +31,7 @@ pub use config::{Config, ConfigError};
 pub use exporter::{Exporter, FileExporter, PromExporter};
 pub use listener::{BeatListener, UdsListener};
 pub use observer::{Event, Observer};
+pub use peer_cred::BeatOrigin;
 pub use recovery::{Recovery, RecoveryOutcome};
 pub use tracker::{EvictionPolicy, Slot, Tracker, Update};
 

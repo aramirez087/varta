@@ -285,7 +285,7 @@ mod udp_impl {
     use std::io;
     use std::net::{SocketAddr, UdpSocket};
 
-    use crate::peer_cred::RecvResult;
+    use crate::peer_cred::{BeatOrigin, RecvResult};
 
     use super::BeatListener;
 
@@ -343,6 +343,7 @@ mod udp_impl {
                         return RecvResult::Authenticated {
                             peer_pid: 0,
                             peer_uid: 0,
+                            origin: BeatOrigin::NetworkUnverified,
                             data: buf,
                         };
                     }
