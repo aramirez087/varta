@@ -371,11 +371,10 @@ fn run(cfg: Config) -> std::io::Result<()> {
     if cfg.secure_key_file.is_some()
         || cfg.accepted_key_file.is_some()
         || cfg.master_key_file.is_some()
-        || cfg.key_env != "VARTA_KEY"
     {
         varta_error!(
-            "--key-file / --accepted-key-file / --master-key-file / --key-env \
-             require secure UDP support (rebuild with --features secure-udp)"
+            "--key-file / --accepted-key-file / --master-key-file require secure \
+             UDP support (rebuild with --features secure-udp)"
         );
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -401,6 +400,7 @@ fn run(cfg: Config) -> std::io::Result<()> {
     let mut recovery = recovery_mode.map(|mode| {
         Recovery::with_timeout(mode, cfg.recovery_debounce, cfg.recovery_timeout)
             .with_recovery_env(cfg.recovery_env.clone())
+            .with_shutdown_grace(cfg.shutdown_grace)
     });
     let mut file_export: Option<FileExporter> = match cfg.file_export.as_ref() {
         Some(path) => Some(FileExporter::create(path, cfg.export_file_max_bytes)?),
@@ -411,15 +411,27 @@ fn run(cfg: Config) -> std::io::Result<()> {
             if !addr.ip().is_loopback() {
                 varta_warn!(
                     "/metrics is bound to a non-loopback address ({addr}); any host \
-                     that can reach this port can scrape it. Prefer binding to \
-                     127.0.0.1 / ::1 and exposing it through a reverse proxy or \
-                     firewall-restricted interface. Per-source-IP rate limiting and \
-                     the 8-serve / 50-drain accept caps still apply, but loopback \
-                     bind plus a network-level allowlist is defense in depth."
+                     that can reach this port can attempt a scrape. The bearer token \
+                     in --prom-token-file is enforced on every connection, but \
+                     binding to 127.0.0.1 / ::1 behind a reverse proxy or \
+                     firewall-restricted interface remains the recommended \
+                     defense-in-depth posture."
                 );
             }
+            // The token is mandatory whenever --prom-addr is set; the
+            // Config layer rejects the combination of `--prom-addr` without
+            // `--prom-token-file` before we get here, so `load_prom_token`
+            // either returns Some(_) or surfaces a hard error from the
+            // validator (mode 0600, ownership, no symlinks).
+            let token = cfg.load_prom_token()?.ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "internal: --prom-addr without --prom-token-file slipped past Config validation",
+                )
+            })?;
             let pe = PromExporter::bind_with_rate_limit(
                 addr,
+                token,
                 cfg.prom_rate_limit_per_sec,
                 cfg.prom_rate_limit_burst,
             )?;

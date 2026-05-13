@@ -15,6 +15,9 @@
 #[cfg(feature = "crypto")]
 pub mod crypto;
 
+pub mod util;
+pub use util::{ct_eq, decode_hex_32, HexDecodeError};
+
 /// Magic prefix on every VLP frame. ASCII `"VA"`, intentionally readable in
 /// hex dumps so a stray byte stream is easy to identify.
 pub const MAGIC: [u8; 2] = [0x56, 0x41];

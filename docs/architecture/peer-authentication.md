@@ -147,10 +147,22 @@ accept flag — they are the default-safe path.
 
 ## Prometheus `/metrics` endpoint exposure
 
-The `/metrics` endpoint is HTTP/1.0 plaintext with no authentication.
-The observer applies four layers of protection so that a hostile actor
-on the same network cannot exhaust file descriptors or starve the
-observer's poll loop with a connection flood:
+The `/metrics` endpoint is HTTP/1.0 with **mandatory bearer-token
+authentication**.  When `--prom-addr` is set, `--prom-token-file` is
+required: the observer refuses to start without it.  Every scrape must
+send `Authorization: Bearer <hex>` where `<hex>` is the lowercase 64-byte
+hex form of the file's 32 random bytes (the format produced by
+`openssl rand -hex 32`).  Missing or wrong tokens get
+`HTTP/1.0 401 Unauthorized` and bump `varta_prom_auth_failures_total`.
+
+The token file is loaded through the same hardened validator that
+guards `--key-file` (see "Secret-file validation" below): regular file,
+no symlinks, owned by the observer UID, mode `0o600` or stricter,
+opened with `O_NOFOLLOW`.
+
+The endpoint also retains four DoS-protection layers from earlier work,
+so that a hostile scraper cannot exhaust file descriptors or starve the
+observer's poll loop even before the auth check runs:
 
 1. **Serve budget** — at most `PROM_MAX_CONNECTIONS_PER_SERVE=8` accepted
    connections per outer poll tick, and a 100 ms wall-clock deadline.
@@ -168,17 +180,112 @@ observer's poll loop with a connection flood:
    then if necessary the oldest entry is force-evicted and counted as
    `varta_prom_connections_dropped_total{reason="ip_table_full"}`.
 
+### Token comparison is constant-time
+
+The exporter compares the presented and expected tokens via
+`varta_vlp::ct_eq` — the same constant-time XOR-and-OR routine that
+guards Poly1305 tag verification.  This prevents byte-by-byte timing
+oracles from leaking the prefix of the token to a remote scraper.
+
 ### Bind-address recommendation
 
-`--prom-addr` accepts any local socket address, but for hospital
-deployment the recommended posture is to bind loopback
-(`127.0.0.1:<port>` or `[::1]:<port>`) and expose `/metrics` only
-through a reverse proxy or a firewalled management interface.  The
-observer emits a startup `varta_warn!` whenever the bound address is
-non-loopback, to surface the exposure in audit logs:
+The bearer token is the authoritative authentication boundary.  Loopback
+bind (`127.0.0.1:<port>` or `[::1]:<port>`) behind a reverse proxy
+remains the recommended posture for defense in depth, but is no longer
+the *only* defense.  The observer still emits a startup `varta_warn!`
+whenever the bound address is non-loopback, so the exposure is visible
+in audit logs.
 
-> `/metrics is bound to a non-loopback address (<addr>); any host that can`
-> `reach this port can scrape it.`
+### Prometheus scrape config
+
+The standard `authorization:` block injects the bearer token verbatim:
+
+```yaml
+scrape_configs:
+  - job_name: 'varta'
+    static_configs:
+      - targets: ['varta-host:9100']
+    authorization:
+      type: Bearer
+      credentials_file: /etc/prometheus/varta-prom.token
+```
+
+The `credentials_file` should be the **same** content as
+`--prom-token-file` on the observer; Prometheus reads it with the same
+0600-or-stricter expectation.
+
+## Secret-file validation
+
+Every file containing key material — `--key-file`, `--accepted-key-file`,
+`--master-key-file`, and the new `--prom-token-file` — flows through
+`validate_secret_file` in `varta-watch/src/config.rs`.  The validator
+enforces:
+
+1. The path is **not a symlink** (`symlink_metadata` + `is_symlink`).
+2. The path resolves to a **regular file** (not a directory, FIFO,
+   block/char device, etc.).
+3. The mode is **`0o600` or stricter** (`mode & 0o077 == 0`).
+4. The file is **owned by the observer's UID** (kernel-attested via
+   `stat.uid`, not derived from the env).
+5. The file is opened with **`O_NOFOLLOW`** to close the TOCTOU window
+   between the metadata check and the read.
+
+A failure on any of these aborts startup with a typed `ConfigError`
+naming the failing constraint (`insecure permissions ...`, `must not be
+a symlink`, `owned by uid X, expected uid Y`, etc.).
+
+## Why environment-variable keys are gone
+
+Earlier releases offered `--key-env <NAME>` as a key-source fallback.
+That flag is **removed**.  Passing it now returns
+`ConfigError::RemovedFlag` with an inline migration hint pointing at
+`--key-file`.  The motivation:
+
+- On Linux, `/proc/<pid>/environ` is readable by any process running
+  under the same UID; a peer with a UDS connection to the observer
+  (which already has UID-restricted access) can read the master key out
+  of the observer's own environment.
+- In containers, `docker inspect <container>` exposes every environment
+  variable to anyone with read access to the Docker socket — typically
+  all members of the `docker` group, which is often a superset of the
+  in-container UID.
+- `systemd-journald` captures process environment on demand for crash
+  reports; an env-var key ends up in `/var/log/journal` indefinitely.
+
+File-based keys avoid all three exposures and slot into the same
+ownership/permission model as TLS private keys, SSH host keys, and any
+other long-lived secret an operator already knows how to manage.
+
+The `Key` type in `varta_vlp::crypto` also lost its `Copy` derive and
+gained a `Drop` impl that volatile-zeros the secret bytes before the
+allocation is returned to the stack, closing a small but real leak
+surface in core dumps and ASLR-defeated speculative reads.
+
+## Shutdown grace and systemd
+
+`--shutdown-grace-ms` (default 5000, minimum 100) bounds the time
+`Recovery::drop` blocks waiting for outstanding recovery children to
+exit after issuing SIGKILL during shutdown.  Children that outlive the
+grace are abandoned to PID 1 for reaping; the observer process exits
+either way, so the bound on shutdown latency is deterministic.
+
+In a systemd unit, `TimeoutStopSec` must be **at least
+`shutdown_grace_ms + 2 s`** (roughly: grace + reap margin) to ensure
+that systemd does not SIGKILL the observer mid-grace and leak an
+unreaped recovery child:
+
+```ini
+[Service]
+Environment=VARTA_SHUTDOWN_GRACE_MS=5000
+ExecStart=/usr/local/bin/varta-watch --shutdown-grace-ms ${VARTA_SHUTDOWN_GRACE_MS} ...
+TimeoutStopSec=7s
+KillMode=mixed
+```
+
+`KillMode=mixed` is recommended: systemd sends SIGTERM to the main
+observer process only; the observer then runs its own Drop sequence to
+kill+reap any recovery children it had spawned.  This is what the
+shutdown-grace tunable is designed around.
 
 ## Recovery command environment isolation
 
@@ -215,6 +322,7 @@ metacharacters (`;`, `|`, `&`, `$`, `` ` ``, etc.).
 | `varta_frame_auth_failures_total`                     | counter | Incremented every time a frame's claimed PID does not match the kernel-verified sender PID (Linux only). |
 | `varta_beats_total{pid="..."}`                        | counter | Per-PID total of accepted beats (only incremented after authentication passes). |
 | `varta_prom_connections_dropped_total{reason="..."}` | counter | `/metrics` connections accepted but closed before serving.  Reasons: `drain` (serve budget exhausted), `rate_limit` (per-IP token bucket empty), `ip_table_full` (per-IP state map force-evicted). |
+| `varta_prom_auth_failures_total`                     | counter | `/metrics` scrapes that arrived without `Authorization: Bearer <hex>` or with a wrong token.  Always emitted on every scrape (even at zero), so `absent()` alert rules stay green-on-green until the first incident. |
 
 ## Trust model summary
 

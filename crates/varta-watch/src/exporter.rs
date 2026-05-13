@@ -464,7 +464,17 @@ pub struct PromExporter {
     /// loop from a fast scraper starving stall detection.
     last_scrape: Option<Instant>,
     evicted_total: u64,
+    /// Number of `/metrics` connections rejected because the bearer token
+    /// was missing or wrong.  Emitted unconditionally as
+    /// `varta_prom_auth_failures_total` (even when zero) so `absent()` alert
+    /// rules stay green; see the matching contract on
+    /// `varta_decode_errors_total`.
     auth_failures_total: u64,
+    /// Pre-shared 32-byte secret enforced on every scrape via the
+    /// `Authorization: Bearer <hex>` request header.  Loaded once at
+    /// startup from `--prom-token-file`; the exporter never reads the
+    /// file again.
+    token: [u8; 32],
     /// Per-kind decode failure counters, indexed by [`decode_kind_index`].
     /// Always emitted in full (even at zero) so `absent()` alert rules and
     /// dashboards stay green-on-green instead of disappearing until the
@@ -516,10 +526,14 @@ pub struct PromExporter {
 impl PromExporter {
     /// Bind a non-blocking TCP listener on `addr` with default per-IP rate
     /// limits.  Equivalent to
-    /// `bind_with_rate_limit(addr, DEFAULT_PROM_RATE_LIMIT_PER_SEC, DEFAULT_PROM_RATE_LIMIT_BURST)`.
-    pub fn bind(addr: SocketAddr) -> io::Result<Self> {
+    /// `bind_with_rate_limit(addr, token, DEFAULT_PROM_RATE_LIMIT_PER_SEC, DEFAULT_PROM_RATE_LIMIT_BURST)`.
+    ///
+    /// `token` is the 32-byte bearer secret enforced on every scrape; see
+    /// [`Self::bind_with_rate_limit`].
+    pub fn bind(addr: SocketAddr, token: [u8; 32]) -> io::Result<Self> {
         Self::bind_with_rate_limit(
             addr,
+            token,
             crate::config::DEFAULT_PROM_RATE_LIMIT_PER_SEC,
             crate::config::DEFAULT_PROM_RATE_LIMIT_BURST,
         )
@@ -529,8 +543,17 @@ impl PromExporter {
     /// rate-limit parameters.  `rate_per_sec` is the bucket refill rate
     /// (connections per second) and `rate_burst` is the bucket capacity
     /// (and thus the burst size a single IP can sustain at once).
+    ///
+    /// `token` is the 32-byte bearer secret enforced on every accepted
+    /// connection. Every scrape must include
+    /// `Authorization: Bearer <hex>` where `<hex>` is the lowercase 64-byte
+    /// hex encoding of this byte array (the same format produced by
+    /// `openssl rand -hex 32`). Missing or wrong tokens return
+    /// `401 Unauthorized` and bump
+    /// `varta_prom_auth_failures_total`.
     pub fn bind_with_rate_limit(
         addr: SocketAddr,
+        token: [u8; 32],
         rate_per_sec: u32,
         rate_burst: u32,
     ) -> io::Result<Self> {
@@ -544,6 +567,7 @@ impl PromExporter {
             last_scrape: None,
             evicted_total: 0,
             auth_failures_total: 0,
+            token,
             decode_errors_total: [0; DECODE_KIND_LABELS.len()],
             io_errors_total: 0,
             ctrl_truncated_total: 0,
@@ -806,18 +830,27 @@ impl PromExporter {
         // PROM_WRITE_TIMEOUT below are wall-clock budgets enforced by the
         // loops themselves, not socket-level timeouts.
         let deadline = Instant::now() + PROM_READ_DEADLINE;
+        // 512 bytes is enough for a request line + Authorization header +
+        // typical scrape headers (Prometheus' default request is ~110 bytes
+        // including the 64-hex-char token).  We accumulate across reads so
+        // that headers split across multiple TCP segments are still
+        // contiguous when we scan for `Authorization:`.
         let mut buf = [0u8; 512];
         let mut total = 0;
         loop {
             if Instant::now() >= deadline {
                 break;
             }
-            match stream.read(&mut buf) {
+            if total >= buf.len() {
+                break;
+            }
+            match stream.read(&mut buf[total..]) {
                 Ok(0) => break,
                 Ok(n) => {
                     total += n;
-                    let preview = &buf[..n];
-                    if preview.windows(4).any(|w| w == b"\r\n\r\n") || total >= PROM_REQUEST_CAP {
+                    if buf[..total].windows(4).any(|w| w == b"\r\n\r\n")
+                        || total >= PROM_REQUEST_CAP
+                    {
                         break;
                     }
                 }
@@ -828,6 +861,26 @@ impl PromExporter {
 
         if total < 4 || buf[..4] != *b"GET " {
             let response = b"HTTP/1.0 405 Method Not Allowed\r\nAllow: GET\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+            let _ =
+                write_all_nonblocking(&mut stream, response, Instant::now() + PROM_WRITE_TIMEOUT);
+            drain_read_to_would_block(&mut stream);
+            let _ = stream.shutdown(Shutdown::Write);
+            return Ok(());
+        }
+
+        // Bearer-token auth.  Header parsing skips the request line and
+        // walks CRLF-terminated header fields until either Authorization
+        // is found (and its 64-hex Bearer value matches the configured
+        // token in constant time) or the headers run out.  All failure
+        // paths bump `auth_failures_total` and return 401 without ever
+        // touching the response body.
+        let authorized = match parse_authorization_bearer(&buf[..total]) {
+            Some(presented) => varta_vlp::ct_eq(&presented, &self.token),
+            None => false,
+        };
+        if !authorized {
+            self.auth_failures_total = self.auth_failures_total.saturating_add(1);
+            let response = b"HTTP/1.0 401 Unauthorized\r\nWWW-Authenticate: Bearer realm=\"varta\"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
             let _ =
                 write_all_nonblocking(&mut stream, response, Instant::now() + PROM_WRITE_TIMEOUT);
             drain_read_to_would_block(&mut stream);
@@ -1011,6 +1064,21 @@ impl PromExporter {
             self.body_buf,
             "varta_scrape_budget_exhausted_total {}",
             self.scrape_budget_exhausted_total
+        );
+        // Authentication failures on /metrics — emit unconditionally
+        // (even at zero) so `absent()` alert rules stay green-on-green
+        // until the first incident.  Same contract as
+        // `varta_decode_errors_total` and
+        // `varta_prom_connections_dropped_total`.
+        self.body_buf.push_str(
+            "# HELP varta_prom_auth_failures_total Number of /metrics scrapes rejected because the bearer token was missing or wrong.\n",
+        );
+        self.body_buf
+            .push_str("# TYPE varta_prom_auth_failures_total counter\n");
+        let _ = writeln!(
+            self.body_buf,
+            "varta_prom_auth_failures_total {}",
+            self.auth_failures_total
         );
         // Per-reason connection drop counter — emit every label value
         // unconditionally so `absent()` alert rules stay green-on-green
@@ -1205,6 +1273,65 @@ fn write_all_nonblocking(stream: &mut TcpStream, buf: &[u8], deadline: Instant) 
     Ok(())
 }
 
+/// Parse `Authorization: Bearer <64hex>` out of a buffered HTTP/1.x
+/// request without allocating.  Returns the decoded 32-byte token when
+/// the header is present, well-formed, and carries exactly 64 hex
+/// characters of token material; returns `None` otherwise.  The header
+/// field name is matched case-insensitively per RFC 7230 §3.2.
+fn parse_authorization_bearer(buf: &[u8]) -> Option<[u8; 32]> {
+    // Skip the request line. find_crlf returns the index of '\r'; bump
+    // past the '\n' that follows.
+    let mut rest = match find_crlf(buf) {
+        Some(eol) => &buf[eol + 2..],
+        // No CRLF at all — too short to carry a header anyway.
+        None => return None,
+    };
+    while let Some(eol) = find_crlf(rest) {
+        let line = &rest[..eol];
+        rest = &rest[eol + 2..];
+        if line.is_empty() {
+            // Empty line == end of headers.
+            return None;
+        }
+        const HDR: &[u8] = b"authorization:";
+        if line.len() >= HDR.len() && line[..HDR.len()].eq_ignore_ascii_case(HDR) {
+            let mut value = &line[HDR.len()..];
+            while let Some(b) = value.first().copied() {
+                if b == b' ' || b == b'\t' {
+                    value = &value[1..];
+                } else {
+                    break;
+                }
+            }
+            const BEARER: &[u8] = b"bearer ";
+            if value.len() < BEARER.len() {
+                return None;
+            }
+            if !value[..BEARER.len()].eq_ignore_ascii_case(BEARER) {
+                return None;
+            }
+            let mut token_part = &value[BEARER.len()..];
+            while let Some(b) = token_part.first().copied() {
+                if b == b' ' || b == b'\t' {
+                    token_part = &token_part[1..];
+                } else {
+                    break;
+                }
+            }
+            if token_part.len() < 64 {
+                return None;
+            }
+            return varta_vlp::decode_hex_32(&token_part[..64]).ok();
+        }
+    }
+    None
+}
+
+/// Position of the first `\r\n` byte pair in `buf`.
+fn find_crlf(buf: &[u8]) -> Option<usize> {
+    buf.windows(2).position(|w| w == b"\r\n")
+}
+
 /// Drain any unread data from the peer's send buffer so that
 /// `shutdown(SHUT_WR)` sends a graceful FIN instead of RST.
 ///
@@ -1228,9 +1355,17 @@ fn drain_read_to_would_block(stream: &mut TcpStream) {
 mod tests {
     use super::*;
 
+    /// Shared 32-byte bearer token for unit tests.  The bytes are arbitrary
+    /// (chosen so a casual `xxd` of a capture is obviously synthetic) and
+    /// the lowercase 64-char hex form is exposed as `TEST_TOKEN_HEX` for
+    /// tests that need to inject it into an HTTP request.
+    const TEST_TOKEN: [u8; 32] = [0xab; 32];
+    const TEST_TOKEN_HEX: &str = "abababababababababababababababababababababababababababababababab";
+
     #[test]
     fn render_body_sorts_pids_numerically() {
-        let mut prom = PromExporter::bind("127.0.0.1:0".parse().unwrap()).expect("bind");
+        let mut prom =
+            PromExporter::bind("127.0.0.1:0".parse().unwrap(), TEST_TOKEN).expect("bind");
         prom.record(&Event::Beat {
             pid: 30,
             status: Status::Ok,
@@ -1265,7 +1400,8 @@ mod tests {
 
     #[test]
     fn decode_and_io_events_do_not_create_rows() {
-        let mut prom = PromExporter::bind("127.0.0.1:0".parse().unwrap()).expect("bind");
+        let mut prom =
+            PromExporter::bind("127.0.0.1:0".parse().unwrap(), TEST_TOKEN).expect("bind");
         prom.record(&Event::Decode(varta_vlp::DecodeError::BadMagic, 0))
             .unwrap();
         prom.record(&Event::Io(io::Error::other("x"), 0)).unwrap();
@@ -1274,7 +1410,8 @@ mod tests {
 
     #[test]
     fn decode_errors_emit_kind_label_for_every_variant_even_at_zero() {
-        let mut prom = PromExporter::bind("127.0.0.1:0".parse().unwrap()).expect("bind");
+        let mut prom =
+            PromExporter::bind("127.0.0.1:0".parse().unwrap(), TEST_TOKEN).expect("bind");
         // Bump bad_magic twice, bad_status once, leave bad_version at zero.
         prom.record(&Event::Decode(DecodeError::BadMagic, 0))
             .unwrap();
@@ -1303,7 +1440,8 @@ mod tests {
 
     #[test]
     fn non_get_request_returns_405() {
-        let mut prom = PromExporter::bind("127.0.0.1:0".parse().unwrap()).expect("bind");
+        let mut prom =
+            PromExporter::bind("127.0.0.1:0".parse().unwrap(), TEST_TOKEN).expect("bind");
         let addr = prom.local_addr().expect("local_addr");
         let mut stream = TcpStream::connect(addr).expect("connect");
         stream
@@ -1312,6 +1450,10 @@ mod tests {
         stream
             .write_all(b"POST /metrics HTTP/1.0\r\n\r\n")
             .expect("write");
+        // Yield so the kernel can deliver the bytes to the listener's
+        // accept queue before serve_pending() runs; under concurrent
+        // test load the write→accept race is otherwise observable.
+        std::thread::sleep(Duration::from_millis(5));
         prom.serve_pending().expect("serve_pending");
         let mut response = String::new();
         stream.read_to_string(&mut response).expect("read");
@@ -1325,9 +1467,148 @@ mod tests {
         );
     }
 
+    /// Drive a single GET against the exporter with optional Authorization
+    /// header; returns the raw response so each test can assert on its
+    /// status line, headers, and body independently.
+    fn one_get(prom: &mut PromExporter, addr: SocketAddr, auth: Option<&str>) -> String {
+        let mut stream = TcpStream::connect(addr).expect("connect");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("read timeout");
+        let mut req = String::from("GET /metrics HTTP/1.0\r\nHost: localhost\r\n");
+        if let Some(a) = auth {
+            req.push_str("Authorization: ");
+            req.push_str(a);
+            req.push_str("\r\n");
+        }
+        req.push_str("Connection: close\r\n\r\n");
+        stream.write_all(req.as_bytes()).expect("write");
+        // Yield so the kernel can deliver the bytes to the accept queue
+        // before serve_pending reads them.
+        std::thread::sleep(Duration::from_millis(5));
+        prom.serve_pending().expect("serve_pending");
+        let mut response = String::new();
+        stream.read_to_string(&mut response).expect("read");
+        response
+    }
+
+    #[test]
+    fn metrics_requires_bearer_token() {
+        let mut prom =
+            PromExporter::bind("127.0.0.1:0".parse().unwrap(), TEST_TOKEN).expect("bind");
+        let addr = prom.local_addr().expect("local_addr");
+        let response = one_get(&mut prom, addr, None);
+        assert!(
+            response.starts_with("HTTP/1.0 401 Unauthorized"),
+            "expected 401 on missing auth, got: {response}"
+        );
+        assert!(
+            response.contains("WWW-Authenticate: Bearer"),
+            "missing WWW-Authenticate header: {response}"
+        );
+        assert_eq!(
+            prom.auth_failures_total, 1,
+            "auth_failures_total must bump on missing auth"
+        );
+    }
+
+    #[test]
+    fn metrics_rejects_wrong_token() {
+        let mut prom =
+            PromExporter::bind("127.0.0.1:0".parse().unwrap(), TEST_TOKEN).expect("bind");
+        let addr = prom.local_addr().expect("local_addr");
+        let bad = "Bearer 0000000000000000000000000000000000000000000000000000000000000000";
+        let response = one_get(&mut prom, addr, Some(bad));
+        assert!(
+            response.starts_with("HTTP/1.0 401 Unauthorized"),
+            "expected 401 on wrong token, got: {response}"
+        );
+        assert_eq!(
+            prom.auth_failures_total, 1,
+            "auth_failures_total must bump on wrong token"
+        );
+    }
+
+    #[test]
+    fn metrics_accepts_valid_token() {
+        let mut prom =
+            PromExporter::bind("127.0.0.1:0".parse().unwrap(), TEST_TOKEN).expect("bind");
+        let addr = prom.local_addr().expect("local_addr");
+        let good = format!("Bearer {TEST_TOKEN_HEX}");
+        let response = one_get(&mut prom, addr, Some(&good));
+        assert!(
+            response.starts_with("HTTP/1.0 200 OK"),
+            "expected 200 on valid token, got: {response}"
+        );
+        assert_eq!(
+            prom.auth_failures_total, 0,
+            "auth_failures_total must not bump on success"
+        );
+    }
+
+    #[test]
+    fn metrics_authorization_header_is_case_insensitive() {
+        let mut prom =
+            PromExporter::bind("127.0.0.1:0".parse().unwrap(), TEST_TOKEN).expect("bind");
+        let addr = prom.local_addr().expect("local_addr");
+        // Lowercase `bearer` and uppercase hex must both succeed.
+        let token_upper = TEST_TOKEN_HEX.to_uppercase();
+        let mut stream = TcpStream::connect(addr).expect("connect");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("read timeout");
+        let req = format!(
+            "GET /metrics HTTP/1.0\r\nauthorization: bearer {token_upper}\r\nConnection: close\r\n\r\n"
+        );
+        stream.write_all(req.as_bytes()).expect("write");
+        std::thread::sleep(Duration::from_millis(5));
+        prom.serve_pending().expect("serve_pending");
+        let mut response = String::new();
+        stream.read_to_string(&mut response).expect("read");
+        assert!(
+            response.starts_with("HTTP/1.0 200 OK"),
+            "expected 200 with case-insensitive header, got: {response}"
+        );
+    }
+
+    #[test]
+    fn auth_failures_counter_emitted_at_zero_in_body() {
+        let mut prom =
+            PromExporter::bind("127.0.0.1:0".parse().unwrap(), TEST_TOKEN).expect("bind");
+        prom.render_body();
+        assert!(
+            prom.body_buf.contains("varta_prom_auth_failures_total 0"),
+            "auth_failures_total must emit at zero; body:\n{}",
+            prom.body_buf
+        );
+    }
+
+    #[test]
+    fn parse_authorization_bearer_finds_token_among_many_headers() {
+        let req = format!(
+            "GET /metrics HTTP/1.0\r\nHost: localhost\r\nX-Foo: bar\r\nAuthorization: Bearer {TEST_TOKEN_HEX}\r\nUser-Agent: prom/2\r\n\r\n"
+        );
+        let parsed =
+            parse_authorization_bearer(req.as_bytes()).expect("token must parse out of headers");
+        assert_eq!(parsed, TEST_TOKEN);
+    }
+
+    #[test]
+    fn parse_authorization_bearer_rejects_non_bearer_scheme() {
+        let req = "GET /metrics HTTP/1.0\r\nAuthorization: Basic dXNlcjpwYXNz\r\n\r\n";
+        assert!(parse_authorization_bearer(req.as_bytes()).is_none());
+    }
+
+    #[test]
+    fn parse_authorization_bearer_rejects_short_token() {
+        let req = "GET /metrics HTTP/1.0\r\nAuthorization: Bearer abc\r\n\r\n";
+        assert!(parse_authorization_bearer(req.as_bytes()).is_none());
+    }
+
     #[test]
     fn record_evicted_pid_removes_row() {
-        let mut prom = PromExporter::bind("127.0.0.1:0".parse().unwrap()).expect("bind");
+        let mut prom =
+            PromExporter::bind("127.0.0.1:0".parse().unwrap(), TEST_TOKEN).expect("bind");
         prom.record(&Event::Beat {
             pid: 42,
             status: Status::Ok,
@@ -1346,7 +1627,8 @@ mod tests {
 
     #[test]
     fn record_evicted_pid_ignores_unknown_pid() {
-        let mut prom = PromExporter::bind("127.0.0.1:0".parse().unwrap()).expect("bind");
+        let mut prom =
+            PromExporter::bind("127.0.0.1:0".parse().unwrap(), TEST_TOKEN).expect("bind");
         // Should not panic when called for a pid that was never tracked.
         prom.record_evicted_pid(99);
         // Verify rows is still empty.
@@ -1355,7 +1637,8 @@ mod tests {
 
     #[test]
     fn self_health_metrics_are_emitted() {
-        let mut prom = PromExporter::bind("127.0.0.1:0".parse().unwrap()).expect("bind");
+        let mut prom =
+            PromExporter::bind("127.0.0.1:0".parse().unwrap(), TEST_TOKEN).expect("bind");
         // Add a tracked PID so pids_tracked > 0
         prom.record(&Event::Beat {
             pid: 7,
@@ -1398,7 +1681,8 @@ mod tests {
     /// `absent()` alert rules and dashboards depend on stable series.
     #[test]
     fn connections_dropped_emit_every_reason_label_at_zero() {
-        let mut prom = PromExporter::bind("127.0.0.1:0".parse().unwrap()).expect("bind");
+        let mut prom =
+            PromExporter::bind("127.0.0.1:0".parse().unwrap(), TEST_TOKEN).expect("bind");
         prom.render_body();
         let body = &prom.body_buf;
         for reason in DROP_REASON_LABELS {
@@ -1418,6 +1702,7 @@ mod tests {
     fn allow_ip_denies_after_burst_and_records_rate_limit() {
         let mut prom = PromExporter::bind_with_rate_limit(
             "127.0.0.1:0".parse().unwrap(),
+            TEST_TOKEN,
             /* rate_per_sec */ 1,
             /* rate_burst   */ 3,
         )
@@ -1449,6 +1734,7 @@ mod tests {
     fn allow_ip_burst_zero_is_unlimited() {
         let mut prom = PromExporter::bind_with_rate_limit(
             "127.0.0.1:0".parse().unwrap(),
+            TEST_TOKEN,
             /* rate_per_sec */ 5,
             /* rate_burst   */ 0,
         )
@@ -1471,6 +1757,7 @@ mod tests {
     fn allow_ip_table_full_force_evicts_and_records() {
         let mut prom = PromExporter::bind_with_rate_limit(
             "127.0.0.1:0".parse().unwrap(),
+            TEST_TOKEN,
             /* rate_per_sec */ 1000,
             /* rate_burst   */ 1000,
         )

@@ -41,6 +41,18 @@ pub const DEFAULT_PROM_RATE_LIMIT_PER_SEC: u32 = 5;
 /// shutting down a sustained flood within a few seconds.
 pub const DEFAULT_PROM_RATE_LIMIT_BURST: u32 = 10;
 
+/// Default wall-clock budget (in milliseconds) [`crate::recovery::Recovery`]
+/// blocks in its [`Drop`] impl waiting for outstanding recovery children to
+/// exit after a `kill(2)`. Five seconds preserves the v0.1 hard-coded
+/// constant.  systemd `TimeoutStopSec` must be at least this value plus a
+/// small reap margin.
+pub const DEFAULT_SHUTDOWN_GRACE_MS: u64 = 5_000;
+
+/// Minimum accepted value for `--shutdown-grace-ms`.  Below this the
+/// shutdown poll loop cannot complete even one [`std::process::Child::try_wait`]
+/// round under load, which would orphan every outstanding child to PID 1.
+pub const MIN_SHUTDOWN_GRACE_MS: u64 = 100;
+
 /// Parsed daemon configuration.
 #[derive(Clone, Debug)]
 pub struct Config {
@@ -76,9 +88,21 @@ pub struct Config {
     pub export_file_max_bytes: Option<u64>,
     /// Optional listening address for the Prometheus exporter.
     pub prom_addr: Option<SocketAddr>,
+    /// Path to a file containing the 32-byte (64-hex-character) bearer token
+    /// for the Prometheus `/metrics` endpoint.  Required whenever
+    /// [`Self::prom_addr`] is set: `/metrics` has no anonymous access.  The
+    /// file must be a regular file (no symlinks), owned by the observer's
+    /// UID, mode `0o600` or stricter — see [`validate_secret_file`].
+    pub prom_token_file: Option<PathBuf>,
     /// Optional deadline after which the daemon shuts itself down. Used by
     /// integration tests to bound run time without relying on signals.
     pub shutdown_after: Option<Duration>,
+    /// Maximum wall-clock time [`crate::recovery::Recovery::drop`] blocks
+    /// waiting for outstanding recovery children after issuing `kill(2)`.
+    /// Defaults to [`DEFAULT_SHUTDOWN_GRACE_MS`]; minimum
+    /// [`MIN_SHUTDOWN_GRACE_MS`].  systemd `TimeoutStopSec` must be at
+    /// least this value plus a small reap margin (~2 s).
+    pub shutdown_grace: Duration,
     /// Optional kill-after deadline for outstanding recovery children.
     /// `None` (the default) preserves v0.1.0 semantics: children are
     /// reaped on completion but never killed. Set via
@@ -114,9 +138,6 @@ pub struct Config {
     /// The observer derives agent-specific keys from the PID in each
     /// frame's `iv_random` prefix.
     pub master_key_file: Option<PathBuf>,
-    /// Environment variable name to read the primary key from (default
-    /// `VARTA_KEY`). Ignored when `--key-file` is set.
-    pub key_env: String,
     /// Optional per-pid maximum beat rate in beats per second.
     /// `None` (the default) means no rate limiting. Beats arriving
     /// faster than this rate from the same pid are dropped and counted
@@ -192,6 +213,27 @@ pub enum ConfigError {
         /// Second conflicting flag.
         b: &'static str,
     },
+    /// A flag that has been removed for security reasons was passed.  The
+    /// `replacement` field carries an inline migration hint so operators
+    /// see the fix in the same line as the error.
+    RemovedFlag {
+        /// The removed flag token (e.g. `"--key-env"`).
+        flag: &'static str,
+        /// Human-readable migration hint (e.g.
+        /// `"--key-file (mode 0600, owned by the observer UID)"`).
+        replacement: &'static str,
+    },
+    /// `--prom-addr` was set but `--prom-token-file` was not.  /metrics
+    /// has no anonymous access; the observer refuses to start rather than
+    /// expose agent topology to anyone who can reach the bound port.
+    PromAddrRequiresToken,
+    /// `--shutdown-grace-ms` was below [`MIN_SHUTDOWN_GRACE_MS`].
+    ShutdownGraceTooLow {
+        /// The value provided on the CLI.
+        value: u64,
+        /// The minimum allowed value.
+        min: u64,
+    },
 }
 
 impl core::fmt::Display for ConfigError {
@@ -225,6 +267,19 @@ impl core::fmt::Display for ConfigError {
             ConfigError::MutuallyExclusive { a, b } => {
                 write!(f, "{a} and {b} are mutually exclusive")
             }
+            ConfigError::RemovedFlag { flag, replacement } => write!(
+                f,
+                "{flag} has been removed for security reasons; use {replacement}"
+            ),
+            ConfigError::PromAddrRequiresToken => f.write_str(
+                "--prom-addr requires --prom-token-file. /metrics has no anonymous access; \
+                 generate a token with `openssl rand -hex 32 > /etc/varta/prom.token && \
+                 chmod 600 /etc/varta/prom.token`.",
+            ),
+            ConfigError::ShutdownGraceTooLow { value, min } => write!(
+                f,
+                "--shutdown-grace-ms: {value} is below the minimum allowed value ({min} ms)"
+            ),
         }
     }
 }
@@ -283,7 +338,26 @@ OPTIONAL:
                                      PATH.1 .. PATH.5).  Without this flag
                                      the file grows without bound.
     --prom-addr <IP:PORT>          Bind a Prometheus text-format endpoint at
-                                    GET /metrics on this address.
+                                    GET /metrics on this address.  Requires
+                                    --prom-token-file; /metrics has no
+                                    anonymous access.
+    --prom-token-file <PATH>       Path to a file containing the 64-hex-char
+                                     bearer token enforced on every /metrics
+                                     scrape.  File must be mode 0600 or
+                                     stricter, owned by the observer UID,
+                                     not a symlink.  Required when
+                                     --prom-addr is set.  Scrapers must send
+                                     'Authorization: Bearer <hex>' to
+                                     receive 200; missing/wrong tokens
+                                     return 401 and bump
+                                     varta_prom_auth_failures_total.
+    --shutdown-grace-ms <MS>       Maximum time the daemon spends in
+                                     Recovery::drop waiting for outstanding
+                                     recovery children to exit after SIGKILL
+                                     during shutdown.  Default 5000.  Minimum
+                                     100.  systemd unit's TimeoutStopSec
+                                     must be at least this value plus ~2
+                                     seconds of reap margin.
     --recovery-timeout-ms <MS>     Kill-after deadline for recovery children;
                                      if a child runs longer than this it is
                                      killed via kill(2) (default: none —
@@ -317,8 +391,6 @@ OPTIONAL:
     --master-key-file <PATH>       Path to a file containing a 64-hex-char
                                      master key for per-agent key derivation
                                      (requires --features secure-udp).
-    --key-env <NAME>               Environment variable to read the primary
-                                     key from (default VARTA_KEY).
     --max-beat-rate <N>            Per-pid maximum beat rate in beats/sec.
                                      Beats arriving faster than this rate
                                      from the same pid are dropped.
@@ -376,8 +448,10 @@ OPTIONAL:
         let mut file_export: Option<PathBuf> = None;
         let mut export_file_max_bytes: Option<u64> = None;
         let mut prom_addr: Option<SocketAddr> = None;
+        let mut prom_token_file: Option<PathBuf> = None;
         let mut shutdown_after_secs: Option<u64> = None;
         let mut recovery_timeout_ms: Option<u64> = None;
+        let mut shutdown_grace_ms: Option<u64> = None;
         let mut socket_mode: Option<u32> = None;
         let mut read_timeout_ms: Option<u64> = None;
         let mut tracker_capacity: Option<usize> = None;
@@ -387,7 +461,6 @@ OPTIONAL:
         let mut secure_key_file: Option<PathBuf> = None;
         let mut accepted_key_file: Option<PathBuf> = None;
         let mut master_key_file: Option<PathBuf> = None;
-        let mut key_env: String = String::from("VARTA_KEY");
         let mut max_beat_rate: Option<u32> = None;
         let mut heartbeat_file: Option<PathBuf> = None;
         let mut prom_rate_limit_per_sec: Option<u32> = None;
@@ -472,11 +545,23 @@ OPTIONAL:
                             .map_err(|_| ConfigError::BadAddr(v))?,
                     );
                 }
+                "--prom-token-file" => {
+                    let v = iter
+                        .next()
+                        .ok_or(ConfigError::MissingValue("--prom-token-file"))?;
+                    prom_token_file = Some(PathBuf::from(v));
+                }
                 "--recovery-timeout-ms" => {
                     let v = iter
                         .next()
                         .ok_or(ConfigError::MissingValue("--recovery-timeout-ms"))?;
                     recovery_timeout_ms = Some(parse_u64("--recovery-timeout-ms", &v)?);
+                }
+                "--shutdown-grace-ms" => {
+                    let v = iter
+                        .next()
+                        .ok_or(ConfigError::MissingValue("--shutdown-grace-ms"))?;
+                    shutdown_grace_ms = Some(parse_u64("--shutdown-grace-ms", &v)?);
                 }
                 "--read-timeout-ms" => {
                     let v = iter
@@ -544,8 +629,19 @@ OPTIONAL:
                         .ok_or(ConfigError::MissingValue("--master-key-file"))?;
                     master_key_file = Some(PathBuf::from(v));
                 }
-                "--key-env" => {
-                    key_env = iter.next().ok_or(ConfigError::MissingValue("--key-env"))?;
+                "--key-env" | "--master-key-env" | "--accepted-key-env" => {
+                    // Removed for security: env-var keys are exposed via
+                    // /proc/<pid>/environ and `docker inspect`. See
+                    // docs/architecture/peer-authentication.md.
+                    let flag = match tok.as_str() {
+                        "--key-env" => "--key-env",
+                        "--master-key-env" => "--master-key-env",
+                        _ => "--accepted-key-env",
+                    };
+                    return Err(ConfigError::RemovedFlag {
+                        flag,
+                        replacement: "--key-file (mode 0600, owned by the observer UID)",
+                    });
                 }
                 "--max-beat-rate" => {
                     let v = iter
@@ -603,6 +699,28 @@ OPTIONAL:
             });
         }
 
+        // /metrics has no anonymous access.  A reverse proxy doing TLS
+        // termination + auth is fine — but it must still inject the bearer
+        // token on the upstream scrape, which means the operator owns the
+        // token file regardless of the network topology.
+        if prom_addr.is_some() && prom_token_file.is_none() {
+            return Err(ConfigError::PromAddrRequiresToken);
+        }
+        if prom_token_file.is_some() && prom_addr.is_none() {
+            return Err(ConfigError::MutuallyExclusive {
+                a: "--prom-token-file",
+                b: "(missing --prom-addr)",
+            });
+        }
+
+        let shutdown_grace_ms = shutdown_grace_ms.unwrap_or(DEFAULT_SHUTDOWN_GRACE_MS);
+        if shutdown_grace_ms < MIN_SHUTDOWN_GRACE_MS {
+            return Err(ConfigError::ShutdownGraceTooLow {
+                value: shutdown_grace_ms,
+                min: MIN_SHUTDOWN_GRACE_MS,
+            });
+        }
+
         let recovery_debounce =
             Duration::from_millis(recovery_debounce_ms.unwrap_or(DEFAULT_RECOVERY_DEBOUNCE_MS));
 
@@ -618,8 +736,10 @@ OPTIONAL:
             file_export,
             export_file_max_bytes,
             prom_addr,
+            prom_token_file,
             shutdown_after: shutdown_after_secs.map(Duration::from_secs),
             recovery_timeout: recovery_timeout_ms.map(Duration::from_millis),
+            shutdown_grace: Duration::from_millis(shutdown_grace_ms),
             socket_mode: socket_mode.unwrap_or(DEFAULT_SOCKET_MODE),
             read_timeout: Duration::from_millis(read_timeout_ms.unwrap_or(DEFAULT_READ_TIMEOUT_MS)),
             tracker_capacity: tracker_capacity.unwrap_or(DEFAULT_CAPACITY),
@@ -629,7 +749,6 @@ OPTIONAL:
             secure_key_file,
             accepted_key_file,
             master_key_file,
-            key_env,
             max_beat_rate,
             heartbeat_file,
             prom_rate_limit_per_sec: prom_rate_limit_per_sec
@@ -756,8 +875,13 @@ OPTIONAL:
 
     /// Load the primary and accepted secure keys for AEAD transport.
     ///
-    /// Priority: `--key-file` > `--key-env` (default `VARTA_KEY`).
-    /// Returns `Ok(None)` when neither is configured (UDP without AEAD).
+    /// `--key-file` is the sole source for secure-UDP keys: it is the only
+    /// path that goes through [`validate_secret_file`], guaranteeing mode
+    /// 0600 ownership and an `O_NOFOLLOW` open. Environment-variable keys
+    /// were removed (see `ConfigError::RemovedFlag`) because they leak
+    /// through `/proc/<pid>/environ` and `docker inspect`.
+    ///
+    /// Returns `Ok(None)` when `--key-file` is not set (UDP without AEAD).
     ///
     /// # Errors
     ///
@@ -771,49 +895,48 @@ OPTIONAL:
         use std::io;
         use varta_vlp::crypto::Key;
 
-        // Load primary key
-        let primary = if let Some(ref path) = self.secure_key_file {
-            let content = std::fs::read_to_string(path)?;
-            let mut key: Option<Key> = None;
-            for line in content.lines() {
-                let line = line.trim();
-                if line.is_empty() || line.starts_with('#') {
-                    continue;
-                }
-                if key.is_some() {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!(
-                            "{}: multiple primary keys found (expected exactly one)",
-                            path.display()
-                        ),
-                    ));
-                }
-                key = Some(Key::from_hex(line).map_err(|e| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!("{}: {e}", path.display()),
-                    )
-                })?);
-            }
-            key
-        } else {
-            match Key::from_env(&self.key_env) {
-                Ok(key) => Some(key),
-                Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
-                Err(e) => return Err(e),
-            }
+        let Some(ref path) = self.secure_key_file else {
+            return Ok(None);
         };
+
+        let content = read_secret_file(path)?;
+        let mut primary: Option<Key> = None;
+        for line in content.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            if primary.is_some() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "{}: multiple primary keys found (expected exactly one)",
+                        path.display()
+                    ),
+                ));
+            }
+            primary = Some(Key::from_hex(line).map_err(|e| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("{}: {e}", path.display()),
+                )
+            })?);
+        }
 
         let primary = match primary {
             Some(k) => k,
-            None => return Ok(None),
+            None => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("{}: no key found in file", path.display()),
+                ))
+            }
         };
 
         // Load accepted (rotation) keys
         let mut accepted = Vec::new();
         if let Some(ref path) = self.accepted_key_file {
-            let content = std::fs::read_to_string(path)?;
+            let content = read_secret_file(path)?;
             for line in content.lines() {
                 let line = line.trim();
                 if line.is_empty() || line.starts_with('#') {
@@ -838,16 +961,53 @@ OPTIONAL:
     ///
     /// # Errors
     ///
-    /// Returns an `io::Error` if the file cannot be read or the key cannot
-    /// be parsed as a 64-character hex string.
+    /// Returns an `io::Error` if the file cannot be read, the file does not
+    /// meet [`validate_secret_file`]'s hardened requirements, or the key
+    /// cannot be parsed as a 64-character hex string.
     #[cfg(feature = "secure-udp")]
     pub fn load_master_key(&self) -> std::io::Result<Option<varta_vlp::crypto::Key>> {
         use varta_vlp::crypto::Key;
 
-        match self.master_key_file {
-            Some(ref path) => Key::from_file(path).map(Some),
-            None => Ok(None),
-        }
+        let Some(ref path) = self.master_key_file else {
+            return Ok(None);
+        };
+        let hex = read_secret_file(path)?;
+        Key::from_hex(hex.trim()).map(Some).map_err(|e| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("{}: {e}", path.display()),
+            )
+        })
+    }
+
+    /// Load the Prometheus `/metrics` bearer token from
+    /// [`Self::prom_token_file`].
+    ///
+    /// Returns `Ok(None)` when `--prom-token-file` is not set.  The file is
+    /// validated through [`validate_secret_file`] (regular file, owned by
+    /// the observer UID, mode `0o600` or stricter, `O_NOFOLLOW` open) and
+    /// the contents must be exactly 64 hex characters (the same encoding
+    /// used by [`varta_vlp::crypto::Key`], so operators can reuse
+    /// `openssl rand -hex 32`).
+    ///
+    /// # Errors
+    ///
+    /// Returns an `io::Error` if the file fails validation or the contents
+    /// cannot be decoded as 64 hex characters.
+    pub fn load_prom_token(&self) -> std::io::Result<Option<[u8; 32]>> {
+        use std::io;
+        let Some(ref path) = self.prom_token_file else {
+            return Ok(None);
+        };
+        let raw = validate_secret_file(path)?;
+        let trimmed = raw.trim();
+        let bytes = varta_vlp::decode_hex_32(trimmed.as_bytes()).map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("{}: {e}", path.display()),
+            )
+        })?;
+        Ok(Some(bytes))
     }
 }
 
@@ -879,21 +1039,18 @@ fn parse_octal(raw: &str) -> Result<u32, ConfigError> {
     u32::from_str_radix(digits, 8).map_err(|_| ConfigError::BadSocketMode(raw.to_string()))
 }
 
-/// Validate that a recovery command file meets security requirements.
+/// Validate that a secret file (recovery command, key, or token) meets the
+/// hardened requirements: regular file, owned by the observer's UID, mode
+/// `0o600` or stricter, no symlinks (`O_NOFOLLOW` open).
 ///
-/// Checks:
-/// 1. The file is a regular file (not a symlink, directory, or device).
-/// 2. The file is owned by the current process's UID.
-/// 3. The file has no group or other permissions (mode `0o600` or stricter).
+/// Uses `symlink_metadata()` (which does **not** follow symlinks) so an
+/// attacker cannot replace the file with a symlink to e.g.
+/// `/etc/cron.d/evil` and have the metadata of the target satisfy the
+/// checks. Opening the file uses `O_NOFOLLOW` to close the TOCTOU window
+/// between check and read.
 ///
-/// Uses `symlink_metadata()` (which does **not** follow symlinks) so that an
-/// attacker who replaces the file with a symlink to e.g. `/etc/cron.d/evil`
-/// cannot bypass the UID and permission checks by pointing at a target whose
-/// metadata passes.  Opening the file uses `O_NOFOLLOW` to close the TOCTOU
-/// window between check and read.
-///
-/// Returns the trimmed file contents on success.
-fn validate_recovery_file(path: &Path) -> std::io::Result<String> {
+/// Returns the raw file contents on success.
+pub(crate) fn validate_secret_file(path: &Path) -> std::io::Result<String> {
     use std::os::unix::fs::MetadataExt;
 
     // Platform-specific O_NOFOLLOW values (hard-coded for zero-dependency).
@@ -961,8 +1118,23 @@ fn validate_recovery_file(path: &Path) -> std::io::Result<String> {
         ));
     }
 
-    let content = read_file_no_follow(path, O_NOFOLLOW)?;
+    read_file_no_follow(path, O_NOFOLLOW)
+}
+
+/// Recovery-command-file wrapper around [`validate_secret_file`] that also
+/// trims surrounding whitespace from the contents (recovery templates do not
+/// want a trailing newline appended to the command line).
+fn validate_recovery_file(path: &Path) -> std::io::Result<String> {
+    let content = validate_secret_file(path)?;
     Ok(content.trim().to_string())
+}
+
+/// Validate and read a secret file (key, accepted-key, master-key, or
+/// Prometheus token). Returns the raw bytes; callers are responsible for
+/// trimming or splitting line-by-line.
+#[cfg(feature = "secure-udp")]
+pub(crate) fn read_secret_file(path: &Path) -> std::io::Result<String> {
+    validate_secret_file(path)
 }
 
 /// Read a file's contents without following symlinks, using `O_NOFOLLOW`.
@@ -1016,6 +1188,9 @@ mod tests {
 
     #[test]
     fn parses_full_flag_surface() {
+        // --prom-addr now requires --prom-token-file; the file does not
+        // need to exist at parse time (it's only validated when load_prom_token
+        // is actually called by main()).
         let cfg = Config::from_args(args(&[
             "--socket",
             "/s",
@@ -1030,6 +1205,8 @@ mod tests {
             "/tmp/e.log",
             "--prom-addr",
             "127.0.0.1:9090",
+            "--prom-token-file",
+            "/tmp/varta-prom.token",
             "--shutdown-after-secs",
             "3",
         ]))
@@ -1041,6 +1218,10 @@ mod tests {
         assert_eq!(
             cfg.prom_addr,
             Some("127.0.0.1:9090".parse::<SocketAddr>().unwrap())
+        );
+        assert_eq!(
+            cfg.prom_token_file,
+            Some(PathBuf::from("/tmp/varta-prom.token"))
         );
         assert_eq!(cfg.shutdown_after, Some(Duration::from_secs(3)));
     }
@@ -1086,6 +1267,8 @@ mod tests {
             "--export-file",
             "--export-file-max-bytes",
             "--prom-addr",
+            "--prom-token-file",
+            "--shutdown-grace-ms",
             "--socket-mode",
             "--shutdown-after-secs",
             "--udp-port",
@@ -1093,7 +1276,6 @@ mod tests {
             "--key-file",
             "--accepted-key-file",
             "--master-key-file",
-            "--key-env",
             "--max-beat-rate",
             "--heartbeat-file",
             "--prom-rate-limit-per-sec",
@@ -1213,6 +1395,98 @@ mod tests {
         ])) {
             Err(ConfigError::BadSocketMode(raw)) => assert_eq!(raw, "0o"),
             other => panic!("expected BadSocketMode, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn prom_addr_without_token_file_is_rejected() {
+        match Config::from_args(args(&[
+            "--socket",
+            "/s",
+            "--threshold-ms",
+            "100",
+            "--prom-addr",
+            "127.0.0.1:9100",
+        ])) {
+            Err(ConfigError::PromAddrRequiresToken) => {}
+            other => panic!("expected PromAddrRequiresToken, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn prom_token_file_without_prom_addr_is_rejected() {
+        match Config::from_args(args(&[
+            "--socket",
+            "/s",
+            "--threshold-ms",
+            "100",
+            "--prom-token-file",
+            "/dev/null",
+        ])) {
+            Err(ConfigError::MutuallyExclusive { a, b: _ }) => {
+                assert_eq!(a, "--prom-token-file");
+            }
+            other => panic!("expected MutuallyExclusive(--prom-token-file, ..), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_shutdown_grace_ms() {
+        let cfg = Config::from_args(args(&[
+            "--socket",
+            "/s",
+            "--threshold-ms",
+            "100",
+            "--shutdown-grace-ms",
+            "1500",
+        ]))
+        .expect("parse");
+        assert_eq!(cfg.shutdown_grace, Duration::from_millis(1500));
+    }
+
+    #[test]
+    fn shutdown_grace_omitted_is_default() {
+        let cfg =
+            Config::from_args(args(&["--socket", "/s", "--threshold-ms", "100"])).expect("parse");
+        assert_eq!(
+            cfg.shutdown_grace,
+            Duration::from_millis(DEFAULT_SHUTDOWN_GRACE_MS)
+        );
+    }
+
+    #[test]
+    fn shutdown_grace_below_minimum_is_rejected() {
+        match Config::from_args(args(&[
+            "--socket",
+            "/s",
+            "--threshold-ms",
+            "100",
+            "--shutdown-grace-ms",
+            "50",
+        ])) {
+            Err(ConfigError::ShutdownGraceTooLow { value, min }) => {
+                assert_eq!(value, 50);
+                assert_eq!(min, MIN_SHUTDOWN_GRACE_MS);
+            }
+            other => panic!("expected ShutdownGraceTooLow, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn key_env_flag_returns_removed_flag_error() {
+        match Config::from_args(args(&[
+            "--socket",
+            "/s",
+            "--threshold-ms",
+            "100",
+            "--key-env",
+            "VARTA_KEY",
+        ])) {
+            Err(ConfigError::RemovedFlag { flag, replacement }) => {
+                assert_eq!(flag, "--key-env");
+                assert!(replacement.contains("--key-file"));
+            }
+            other => panic!("expected RemovedFlag(--key-env, ..), got {other:?}"),
         }
     }
 

@@ -30,6 +30,11 @@ const PANIC_CHILD_ENV: &str = "VARTA_E2E_PANIC_CHILD";
 const AGENT_CHILD_ENV: &str = "VARTA_E2E_AGENT_CHILD";
 const DEGRADED_CHILD_ENV: &str = "VARTA_E2E_DEGRADED_CHILD";
 
+/// Shared bearer token for the e2e suite.  The 64-char hex form is what
+/// `Authorization: Bearer <…>` carries; the raw bytes are what
+/// `varta-watch` validates against the file content (after `decode_hex_32`).
+const PROM_TOKEN_HEX: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
 /// Number of concurrent agent processes spawned in the multi-agent test.
 const MULTI_AGENT_COUNT: usize = 10;
 
@@ -1727,8 +1732,42 @@ impl Drop for ChildGuard<'_> {
 
 fn spawn_watch(args: &[&str]) -> (Child, SocketAddr) {
     let exe = locate_watch_binary();
-    let mut child = Command::new(&exe)
-        .args(args)
+
+    // Whenever the test asks for --prom-addr, the observer now also
+    // requires --prom-token-file.  Synthesize a 0600-mode token file for
+    // the suite-wide constant and append the flag transparently.  The
+    // file is intentionally leaked: the test process is short-lived and
+    // cleaning up means racing with the child's still-open file handle.
+    let needs_prom_token = args.contains(&"--prom-addr") && !args.contains(&"--prom-token-file");
+    let mut extra_args: Vec<String> = Vec::new();
+    let mut leaked_token_path: Option<String> = None;
+    if needs_prom_token {
+        let dir = std::env::temp_dir().join(format!(
+            "varta-e2e-prom-token-{}-{}",
+            std::process::id(),
+            TMP_COUNTER.fetch_add(1, Ordering::Relaxed),
+        ));
+        std::fs::create_dir_all(&dir).expect("create token dir");
+        let path = dir.join("prom.token");
+        std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .mode(0o600)
+            .open(&path)
+            .and_then(|mut f| f.write_all(PROM_TOKEN_HEX.as_bytes()))
+            .expect("write prom token");
+        leaked_token_path = Some(path.to_string_lossy().into_owned());
+    }
+
+    let mut cmd = Command::new(&exe);
+    cmd.args(args);
+    if let Some(ref p) = leaked_token_path {
+        extra_args.push(String::from("--prom-token-file"));
+        extra_args.push(p.clone());
+    }
+    cmd.args(&extra_args);
+    let mut child = cmd
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
@@ -1801,12 +1840,27 @@ fn wait_until_with_timeout<F: FnMut() -> Option<T>, T>(mut f: F, timeout: Durati
     }
 }
 
-/// Synchronous HTTP/1.0 GET. Returns (status_code, body).
+/// Synchronous HTTP/1.0 GET with the suite-wide bearer token.  Returns
+/// `(status_code, body)`.
 fn http_get(addr: SocketAddr, path: &str) -> std::io::Result<(u16, String)> {
+    http_get_with_auth(addr, path, Some(PROM_TOKEN_HEX))
+}
+
+/// HTTP/1.0 GET that lets the caller pick the Authorization token (or omit
+/// it entirely, to exercise the 401 path).
+fn http_get_with_auth(
+    addr: SocketAddr,
+    path: &str,
+    bearer: Option<&str>,
+) -> std::io::Result<(u16, String)> {
     let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(1))?;
     stream.set_read_timeout(Some(Duration::from_secs(2)))?;
     stream.set_write_timeout(Some(Duration::from_secs(2)))?;
-    let req = format!("GET {path} HTTP/1.0\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+    let mut req = format!("GET {path} HTTP/1.0\r\nHost: localhost\r\nConnection: close\r\n");
+    if let Some(token) = bearer {
+        req.push_str(&format!("Authorization: Bearer {token}\r\n"));
+    }
+    req.push_str("\r\n");
     stream.write_all(req.as_bytes())?;
     let mut buf = Vec::with_capacity(2048);
     stream.read_to_end(&mut buf)?;
@@ -1864,12 +1918,28 @@ fn udp_client_to_observer_beats_and_stall() {
 fn secure_udp_client_to_observer_beats() {
     use std::io::Write;
     use std::net::UdpSocket;
+    use std::os::unix::fs::PermissionsExt;
 
     let tmp = TempDir::new("secure-udp");
     let key_path = tmp.path().join("test.key");
     // 32-byte test key as 64-character hex
     let key_hex = "abababababababababababababababababababababababababababababababab";
-    std::fs::write(&key_path, format!("{key_hex}\n")).expect("write key file");
+    // varta-watch's --key-file validator requires mode 0600 or stricter.
+    // Use OpenOptions::mode at create time and chmod again for good
+    // measure — `std::fs::write` would inherit the process umask.
+    {
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .mode(0o600)
+            .open(&key_path)
+            .expect("create key file");
+        f.write_all(format!("{key_hex}\n").as_bytes())
+            .expect("write key file");
+    }
+    std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600))
+        .expect("chmod key file");
     let key = varta_vlp::crypto::Key::from_bytes([0xabu8; 32]);
 
     // Reserve an ephemeral UDP port for the observer

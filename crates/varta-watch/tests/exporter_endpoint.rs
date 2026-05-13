@@ -16,6 +16,12 @@ use varta_watch::{Event, Exporter, FileExporter, PromExporter};
 
 static TMP_COUNTER: AtomicU32 = AtomicU32::new(0);
 
+/// Shared bearer token across the integration suite.  Bytes are arbitrary;
+/// `TEST_TOKEN_HEX` is the lowercase 64-char hex form for the
+/// `Authorization: Bearer` header.
+const TEST_TOKEN: [u8; 32] = [0xcd; 32];
+const TEST_TOKEN_HEX: &str = "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd";
+
 fn unique_tmp(tag: &str) -> TempPath {
     let pid = std::process::id();
     let n = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -51,7 +57,7 @@ fn http_get(prom: &mut PromExporter, addr: SocketAddr, path: &str) -> String {
         .set_write_timeout(Some(Duration::from_secs(2)))
         .expect("write timeout");
 
-    let req = format!("GET {path} HTTP/1.0\r\n\r\n");
+    let req = format!("GET {path} HTTP/1.0\r\nAuthorization: Bearer {TEST_TOKEN_HEX}\r\n\r\n");
     stream
         .write_all(req.as_bytes())
         .expect("write http request");
@@ -73,7 +79,7 @@ fn http_get(prom: &mut PromExporter, addr: SocketAddr, path: &str) -> String {
 
 #[test]
 fn prom_exporter_reports_beats_total_per_pid() {
-    let mut prom = PromExporter::bind("127.0.0.1:0".parse().unwrap()).expect("bind");
+    let mut prom = PromExporter::bind("127.0.0.1:0".parse().unwrap(), TEST_TOKEN).expect("bind");
     let addr = prom.local_addr().expect("local_addr");
     for n in 1..=3 {
         prom.record(&Event::Beat {
@@ -94,7 +100,7 @@ fn prom_exporter_reports_beats_total_per_pid() {
 
 #[test]
 fn prom_exporter_reports_stalls_total_per_pid() {
-    let mut prom = PromExporter::bind("127.0.0.1:0".parse().unwrap()).expect("bind");
+    let mut prom = PromExporter::bind("127.0.0.1:0".parse().unwrap(), TEST_TOKEN).expect("bind");
     let addr = prom.local_addr().expect("local_addr");
     prom.record(&Event::Beat {
         pid: 9,

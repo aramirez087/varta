@@ -125,7 +125,7 @@ impl SecureUdpTransport {
         // agent key before decryption. Fill iv_random[4..8] with random
         // bytes for nonce uniqueness across reconnects.
         let mut iv_random = [0u8; 8];
-        iv_random[..4].copy_from_slice(&(peer_pid as u32).to_le_bytes());
+        iv_random[..4].copy_from_slice(&peer_pid.to_le_bytes());
         iv_random[4..].copy_from_slice(&read_iv_random_prefix_4()?);
 
         Ok(SecureUdpTransport {

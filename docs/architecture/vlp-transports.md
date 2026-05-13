@@ -94,10 +94,6 @@ varta-watch --socket /tmp/varta.sock --threshold-ms 500 \
             --udp-port 9000 --key-file /tmp/varta.key \
             --accepted-key-file /tmp/varta-new.key
 
-# Key from environment variable (default: VARTA_KEY)
-export VARTA_KEY=$(openssl rand -hex 32)
-varta-watch --socket /tmp/varta.sock --threshold-ms 500 --udp-port 9000
-
 # Per-agent key derivation from master key
 # The observer derives agent-specific keys from the PID embedded in
 # each frame's iv_random prefix. Compromise of one agent's key does
@@ -115,7 +111,7 @@ varta-watch --socket /tmp/varta.sock --threshold-ms 500 \
 | `varta-client` | `udp` | Enables `UdpTransport`, `Varta::connect_udp()`, `install_panic_handler_udp()` |
 | `varta-client` | `secure-udp` | Enables `SecureUdpTransport`, `Varta::connect_secure_udp()`; implies `udp` |
 | `varta-watch` | `udp` | Enables `UdpListener`, `--udp-port` / `--udp-bind-addr` CLI flags |
-| `varta-watch` | `secure-udp` | Enables `SecureUdpListener`, `--key-file` / `--accepted-key-file` / `--key-env`; implies `udp` |
+| `varta-watch` | `secure-udp` | Enables `SecureUdpListener`, `--key-file` / `--accepted-key-file` / `--master-key-file`; implies `udp-core` |
 | `varta-tests` | `udp` | Enables UDP integration tests |
 | `varta-bench` | `udp` | Enables `udp-latency` benchmark subcommand |
 

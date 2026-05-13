@@ -340,12 +340,33 @@ fn cli_recovery_exec_does_not_require_accept_flag() {
 #[cfg(feature = "secure-udp")]
 #[test]
 fn cli_secure_udp_binds_single_listener_for_udp_port() {
+    use std::io::Write;
+    use std::os::unix::fs::PermissionsExt;
+
     let path = unique_uds_path("secure-udp");
     let port = unused_udp_port().to_string();
     let key = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
 
+    // The observer enforces mode 0600 on the key file; write it with the
+    // permissions the validator expects.
+    let key_dir = std::env::temp_dir().join(format!(
+        "varta-cli-smoke-key-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&key_dir).expect("create key dir");
+    let key_path = key_dir.join("key.hex");
+    {
+        let mut f = std::fs::File::create(&key_path).expect("create key file");
+        f.write_all(key.as_bytes()).expect("write key");
+    }
+    std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600))
+        .expect("chmod 0600 on key file");
+
     let out = Command::new(env!("CARGO_BIN_EXE_varta-watch"))
-        .env("VARTA_KEY", key)
         .args([
             "--socket",
             path.as_str(),
@@ -355,18 +376,173 @@ fn cli_secure_udp_binds_single_listener_for_udp_port() {
             "127.0.0.1",
             "--udp-port",
             &port,
-            "--key-env",
-            "VARTA_KEY",
+            "--key-file",
+            key_path.to_str().expect("utf-8 key path"),
             "--shutdown-after-secs",
             "0",
         ])
         .output()
         .expect("spawn varta-watch with secure UDP");
 
+    let _ = std::fs::remove_dir_all(&key_dir);
+
     assert!(
         out.status.success(),
         "secure UDP must bind the configured UDP port exactly once; got {:?} (stderr: {})",
         out.status,
         String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn cli_key_env_flag_is_rejected_with_migration_hint() {
+    let path = unique_uds_path("key-env-removed");
+    let out = Command::new(env!("CARGO_BIN_EXE_varta-watch"))
+        .args([
+            "--socket",
+            path.as_str(),
+            "--threshold-ms",
+            "100",
+            "--key-env",
+            "VARTA_KEY",
+        ])
+        .output()
+        .expect("spawn varta-watch with --key-env");
+
+    assert!(
+        !out.status.success(),
+        "--key-env must hard-error after removal; got status {:?}",
+        out.status
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("--key-env") && stderr.contains("--key-file"),
+        "error must reference --key-env and the --key-file replacement; got: {stderr}"
+    );
+}
+
+/// Write a 64-hex-char string to a freshly-created temp file with the
+/// chosen mode and return the absolute path.  Caller owns the file (the
+/// directory is intentionally leaked: tests are short-lived and racing
+/// the cleanup with the spawned child is more trouble than the few
+/// kilobytes are worth).
+fn write_secret_file(tag: &str, content: &str, mode: u32) -> std::path::PathBuf {
+    use std::io::Write;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    let dir = std::env::temp_dir().join(format!(
+        "varta-secret-{tag}-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).expect("create secret dir");
+    let path = dir.join("secret.hex");
+    {
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .mode(mode)
+            .open(&path)
+            .expect("create secret file");
+        f.write_all(content.as_bytes()).expect("write secret");
+    }
+    // OpenOptions::mode is applied at open(2); chmod again to make the
+    // mode authoritative regardless of process umask.
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode))
+        .expect("chmod secret file");
+    path
+}
+
+#[cfg(feature = "secure-udp")]
+#[test]
+fn cli_key_file_with_world_readable_mode_is_rejected() {
+    let socket = unique_uds_path("key-file-perm");
+    let port = unused_udp_port().to_string();
+    let key = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
+    // 0o644 leaves group+other readable — the validator must refuse.
+    let key_path = write_secret_file("key-0644", key, 0o644);
+    let out = Command::new(env!("CARGO_BIN_EXE_varta-watch"))
+        .args([
+            "--socket",
+            socket.as_str(),
+            "--threshold-ms",
+            "100",
+            "--udp-bind-addr",
+            "127.0.0.1",
+            "--udp-port",
+            &port,
+            "--key-file",
+            key_path.to_str().expect("utf-8 key path"),
+        ])
+        .output()
+        .expect("spawn varta-watch");
+    assert!(
+        !out.status.success(),
+        "world-readable key file must be rejected; got status {:?}",
+        out.status
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("insecure permissions") || stderr.contains("0600"),
+        "error must explain the 0600 requirement; got: {stderr}"
+    );
+}
+
+#[test]
+fn cli_prom_addr_without_token_file_is_rejected() {
+    let socket = unique_uds_path("prom-noauth");
+    let out = Command::new(env!("CARGO_BIN_EXE_varta-watch"))
+        .args([
+            "--socket",
+            socket.as_str(),
+            "--threshold-ms",
+            "100",
+            "--prom-addr",
+            "127.0.0.1:0",
+        ])
+        .output()
+        .expect("spawn varta-watch");
+    assert!(
+        !out.status.success(),
+        "--prom-addr without --prom-token-file must hard-error; got status {:?}",
+        out.status
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("--prom-token-file"),
+        "error must name --prom-token-file; got: {stderr}"
+    );
+}
+
+#[test]
+fn cli_prom_token_file_with_world_readable_mode_is_rejected() {
+    let socket = unique_uds_path("prom-tok-perm");
+    let token = "abababababababababababababababababababababababababababababababab";
+    let token_path = write_secret_file("prom-token-0644", token, 0o644);
+    let out = Command::new(env!("CARGO_BIN_EXE_varta-watch"))
+        .args([
+            "--socket",
+            socket.as_str(),
+            "--threshold-ms",
+            "100",
+            "--prom-addr",
+            "127.0.0.1:0",
+            "--prom-token-file",
+            token_path.to_str().expect("utf-8 token path"),
+        ])
+        .output()
+        .expect("spawn varta-watch");
+    assert!(
+        !out.status.success(),
+        "world-readable prom token must be rejected; got status {:?}",
+        out.status
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("insecure permissions") || stderr.contains("0600"),
+        "error must explain the 0600 requirement; got: {stderr}"
     );
 }

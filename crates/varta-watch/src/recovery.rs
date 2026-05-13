@@ -122,6 +122,11 @@ pub struct Recovery {
     /// `PATH=/usr/bin:/bin` plus these variables. When empty, the child
     /// inherits the observer's environment (backward compatible).
     recovery_env: Vec<String>,
+    /// Maximum wall-clock time the [`Drop`] impl will block waiting for
+    /// outstanding children to exit after issuing `kill(2)`. Children that
+    /// outlive the grace are abandoned to PID 1 (init) for reaping.  Tuned
+    /// via `--shutdown-grace-ms` in the observer CLI.
+    shutdown_grace: Duration,
 }
 
 impl Recovery {
@@ -153,6 +158,9 @@ impl Recovery {
     /// are reaped on completion but are never killed. `timeout = Some(d)`
     /// asks `try_reap` to issue `kill(2)` once a child has been
     /// outstanding longer than `d`.
+    ///
+    /// The [`Drop`] grace defaults to [`crate::config::DEFAULT_SHUTDOWN_GRACE_MS`].
+    /// Use [`Self::with_shutdown_grace`] to override.
     pub fn with_timeout(mode: RecoveryMode, debounce: Duration, timeout: Option<Duration>) -> Self {
         Recovery {
             mode,
@@ -162,7 +170,18 @@ impl Recovery {
             outstanding: HashMap::new(),
             pending_outcomes: Vec::new(),
             recovery_env: Vec::new(),
+            shutdown_grace: Duration::from_millis(crate::config::DEFAULT_SHUTDOWN_GRACE_MS),
         }
+    }
+
+    /// Override the Drop-time shutdown grace.  See
+    /// [`crate::config::DEFAULT_SHUTDOWN_GRACE_MS`] and
+    /// [`crate::config::MIN_SHUTDOWN_GRACE_MS`] for the bounds; values
+    /// shorter than the minimum are clamped on the way in.
+    pub fn with_shutdown_grace(mut self, grace: Duration) -> Self {
+        let min = Duration::from_millis(crate::config::MIN_SHUTDOWN_GRACE_MS);
+        self.shutdown_grace = grace.max(min);
+        self
     }
 
     /// Set explicit environment variables for child processes.
@@ -392,7 +411,6 @@ impl Recovery {
 
 impl Drop for Recovery {
     fn drop(&mut self) {
-        const SHUTDOWN_DEADLINE: Duration = Duration::from_secs(5);
         const POLL_INTERVAL: Duration = Duration::from_millis(10);
 
         // Phase 1: kill all outstanding children immediately (no waiting).
@@ -405,9 +423,14 @@ impl Drop for Recovery {
             })
             .collect();
 
-        // Phase 2: wait for all children with a single shared deadline.
-        // Previously this was per-child (N × 5s), now it's total 5s max.
-        let deadline = Instant::now() + SHUTDOWN_DEADLINE;
+        // Phase 2: wait for all children with a single shared deadline
+        // (configured via `--shutdown-grace-ms`).  This is total wall-clock
+        // time across all outstanding children, not per-child, so a noisy
+        // recovery template cannot stretch shutdown beyond the operator's
+        // budget.  systemd's `TimeoutStopSec` should be at least
+        // `shutdown_grace_ms` + a small reap margin (~2 s) — see
+        // `docs/architecture/peer-authentication.md`.
+        let deadline = Instant::now() + self.shutdown_grace;
         while !children.is_empty() && Instant::now() < deadline {
             children.retain_mut(|child| match child.try_wait() {
                 Ok(Some(_)) | Err(_) => false, // reaped or error — remove
@@ -435,6 +458,29 @@ mod tests {
         let second = rec.on_stall(1);
         assert!(matches!(first, RecoveryOutcome::Spawned { .. }));
         assert!(matches!(second, RecoveryOutcome::Debounced));
+    }
+
+    /// The configurable Drop grace must bound wall-clock shutdown time
+    /// even when outstanding children are still running.  We spawn a child
+    /// that sleeps far longer than the grace, then drop the Recovery and
+    /// time the unwind.  The deadline gives SIGKILL ample headroom over
+    /// the grace itself; the test fails if Drop blocked for the full
+    /// 30-second sleep.
+    #[test]
+    fn drop_returns_within_configured_grace() {
+        let mut rec = Recovery::new("sleep 30".to_string(), Duration::ZERO)
+            .with_shutdown_grace(Duration::from_millis(200));
+        match rec.on_stall(99) {
+            RecoveryOutcome::Spawned { .. } => {}
+            other => panic!("expected first stall to spawn, got {other:?}"),
+        }
+        let start = Instant::now();
+        drop(rec);
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < Duration::from_millis(1_500),
+            "Drop took {elapsed:?}; must respect --shutdown-grace-ms (~200 ms here)"
+        );
     }
 
     #[test]

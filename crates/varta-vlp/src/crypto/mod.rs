@@ -61,7 +61,11 @@ impl core::fmt::Display for KeyError {
 ///
 /// Created from a hex string (64 characters) or raw bytes. Both the agent
 /// and observer must share the same key.
-#[derive(Clone, Copy, PartialEq, Eq)]
+///
+/// `Key` is intentionally **not** `Copy`. The [`Drop`] impl volatile-zeros
+/// the secret bytes; an implicit copy would defeat that wipe by leaving a
+/// silent duplicate behind in some other stack frame.
+#[derive(Clone)]
 pub struct Key {
     pub(crate) bytes: [u8; KEY_BYTES],
 }
@@ -80,47 +84,13 @@ impl Key {
     /// characters, or [`KeyError::InvalidCharacter`] if a non-hex digit is
     /// found.
     pub fn from_hex(hex: &str) -> Result<Self, KeyError> {
-        if hex.len() != 64 {
-            return Err(KeyError::InvalidLength(hex.len()));
-        }
-
-        let mut bytes = [0u8; KEY_BYTES];
-        for (i, chunk) in hex.as_bytes().chunks(2).enumerate() {
-            let hi =
-                hex_val(chunk[0]).ok_or(KeyError::InvalidCharacter(i * 2, chunk[0] as char))?;
-            let lo =
-                hex_val(chunk[1]).ok_or(KeyError::InvalidCharacter(i * 2 + 1, chunk[1] as char))?;
-            bytes[i] = (hi << 4) | lo;
-        }
-        Ok(Key { bytes })
-    }
-
-    /// Load a key from an environment variable.
-    ///
-    /// Reads the variable `name` and parses it as a hex-encoded 64-character
-    /// string.
-    ///
-    /// # Errors
-    ///
-    /// Returns an `io::Error` with kind `NotFound` if the variable is not set,
-    /// or kind `InvalidData` if the value cannot be parsed as a hex key.
-    pub fn from_env(name: &str) -> std::io::Result<Self> {
-        let val = std::env::var(name).map_err(|e| match e {
-            std::env::VarError::NotPresent => std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                format!("environment variable {name} is not set"),
-            ),
-            std::env::VarError::NotUnicode(_) => std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("environment variable {name} is not valid Unicode"),
-            ),
+        let bytes = crate::util::decode_hex_32(hex.as_bytes()).map_err(|e| match e {
+            crate::util::HexDecodeError::InvalidLength(n) => KeyError::InvalidLength(n),
+            crate::util::HexDecodeError::InvalidCharacter(pos, ch) => {
+                KeyError::InvalidCharacter(pos, ch)
+            }
         })?;
-        Key::from_hex(&val).map_err(|e| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("failed to parse {name}: {e}"),
-            )
-        })
+        Ok(Key { bytes })
     }
 
     /// Load a key from a file containing a 64-character hex string.
@@ -153,14 +123,29 @@ impl core::fmt::Debug for Key {
     }
 }
 
-fn hex_val(b: u8) -> Option<u8> {
-    match b {
-        b'0'..=b'9' => Some(b - b'0'),
-        b'a'..=b'f' => Some(b - b'a' + 10),
-        b'A'..=b'F' => Some(b - b'A' + 10),
-        _ => None,
+// Secure zeroization of a 256-bit secret requires volatile writes so the
+// compiler cannot dead-store-eliminate the wipe after the value is no longer
+// observed. The volatile-write intrinsic is `unsafe` even though its inputs
+// here are trivially safe (a valid `&mut u8` from this stack frame). The
+// workspace-wide `unsafe_code = "deny"` is suppressed only on this single
+// item; no other unsafe usage is introduced elsewhere in `varta-vlp`.
+#[allow(unsafe_code)]
+impl Drop for Key {
+    fn drop(&mut self) {
+        for b in &mut self.bytes {
+            // SAFETY: `b` is a valid, non-null `&mut u8` from this Key's
+            // own buffer. `write_volatile` only requires a properly aligned
+            // pointer to allocated memory of the right size; a `&mut u8`
+            // satisfies all of these.
+            unsafe { core::ptr::write_volatile(b as *mut u8, 0) };
+        }
+        // Order the wipe before any later side effect that might reuse the
+        // backing memory (e.g. stack frame reuse for the next call).
+        core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
     }
 }
+
+pub use crate::util::{ct_eq, decode_hex_32, HexDecodeError};
 
 #[cfg(test)]
 mod tests {

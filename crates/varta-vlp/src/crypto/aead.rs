@@ -104,12 +104,8 @@ pub fn open(
 
     let computed_tag = poly1305_mac(&otk, &mac_data);
 
-    // Constant-time comparison (timing-safe)
-    let mut diff = 0u8;
-    for i in 0..16 {
-        diff |= tag[i] ^ computed_tag[i];
-    }
-    if diff != 0 {
+    // Constant-time tag verification — see `crate::util::ct_eq`.
+    if !crate::util::ct_eq(tag, &computed_tag) {
         return Err(AuthError);
     }
 
