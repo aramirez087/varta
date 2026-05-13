@@ -5,6 +5,9 @@ edition = "2021"
 license = "MIT OR Apache-2.0"
 description = "Varta performance harness — owned by Session 06."
 
+[lints]
+workspace = true
+
 [dependencies]
 varta-vlp = { path = "../varta-vlp" }
 varta-client = { path = "../varta-client" }

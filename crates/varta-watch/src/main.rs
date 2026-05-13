@@ -1,5 +1,8 @@
 #![deny(missing_docs, unsafe_op_in_unsafe_fn, rust_2018_idioms)]
 #![forbid(clippy::dbg_macro, clippy::print_stdout)]
+// SAFETY: unsafe_code is legitimately required for sigaction(2) FFI in
+// install_signal_handlers().  The workspace-level deny forces explicit opt-in.
+#![allow(unsafe_code)]
 
 //! Varta observer binary entry point.
 //!
@@ -9,9 +12,9 @@
 //! `--shutdown-after-secs` deadline elapses or a signal (SIGINT /
 //! SIGTERM) flips the [`SHUTDOWN`] latch.
 //!
-//! This binary is the only place in the workspace where `eprintln!` is
-//! permitted. Diagnostics (errors, recovery outcomes) go to stderr; the
-//! `--help` text goes to stdout via `std::io::stdout`.
+//! This binary uses `varta_watch::varta_*` logging macros.  Diagnostics
+//! go to stderr — either plain `eprintln!` format (default) or JSON lines
+//! when the `json-log` feature is enabled.
 
 use std::io::Write;
 use std::process::ExitCode;
@@ -19,8 +22,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use varta_watch::{
-    Config, ConfigError, Event, Exporter, FileExporter, Observer, PromExporter, Recovery,
-    RecoveryOutcome,
+    varta_error, varta_error_err, varta_error_pid, varta_info_pid_child, varta_warn,
+    varta_warn_child, Config, ConfigError, Event, Exporter, FileExporter, Observer, PromExporter,
+    Recovery, RecoveryOutcome,
 };
 
 /// Shutdown latch flipped by [`install_signal_handlers`] on SIGINT/SIGTERM
@@ -195,7 +199,7 @@ fn main() -> ExitCode {
         Ok(cfg) => match run(cfg) {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => {
-                eprintln!("varta-watch: {e}");
+                varta_error!("{e}");
                 ExitCode::from(1)
             }
         },
@@ -204,8 +208,7 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         Err(e) => {
-            eprintln!("varta-watch: {e}");
-            eprintln!();
+            varta_error!("{e}");
             let _ = std::io::stderr().lock().write_all(Config::HELP.as_bytes());
             ExitCode::from(2)
         }
@@ -242,8 +245,8 @@ fn run(cfg: Config) -> std::io::Result<()> {
         target_os = "dragonfly",
         target_os = "netbsd",
     )))]
-    eprintln!(
-        "varta-watch: running on {} — per-datagram PID verification is unavailable. \
+    varta_warn!(
+        "running on {} — per-datagram PID verification is unavailable. \
          The only defence is --socket-mode (default 0600); any process under the same \
          UID can impersonate any PID.",
         std::env::consts::OS,
@@ -294,8 +297,8 @@ fn run(cfg: Config) -> std::io::Result<()> {
                     std::io::Error::new(e.kind(), format!("UDP bind {}: {e}", addr))
                 })?;
                 observer.add_listener(Box::new(udp));
-                eprintln!(
-                    "varta-watch: WARNING — UDP on {addr} running WITHOUT authentication \
+                varta_warn!(
+                    "WARNING — UDP on {addr} running WITHOUT authentication \
                      (no keys configured). Any device on the network can spoof heartbeats, \
                      suppress agent failure detection, or trigger false stall events. \
                      Provide --key-file to enable AEAD-authenticated transport.",
@@ -308,8 +311,8 @@ fn run(cfg: Config) -> std::io::Result<()> {
             let udp = varta_watch::UdpListener::bind(addr)
                 .map_err(|e| std::io::Error::new(e.kind(), format!("UDP bind {}: {e}", addr)))?;
             observer.add_listener(Box::new(udp));
-            eprintln!(
-                "varta-watch: WARNING — UDP on {addr} has NO authentication (build lacks \
+            varta_warn!(
+                "WARNING — UDP on {addr} has NO authentication (build lacks \
                  --features secure-udp). Any device on the network can spoof heartbeats, \
                  suppress agent failure detection, or trigger false stall events. \
                  Rebuild with --features secure-udp for AEAD-authenticated transport.",
@@ -319,7 +322,7 @@ fn run(cfg: Config) -> std::io::Result<()> {
 
     #[cfg(not(feature = "udp"))]
     if cfg.udp_port.is_some() {
-        eprintln!("varta-watch: --udp-port requires UDP support (rebuild with --features udp)");
+        varta_error!("--udp-port requires UDP support (rebuild with --features udp)");
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             "UDP support not compiled in",
@@ -332,8 +335,8 @@ fn run(cfg: Config) -> std::io::Result<()> {
         || cfg.master_key_file.is_some()
         || cfg.key_env != "VARTA_KEY"
     {
-        eprintln!(
-            "varta-watch: --key-file / --accepted-key-file / --master-key-file / --key-env \
+        varta_error!(
+            "--key-file / --accepted-key-file / --master-key-file / --key-env \
              require secure UDP support (rebuild with --features secure-udp)"
         );
         return Err(std::io::Error::new(
@@ -345,8 +348,8 @@ fn run(cfg: Config) -> std::io::Result<()> {
     let recovery_mode = cfg.resolve_recovery_mode()?;
 
     if cfg.recovery_cmd.is_some() {
-        eprintln!(
-            "varta-watch: --recovery-cmd (inline shell template) executes /bin/sh -c with \
+        varta_warn!(
+            "--recovery-cmd (inline shell template) executes /bin/sh -c with \
              root-equivalent process authority. Use --recovery-cmd-file (with 0600 file \
              permissions and same-UID ownership) or --recovery-exec (no shell, no injection \
              surface) for any production deployment."
@@ -392,7 +395,7 @@ fn run(cfg: Config) -> std::io::Result<()> {
         while let Some(ev) = observer.poll_pending() {
             if let Some(fe) = file_export.as_mut() {
                 if let Err(e) = fe.record(&ev) {
-                    eprintln!("varta-watch: file export error: {e}");
+                    varta_error!("file export error: {e}");
                 }
             }
             if let Some(pe) = prom_export.as_mut() {
@@ -402,13 +405,19 @@ fn run(cfg: Config) -> std::io::Result<()> {
                 if let Some(rec) = recovery.as_mut() {
                     match rec.on_stall(*pid) {
                         RecoveryOutcome::Spawned { child_pid } => {
-                            eprintln!(
-                                "varta-watch: recovery for pid {pid} spawned (child {child_pid})"
+                            varta_info_pid_child!(
+                                *pid,
+                                child_pid,
+                                "recovery for pid {pid} spawned (child {child_pid})"
                             );
                         }
                         RecoveryOutcome::Debounced => {}
                         RecoveryOutcome::SpawnFailed(e) => {
-                            eprintln!("varta-watch: recovery for pid {pid} failed to spawn: {e}");
+                            varta_error_pid!(
+                                *pid,
+                                e,
+                                "recovery for pid {pid} failed to spawn: {e}"
+                            );
                         }
                         RecoveryOutcome::Reaped { .. }
                         | RecoveryOutcome::Killed { .. }
@@ -426,7 +435,7 @@ fn run(cfg: Config) -> std::io::Result<()> {
         let had_io = if let Some(ev) = observer.poll() {
             if let Some(fe) = file_export.as_mut() {
                 if let Err(e) = fe.record(&ev) {
-                    eprintln!("varta-watch: file export error: {e}");
+                    varta_error!("file export error: {e}");
                 }
             }
             if let Some(pe) = prom_export.as_mut() {
@@ -501,15 +510,19 @@ fn run(cfg: Config) -> std::io::Result<()> {
             for outcome in rec.try_reap() {
                 match outcome {
                     RecoveryOutcome::Reaped { child_pid, status } if !status.success() => {
-                        eprintln!(
-                            "varta-watch: recovery child {child_pid} exited non-zero: {status}"
+                        varta_warn_child!(
+                            child_pid,
+                            "recovery child {child_pid} exited non-zero: {status}"
                         );
                     }
                     RecoveryOutcome::Killed { child_pid } => {
-                        eprintln!("varta-watch: recovery child {child_pid} killed after timeout");
+                        varta_warn_child!(
+                            child_pid,
+                            "recovery child {child_pid} killed after timeout"
+                        );
                     }
                     RecoveryOutcome::ReapFailed(e) => {
-                        eprintln!("varta-watch: recovery reap failed: {e}");
+                        varta_error_err!(e, "recovery reap failed: {e}");
                     }
                     _ => {}
                 }
@@ -518,7 +531,7 @@ fn run(cfg: Config) -> std::io::Result<()> {
 
         if let Some(pe) = prom_export.as_mut() {
             if let Err(e) = pe.serve_pending() {
-                eprintln!("varta-watch: /metrics serve error: {e}");
+                varta_error!("/metrics serve error: {e}");
             }
             pe.record_loop_tick();
         }
@@ -538,7 +551,7 @@ fn run(cfg: Config) -> std::io::Result<()> {
             let ts = observer.now_ns();
             let line = format!("{loop_count} {ts}\n");
             if let Err(e) = std::fs::write(hb_path, line.as_bytes()) {
-                eprintln!("varta-watch: heartbeat file write error: {e}");
+                varta_error!("heartbeat file write error: {e}");
             }
         }
     }

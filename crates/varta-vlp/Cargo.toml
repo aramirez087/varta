@@ -12,4 +12,7 @@ default = []
 # Enables ChaCha20-Poly1305 AEAD for secure VLP transport.
 crypto = []
 
+[lints]
+workspace = true
+
 [dependencies]

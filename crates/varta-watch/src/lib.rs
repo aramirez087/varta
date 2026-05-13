@@ -1,5 +1,10 @@
 #![deny(missing_docs, unsafe_op_in_unsafe_fn, rust_2018_idioms)]
 #![forbid(clippy::dbg_macro, clippy::print_stdout)]
+// SAFETY: unsafe_code is legitimately required for FFI to kernel interfaces
+// (recvmsg/cmsg parsing in peer_cred.rs, umask in listener.rs).  All unsafe
+// sites are guarded by compile-time layout assertions and per-block SAFETY
+// comments.  The workspace-level deny forces us to explicitly opt in here.
+#![allow(unsafe_code)]
 
 //! Varta observer library — receive loop over configurable transport listeners,
 //! per-pid tracker, stall surface.
@@ -12,6 +17,7 @@
 pub mod config;
 pub mod exporter;
 pub mod listener;
+pub mod log;
 pub mod observer;
 pub mod peer_cred;
 pub mod recovery;

@@ -1,4 +1,5 @@
 //! Runtime verification that signal handlers can be installed and deliver
+#![allow(unsafe_code)]
 //! correctly to a lock-free atomic flag. Uses `SIGURG` (a benign signal
 //! unlikely to be in use by the test runner) to avoid interfering with
 //! `SIGINT`/`SIGTERM` that the real daemon relies on.

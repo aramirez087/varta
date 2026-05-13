@@ -19,13 +19,15 @@ use crate::secure_transport::SecureUdpTransport;
 #[cfg(feature = "secure-udp")]
 use varta_vlp::crypto::Key;
 
-/// Linux value of `ENOBUFS` from `<asm-generic/errno.h>`. Hard-coded to
-/// preserve the zero-dependency invariant; do not replace with `libc`.
+/// Linux value of `ENOBUFS` from `<asm-generic/errno-base.h>` (Linux 2.6+,
+/// verified against 6.12). Hard-coded to preserve the zero-dependency
+/// invariant; do not replace with `libc`.
 #[cfg(target_os = "linux")]
 const ENOBUFS: i32 = 105;
 
-/// Darwin / BSD value of `ENOBUFS` from `<sys/errno.h>`. Hard-coded for
-/// the same reason.
+/// Darwin / BSD value of `ENOBUFS` from `<sys/errno.h>` (macOS 15 / XNU,
+/// FreeBSD 14, NetBSD 10, OpenBSD 7, DragonFly 6). Hard-coded for the
+/// same reason.
 #[cfg(any(
     target_os = "macos",
     target_os = "ios",

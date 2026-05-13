@@ -1,4 +1,5 @@
 //! Session 02 zero-allocation guard for `Varta::beat`.
+#![allow(unsafe_code)]
 //!
 //! A `#[global_allocator]` wraps the system allocator with an "armed" flag.
 //! Once armed, every allocation increments an atomic counter. The contract

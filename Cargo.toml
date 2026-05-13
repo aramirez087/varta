@@ -9,6 +9,12 @@ members = [
     "crates/varta-bench",
 ]
 
+# Every crate must explicitly opt out of unsafe_code with #![allow(unsafe_code)]
+# where FFI or kernel interfaces require it.  This creates a grep-able audit
+# trail: search for `allow(unsafe_code)` to find all permitted unsafe sites.
+[workspace.lints.rust]
+unsafe_code = "deny"
+
 [profile.release]
 overflow-checks = true
 panic = "abort"

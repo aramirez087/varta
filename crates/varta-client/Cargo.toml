@@ -16,6 +16,9 @@ udp = []
 # Implies `udp` and `varta-vlp/crypto`.
 secure-udp = ["udp", "varta-vlp/crypto"]
 
+[lints]
+workspace = true
+
 [dependencies]
 
 [dependencies.varta-vlp]

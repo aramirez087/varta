@@ -142,7 +142,9 @@ exchange (e.g. X25519), which is incompatible with the connectionless,
 one-way heartbeat model.
 
 When the master key is rotated, all agents must be updated atomically.
-The observer can load a new master key via `SIGHUP` (see `--master-key-file`).
+The observer reads the master key once at startup from `--master-key-file`. To
+rotate keys, restart the observer with the new master key file. SIGHUP-based
+hot-reload is planned for a future release.
 
 ### Little-endian only
 

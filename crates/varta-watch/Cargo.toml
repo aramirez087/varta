@@ -7,6 +7,9 @@ description = "Varta observer — receives VLP frames and surfaces stalls."
 authors = ["Alexander Ramirez"]
 repository = "https://github.com/aramirez087/Varta"
 
+[lints]
+workspace = true
+
 [dependencies]
 
 [features]
@@ -16,6 +19,11 @@ udp = []
 # Enable secure UDP listener with ChaCha20-Poly1305 AEAD decryption.
 # Implies `udp` and `varta-vlp/crypto`.
 secure-udp = ["udp", "varta-vlp/crypto"]
+# Emit structured JSON lines to stderr instead of plain eprintln!.
+# Each line is a self-contained JSON object with ts_ns, level, msg,
+# and optional context fields (pid, child_pid, error).  Suitable for
+# SIEM / syslog ingestion in hospital IT environments.
+json-log = []
 
 [dependencies.varta-vlp]
 path = "../varta-vlp"

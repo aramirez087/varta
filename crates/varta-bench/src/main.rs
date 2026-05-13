@@ -1,5 +1,8 @@
 #![deny(missing_docs, unsafe_op_in_unsafe_fn, rust_2018_idioms)]
 #![forbid(clippy::dbg_macro, clippy::print_stdout)]
+// SAFETY: unsafe_code used for getrusage(2) via libc crate in bench harness.
+// The workspace-level deny forces explicit opt-in.
+#![allow(unsafe_code)]
 
 //! Varta performance harness.
 //!
