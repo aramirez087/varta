@@ -55,7 +55,12 @@ fn mul_mod(h: [u64; 5], r: [u64; 5]) -> [u64; 5] {
     for i in 0..5 {
         let hi = h[i] as u128;
         for j in 0..5 {
-            d[i + j] = d[i + j].wrapping_add((hi * r[j] as u128) as u64);
+            let product = hi * r[j] as u128;
+            debug_assert!(
+                product <= u64::MAX as u128,
+                "Poly1305 limb product overflow at i={i} j={j}"
+            );
+            d[i + j] = d[i + j].wrapping_add(product as u64);
         }
     }
 

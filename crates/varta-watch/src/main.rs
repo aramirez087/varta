@@ -96,9 +96,13 @@ unsafe fn install_signal_handlers() {
         sa_mask: [u8; 16],
     }
 
-    // Compile-time size assertions — guard against ABI drift across kernel /
-    // libc versions.  A mismatch here becomes a hard compile error instead of
-    // stack corruption at signal-install time.
+    // Compile-time size and offset assertions — guard against ABI drift
+    // across kernel / libc versions.  These `const _` assertions are
+    // evaluated at compile time (not runtime), so a mismatch becomes a
+    // hard "evaluation of constant value failed" error during `cargo build`,
+    // preventing stack corruption at signal-install time.  Every platform
+    // field's size and offset is pinned against the known-good C ABI values
+    // documented in the per-platform struct comments above.
     #[cfg(target_os = "linux")]
     const _: () = assert!(core::mem::size_of::<SigAction>() == 152);
     #[cfg(target_os = "macos")]
@@ -222,6 +226,7 @@ fn run(cfg: Config) -> std::io::Result<()> {
         cfg.socket_mode,
         cfg.read_timeout,
         cfg.tracker_capacity,
+        cfg.tracker_eviction_policy,
         cfg.max_beat_rate,
     )?;
 
@@ -289,6 +294,12 @@ fn run(cfg: Config) -> std::io::Result<()> {
                     std::io::Error::new(e.kind(), format!("UDP bind {}: {e}", addr))
                 })?;
                 observer.add_listener(Box::new(udp));
+                eprintln!(
+                    "varta-watch: WARNING — UDP on {addr} running WITHOUT authentication \
+                     (no keys configured). Any device on the network can spoof heartbeats, \
+                     suppress agent failure detection, or trigger false stall events. \
+                     Provide --key-file to enable AEAD-authenticated transport.",
+                );
             }
         }
 
@@ -297,6 +308,12 @@ fn run(cfg: Config) -> std::io::Result<()> {
             let udp = varta_watch::UdpListener::bind(addr)
                 .map_err(|e| std::io::Error::new(e.kind(), format!("UDP bind {}: {e}", addr)))?;
             observer.add_listener(Box::new(udp));
+            eprintln!(
+                "varta-watch: WARNING — UDP on {addr} has NO authentication (build lacks \
+                 --features secure-udp). Any device on the network can spoof heartbeats, \
+                 suppress agent failure detection, or trigger false stall events. \
+                 Rebuild with --features secure-udp for AEAD-authenticated transport.",
+            );
         }
     }
 
@@ -329,9 +346,10 @@ fn run(cfg: Config) -> std::io::Result<()> {
 
     if cfg.recovery_cmd.is_some() {
         eprintln!(
-            "varta-watch: --recovery-cmd passes the template directly to /bin/sh -c. \
-             Prefer --recovery-cmd-file (with restrictive file permissions) or \
-             --recovery-exec (no shell) for production deployments."
+            "varta-watch: --recovery-cmd (inline shell template) executes /bin/sh -c with \
+             root-equivalent process authority. Use --recovery-cmd-file (with 0600 file \
+             permissions and same-UID ownership) or --recovery-exec (no shell, no injection \
+             surface) for any production deployment."
         );
     }
 

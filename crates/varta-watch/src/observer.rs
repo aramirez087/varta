@@ -19,7 +19,7 @@ use varta_vlp::{DecodeError, Frame, Status};
 
 use crate::listener::{BeatListener, UdsListener};
 use crate::peer_cred::RecvResult;
-use crate::tracker::{Tracker, Update};
+use crate::tracker::{EvictionPolicy, Tracker, Update};
 
 /// Event surfaced by [`Observer::poll`].
 ///
@@ -95,6 +95,9 @@ pub struct Observer {
     rate_limit_interval_ns: Option<u64>,
     /// Total beats dropped by the rate limiter since the last drain.
     rate_limited_total: u64,
+    /// Monotonicity guard — last `now_ns()` value, clamped forward-only to
+    /// survive TSC drift and VM live migration.
+    last_now_ns: u64,
 }
 
 impl Observer {
@@ -107,11 +110,21 @@ impl Observer {
     /// dropped with [`Update::CapacityExceeded`] (the counter is surfaced
     /// via `varta_tracker_capacity_exceeded_total`).
     ///
+    /// `eviction_policy` controls which slot to reclaim when the tracker
+    /// is full and a new pid arrives ([`EvictionPolicy::Strict`] only
+    /// evicts confirmed-stalled agents; [`EvictionPolicy::Balanced`] also
+    /// evicts the oldest active slot to prevent capacity exhaustion).
+    ///
     /// `max_beat_rate` is an optional per-pid rate limit in beats per
     /// second.  When set, beats arriving faster than this rate from the
     /// same pid are dropped and counted via [`Observer::drain_rate_limited`].
     /// `None` (the default) disables rate limiting.
-    pub fn new(threshold: Duration, tracker_capacity: usize, max_beat_rate: Option<u32>) -> Self {
+    pub fn new(
+        threshold: Duration,
+        tracker_capacity: usize,
+        eviction_policy: EvictionPolicy,
+        max_beat_rate: Option<u32>,
+    ) -> Self {
         let threshold_ns = threshold.as_nanos().min(u64::MAX as u128) as u64;
         let rate_limit_interval_ns = max_beat_rate.and_then(|rps| {
             if rps == 0 {
@@ -125,7 +138,7 @@ impl Observer {
         });
         Observer {
             listeners: Vec::new(),
-            tracker: Tracker::new(tracker_capacity),
+            tracker: Tracker::new(tracker_capacity, eviction_policy),
             threshold_ns,
             start: Instant::now(),
             stall_queue: Vec::with_capacity(tracker_capacity),
@@ -133,6 +146,7 @@ impl Observer {
             next_listener_start: 0,
             rate_limit_interval_ns,
             rate_limited_total: 0,
+            last_now_ns: 0,
         }
     }
 
@@ -141,9 +155,10 @@ impl Observer {
         listener: L,
         threshold: Duration,
         tracker_capacity: usize,
+        eviction_policy: EvictionPolicy,
         max_beat_rate: Option<u32>,
     ) -> Self {
-        let mut obs = Self::new(threshold, tracker_capacity, max_beat_rate);
+        let mut obs = Self::new(threshold, tracker_capacity, eviction_policy, max_beat_rate);
         obs.add_listener(Box::new(listener));
         obs
     }
@@ -160,6 +175,7 @@ impl Observer {
         socket_mode: u32,
         read_timeout: Duration,
         tracker_capacity: usize,
+        eviction_policy: EvictionPolicy,
         max_beat_rate: Option<u32>,
     ) -> io::Result<Self> {
         let listener = UdsListener::bind(path, socket_mode, read_timeout)?;
@@ -167,6 +183,7 @@ impl Observer {
             listener,
             threshold,
             tracker_capacity,
+            eviction_policy,
             max_beat_rate,
         ))
     }
@@ -288,9 +305,16 @@ impl Observer {
     }
 
     /// Observer-local nanosecond timestamp (ns since [`Observer`] start).
-    pub fn now_ns(&self) -> u64 {
+    ///
+    /// Clamped to never decrease — on some platforms (VMs with TSC drift,
+    /// live-migration pause-and-resume), `Instant::elapsed()` can produce
+    /// values that appear to go backwards. Without clamping, a forward clock
+    /// jump after a backward excursion can cause false stall detections.
+    pub fn now_ns(&mut self) -> u64 {
         let elapsed = self.start.elapsed().as_nanos();
-        elapsed.min(u64::MAX as u128) as u64
+        let raw = elapsed.min(u64::MAX as u128) as u64;
+        self.last_now_ns = self.last_now_ns.max(raw);
+        self.last_now_ns
     }
 
     fn drain_stalls(&mut self) {
@@ -390,6 +414,7 @@ mod tests {
             0o600,
             Duration::from_millis(100),
             64,
+            EvictionPolicy::Strict,
             None,
         )
         .expect("bind should succeed on a clean temp path");

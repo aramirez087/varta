@@ -25,7 +25,7 @@ pub use exporter::{Exporter, FileExporter, PromExporter};
 pub use listener::{BeatListener, UdsListener};
 pub use observer::{Event, Observer};
 pub use recovery::{Recovery, RecoveryOutcome};
-pub use tracker::{Slot, Tracker, Update};
+pub use tracker::{EvictionPolicy, Slot, Tracker, Update};
 
 #[cfg(feature = "udp")]
 pub use listener::UdpListener;

@@ -218,10 +218,10 @@ impl Exporter for FileExporter {
                 + 1  // "-"
                 + 1
             } // \n
-            // Error events with variable-length messages: use a
-            // conservative estimate of 256 bytes.  These are rare
-            // relative to beats and stalls so the drift is negligible.
-            Event::Decode(_, _) | Event::Io(_, _) | Event::CtrlTruncated(_, _) => 256,
+            // Error events with variable-length messages: compute exact
+            // length after the write below rather than using a fixed
+            // estimate (prevents file-rotation timing drift).
+            Event::Decode(_, _) | Event::Io(_, _) | Event::CtrlTruncated(_, _) => 0,
             Event::AuthFailure {
                 claimed_pid,
                 observer_ns,
@@ -287,7 +287,25 @@ impl Exporter for FileExporter {
             Err(e) => Err(e),
             Ok(()) => {
                 self.pending_err = None;
-                self.after_write(line_len);
+                let actual_len = if line_len > 0 {
+                    line_len
+                } else {
+                    match ev {
+                        Event::Decode(err, observer_ns) => {
+                            format!("{observer_ns}\tdecode\t-\t-\t-\t{err:?}\n").len() as u64
+                        }
+                        Event::Io(err, observer_ns) => {
+                            let msg = err.to_string();
+                            format!("{observer_ns}\tio\t-\t-\t-\t{msg}\n").len() as u64
+                        }
+                        Event::CtrlTruncated(err, observer_ns) => {
+                            let msg = err.to_string();
+                            format!("{observer_ns}\tctrunc\t-\t-\t-\t{msg}\n").len() as u64
+                        }
+                        _ => unreachable!(),
+                    }
+                };
+                self.after_write(actual_len);
                 Ok(())
             }
         }
@@ -368,6 +386,12 @@ const PROM_WRITE_TIMEOUT: Duration = Duration::from_millis(50);
 /// under a storm of slow scrapers. The 100 ms serve deadline still applies
 /// as an additional guard.
 const PROM_MAX_CONNECTIONS_PER_SERVE: usize = 8;
+/// After the serve budget is exhausted, the exporter enters drain mode:
+/// remaining connections are accepted and immediately closed (without
+/// serving) to prevent the kernel's accept queue from building up under a
+/// connection flood. A hostile client opening thousands of connections
+/// would otherwise fill the backlog and starve legitimate scrapers.
+const PROM_MAX_DRAIN_PER_SERVE: usize = 50;
 /// Cap on how many bytes [`PromExporter::serve_pending`] reads from a
 /// single request before responding (we discard the request line/headers).
 const PROM_REQUEST_CAP: usize = 4096;
@@ -534,13 +558,14 @@ impl PromExporter {
     /// [`PROM_MAX_CONNECTIONS_PER_SERVE`] accepted connections. Both
     /// exist to prevent a storm of slow scrapers from starving the
     /// observer poll loop (stall detection, I/O polling, reaping).
+    ///
+    /// After the service budget is exhausted, the exporter enters a
+    /// drain phase that accepts and immediately closes up to
+    /// [`PROM_MAX_DRAIN_PER_SERVE`] additional connections without
+    /// serving them.  This prevents the kernel's accept queue from
+    /// building up under a connection flood (hostile client opening
+    /// thousands of connections).
     pub fn serve_pending(&mut self) -> io::Result<()> {
-        // Rate-limit: if a scrape was already served within
-        // PROM_MIN_SCRAPE_INTERVAL, additional scrapes still receive a
-        // response (the cached body from the last fresh render) but
-        // render_body() is skipped.  This prevents a fast / misconfigured
-        // scraper from starving the single-threaded poll loop while keeping
-        // all Prometheus scrapes successful.
         let render_fresh = self
             .last_scrape
             .is_none_or(|last| last.elapsed() >= PROM_MIN_SCRAPE_INTERVAL);
@@ -571,6 +596,20 @@ impl PromExporter {
         };
         if served > 0 && render_fresh {
             self.last_scrape = Some(Instant::now());
+        }
+        let mut drained = 0;
+        while drained < PROM_MAX_DRAIN_PER_SERVE {
+            if Instant::now() >= serve_deadline + Duration::from_millis(100) {
+                break;
+            }
+            match self.listener.accept() {
+                Ok((stream, _)) => {
+                    drop(stream);
+                    drained += 1;
+                }
+                Err(e) if e.kind() == ErrorKind::WouldBlock => break,
+                Err(_) => break,
+            }
         }
         result
     }

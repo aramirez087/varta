@@ -1,7 +1,7 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use varta_watch::tracker::{Tracker, Update};
+use varta_watch::tracker::{EvictionPolicy, Tracker, Update};
 
 fuzz_target!(|data: &[u8]| {
     // Each record call consumes 37 bytes of input:
@@ -14,7 +14,7 @@ fuzz_target!(|data: &[u8]| {
 
     // Capacity between 1 and 65 — exercises full, near-full, and tiny trackers.
     let capacity = 1 + (data[0] as usize % 65);
-    let mut tracker = Tracker::new(capacity);
+    let mut tracker = Tracker::new(capacity, EvictionPolicy::Strict);
     let mut offset: usize = 1;
     let mut wall: u64 = 0;
 

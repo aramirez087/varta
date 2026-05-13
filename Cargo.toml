@@ -8,3 +8,8 @@ members = [
     "crates/varta-tests",
     "crates/varta-bench",
 ]
+
+[profile.release]
+overflow-checks = true
+panic = "abort"
+lto = "thin"

@@ -11,7 +11,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use varta_watch::Observer;
+use varta_watch::{EvictionPolicy, Observer};
 
 static COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -39,6 +39,7 @@ fn bind_succeeds_on_clean_path() {
         0o600,
         Duration::from_millis(100),
         64,
+        EvictionPolicy::Strict,
         None,
     )
     .expect("bind on clean path should succeed");
@@ -71,6 +72,7 @@ fn bind_fails_when_live_observer_present() {
         0o600,
         Duration::from_millis(100),
         64,
+        EvictionPolicy::Strict,
         None,
     )
     .expect("first bind must succeed");
@@ -81,6 +83,7 @@ fn bind_fails_when_live_observer_present() {
         0o600,
         Duration::from_millis(100),
         64,
+        EvictionPolicy::Strict,
         None,
     )
     .err()
@@ -119,6 +122,7 @@ fn bind_cleans_up_stale_socket_file() {
         0o600,
         Duration::from_millis(100),
         64,
+        EvictionPolicy::Strict,
         None,
     )
     .expect("bind over stale socket must succeed");
@@ -147,6 +151,7 @@ fn bind_preserves_non_socket_file_at_path() {
         0o600,
         Duration::from_millis(100),
         64,
+        EvictionPolicy::Strict,
         None,
     )
     .err()
@@ -177,6 +182,7 @@ fn drop_unlinks_bound_socket() {
         0o600,
         Duration::from_millis(100),
         64,
+        EvictionPolicy::Strict,
         None,
     )
     .expect("bind must succeed");
@@ -199,6 +205,7 @@ fn drop_swallows_missing_file() {
         0o600,
         Duration::from_millis(100),
         64,
+        EvictionPolicy::Strict,
         None,
     )
     .expect("bind must succeed");
@@ -221,6 +228,7 @@ fn drop_preserves_foreign_inode() {
         0o600,
         Duration::from_millis(100),
         64,
+        EvictionPolicy::Strict,
         None,
     )
     .expect("first bind must succeed");
@@ -233,6 +241,7 @@ fn drop_preserves_foreign_inode() {
         0o600,
         Duration::from_millis(100),
         64,
+        EvictionPolicy::Strict,
         None,
     )
     .expect("second bind must succeed");

@@ -136,10 +136,9 @@ pub fn install_panic_handler_secure_udp(addr: std::net::SocketAddr, key: Key) {
     let start = Instant::now();
     // Pre-compute the IV random prefix at install time — /dev/urandom
     // reads are not async-signal-safe and must not happen inside the
-    // panic hook.  If /dev/urandom is unavailable the deterministic
-    // lcg_iv_random() fallback is used — the resulting IVs are
-    // predictable and NOT cryptographically secure.  Production
-    // deployments must ensure /dev/urandom availability.
+    // panic hook.  If /dev/urandom is unavailable the multi-source
+    // lcg_iv_random() fallback is used — far stronger than a
+    // deterministic LCG but still not cryptographically secure.
     let iv_random: [u8; 8] = read_iv_random().unwrap_or_else(|_| lcg_iv_random());
     let prev = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {

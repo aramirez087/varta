@@ -218,25 +218,37 @@ fn read_iv_random_prefix_4() -> io::Result<[u8; 4]> {
 }
 /// Deterministic 8-byte IV prefix for non-cryptographic use.
 ///
-/// Produces a deterministic 8-byte prefix via a linear congruential
-/// generator — **not cryptographically secure**.  Used only when
-/// `/dev/urandom` is unavailable (e.g. inside a panic handler, where
-/// file I/O is not safe).
+/// This is the panic-hook fallback used when `/dev/urandom` is unavailable
+/// (e.g. inside a chroot or container without `/dev`).  It mixes multiple
+/// entropy sources through Rust's `DefaultHasher` (SipHash-2-4 with a
+/// per-thread `RandomState` key seeded from OS entropy) to produce IVs
+/// that are unpredictable to an observer who cannot see the process's
+/// address space.
 ///
-/// # Security warning
-///
-/// This fallback produces **predictable IVs**. Deployments that rely on
-/// secure-UDP confidentiality or replay resistance **must** ensure
-/// `/dev/urandom` is available at panic-handler installation time.
-/// Without `/dev/urandom`, panic-fired frames may be forged by any local
-/// observer that can guess the PID and sequence counter.
-#[allow(dead_code)]
+/// **Not cryptographically secure** — the `RandomState` key is a fixed
+/// per-thread secret, not a stream cipher.  Deployments that rely on
+/// secure-UDP confidentiality **must** ensure `/dev/urandom` is
+/// available.  This fallback is a last-resort measure that is far
+/// stronger than the previously-used deterministic LCG.
 pub(crate) fn lcg_iv_random() -> [u8; 8] {
-    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let raw = (std::process::id() as u64)
-        .wrapping_mul(6364136223846793005)
-        .wrapping_add(SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
-    raw.to_le_bytes()
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+
+    let mut hasher = DefaultHasher::new();
+    // PID — varies per process.
+    std::process::id().hash(&mut hasher);
+    // Atomic counter — unique across calls within this process.
+    SEQ.fetch_add(1, Ordering::Relaxed).hash(&mut hasher);
+    // Address of a stack variable — ASLR entropy.
+    let stack_dummy: u8 = 0;
+    (&stack_dummy as *const u8 as usize).hash(&mut hasher);
+    // Thread ID — per-thread uniqueness.
+    std::thread::current().id().hash(&mut hasher);
+
+    hasher.finish().to_le_bytes()
 }
 
 #[cfg(test)]

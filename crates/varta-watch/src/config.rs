@@ -9,7 +9,7 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use crate::tracker::DEFAULT_CAPACITY;
+use crate::tracker::{EvictionPolicy, DEFAULT_CAPACITY};
 
 /// Default per-pid debounce window applied when `--recovery-cmd` is set
 /// without an explicit `--recovery-debounce-ms`.
@@ -79,9 +79,12 @@ pub struct Config {
     /// [`DEFAULT_READ_TIMEOUT_MS`] milliseconds.
     pub read_timeout: Duration,
     /// Maximum number of distinct agent pids tracked concurrently.
-    /// Defaults to [`crate::tracker::DEFAULT_CAPACITY`] (64). Beats for
+    /// Defaults to [`crate::tracker::DEFAULT_CAPACITY`] (256). Beats for
     /// new pids beyond this limit are dropped.
     pub tracker_capacity: usize,
+    /// Eviction policy applied when the tracker is at capacity and a
+    /// new pid arrives. Defaults to [`EvictionPolicy::Strict`].
+    pub tracker_eviction_policy: EvictionPolicy,
     /// Optional UDP port for network-based observers. When set, the observer
     /// also binds a UDP listener alongside the UDS socket.
     pub udp_port: Option<u16>,
@@ -133,6 +136,13 @@ pub enum ConfigError {
     BadSocketMode(String),
     /// `--prom-addr` value did not parse as `IP:PORT`.
     BadAddr(String),
+    /// A value for a string-enum flag was not one of the accepted choices.
+    BadValue {
+        /// The flag whose value was rejected.
+        flag: &'static str,
+        /// The raw string that was provided.
+        raw: String,
+    },
     /// The user passed `--help` / `-h`. Not a true error; `main` prints
     /// [`Config::HELP`] and exits 0.
     HelpRequested,
@@ -169,6 +179,9 @@ impl core::fmt::Display for ConfigError {
             }
             ConfigError::BadAddr(raw) => {
                 write!(f, "--prom-addr: not a valid socket address: {raw:?}")
+            }
+            ConfigError::BadValue { flag, raw } => {
+                write!(f, "{flag}: invalid value {raw:?}",)
             }
             ConfigError::HelpRequested => f.write_str("--help"),
             ConfigError::ThresholdTooLow { value, min } => {
@@ -247,9 +260,14 @@ OPTIONAL:
                                      (default 100).  Bounded so a stalled peer
                                      cannot hold the observer loop indefinitely.
     --tracker-capacity <N>          Maximum number of distinct agent pids
-                                     tracked concurrently (default 64).
-                                     Beats for new pids beyond this limit are
-                                     dropped.
+                                      tracked concurrently (default 256).
+                                      Beats for new pids beyond this limit are
+                                      dropped.
+    --tracker-eviction-policy <P>   Eviction policy when tracker is full:
+                                      strict (default) evicts only confirmed-
+                                      stalled agents; balanced falls back to
+                                      evicting the oldest active slot to
+                                      prevent capacity-exhaustion attacks.
     --shutdown-after-secs <SECS>   Exit cleanly after the given uptime
                                      (used by integration tests).
     --udp-port <PORT>              Bind a UDP listener on this port for
@@ -299,6 +317,7 @@ OPTIONAL:
         let mut socket_mode: Option<u32> = None;
         let mut read_timeout_ms: Option<u64> = None;
         let mut tracker_capacity: Option<usize> = None;
+        let mut tracker_eviction_policy: Option<EvictionPolicy> = None;
         let mut udp_port: Option<u16> = None;
         let mut udp_bind_addr: Option<std::net::IpAddr> = None;
         let mut secure_key_file: Option<PathBuf> = None;
@@ -407,6 +426,21 @@ OPTIONAL:
                             raw: v,
                         })?);
                 }
+                "--tracker-eviction-policy" => {
+                    let v = iter
+                        .next()
+                        .ok_or(ConfigError::MissingValue("--tracker-eviction-policy"))?;
+                    tracker_eviction_policy = Some(match v.as_str() {
+                        "strict" => EvictionPolicy::Strict,
+                        "balanced" => EvictionPolicy::Balanced,
+                        _ => {
+                            return Err(ConfigError::BadValue {
+                                flag: "--tracker-eviction-policy",
+                                raw: v,
+                            })
+                        }
+                    });
+                }
                 "--shutdown-after-secs" => {
                     let v = iter
                         .next()
@@ -495,6 +529,7 @@ OPTIONAL:
             socket_mode: socket_mode.unwrap_or(DEFAULT_SOCKET_MODE),
             read_timeout: Duration::from_millis(read_timeout_ms.unwrap_or(DEFAULT_READ_TIMEOUT_MS)),
             tracker_capacity: tracker_capacity.unwrap_or(DEFAULT_CAPACITY),
+            tracker_eviction_policy: tracker_eviction_policy.unwrap_or(EvictionPolicy::Strict),
             udp_port,
             udp_bind_addr,
             secure_key_file,
@@ -735,15 +770,50 @@ fn parse_octal(raw: &str) -> Result<u32, ConfigError> {
 /// 2. The file is owned by the current process's UID.
 /// 3. The file has no group or other permissions (mode `0o600` or stricter).
 ///
+/// Uses `symlink_metadata()` (which does **not** follow symlinks) so that an
+/// attacker who replaces the file with a symlink to e.g. `/etc/cron.d/evil`
+/// cannot bypass the UID and permission checks by pointing at a target whose
+/// metadata passes.  Opening the file uses `O_NOFOLLOW` to close the TOCTOU
+/// window between check and read.
+///
 /// Returns the trimmed file contents on success.
 fn validate_recovery_file(path: &Path) -> std::io::Result<String> {
     use std::os::unix::fs::MetadataExt;
 
-    extern "C" {
-        fn getuid() -> u32;
+    // Platform-specific O_NOFOLLOW values (hard-coded for zero-dependency).
+    #[cfg(any(
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_os = "dragonfly",
+    ))]
+    const O_NOFOLLOW: i32 = 0x0100;
+
+    #[cfg(target_os = "linux")]
+    const O_NOFOLLOW: i32 = 0x20000;
+
+    #[cfg(not(any(
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_os = "dragonfly",
+        target_os = "linux",
+    )))]
+    compile_error!("O_NOFOLLOW value is unknown for this target — add it to the cfg gates above");
+
+    let meta = std::fs::symlink_metadata(path)?;
+
+    if meta.file_type().is_symlink() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("{}: must not be a symlink", path.display()),
+        ));
     }
 
-    let meta = std::fs::metadata(path)?;
     if !meta.is_file() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -763,7 +833,7 @@ fn validate_recovery_file(path: &Path) -> std::io::Result<String> {
         ));
     }
 
-    let my_uid = unsafe { getuid() };
+    let my_uid = crate::peer_cred::observer_uid();
     let file_uid = meta.uid();
     if file_uid != my_uid {
         return Err(std::io::Error::new(
@@ -775,8 +845,21 @@ fn validate_recovery_file(path: &Path) -> std::io::Result<String> {
         ));
     }
 
-    let content = std::fs::read_to_string(path)?;
+    let content = read_file_no_follow(path, O_NOFOLLOW)?;
     Ok(content.trim().to_string())
+}
+
+/// Read a file's contents without following symlinks, using `O_NOFOLLOW`.
+fn read_file_no_follow(path: &Path, nofollow_flag: i32) -> std::io::Result<String> {
+    use std::io::Read;
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(nofollow_flag)
+        .open(path)?;
+    let mut content = String::new();
+    file.read_to_string(&mut content)?;
+    Ok(content)
 }
 
 /// Parse a recovery command line into (program, args).

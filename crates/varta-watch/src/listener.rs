@@ -17,6 +17,18 @@ extern "C" {
     fn umask(mode: u32) -> u32;
 }
 
+/// RAII guard that restores the process umask on drop, even if a panic
+/// unwinds through the bind path.
+struct UmaskGuard(u32);
+
+impl Drop for UmaskGuard {
+    fn drop(&mut self) {
+        unsafe {
+            umask(self.0);
+        }
+    }
+}
+
 use crate::peer_cred::{self, RecvResult};
 
 /// Abstraction over a source that can receive 32-byte VLP frames.
@@ -92,9 +104,8 @@ impl UdsListener {
         let owned_path: PathBuf = path.to_path_buf();
 
         let restrict_umask = !socket_mode & 0o777;
-        let old_umask = unsafe { umask(restrict_umask) };
+        let _umask_guard = UmaskGuard(unsafe { umask(restrict_umask) });
         let bind_result = UnixDatagram::bind(path);
-        unsafe { umask(old_umask) };
         let sock = match bind_result {
             Ok(sock) => sock,
             Err(e) if e.kind() == ErrorKind::AddrInUse => {
@@ -143,9 +154,8 @@ impl UdsListener {
                                 ));
                             }
                         }
-                        let old_umask = unsafe { umask(restrict_umask) };
+                        let _umask_guard = UmaskGuard(unsafe { umask(restrict_umask) });
                         let sock = UnixDatagram::bind(path)?;
-                        unsafe { umask(old_umask) };
                         std::fs::set_permissions(
                             path,
                             std::fs::Permissions::from_mode(socket_mode),
@@ -279,14 +289,24 @@ mod udp_impl {
     /// Receives 32-byte VLP frames over UDP from remote agents. Created via
     /// [`UdpListener::bind`] and used with [`Observer::from_listener`].
     ///
-    /// # PID verification
+    /// # Security: no authentication
     ///
-    /// UDP has no kernel credential attestation — `peer_pid` is always 0 (the
-    /// same sentinel used on macOS for UDS). The observer skips PID
-    /// verification for UDP traffic. Trust should be established via network
-    /// segmentation (firewall, VPC) rather than kernel credential passing.
+    /// Plain UDP has NO cryptographic authentication — any device on the
+    /// local subnet can inject arbitrary frames. Frame-level PID
+    /// verification is impossible because UDP lacks kernel credential
+    /// attestation (`peer_pid` is always 0). **Do not use this transport in
+    /// production without network segmentation (firewall, VPC) that limits
+    /// which hosts can reach the observer port.**
+    ///
+    /// For authenticated transport, see [`SecureUdpListener`], which provides
+    /// ChaCha20-Poly1305 AEAD per-agent and/or per-epoch master-key decryption
+    /// behind the `secure-udp` feature flag.
+    ///
+    /// The observer emits a startup warning via stderr whenever plaintext UDP
+    /// is in use.
     ///
     /// [`Observer::from_listener`]: crate::Observer::from_listener
+    /// [`SecureUdpListener`]: crate::secure_listener::SecureUdpListener
     pub struct UdpListener {
         sock: UdpSocket,
         truncated_count: u64,

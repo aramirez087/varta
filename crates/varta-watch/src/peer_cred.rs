@@ -15,6 +15,19 @@
 //! satisfy the workspace's zero-registry-dependency constraint.
 
 use std::io;
+use std::sync::OnceLock;
+
+extern "C" {
+    fn getuid() -> u32;
+}
+
+/// Cached observer UID — called once at startup, then read from the static.
+/// On platforms where `getuid()` isn't available as a direct symbol (e.g.
+/// musl), caching avoids per-datagram syscall overhead and portability issues.
+pub(crate) fn observer_uid() -> u32 {
+    static UID: OnceLock<u32> = OnceLock::new();
+    *UID.get_or_init(|| unsafe { getuid() })
+}
 
 // ---------------------------------------------------------------------------
 // Platform-agnostic result type
@@ -719,10 +732,7 @@ pub(crate) fn recv_authenticated(fd: i32) -> RecvResult {
         }
     };
 
-    extern "C" {
-        fn getuid() -> u32;
-    }
-    let my_uid = unsafe { getuid() };
+    let my_uid = observer_uid();
     if peer_pid != 0 && peer_uid != my_uid {
         return RecvResult::IoError(io::Error::new(
             io::ErrorKind::PermissionDenied,

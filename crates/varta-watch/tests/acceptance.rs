@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 
 use varta_vlp::{DecodeError, Frame, Status};
 use varta_watch::tracker::MAX_CAPACITY;
+use varta_watch::EvictionPolicy;
 use varta_watch::{Event, Observer, Tracker, Update};
 
 static UDS_COUNTER: AtomicU32 = AtomicU32::new(0);
@@ -97,6 +98,7 @@ fn observer_emits_beat_per_received_frame() {
         0o600,
         Duration::from_millis(100),
         64,
+        EvictionPolicy::Strict,
         None,
     )
     .expect("bind observer");
@@ -163,6 +165,7 @@ fn observer_emits_stall_after_threshold_elapses() {
         0o600,
         Duration::from_millis(100),
         64,
+        EvictionPolicy::Strict,
         None,
     )
     .expect("bind observer");
@@ -211,6 +214,7 @@ fn observer_reports_decode_error_for_bad_magic() {
         0o600,
         Duration::from_millis(100),
         64,
+        EvictionPolicy::Strict,
         None,
     )
     .expect("bind observer");
@@ -229,7 +233,7 @@ fn observer_reports_decode_error_for_bad_magic() {
 
 #[test]
 fn tracker_capacity_bounded_to_64_pids() {
-    let mut tracker = Tracker::new(64);
+    let mut tracker = Tracker::new(64, EvictionPolicy::Strict);
     let now_ns: u64 = 1_000;
     let threshold_ns: u64 = 100;
 
@@ -262,6 +266,7 @@ fn observer_rejects_spoofed_pid_frame() {
         0o600,
         Duration::from_millis(100),
         64,
+        EvictionPolicy::Strict,
         None,
     )
     .expect("bind observer");
@@ -314,6 +319,7 @@ fn observer_counts_truncated_datagrams() {
         0o600,
         Duration::from_millis(100),
         64,
+        EvictionPolicy::Strict,
         None,
     )
     .expect("bind observer");
@@ -354,7 +360,7 @@ fn observer_counts_truncated_datagrams() {
 #[test]
 fn tracker_capacity_clamped_to_max_capacity() {
     // Clamping: requests above MAX_CAPACITY are silently capped.
-    let mut over = Tracker::new(MAX_CAPACITY + 1000);
+    let mut over = Tracker::new(MAX_CAPACITY + 1000, EvictionPolicy::Strict);
     let now_ns: u64 = 1_000;
     let threshold_ns: u64 = 100;
 

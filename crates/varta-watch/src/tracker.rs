@@ -12,9 +12,8 @@ use varta_vlp::{Frame, Status};
 
 /// Maximum number of distinct agents the observer can track concurrently.
 ///
-/// v0.1.0 ships with a fixed budget; the bench session pins this number in
-/// the CPU target (50 agents × 1 Hz). Override via `--tracker-capacity`.
-pub const DEFAULT_CAPACITY: usize = 64;
+/// v0.2.0 raises this from 64 to 256. Override via `--tracker-capacity`.
+pub const DEFAULT_CAPACITY: usize = 256;
 
 /// Hard upper bound for `--tracker-capacity`. The tracker uses a linear scan
 /// over active slots; at capacities exceeding this value the scan becomes a
@@ -40,6 +39,23 @@ const EVICTION_MULTIPLIER: u32 = 10;
 /// would take days to exhaust the nonce space, so a genuine gap this large
 /// can only be a wrap.
 const NONCE_WRAP_THRESHOLD: u64 = 1_048_576;
+
+/// Controls which slot to reclaim when the tracker is at capacity and a
+/// new pid arrives.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EvictionPolicy {
+    /// Only evict slots that have already been surfaced as stalled and
+    /// have been silent for > `threshold * EVICTION_MULTIPLIER`. This is
+    /// the safest choice — a correctly-beating agent is never evicted,
+    /// but a capacity-exhaustion attack can cause `CapacityExceeded`.
+    Strict,
+    /// Like `Strict`, but when no strictly-evictable slot exists, falls
+    /// back to evicting the oldest active slot (by `last_ns`) whose
+    /// silence exceeds `threshold * EVICTION_MULTIPLIER`. This prevents
+    /// `CapacityExceeded` completely at the expense of potentially
+    /// evicting a slow-but-alive agent during a flood.
+    Balanced,
+}
 
 /// Liveness slot for a single agent pid.
 ///
@@ -101,11 +117,12 @@ pub struct Tracker {
     capacity_exceeded: u64,
     nonce_wraps: u64,
     last_evicted_pid: Option<u32>,
+    eviction_policy: EvictionPolicy,
 }
 
 impl Default for Tracker {
     fn default() -> Self {
-        Self::new(DEFAULT_CAPACITY)
+        Self::new(DEFAULT_CAPACITY, EvictionPolicy::Strict)
     }
 }
 
@@ -115,16 +132,22 @@ impl Tracker {
     /// The slot table is pre-allocated to `capacity` entries; pushing
     /// beyond that boundary yields [`Update::CapacityExceeded`] rather
     /// than reallocating.
-    pub fn new(capacity: usize) -> Self {
+    pub fn new(capacity: usize, eviction_policy: EvictionPolicy) -> Self {
         let cap = capacity.min(MAX_CAPACITY);
+        let map_cap = cap
+            .saturating_mul(8)
+            .saturating_div(7)
+            .saturating_add(1)
+            .min(MAX_CAPACITY * 2);
         Tracker {
             entries: Vec::with_capacity(cap),
             len: 0,
-            pid_to_index: HashMap::with_capacity(cap),
+            pid_to_index: HashMap::with_capacity(map_cap),
             evictions: 0,
             capacity_exceeded: 0,
             nonce_wraps: 0,
             last_evicted_pid: None,
+            eviction_policy,
         }
     }
 
@@ -209,8 +232,15 @@ impl Tracker {
     /// 2. Silence duration exceeds `threshold_ns * EVICTION_MULTIPLIER`.
     ///
     /// Among eligible slots the one with the oldest `last_ns` is chosen
-    /// (oldest-dead-first). If no slot satisfies both criteria, returns
-    /// `None` and the caller receives [`Update::CapacityExceeded`].
+    /// (oldest-dead-first). If no slot satisfies both criteria and the
+    /// policy is [`EvictionPolicy::Strict`], returns `None` and the caller
+    /// receives [`Update::CapacityExceeded`].
+    ///
+    /// When the policy is [`EvictionPolicy::Balanced`] and no
+    /// strictly-evictable slot exists, a second pass picks the oldest slot
+    /// by `last_ns` whose silence exceeds the same threshold — disregarding
+    /// `stall_emitted`. This prevents capacity-exhaustion attacks at the
+    /// expense of potentially evicting a slow-but-alive agent.
     fn find_evictable_slot(&self, now_ns: u64, threshold_ns: u64) -> Option<usize> {
         let evict_threshold = threshold_ns.saturating_mul(EVICTION_MULTIPLIER as u64);
         let mut best_idx: Option<usize> = None;
@@ -223,6 +253,20 @@ impl Tracker {
             {
                 best_last_ns = slot.last_ns;
                 best_idx = Some(idx);
+            }
+        }
+        if best_idx.is_some() {
+            return best_idx;
+        }
+        if self.eviction_policy == EvictionPolicy::Balanced {
+            best_last_ns = u64::MAX;
+            for (idx, slot) in self.entries[..self.len].iter().enumerate() {
+                if now_ns.saturating_sub(slot.last_ns) > evict_threshold
+                    && slot.last_ns < best_last_ns
+                {
+                    best_last_ns = slot.last_ns;
+                    best_idx = Some(idx);
+                }
             }
         }
         best_idx

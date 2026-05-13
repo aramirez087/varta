@@ -178,6 +178,7 @@ pub struct Varta<T: BeatTransport = UdsTransport> {
     nonce: u64,
     consecutive_dropped: u32,
     reconnect_after: u32,
+    last_timestamp: u64,
 }
 
 // Static assertion: Varta<UdsTransport> is Send and must remain so.
@@ -210,6 +211,7 @@ impl Varta<UdsTransport> {
             nonce: 0,
             consecutive_dropped: 0,
             reconnect_after: 0,
+            last_timestamp: 0,
         })
     }
 }
@@ -243,6 +245,7 @@ impl Varta<UdpTransport> {
             nonce: 0,
             consecutive_dropped: 0,
             reconnect_after: 0,
+            last_timestamp: 0,
         })
     }
 }
@@ -274,6 +277,7 @@ impl Varta<SecureUdpTransport> {
             nonce: 0,
             consecutive_dropped: 0,
             reconnect_after: 0,
+            last_timestamp: 0,
         })
     }
 
@@ -305,6 +309,7 @@ impl Varta<SecureUdpTransport> {
             nonce: 0,
             consecutive_dropped: 0,
             reconnect_after: 0,
+            last_timestamp: 0,
         })
     }
 }
@@ -354,8 +359,11 @@ impl<T: BeatTransport> Varta<T> {
         if pid != self.last_pid {
             self.start = Instant::now();
             self.last_pid = pid;
+            self.last_timestamp = 0;
         }
-        let timestamp = self.start.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+        let raw_elapsed = self.start.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+        self.last_timestamp = self.last_timestamp.max(raw_elapsed);
+        let timestamp = self.last_timestamp;
         debug_assert!(
             self.nonce != NONCE_TERMINAL,
             "regular beat nonce must not equal NONCE_TERMINAL sentinel"
