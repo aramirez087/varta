@@ -272,10 +272,15 @@ fn probe_live(path: &Path) -> io::Result<bool> {
 }
 
 // ---------------------------------------------------------------------------
-// UDP listener (feature-gated)
+// Plaintext UDP listener (feature-gated behind `unsafe-plaintext-udp`)
+//
+// This transport has NO cryptographic authentication.  It is exposed only
+// when the operator opts in at *both* compile time (Cargo feature flag whose
+// name starts with `unsafe-`) and runtime (`--i-accept-plaintext-udp`).  In
+// any other configuration the plaintext path is structurally unreachable.
 // ---------------------------------------------------------------------------
 
-#[cfg(feature = "udp")]
+#[cfg(feature = "unsafe-plaintext-udp")]
 mod udp_impl {
     use std::io;
     use std::net::{SocketAddr, UdpSocket};
@@ -364,5 +369,5 @@ mod udp_impl {
     }
 }
 
-#[cfg(feature = "udp")]
+#[cfg(feature = "unsafe-plaintext-udp")]
 pub use udp_impl::UdpListener;

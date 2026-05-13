@@ -258,12 +258,20 @@ fn run(cfg: Config) -> std::io::Result<()> {
     #[cfg(feature = "secure-udp")]
     let master_key = cfg.load_master_key()?;
 
-    #[cfg(feature = "udp")]
+    #[cfg(feature = "udp-core")]
     if let Some(port) = cfg.udp_port {
         let bind_addr = cfg
             .udp_bind_addr
             .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
         let addr = std::net::SocketAddr::new(bind_addr, port);
+
+        // Listener selection — strict priority:
+        //   1. secure-udp feature + keys loaded → SecureUdpListener
+        //   2. unsafe-plaintext-udp feature + --i-accept-plaintext-udp
+        //      → UdpListener with a high-visibility warning
+        //   3. otherwise → hard error (no warn-and-continue path)
+        #[allow(unused_mut, unused_assignments)]
+        let mut secure_bound = false;
 
         #[cfg(feature = "secure-udp")]
         {
@@ -292,37 +300,67 @@ fn run(cfg: Config) -> std::io::Result<()> {
                     })?
                 };
                 observer.add_listener(Box::new(secure));
-            } else {
+                secure_bound = true;
+            }
+        }
+
+        if !secure_bound {
+            // No authenticated listener was bound — only the plaintext path
+            // remains.  Refuse to fall back unless the operator has
+            // explicitly opted in at runtime, and the plaintext path was
+            // compiled in.
+            if !cfg.i_accept_plaintext_udp {
+                varta_error!(
+                    "--udp-port {addr} cannot bind: no AEAD keys are configured \
+                     and --i-accept-plaintext-udp was not passed. Provide \
+                     --key-file (or --master-key-file) for authenticated transport, \
+                     or pass --i-accept-plaintext-udp to explicitly accept the \
+                     security risk of an unauthenticated UDP listener (test/dev only)."
+                );
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "plaintext UDP requires --i-accept-plaintext-udp (and no keys are configured)",
+                ));
+            }
+
+            #[cfg(feature = "unsafe-plaintext-udp")]
+            {
                 let udp = varta_watch::UdpListener::bind(addr).map_err(|e| {
                     std::io::Error::new(e.kind(), format!("UDP bind {}: {e}", addr))
                 })?;
                 observer.add_listener(Box::new(udp));
                 varta_warn!(
-                    "WARNING — UDP on {addr} running WITHOUT authentication \
-                     (no keys configured). Any device on the network can spoof heartbeats, \
-                     suppress agent failure detection, or trigger false stall events. \
-                     Provide --key-file to enable AEAD-authenticated transport.",
+                    "UDP on {addr} is running WITHOUT authentication \
+                     (--i-accept-plaintext-udp). Any device with network reach to \
+                     this port can inject heartbeats, suppress stall detection, or \
+                     trigger false recovery commands. NOT for production / \
+                     safety-critical use."
                 );
             }
-        }
 
-        #[cfg(not(feature = "secure-udp"))]
-        {
-            let udp = varta_watch::UdpListener::bind(addr)
-                .map_err(|e| std::io::Error::new(e.kind(), format!("UDP bind {}: {e}", addr)))?;
-            observer.add_listener(Box::new(udp));
-            varta_warn!(
-                "WARNING — UDP on {addr} has NO authentication (build lacks \
-                 --features secure-udp). Any device on the network can spoof heartbeats, \
-                 suppress agent failure detection, or trigger false stall events. \
-                 Rebuild with --features secure-udp for AEAD-authenticated transport.",
-            );
+            #[cfg(not(feature = "unsafe-plaintext-udp"))]
+            {
+                varta_error!(
+                    "--udp-port {addr} cannot bind: this build does not include \
+                     --features unsafe-plaintext-udp, and no AEAD keys are \
+                     configured. Rebuild with --features secure-udp and provide \
+                     --key-file / --master-key-file."
+                );
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "plaintext UDP not compiled in; no keys configured",
+                ));
+            }
         }
     }
 
-    #[cfg(not(feature = "udp"))]
+    #[cfg(not(feature = "udp-core"))]
     if cfg.udp_port.is_some() {
-        varta_error!("--udp-port requires UDP support (rebuild with --features udp)");
+        varta_error!(
+            "--udp-port requires UDP support (rebuild with --features secure-udp \
+             for authenticated transport, or --features unsafe-plaintext-udp for \
+             a development/testing plaintext listener)"
+        );
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             "UDP support not compiled in",
@@ -347,12 +385,16 @@ fn run(cfg: Config) -> std::io::Result<()> {
 
     let recovery_mode = cfg.resolve_recovery_mode()?;
 
-    if cfg.recovery_cmd.is_some() {
+    // Audit-trail warning when the operator explicitly opts into shell-mode
+    // recovery.  resolve_recovery_mode() already hard-errors when shell mode
+    // is configured without the flag, so reaching here with the flag set
+    // means the choice was deliberate — log it once so it appears in any
+    // SIEM / syslog ingest alongside the other startup banners.
+    if cfg.i_accept_shell_risk && (cfg.recovery_cmd.is_some() || cfg.recovery_cmd_file.is_some()) {
         varta_warn!(
-            "--recovery-cmd (inline shell template) executes /bin/sh -c with \
-             root-equivalent process authority. Use --recovery-cmd-file (with 0600 file \
-             permissions and same-UID ownership) or --recovery-exec (no shell, no injection \
-             surface) for any production deployment."
+            "shell-mode recovery is active (--i-accept-shell-risk). /bin/sh -c \
+             will be spawned with root-equivalent process authority on each unique \
+             stall. NOT for production / safety-critical use — prefer --recovery-exec."
         );
     }
 
@@ -366,7 +408,21 @@ fn run(cfg: Config) -> std::io::Result<()> {
     };
     let mut prom_export: Option<PromExporter> = match cfg.prom_addr {
         Some(addr) => {
-            let pe = PromExporter::bind(addr)?;
+            if !addr.ip().is_loopback() {
+                varta_warn!(
+                    "/metrics is bound to a non-loopback address ({addr}); any host \
+                     that can reach this port can scrape it. Prefer binding to \
+                     127.0.0.1 / ::1 and exposing it through a reverse proxy or \
+                     firewall-restricted interface. Per-source-IP rate limiting and \
+                     the 8-serve / 50-drain accept caps still apply, but loopback \
+                     bind plus a network-level allowlist is defense in depth."
+                );
+            }
+            let pe = PromExporter::bind_with_rate_limit(
+                addr,
+                cfg.prom_rate_limit_per_sec,
+                cfg.prom_rate_limit_burst,
+            )?;
             if let Ok(bound_addr) = pe.local_addr() {
                 let line = format!("{bound_addr}\n");
                 let _ = std::io::stdout().lock().write_all(line.as_bytes());

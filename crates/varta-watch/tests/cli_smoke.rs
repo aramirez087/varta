@@ -39,7 +39,7 @@ impl Drop for UdsPath {
     }
 }
 
-#[cfg(feature = "secure-udp")]
+#[cfg(any(feature = "secure-udp", feature = "unsafe-plaintext-udp"))]
 fn unused_udp_port() -> u16 {
     std::net::UdpSocket::bind("127.0.0.1:0")
         .expect("bind ephemeral UDP port")
@@ -156,6 +156,182 @@ fn cli_parses_socket_mode() {
     assert!(
         out.status.success(),
         "--socket-mode must parse cleanly; got {:?} (stderr: {})",
+        out.status,
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Plaintext UDP must require two-layer opt-in (compile feature
+// `unsafe-plaintext-udp` plus the runtime flag `--i-accept-plaintext-udp`).
+// Without the runtime flag, startup must hard-error and exit non-zero even
+// when --udp-port is otherwise valid.  Regression for security issue C1.
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "unsafe-plaintext-udp")]
+#[test]
+fn cli_plaintext_udp_without_accept_flag_is_rejected() {
+    let path = unique_uds_path("plaintext-no-accept");
+    let port = unused_udp_port().to_string();
+
+    let out = Command::new(env!("CARGO_BIN_EXE_varta-watch"))
+        .args([
+            "--socket",
+            path.as_str(),
+            "--threshold-ms",
+            "100",
+            "--udp-bind-addr",
+            "127.0.0.1",
+            "--udp-port",
+            &port,
+            "--shutdown-after-secs",
+            "0",
+        ])
+        .output()
+        .expect("spawn varta-watch with plaintext --udp-port and no accept flag");
+
+    assert!(
+        !out.status.success(),
+        "plaintext UDP without --i-accept-plaintext-udp must hard-error; \
+         got {:?} (stderr: {})",
+        out.status,
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("--i-accept-plaintext-udp"),
+        "error must name the accept flag, got: {stderr}"
+    );
+}
+
+#[cfg(feature = "unsafe-plaintext-udp")]
+#[test]
+fn cli_plaintext_udp_with_accept_flag_starts() {
+    let path = unique_uds_path("plaintext-accept");
+    let port = unused_udp_port().to_string();
+
+    let out = Command::new(env!("CARGO_BIN_EXE_varta-watch"))
+        .args([
+            "--socket",
+            path.as_str(),
+            "--threshold-ms",
+            "100",
+            "--udp-bind-addr",
+            "127.0.0.1",
+            "--udp-port",
+            &port,
+            "--i-accept-plaintext-udp",
+            "--shutdown-after-secs",
+            "0",
+        ])
+        .output()
+        .expect("spawn varta-watch with plaintext --udp-port and accept flag");
+
+    assert!(
+        out.status.success(),
+        "plaintext UDP with --i-accept-plaintext-udp must start; \
+         got {:?} (stderr: {})",
+        out.status,
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("WITHOUT authentication"),
+        "high-visibility warning must be emitted, stderr was: {stderr}"
+    );
+}
+
+#[cfg(not(feature = "unsafe-plaintext-udp"))]
+#[test]
+fn cli_plaintext_udp_not_compiled_in_is_rejected() {
+    let path = unique_uds_path("plaintext-not-built");
+    // We can't bind a UDP probe without unsafe-plaintext-udp because the
+    // test crate's `unused_udp_port` is gated on secure-udp; pick a
+    // high port at random and rely on the parse-and-validate path
+    // rejecting before bind is attempted.
+    let out = Command::new(env!("CARGO_BIN_EXE_varta-watch"))
+        .args([
+            "--socket",
+            path.as_str(),
+            "--threshold-ms",
+            "100",
+            "--udp-bind-addr",
+            "127.0.0.1",
+            "--udp-port",
+            "59999",
+            "--i-accept-plaintext-udp",
+            "--shutdown-after-secs",
+            "0",
+        ])
+        .output()
+        .expect("spawn varta-watch without plaintext-udp feature");
+
+    assert!(
+        !out.status.success(),
+        "--udp-port must hard-error when neither secure-udp nor unsafe-plaintext-udp \
+         is compiled in; got {:?} (stderr: {})",
+        out.status,
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Shell-mode recovery (--recovery-cmd / --recovery-cmd-file) must require
+// --i-accept-shell-risk.  Regression for security issue C2.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn cli_recovery_cmd_without_accept_flag_is_rejected() {
+    let path = unique_uds_path("shell-no-accept");
+    let out = Command::new(env!("CARGO_BIN_EXE_varta-watch"))
+        .args([
+            "--socket",
+            path.as_str(),
+            "--threshold-ms",
+            "100",
+            "--recovery-cmd",
+            "true",
+            "--shutdown-after-secs",
+            "0",
+        ])
+        .output()
+        .expect("spawn varta-watch with --recovery-cmd and no accept flag");
+
+    assert!(
+        !out.status.success(),
+        "shell-mode recovery without --i-accept-shell-risk must hard-error; \
+         got {:?} (stderr: {})",
+        out.status,
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("--i-accept-shell-risk") && stderr.contains("--recovery-exec"),
+        "error must name both --i-accept-shell-risk and the safer --recovery-exec, got: {stderr}"
+    );
+}
+
+#[test]
+fn cli_recovery_exec_does_not_require_accept_flag() {
+    let path = unique_uds_path("exec-no-flag");
+    let out = Command::new(env!("CARGO_BIN_EXE_varta-watch"))
+        .args([
+            "--socket",
+            path.as_str(),
+            "--threshold-ms",
+            "100",
+            "--recovery-exec",
+            "/bin/true",
+            "--shutdown-after-secs",
+            "0",
+        ])
+        .output()
+        .expect("spawn varta-watch with --recovery-exec only");
+
+    assert!(
+        out.status.success(),
+        "--recovery-exec (the safe path) must start without any accept flag; \
+         got {:?} (stderr: {})",
         out.status,
         String::from_utf8_lossy(&out.stderr)
     );

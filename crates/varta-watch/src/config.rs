@@ -29,6 +29,18 @@ pub const DEFAULT_READ_TIMEOUT_MS: u64 = 100;
 /// on every poll cycle.
 pub const MIN_THRESHOLD_MS: u64 = 10;
 
+/// Default per-source-IP refill rate (connections per second) for the
+/// Prometheus `/metrics` endpoint token bucket.  Comfortably above the
+/// 1-per-15-second cadence used by typical Prometheus scrapers; low enough
+/// that a hostile actor on the same network cannot exhaust file descriptors
+/// or saturate the observer's poll loop with a flood of opens.
+pub const DEFAULT_PROM_RATE_LIMIT_PER_SEC: u32 = 5;
+
+/// Default burst capacity for the per-source-IP token bucket.  Tolerates a
+/// short cluster of legitimate scrapes (e.g. dashboard refresh) while still
+/// shutting down a sustained flood within a few seconds.
+pub const DEFAULT_PROM_RATE_LIMIT_BURST: u32 = 10;
+
 /// Parsed daemon configuration.
 #[derive(Clone, Debug)]
 pub struct Config {
@@ -114,6 +126,26 @@ pub struct Config {
     /// writes a timestamp + loop-counter line on every poll iteration,
     /// allowing external watchdogs to detect observer stalls.
     pub heartbeat_file: Option<PathBuf>,
+    /// Per-source-IP refill rate (connections per second) for the
+    /// Prometheus `/metrics` endpoint.  Defaults to
+    /// [`DEFAULT_PROM_RATE_LIMIT_PER_SEC`].
+    pub prom_rate_limit_per_sec: u32,
+    /// Per-source-IP burst (token-bucket capacity) for the Prometheus
+    /// `/metrics` endpoint.  Defaults to [`DEFAULT_PROM_RATE_LIMIT_BURST`].
+    pub prom_rate_limit_burst: u32,
+    /// Operator opt-in required to bind a plaintext UDP listener.  When
+    /// `--udp-port` is set and no AEAD keys are configured, startup
+    /// refuses to proceed unless this is `true`.  The build must also
+    /// include `--features unsafe-plaintext-udp` for the plaintext path
+    /// to exist at all.  Set by `--i-accept-plaintext-udp`.
+    pub i_accept_plaintext_udp: bool,
+    /// Operator opt-in required to run shell-mode recovery (`--recovery-cmd`
+    /// or `--recovery-cmd-file`).  Shell mode spawns `/bin/sh -c <template>`
+    /// with root-equivalent process authority — a single template-injection
+    /// vector can terminate any process the observer can reach.  For
+    /// production deployments use `--recovery-exec` (no shell, no injection
+    /// surface).  Set by `--i-accept-shell-risk`.
+    pub i_accept_shell_risk: bool,
 }
 
 /// Failure modes for [`Config::from_args`].
@@ -295,6 +327,38 @@ OPTIONAL:
                                      this file on every poll iteration.
                                      External watchdogs can monitor the file
                                      mtime to detect observer stalls.
+    --prom-rate-limit-per-sec <N>  Per-source-IP refill rate for the
+                                     /metrics endpoint token bucket
+                                     (default 5).  Scrapes from any single
+                                     IP arriving faster than this rate are
+                                     accepted and immediately closed
+                                     without serving.  Counted as
+                                     varta_prom_connections_dropped_total
+                                     {reason=\"rate_limit\"}.
+    --prom-rate-limit-burst <N>    Maximum burst (and bucket capacity) for
+                                     the per-source-IP token bucket
+                                     (default 10).  Tune higher only if
+                                     legitimate scrapers cluster requests.
+    --i-accept-plaintext-udp       UNSAFE: explicitly accept the security
+                                     risk of binding an unauthenticated
+                                     plaintext UDP listener.  Required
+                                     when --udp-port is set and no
+                                     --key-file / --master-key-file is
+                                     configured.  Build must also include
+                                     --features unsafe-plaintext-udp.  NOT
+                                     for production / safety-critical use;
+                                     any device with network reach to the
+                                     bound port can inject heartbeats.
+    --i-accept-shell-risk          UNSAFE: explicitly accept the security
+                                     risk of shell-mode recovery
+                                     (--recovery-cmd / --recovery-cmd-file).
+                                     Required to use shell-mode at all;
+                                     without this flag, only --recovery-exec
+                                     / --recovery-exec-file are permitted.
+                                     Shell mode spawns /bin/sh -c with
+                                     root-equivalent process authority —
+                                     prefer --recovery-exec for any
+                                     production deployment.
 
     -h, --help                     Print this message and exit.
 ";
@@ -326,6 +390,10 @@ OPTIONAL:
         let mut key_env: String = String::from("VARTA_KEY");
         let mut max_beat_rate: Option<u32> = None;
         let mut heartbeat_file: Option<PathBuf> = None;
+        let mut prom_rate_limit_per_sec: Option<u32> = None;
+        let mut prom_rate_limit_burst: Option<u32> = None;
+        let mut i_accept_plaintext_udp = false;
+        let mut i_accept_shell_risk = false;
 
         let mut iter = args.into_iter();
         while let Some(tok) = iter.next() {
@@ -495,6 +563,32 @@ OPTIONAL:
                         .ok_or(ConfigError::MissingValue("--heartbeat-file"))?;
                     heartbeat_file = Some(PathBuf::from(v));
                 }
+                "--prom-rate-limit-per-sec" => {
+                    let v = iter
+                        .next()
+                        .ok_or(ConfigError::MissingValue("--prom-rate-limit-per-sec"))?;
+                    prom_rate_limit_per_sec =
+                        Some(v.parse::<u32>().map_err(|_| ConfigError::BadInteger {
+                            flag: "--prom-rate-limit-per-sec",
+                            raw: v,
+                        })?);
+                }
+                "--prom-rate-limit-burst" => {
+                    let v = iter
+                        .next()
+                        .ok_or(ConfigError::MissingValue("--prom-rate-limit-burst"))?;
+                    prom_rate_limit_burst =
+                        Some(v.parse::<u32>().map_err(|_| ConfigError::BadInteger {
+                            flag: "--prom-rate-limit-burst",
+                            raw: v,
+                        })?);
+                }
+                "--i-accept-plaintext-udp" => {
+                    i_accept_plaintext_udp = true;
+                }
+                "--i-accept-shell-risk" => {
+                    i_accept_shell_risk = true;
+                }
                 other => return Err(ConfigError::UnknownFlag(other.to_string())),
             }
         }
@@ -538,6 +632,11 @@ OPTIONAL:
             key_env,
             max_beat_rate,
             heartbeat_file,
+            prom_rate_limit_per_sec: prom_rate_limit_per_sec
+                .unwrap_or(DEFAULT_PROM_RATE_LIMIT_PER_SEC),
+            prom_rate_limit_burst: prom_rate_limit_burst.unwrap_or(DEFAULT_PROM_RATE_LIMIT_BURST),
+            i_accept_plaintext_udp,
+            i_accept_shell_risk,
         })
     }
 
@@ -564,6 +663,23 @@ OPTIONAL:
 
         let shell_any = has_cmd || has_cmd_file;
         let exec_any = has_exec || has_exec_file;
+
+        // Shell mode — inline OR file-based — spawns /bin/sh -c with
+        // root-equivalent process authority.  A template-injection vector
+        // can terminate any process the observer can reach.  Refuse to
+        // proceed unless the operator has explicitly acknowledged the
+        // risk; recommend the safer --recovery-exec path.  The check sits
+        // before mutual-exclusion enforcement so the more actionable
+        // diagnostic wins when both forms of misconfiguration are present.
+        if shell_any && !self.i_accept_shell_risk {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "shell-mode recovery (--recovery-cmd / --recovery-cmd-file) spawns \
+                 /bin/sh -c with root-equivalent process authority. For production, \
+                 use --recovery-exec (no shell, no injection surface). To proceed \
+                 with shell mode anyway, pass --i-accept-shell-risk.",
+            ));
+        }
 
         // Shell and exec are mutually exclusive
         if shell_any && exec_any {
@@ -907,6 +1023,7 @@ mod tests {
             "100",
             "--recovery-cmd",
             "echo $1",
+            "--i-accept-shell-risk",
             "--recovery-debounce-ms",
             "750",
             "--export-file",
@@ -918,6 +1035,7 @@ mod tests {
         ]))
         .expect("parse");
         assert_eq!(cfg.recovery_cmd.as_deref(), Some("echo $1"));
+        assert!(cfg.i_accept_shell_risk);
         assert_eq!(cfg.recovery_debounce, Duration::from_millis(750));
         assert_eq!(cfg.file_export, Some(PathBuf::from("/tmp/e.log")));
         assert_eq!(
@@ -978,6 +1096,10 @@ mod tests {
             "--key-env",
             "--max-beat-rate",
             "--heartbeat-file",
+            "--prom-rate-limit-per-sec",
+            "--prom-rate-limit-burst",
+            "--i-accept-plaintext-udp",
+            "--i-accept-shell-risk",
             "--help",
         ] {
             assert!(
@@ -1193,6 +1315,7 @@ mod tests {
             "100",
             "--recovery-cmd",
             "echo $1",
+            "--i-accept-shell-risk",
             "--recovery-exec",
             "true",
         ]))
@@ -1213,6 +1336,7 @@ mod tests {
             "100",
             "--recovery-cmd",
             "echo $1",
+            "--i-accept-shell-risk",
             "--recovery-cmd-file",
             "/nonexistent",
         ]))
@@ -1233,6 +1357,7 @@ mod tests {
             "100",
             "--recovery-cmd",
             "echo $1",
+            "--i-accept-shell-risk",
         ]))
         .expect("parse");
         let mode = cfg.resolve_recovery_mode().expect("resolve").expect("some");
@@ -1240,6 +1365,114 @@ mod tests {
             crate::recovery::RecoveryMode::Shell(tpl) => assert_eq!(tpl, "echo $1"),
             other => panic!("expected Shell mode, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn shell_mode_inline_without_accept_flag_is_rejected() {
+        let cfg = Config::from_args(args(&[
+            "--socket",
+            "/s",
+            "--threshold-ms",
+            "100",
+            "--recovery-cmd",
+            "echo $1",
+        ]))
+        .expect("parse");
+        let err = cfg.resolve_recovery_mode().expect_err("must reject");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        let msg = err.to_string();
+        assert!(
+            msg.contains("--i-accept-shell-risk"),
+            "expected error to name the accept flag, got: {msg}"
+        );
+        assert!(
+            msg.contains("--recovery-exec"),
+            "expected error to recommend --recovery-exec, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn shell_mode_file_without_accept_flag_is_rejected() {
+        // The file does not need to exist — the accept-flag check runs
+        // before the file-permission validation, so we never read it.
+        let cfg = Config::from_args(args(&[
+            "--socket",
+            "/s",
+            "--threshold-ms",
+            "100",
+            "--recovery-cmd-file",
+            "/nonexistent",
+        ]))
+        .expect("parse");
+        let err = cfg.resolve_recovery_mode().expect_err("must reject");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(err.to_string().contains("--i-accept-shell-risk"));
+    }
+
+    #[test]
+    fn exec_mode_does_not_require_shell_risk_flag() {
+        // --recovery-exec is the safe path; no accept flag should be needed.
+        let cfg = Config::from_args(args(&[
+            "--socket",
+            "/s",
+            "--threshold-ms",
+            "100",
+            "--recovery-exec",
+            "/bin/true",
+        ]))
+        .expect("parse");
+        let mode = cfg.resolve_recovery_mode().expect("resolve").expect("some");
+        match mode {
+            crate::recovery::RecoveryMode::Exec { program, .. } => {
+                assert_eq!(program, "/bin/true");
+            }
+            other => panic!("expected Exec mode, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_i_accept_plaintext_udp_flag() {
+        let cfg = Config::from_args(args(&[
+            "--socket",
+            "/s",
+            "--threshold-ms",
+            "100",
+            "--i-accept-plaintext-udp",
+        ]))
+        .expect("parse");
+        assert!(cfg.i_accept_plaintext_udp);
+    }
+
+    #[test]
+    fn i_accept_plaintext_udp_defaults_to_false() {
+        let cfg =
+            Config::from_args(args(&["--socket", "/s", "--threshold-ms", "100"])).expect("parse");
+        assert!(!cfg.i_accept_plaintext_udp);
+    }
+
+    #[test]
+    fn parses_prom_rate_limit_flags() {
+        let cfg = Config::from_args(args(&[
+            "--socket",
+            "/s",
+            "--threshold-ms",
+            "100",
+            "--prom-rate-limit-per-sec",
+            "20",
+            "--prom-rate-limit-burst",
+            "50",
+        ]))
+        .expect("parse");
+        assert_eq!(cfg.prom_rate_limit_per_sec, 20);
+        assert_eq!(cfg.prom_rate_limit_burst, 50);
+    }
+
+    #[test]
+    fn prom_rate_limit_defaults() {
+        let cfg =
+            Config::from_args(args(&["--socket", "/s", "--threshold-ms", "100"])).expect("parse");
+        assert_eq!(cfg.prom_rate_limit_per_sec, DEFAULT_PROM_RATE_LIMIT_PER_SEC);
+        assert_eq!(cfg.prom_rate_limit_burst, DEFAULT_PROM_RATE_LIMIT_BURST);
     }
 
     #[test]
@@ -1270,8 +1503,8 @@ mod tests {
             "/s",
             "--threshold-ms",
             "100",
-            "--recovery-cmd",
-            "echo $1",
+            "--recovery-exec",
+            "/bin/true",
             "--recovery-env",
             "FOO=bar",
             "--recovery-env",

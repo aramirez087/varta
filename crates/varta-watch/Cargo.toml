@@ -14,11 +14,21 @@ workspace = true
 
 [features]
 default = []
-# Enable UDP listener transport for network-based agents.
-udp = []
-# Enable secure UDP listener with ChaCha20-Poly1305 AEAD decryption.
-# Implies `udp` and `varta-vlp/crypto`.
-secure-udp = ["udp", "varta-vlp/crypto"]
+# Internal: shared UDP socket wiring (UdpSocket bind/recv) used by both
+# secure and plaintext UDP listeners.  Not user-facing on its own —
+# enable `secure-udp` or `unsafe-plaintext-udp` instead.
+udp-core = []
+# Enable the AEAD-authenticated UDP listener (ChaCha20-Poly1305).  This
+# is the recommended UDP transport — the only one with cryptographic
+# sender authentication.
+secure-udp = ["udp-core", "varta-vlp/crypto"]
+# UNSAFE: enable the unauthenticated plaintext UDP listener.  Any device
+# with network reach to the bound port can inject heartbeats, suppress
+# stall detection, or trigger false recovery commands.  Even with this
+# feature compiled in, the listener will refuse to bind at runtime
+# unless `--i-accept-plaintext-udp` is passed.  Do not enable in
+# production builds.
+unsafe-plaintext-udp = ["udp-core"]
 # Emit structured JSON lines to stderr instead of plain eprintln!.
 # Each line is a self-contained JSON object with ts_ns, level, msg,
 # and optional context fields (pid, child_pid, error).  Suitable for

@@ -33,7 +33,7 @@ pub use observer::{Event, Observer};
 pub use recovery::{Recovery, RecoveryOutcome};
 pub use tracker::{EvictionPolicy, Slot, Tracker, Update};
 
-#[cfg(feature = "udp")]
+#[cfg(feature = "unsafe-plaintext-udp")]
 pub use listener::UdpListener;
 
 #[cfg(feature = "secure-udp")]

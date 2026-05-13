@@ -14,7 +14,7 @@ use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufWriter, ErrorKind, Read, Write};
-use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
+use std::net::{IpAddr, Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -401,6 +401,53 @@ const PROM_REQUEST_CAP: usize = 4096;
 /// gates pathological or misconfigured scrapers.
 const PROM_MIN_SCRAPE_INTERVAL: Duration = Duration::from_secs(1);
 
+/// Maximum number of unique source IPs tracked in the per-IP token bucket.
+/// Bounds memory consumption against a horizontal flood (many distinct IPs,
+/// each sending one connection).  When the table is full, stale entries are
+/// evicted first; if every entry is still fresh, the oldest is force-evicted
+/// and counted as `varta_prom_connections_dropped_total{reason="ip_table_full"}`.
+const MAX_PROM_IP_STATES: usize = 1024;
+
+/// How long a source IP's bucket state is retained after its last seen
+/// connection. Entries older than this are eligible for stale-eviction.
+const PROM_IP_STATE_TTL: Duration = Duration::from_secs(60);
+
+/// How often the stale-IP sweep runs (only triggered when the IP table
+/// reaches capacity).
+const PROM_IP_STATE_SWEEP_INTERVAL: Duration = Duration::from_secs(10);
+
+/// Per-source-IP token bucket state for the Prometheus `/metrics` endpoint.
+#[derive(Clone, Copy, Debug)]
+struct PromIpState {
+    /// Tokens available (fractional, scaled by 1000 to avoid floats).
+    /// Each accepted connection consumes 1000 milli-tokens.
+    tokens_milli: u32,
+    /// Wall-clock instant at which `tokens_milli` was last refilled.
+    last_refill: Instant,
+    /// Most recent connection from this IP — used for stale eviction.
+    last_seen: Instant,
+}
+
+/// Reasons a `/metrics` connection can be dropped before serving.  Indexed by
+/// [`drop_reason_index`]; the array doubles as the canonical ordering for
+/// the exposition output, so series remain stable across scrapes.
+const DROP_REASON_LABELS: [&str; 3] = ["drain", "rate_limit", "ip_table_full"];
+
+#[derive(Clone, Copy, Debug)]
+enum DropReason {
+    Drain,
+    RateLimit,
+    IpTableFull,
+}
+
+fn drop_reason_index(r: DropReason) -> usize {
+    match r {
+        DropReason::Drain => 0,
+        DropReason::RateLimit => 1,
+        DropReason::IpTableFull => 2,
+    }
+}
+
 /// Prometheus text-format exporter served over HTTP/1.0.
 ///
 /// The exporter is poll-driven: the daemon main loop calls
@@ -441,6 +488,22 @@ pub struct PromExporter {
     /// on this to detect when the exporter cannot serve all incoming scrapes
     /// within a single poll tick.
     scrape_budget_exhausted_total: u64,
+    /// Per-source-IP token bucket state.  Bounded by
+    /// [`MAX_PROM_IP_STATES`]; entries older than [`PROM_IP_STATE_TTL`] are
+    /// evicted lazily when the table reaches capacity.
+    ip_state: HashMap<IpAddr, PromIpState>,
+    /// Per-source-IP refill rate (connections per second). Set from
+    /// `Config::prom_rate_limit_per_sec` at construction time.
+    rate_per_sec: u32,
+    /// Per-source-IP burst (token-bucket capacity). Set from
+    /// `Config::prom_rate_limit_burst` at construction time.
+    rate_burst: u32,
+    /// Last instant at which `evict_stale_ip_state` was called.
+    last_ip_sweep: Instant,
+    /// Connections dropped before serving, broken down by reason.  Always
+    /// emitted in full (even at zero) so `absent()` alert rules stay green.
+    /// Indexed by [`drop_reason_index`].
+    connections_dropped_total: [u64; DROP_REASON_LABELS.len()],
     /// Observer startup instant (monotonic). Used to emit
     /// `varta_watch_uptime_seconds`.
     started_at: Instant,
@@ -451,10 +514,29 @@ pub struct PromExporter {
 }
 
 impl PromExporter {
-    /// Bind a non-blocking TCP listener on `addr` and return the exporter.
+    /// Bind a non-blocking TCP listener on `addr` with default per-IP rate
+    /// limits.  Equivalent to
+    /// `bind_with_rate_limit(addr, DEFAULT_PROM_RATE_LIMIT_PER_SEC, DEFAULT_PROM_RATE_LIMIT_BURST)`.
     pub fn bind(addr: SocketAddr) -> io::Result<Self> {
+        Self::bind_with_rate_limit(
+            addr,
+            crate::config::DEFAULT_PROM_RATE_LIMIT_PER_SEC,
+            crate::config::DEFAULT_PROM_RATE_LIMIT_BURST,
+        )
+    }
+
+    /// Bind a non-blocking TCP listener on `addr` with the supplied per-IP
+    /// rate-limit parameters.  `rate_per_sec` is the bucket refill rate
+    /// (connections per second) and `rate_burst` is the bucket capacity
+    /// (and thus the burst size a single IP can sustain at once).
+    pub fn bind_with_rate_limit(
+        addr: SocketAddr,
+        rate_per_sec: u32,
+        rate_burst: u32,
+    ) -> io::Result<Self> {
         let listener = TcpListener::bind(addr)?;
         listener.set_nonblocking(true)?;
+        let now = Instant::now();
         Ok(PromExporter {
             listener,
             rows: HashMap::new(),
@@ -473,9 +555,92 @@ impl PromExporter {
             nonce_wrap_total: 0,
             scrape_skipped_total: 0,
             scrape_budget_exhausted_total: 0,
-            started_at: Instant::now(),
+            ip_state: HashMap::new(),
+            rate_per_sec,
+            rate_burst,
+            last_ip_sweep: now,
+            connections_dropped_total: [0; DROP_REASON_LABELS.len()],
+            started_at: now,
             last_loop_system: SystemTime::now(),
         })
+    }
+
+    /// Returns `true` and consumes one token if the source IP has tokens
+    /// available; otherwise returns `false`.  Capacity-evicts stale or
+    /// (as a last resort) the oldest entry when the table is full, and
+    /// bumps the corresponding drop counter so operators can observe
+    /// rate-limit vs table-full pressure separately.
+    fn allow_ip(&mut self, ip: IpAddr, now: Instant) -> bool {
+        // Burst of 0 means "no per-IP limit". Skip the bookkeeping entirely.
+        if self.rate_burst == 0 {
+            return true;
+        }
+        let cap_milli: u32 = self.rate_burst.saturating_mul(1000);
+        let refill_per_ms: u32 = self.rate_per_sec; // 1000 milli-tokens / 1000 ms
+
+        // Periodic stale sweep — cheap when the table is sparse, bounded
+        // by MAX_PROM_IP_STATES iterations when it isn't.
+        if now.duration_since(self.last_ip_sweep) >= PROM_IP_STATE_SWEEP_INTERVAL {
+            self.last_ip_sweep = now;
+            self.ip_state
+                .retain(|_, st| now.duration_since(st.last_seen) < PROM_IP_STATE_TTL);
+        }
+
+        match self.ip_state.get_mut(&ip) {
+            Some(st) => {
+                let elapsed_ms = now.duration_since(st.last_refill).as_millis() as u64;
+                if elapsed_ms > 0 {
+                    let add_milli =
+                        (elapsed_ms as u128 * refill_per_ms as u128).min(u32::MAX as u128) as u32;
+                    st.tokens_milli = st.tokens_milli.saturating_add(add_milli).min(cap_milli);
+                    st.last_refill = now;
+                }
+                st.last_seen = now;
+                if st.tokens_milli >= 1000 {
+                    st.tokens_milli -= 1000;
+                    true
+                } else {
+                    self.connections_dropped_total[drop_reason_index(DropReason::RateLimit)] = self
+                        .connections_dropped_total[drop_reason_index(DropReason::RateLimit)]
+                    .saturating_add(1);
+                    false
+                }
+            }
+            None => {
+                if self.ip_state.len() >= MAX_PROM_IP_STATES {
+                    // Try to make room by evicting stale entries first.
+                    self.ip_state
+                        .retain(|_, st| now.duration_since(st.last_seen) < PROM_IP_STATE_TTL);
+                }
+                if self.ip_state.len() >= MAX_PROM_IP_STATES {
+                    // Still full — force-evict the oldest entry.  Count the
+                    // event so a sustained horizontal flood is observable.
+                    if let Some(oldest_ip) = self
+                        .ip_state
+                        .iter()
+                        .min_by_key(|(_, s)| s.last_seen)
+                        .map(|(k, _)| *k)
+                    {
+                        self.ip_state.remove(&oldest_ip);
+                    }
+                    self.connections_dropped_total[drop_reason_index(DropReason::IpTableFull)] =
+                        self.connections_dropped_total[drop_reason_index(DropReason::IpTableFull)]
+                            .saturating_add(1);
+                }
+                // New entry starts with a full bucket minus the one token
+                // consumed by this connection.
+                let tokens_milli = cap_milli.saturating_sub(1000);
+                self.ip_state.insert(
+                    ip,
+                    PromIpState {
+                        tokens_milli,
+                        last_refill: now,
+                        last_seen: now,
+                    },
+                );
+                true
+            }
+        }
     }
 
     /// Address the listener is actually bound to. Useful for tests that
@@ -583,7 +748,16 @@ impl PromExporter {
                 break Ok(());
             }
             match self.listener.accept() {
-                Ok((stream, _)) => {
+                Ok((stream, peer)) => {
+                    // Per-IP rate limit applies even before serve-budget
+                    // counting: dropping a rate-limited connection costs
+                    // an accept(2) + drop(2) but no body render, and does
+                    // not consume the 8-conn budget.  This keeps a single
+                    // hostile IP from squeezing out legitimate scrapers.
+                    if !self.allow_ip(peer.ip(), Instant::now()) {
+                        drop(stream);
+                        continue;
+                    }
                     self.serve_one(stream, render_fresh)?;
                     served += 1;
                     if !render_fresh {
@@ -603,9 +777,17 @@ impl PromExporter {
                 break;
             }
             match self.listener.accept() {
-                Ok((stream, _)) => {
+                Ok((stream, peer)) => {
+                    // Update the IP bucket even on drained connections so a
+                    // sustained flooder doesn't get a free pass once the
+                    // serve budget is exhausted — its bucket continues to
+                    // drain toward 0 and stays there.
+                    let _ = self.allow_ip(peer.ip(), Instant::now());
                     drop(stream);
                     drained += 1;
+                    self.connections_dropped_total[drop_reason_index(DropReason::Drain)] = self
+                        .connections_dropped_total[drop_reason_index(DropReason::Drain)]
+                    .saturating_add(1);
                 }
                 Err(e) if e.kind() == ErrorKind::WouldBlock => break,
                 Err(_) => break,
@@ -830,6 +1012,25 @@ impl PromExporter {
             "varta_scrape_budget_exhausted_total {}",
             self.scrape_budget_exhausted_total
         );
+        // Per-reason connection drop counter — emit every label value
+        // unconditionally so `absent()` alert rules stay green-on-green
+        // until the first incident of that kind.  Three reasons today:
+        // drain (accept-and-close after serve budget exhausted),
+        // rate_limit (per-source-IP token bucket empty), and
+        // ip_table_full (per-IP state table at MAX_PROM_IP_STATES and the
+        // oldest entry was force-evicted).
+        self.body_buf.push_str(
+            "# HELP varta_prom_connections_dropped_total Connections accepted on /metrics but closed before serving, by reason.\n",
+        );
+        self.body_buf
+            .push_str("# TYPE varta_prom_connections_dropped_total counter\n");
+        for (idx, reason) in DROP_REASON_LABELS.iter().enumerate() {
+            let _ = writeln!(
+                self.body_buf,
+                "varta_prom_connections_dropped_total{{reason=\"{reason}\"}} {}",
+                self.connections_dropped_total[idx]
+            );
+        }
         self.body_buf.push_str(
             "# HELP varta_nonce_wrap_total Total nonce-space wrap events detected (agent exhausted u64 nonces).\n",
         );
@@ -1189,6 +1390,121 @@ mod tests {
         assert!(
             body2.contains("varta_watch_pids_tracked 0"),
             "pids_tracked should be 0 after eviction:\n{body2}"
+        );
+    }
+
+    /// The dropped-connection metric must emit every label value on every
+    /// scrape, even at zero — same contract as `varta_decode_errors_total`.
+    /// `absent()` alert rules and dashboards depend on stable series.
+    #[test]
+    fn connections_dropped_emit_every_reason_label_at_zero() {
+        let mut prom = PromExporter::bind("127.0.0.1:0".parse().unwrap()).expect("bind");
+        prom.render_body();
+        let body = &prom.body_buf;
+        for reason in DROP_REASON_LABELS {
+            let series = format!(
+                "varta_prom_connections_dropped_total{{reason=\"{reason}\"}} 0"
+            );
+            assert!(
+                body.contains(&series),
+                "missing zero-emission for reason={reason}:\n{body}"
+            );
+        }
+    }
+
+    /// Per-IP token bucket: a single IP exceeding its burst must be denied,
+    /// and the denial must bump `varta_prom_connections_dropped_total
+    /// {reason="rate_limit"}`.  Unit-tested directly on `allow_ip` to avoid
+    /// the flakiness of real TCP-accept loops.
+    #[test]
+    fn allow_ip_denies_after_burst_and_records_rate_limit() {
+        let mut prom = PromExporter::bind_with_rate_limit(
+            "127.0.0.1:0".parse().unwrap(),
+            /* rate_per_sec */ 1,
+            /* rate_burst   */ 3,
+        )
+        .expect("bind");
+
+        let ip: std::net::IpAddr = "127.0.0.1".parse().unwrap();
+        let t0 = Instant::now();
+
+        // Burst of 3 consumes all tokens.
+        for _ in 0..3 {
+            assert!(prom.allow_ip(ip, t0));
+        }
+        // 4th attempt within the same instant must be denied.
+        assert!(!prom.allow_ip(ip, t0));
+        let idx = drop_reason_index(DropReason::RateLimit);
+        assert_eq!(
+            prom.connections_dropped_total[idx], 1,
+            "rate_limit drop counter must increment on denial"
+        );
+
+        // After enough time, the bucket refills and a new connection passes.
+        let t1 = t0 + Duration::from_secs(2);
+        assert!(prom.allow_ip(ip, t1));
+    }
+
+    /// `allow_ip` with `rate_burst = 0` must always allow — this is the
+    /// "no rate limit" escape hatch.  The IP-state map must stay empty.
+    #[test]
+    fn allow_ip_burst_zero_is_unlimited() {
+        let mut prom = PromExporter::bind_with_rate_limit(
+            "127.0.0.1:0".parse().unwrap(),
+            /* rate_per_sec */ 5,
+            /* rate_burst   */ 0,
+        )
+        .expect("bind");
+        let ip: std::net::IpAddr = "127.0.0.1".parse().unwrap();
+        let t = Instant::now();
+        for _ in 0..1000 {
+            assert!(prom.allow_ip(ip, t));
+        }
+        assert!(
+            prom.ip_state.is_empty(),
+            "burst=0 path must not allocate per-IP state"
+        );
+    }
+
+    /// Filling the per-IP table past `MAX_PROM_IP_STATES` must force-evict
+    /// the oldest entry and bump
+    /// `varta_prom_connections_dropped_total{reason="ip_table_full"}`.
+    #[test]
+    fn allow_ip_table_full_force_evicts_and_records() {
+        let mut prom = PromExporter::bind_with_rate_limit(
+            "127.0.0.1:0".parse().unwrap(),
+            /* rate_per_sec */ 1000,
+            /* rate_burst   */ 1000,
+        )
+        .expect("bind");
+        // Insert MAX_PROM_IP_STATES distinct IPs at t0; the (N+1)th must
+        // trigger force-eviction.  Use IPv4 within 10.0.0.0/8 to avoid any
+        // overlap with the loopback used elsewhere in tests.
+        let t0 = Instant::now();
+        for i in 0..MAX_PROM_IP_STATES {
+            let ip = std::net::IpAddr::V4(std::net::Ipv4Addr::new(
+                10,
+                ((i >> 16) & 0xff) as u8,
+                ((i >> 8) & 0xff) as u8,
+                (i & 0xff) as u8,
+            ));
+            assert!(prom.allow_ip(ip, t0));
+        }
+        assert_eq!(prom.ip_state.len(), MAX_PROM_IP_STATES);
+
+        // One more IP at the same instant — sweep can't free anything
+        // because everyone is fresh, so the oldest gets force-evicted.
+        let new_ip = std::net::IpAddr::V4(std::net::Ipv4Addr::new(11, 0, 0, 1));
+        assert!(prom.allow_ip(new_ip, t0));
+        assert_eq!(
+            prom.ip_state.len(),
+            MAX_PROM_IP_STATES,
+            "table size must remain capped"
+        );
+        let idx = drop_reason_index(DropReason::IpTableFull);
+        assert!(
+            prom.connections_dropped_total[idx] >= 1,
+            "ip_table_full drop counter must increment on force-eviction"
         );
     }
 }

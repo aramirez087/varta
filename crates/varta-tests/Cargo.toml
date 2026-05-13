@@ -11,7 +11,12 @@ workspace = true
 [dependencies]
 
 [features]
-udp = ["varta-client/udp", "varta-watch/udp"]
+# Test the plaintext UDP transport end-to-end.  The observer side requires
+# `varta-watch/unsafe-plaintext-udp` (compiled-in plaintext path) and the
+# binary must be invoked with `--i-accept-plaintext-udp` at runtime — both
+# are deliberate opt-ins to reflect the production posture: plaintext UDP
+# is unsafe and must be acknowledged at every layer.
+udp = ["varta-client/udp", "varta-watch/unsafe-plaintext-udp"]
 secure-udp = ["varta-client/secure-udp", "varta-watch/secure-udp"]
 
 [dev-dependencies]
