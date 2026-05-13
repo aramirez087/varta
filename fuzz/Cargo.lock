@@ -92,6 +92,14 @@ version = "0.0.0"
 dependencies = [
  "libfuzzer-sys",
  "varta-vlp",
+ "varta-watch",
+]
+
+[[package]]
+name = "varta-watch"
+version = "0.1.0"
+dependencies = [
+ "varta-vlp",
 ]
 
 [[package]]

@@ -43,7 +43,17 @@ pub use panic::install as install_panic_handler;
 #[cfg(all(feature = "panic-handler", feature = "udp"))]
 pub use panic::install_panic_handler_udp;
 
-/// Install the secure UDP panic hook — see [`panic::install_panic_handler_secure_udp`]
-/// for the full contract.
+/// Error returned by [`install_panic_handler_secure_udp`].
+#[cfg(all(feature = "panic-handler", feature = "secure-udp"))]
+pub use panic::PanicInstallError;
+
+/// Install the secure UDP panic hook (fail-closed) — see
+/// [`panic::install_panic_handler_secure_udp`] for the full contract.
 #[cfg(all(feature = "panic-handler", feature = "secure-udp"))]
 pub use panic::install_panic_handler_secure_udp;
+
+/// Install the secure UDP panic hook with non-cryptographic IV fallback — see
+/// [`panic::install_panic_handler_secure_udp_accept_degraded_entropy`] for
+/// the full contract including nonce-reuse risk.
+#[cfg(all(feature = "panic-handler", feature = "secure-udp"))]
+pub use panic::install_panic_handler_secure_udp_accept_degraded_entropy;

@@ -99,8 +99,7 @@ jobs:
 
   fuzz-smoke:
     name: fuzz-smoke
-    # Run on push to main only — fuzz is too heavy for every PR commit.
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    # Run on every PR and push — fuzzing is mandatory for safety-critical use.
     runs-on: ubuntu-latest
     steps:
       - name: checkout
@@ -113,13 +112,16 @@ jobs:
         run: cargo install cargo-fuzz
 
       - name: fuzz frame_decode (30 s)
-        run: cargo fuzz run frame_decode -- -max_total_time=30
+        run: cargo fuzz run frame_decode fuzz/corpus/frame_decode -- -max_total_time=30
 
       - name: fuzz frame_roundtrip (30 s)
         run: cargo fuzz run frame_roundtrip -- -max_total_time=30
 
       - name: fuzz aead_roundtrip (30 s)
-        run: cargo fuzz run aead_roundtrip -- -max_total_time=30
+        run: cargo fuzz run aead_roundtrip fuzz/corpus/aead_roundtrip -- -max_total_time=30
+
+      - name: fuzz poly1305_mac (30 s)
+        run: cargo fuzz run poly1305_mac fuzz/corpus/poly1305_mac -- -max_total_time=30
 
       - name: fuzz tracker_record (30 s)
         run: cargo fuzz run tracker_record -- -max_total_time=30
@@ -129,3 +131,6 @@ jobs:
 
       - name: fuzz kdf_derive (30 s)
         run: cargo fuzz run kdf_derive -- -max_total_time=30
+
+      - name: assert no fuzz artifacts (reproducer = CI failure)
+        run: test -z "$(find fuzz/artifacts -type f 2>/dev/null)"

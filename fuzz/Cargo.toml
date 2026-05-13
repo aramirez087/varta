@@ -9,8 +9,7 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
-varta-vlp = { path = "../crates/varta-vlp" }
-varta-vlp-crypto = { path = "../crates/varta-vlp", features = ["crypto"], package = "varta-vlp" }
+varta-vlp = { path = "../crates/varta-vlp", features = ["crypto"] }
 varta-watch = { path = "../crates/varta-watch" }
 
 [[bin]]
@@ -51,6 +50,13 @@ bench = false
 [[bin]]
 name = "kdf_derive"
 path = "fuzz_targets/kdf_derive.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "poly1305_mac"
+path = "fuzz_targets/poly1305_mac.rs"
 test = false
 doc = false
 bench = false

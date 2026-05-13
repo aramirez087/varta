@@ -136,6 +136,12 @@ varta-watch --socket /tmp/varta.sock --threshold-ms 500 \
     of one agent's key does not reveal other agents' keys or the master key.
   - Replay attacks are blocked by enforcing monotonic IV counters per sender.
     Key rotation is supported via `--accepted-key-file` (no downtime required).
+  - **Panic-hook entropy**: `install_panic_handler_secure_udp` reads entropy at
+    install time and **fails closed** if all sources (`getrandom`, `getentropy`,
+    `/dev/urandom`) are unavailable. In chrooted environments without `/dev`,
+    use `install_panic_handler_secure_udp_accept_degraded_entropy` to opt into a
+    non-cryptographic fallback — see `docs/architecture/peer-authentication.md`
+    for the full nonce-reuse risk analysis.
 
 - **Recovery commands**: Two execution modes:
   - `--recovery-cmd`: Shell mode — templates executed via `/bin/sh -c` with

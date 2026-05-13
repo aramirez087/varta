@@ -15,6 +15,43 @@ use crate::transport::bind_ephemeral;
 use varta_vlp::crypto::Key;
 use varta_vlp::{Frame, Status, NONCE_TERMINAL};
 
+/// Error returned by [`install_panic_handler_secure_udp`] when entropy is
+/// unavailable at install time.
+///
+/// This type is not `#[non_exhaustive]`; adding a variant is a deliberate
+/// breaking change (consistent with the project's exhaustiveness policy for
+/// `Status` and `DecodeError`).
+#[cfg(all(feature = "panic-handler", feature = "secure-udp"))]
+#[derive(Debug)]
+pub enum PanicInstallError {
+    /// Both `getrandom`/`getentropy` and `/dev/urandom` failed. Proceeding
+    /// would require the non-cryptographic `fallback_iv_random()`, which risks
+    /// nonce reuse under the same AEAD key if the process panics more than
+    /// once. Use [`install_panic_handler_secure_udp_accept_degraded_entropy`]
+    /// to opt in explicitly.
+    EntropyUnavailable(std::io::Error),
+}
+
+#[cfg(all(feature = "panic-handler", feature = "secure-udp"))]
+impl core::fmt::Display for PanicInstallError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            PanicInstallError::EntropyUnavailable(e) => {
+                write!(f, "varta: panic-hook install failed — entropy unavailable: {e}")
+            }
+        }
+    }
+}
+
+#[cfg(all(feature = "panic-handler", feature = "secure-udp"))]
+impl std::error::Error for PanicInstallError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            PanicInstallError::EntropyUnavailable(e) => Some(e),
+        }
+    }
+}
+
 /// Register a panic hook that emits a [`Status::Critical`] VLP frame on the
 /// Unix Domain Socket at `socket_path` before resuming normal unwinding.
 ///
@@ -116,30 +153,27 @@ pub fn install_panic_handler_udp(addr: std::net::SocketAddr) {
     }));
 }
 
-/// Install a UDP panic handler with ChaCha20-Poly1305 encryption.
+/// Inner implementation used by both public secure-UDP panic-hook installers.
 ///
-/// On panic, creates a one-shot secure UDP socket, encrypts a `Critical`
-/// frame with `NONCE_TERMINAL` using the provided key, and sends it to
-/// `addr`.
-///
-/// All I/O and crypto errors are silently ignored.
-///
-/// # Chaining
-///
-/// This function captures the previously registered hook via
-/// [`std::panic::take_hook`] and invokes it after firing the secure VLP frame.
+/// `provider` is called once at install time to obtain the 8-byte IV random
+/// prefix. If it returns `Err`, installation is aborted and the error is
+/// returned to the caller; the panic hook is NOT registered.
 #[cfg(all(feature = "panic-handler", feature = "secure-udp"))]
-pub fn install_panic_handler_secure_udp(addr: std::net::SocketAddr, key: Key) {
-    use crate::secure_transport::{fallback_iv_random, read_iv_random};
+pub(crate) fn install_with_entropy_provider<F>(
+    addr: std::net::SocketAddr,
+    key: Key,
+    provider: F,
+) -> Result<(), PanicInstallError>
+where
+    F: FnOnce() -> std::io::Result<[u8; 8]>,
+{
     use varta_vlp::crypto::{self, NONCE_BYTES};
 
     let start = Instant::now();
     // Pre-compute the IV random prefix at install time — /dev/urandom
     // reads are not async-signal-safe and must not happen inside the
-    // panic hook.  If both getrandom/getentropy and /dev/urandom are
-    // unavailable, fallback_iv_random() provides a best-effort mix of
-    // time, PID, TID, and a counter — not cryptographically secure.
-    let iv_random: [u8; 8] = read_iv_random().unwrap_or_else(|_| fallback_iv_random());
+    // panic hook.
+    let iv_random: [u8; 8] = provider().map_err(PanicInstallError::EntropyUnavailable)?;
     let prev = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         let _ = (|| {
@@ -157,8 +191,8 @@ pub fn install_panic_handler_secure_udp(addr: std::net::SocketAddr, key: Key) {
             let mut buf = [0u8; 32];
             frame.encode(&mut buf);
 
-            // Use the pre-computed IV from install time (read_iv_random() or
-            // LCG fallback).  File I/O inside a panic hook is not signal-safe.
+            // Use the pre-computed IV from install time.
+            // File I/O inside a panic hook is not async-signal-safe.
             let iv_counter = 1u32;
 
             let mut nonce = [0u8; NONCE_BYTES];
@@ -177,4 +211,113 @@ pub fn install_panic_handler_secure_udp(addr: std::net::SocketAddr, key: Key) {
         })();
         prev(info);
     }));
+    Ok(())
+}
+
+/// Install a UDP panic handler with ChaCha20-Poly1305 encryption.
+///
+/// On panic, creates a one-shot secure UDP socket, encrypts a `Critical`
+/// frame with `NONCE_TERMINAL` using the provided key, and sends it to
+/// `addr`.
+///
+/// All I/O and crypto errors are silently ignored.
+///
+/// # Entropy requirement
+///
+/// This function reads 8 bytes of cryptographic entropy at install time
+/// (`getrandom`/`getentropy`, falling back to `/dev/urandom`). If all
+/// sources fail — common in chrooted or stripped-container environments
+/// without a mounted `/dev` — installation is **aborted** and
+/// `Err(PanicInstallError::EntropyUnavailable)` is returned. The hook is
+/// NOT registered in that case.
+///
+/// To opt into a non-cryptographic IV fallback (with nonce-reuse risk),
+/// use [`install_panic_handler_secure_udp_accept_degraded_entropy`] instead.
+///
+/// # Chaining
+///
+/// This function captures the previously registered hook via
+/// [`std::panic::take_hook`] and invokes it after firing the secure VLP frame.
+#[cfg(all(feature = "panic-handler", feature = "secure-udp"))]
+pub fn install_panic_handler_secure_udp(
+    addr: std::net::SocketAddr,
+    key: Key,
+) -> Result<(), PanicInstallError> {
+    use crate::secure_transport::read_iv_random;
+    install_with_entropy_provider(addr, key, read_iv_random)
+}
+
+/// Install a UDP panic handler with ChaCha20-Poly1305 encryption, accepting
+/// degraded entropy as a fallback.
+///
+/// Identical to [`install_panic_handler_secure_udp`] except that when
+/// `getrandom`/`getentropy` and `/dev/urandom` all fail, the IV is derived
+/// from a non-cryptographic mix of PID, TID, monotonic time, and a counter
+/// (SipHash-2-4 keyed by `RandomState`). This always succeeds.
+///
+/// # Safety / Correctness
+///
+/// If the non-cryptographic fallback is used, multiple panic frames from the
+/// same process under the same AEAD key **may collide on IV**, causing nonce
+/// reuse — a catastrophic confidentiality and integrity failure. Use this
+/// function only in environments where panic frequency is controlled or where
+/// frame confidentiality is not load-bearing. The verbose name is intentional:
+/// the operator must type the risk out explicitly (matching the project's
+/// `--i-accept-<risk>` convention for safety-critical configuration).
+///
+/// # Chaining
+///
+/// This function captures the previously registered hook via
+/// [`std::panic::take_hook`] and invokes it after firing the secure VLP frame.
+#[cfg(all(feature = "panic-handler", feature = "secure-udp"))]
+pub fn install_panic_handler_secure_udp_accept_degraded_entropy(
+    addr: std::net::SocketAddr,
+    key: Key,
+) {
+    use crate::secure_transport::{fallback_iv_random, read_iv_random};
+    let _ = install_with_entropy_provider(addr, key, || {
+        Ok(read_iv_random().unwrap_or_else(|_| fallback_iv_random()))
+    });
+}
+
+#[cfg(all(test, feature = "panic-handler", feature = "secure-udp"))]
+mod tests {
+    use super::*;
+    use std::io;
+    use std::net::SocketAddr;
+
+    fn dummy_addr() -> SocketAddr {
+        "127.0.0.1:0".parse().unwrap()
+    }
+
+    fn dummy_key() -> Key {
+        Key::from_bytes([0u8; 32])
+    }
+
+    #[test]
+    fn install_with_entropy_provider_happy_path_returns_ok() {
+        let result = install_with_entropy_provider(dummy_addr(), dummy_key(), || Ok([1u8; 8]));
+        assert!(result.is_ok());
+        // Restore default hook so other tests are not affected.
+        let _ = std::panic::take_hook();
+    }
+
+    #[test]
+    fn install_with_entropy_provider_failure_returns_err_and_does_not_install() {
+        let err = io::Error::new(io::ErrorKind::NotFound, "no /dev in chroot");
+        let result = install_with_entropy_provider(dummy_addr(), dummy_key(), || Err(err));
+        match result {
+            Err(PanicInstallError::EntropyUnavailable(inner)) => {
+                assert_eq!(inner.kind(), io::ErrorKind::NotFound);
+            }
+            Ok(()) => panic!("expected Err but got Ok"),
+        }
+    }
+
+    #[test]
+    fn accept_degraded_entropy_always_succeeds() {
+        // The degraded-entropy variant must never panic or return an error.
+        install_panic_handler_secure_udp_accept_degraded_entropy(dummy_addr(), dummy_key());
+        let _ = std::panic::take_hook();
+    }
 }

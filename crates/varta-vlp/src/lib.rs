@@ -47,8 +47,12 @@ pub const NONCE_TERMINAL: u64 = u64::MAX;
 /// The discriminants are explicit because they form part of the on-wire
 /// contract: agents serialise `Status as u8` and observers reconstruct via
 /// [`Status::try_from_u8`].
+///
+/// This enum is exhaustive. Adding a variant is a workspace-wide compile-error
+/// change. The wire format (version-pinned by [`VERSION`]) guarantees that no
+/// in-memory `Status` value exists outside this list; unknown bytes are rejected
+/// by [`Status::try_from_u8`] as [`DecodeError::BadStatus`].
 #[repr(u8)]
-#[non_exhaustive]
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub enum Status {
     /// The agent is healthy and making progress.
@@ -197,7 +201,9 @@ impl Frame {
 /// The variants form an exhaustive list of validation failures the protocol
 /// can detect statically; everything else (timestamp drift, nonce regression)
 /// is policy enforced higher in the stack.
-#[non_exhaustive]
+///
+/// This enum is exhaustive. Adding a variant is a workspace-wide compile-error
+/// change that requires updating every match site explicitly.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DecodeError {
     /// First two bytes did not equal [`MAGIC`].
