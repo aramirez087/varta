@@ -182,6 +182,7 @@ pub struct Varta<T: BeatTransport = UdsTransport> {
     consecutive_dropped: u32,
     reconnect_after: u32,
     last_timestamp: u64,
+    clock_regressions: u64,
 }
 
 // Static assertion: Varta<UdsTransport> is Send and must remain so.
@@ -213,6 +214,7 @@ impl Varta<UdsTransport> {
             consecutive_dropped: 0,
             reconnect_after: 0,
             last_timestamp: 0,
+            clock_regressions: 0,
         })
     }
 }
@@ -246,6 +248,7 @@ impl Varta<UdpTransport> {
             consecutive_dropped: 0,
             reconnect_after: 0,
             last_timestamp: 0,
+            clock_regressions: 0,
         })
     }
 }
@@ -277,6 +280,7 @@ impl Varta<SecureUdpTransport> {
             consecutive_dropped: 0,
             reconnect_after: 0,
             last_timestamp: 0,
+            clock_regressions: 0,
         })
     }
 
@@ -308,6 +312,7 @@ impl Varta<SecureUdpTransport> {
             consecutive_dropped: 0,
             reconnect_after: 0,
             last_timestamp: 0,
+            clock_regressions: 0,
         })
     }
 }
@@ -355,6 +360,12 @@ impl<T: BeatTransport> Varta<T> {
         }
         let pid = std::process::id();
         let raw_elapsed = self.start.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+        if raw_elapsed < self.last_timestamp {
+            // Underlying Instant::now() regressed — surface via the counter
+            // while preserving wire-format monotonicity through the .max()
+            // clamp below.
+            self.clock_regressions = self.clock_regressions.saturating_add(1);
+        }
         self.last_timestamp = self.last_timestamp.max(raw_elapsed);
         let timestamp = self.last_timestamp;
         debug_assert!(
@@ -419,5 +430,94 @@ impl<T: BeatTransport> Varta<T> {
     pub fn set_reconnect_after(&mut self, n: u32) {
         self.reconnect_after = n;
         self.consecutive_dropped = 0;
+    }
+
+    /// Number of times [`beat`](Self::beat) has observed
+    /// [`Instant::now`](std::time::Instant::now) regress since
+    /// [`connect`](Self::connect). Saturating; never wraps.
+    ///
+    /// The wire-format timestamp remains monotonic because `beat()` clamps
+    /// it through `.max()`, so a regression manifests on the wire as a
+    /// duplicate timestamp rather than a backwards jump. A non-zero value
+    /// here is the only in-process signal of the underlying platform-clock
+    /// bug.
+    ///
+    /// Consumers wiring a Prometheus exporter SHOULD publish this as a
+    /// counter named `varta_client_clock_regression_total`.
+    pub fn clock_regressions(&self) -> u64 {
+        self.clock_regressions
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::net::UnixDatagram;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    /// Bind a fresh UDS listener at a unique tempdir path and return both
+    /// the listener (kept alive by the caller) and its path. The listener
+    /// silently drops every datagram — enough to satisfy `Varta::connect`.
+    fn bind_listener() -> (UnixDatagram, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!(
+            "varta-clock-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir(&dir).expect("create tempdir");
+        // Cerebrum 2026-05-13: process-wide umask from a concurrent
+        // UnixDatagram::bind elsewhere can strip the executable bit; force
+        // 0o755 before any further open() inside this dir.
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod 0o755");
+        let sock_path = dir.join("varta.sock");
+        let listener = UnixDatagram::bind(&sock_path).expect("bind listener");
+        (listener, sock_path)
+    }
+
+    #[test]
+    fn clock_regression_counter_stays_zero_on_forward_clock() {
+        let (_listener, path) = bind_listener();
+        let mut agent = Varta::connect(&path).expect("connect");
+        let _ = agent.beat(Status::Ok, 0);
+        let _ = agent.beat(Status::Ok, 0);
+        assert_eq!(
+            agent.clock_regressions(),
+            0,
+            "no regression should be observed on a forward clock"
+        );
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir(path.parent().unwrap());
+    }
+
+    #[test]
+    fn clock_regression_counter_increments_on_backwards_clock() {
+        let (_listener, path) = bind_listener();
+        let mut agent = Varta::connect(&path).expect("connect");
+
+        // Jam the high-water mark past any plausible `start.elapsed()` so
+        // every subsequent beat trips the regression branch.
+        agent.last_timestamp = u64::MAX / 2;
+        let baseline_ts = agent.last_timestamp;
+
+        let _ = agent.beat(Status::Ok, 0);
+        assert_eq!(agent.clock_regressions(), 1);
+        // Wire timestamp must remain monotonic — `.max()` is unchanged.
+        assert_eq!(agent.last_timestamp, baseline_ts);
+
+        let _ = agent.beat(Status::Ok, 0);
+        assert_eq!(
+            agent.clock_regressions(),
+            2,
+            "counter must accumulate across consecutive regressions"
+        );
+        assert_eq!(agent.last_timestamp, baseline_ts);
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir(path.parent().unwrap());
     }
 }

@@ -157,8 +157,21 @@ impl Frame {
     }
 
     /// Decode a 32-byte buffer back into a [`Frame`], validating magic,
-    /// version, and status in that order. Returns [`DecodeError`] on the
-    /// first failed check; the integer fields are not interpreted further.
+    /// version, status, and field ranges in that order. Returns
+    /// [`DecodeError`] on the first failed check.
+    ///
+    /// Field-range rules enforced after the byte-level fields are read:
+    /// * `pid ∈ {0, 1}` is rejected — pid 0 is the kernel/scheduler and
+    ///   pid 1 is init/systemd; no legitimate agent runs at either, and
+    ///   accepting them lets a hostile sender spoof "init has stalled" to
+    ///   the recovery path.
+    /// * `timestamp == u64::MAX` is rejected — `varta_client::Varta::beat`
+    ///   saturates at this value with `.min(u64::MAX as u128) as u64`, and
+    ///   reaching it through real elapsed time (~584 years) is impossible.
+    ///   The sentinel is reserved.
+    /// * `nonce == NONCE_TERMINAL` is allowed only when paired with
+    ///   `Status::Critical`; the sentinel is the panic-hook's terminal
+    ///   marker and is never emitted on the regular beat path.
     pub fn decode(bytes: &[u8; 32]) -> Result<Frame, DecodeError> {
         let magic = [bytes[0], bytes[1]];
         if magic != MAGIC {
@@ -183,6 +196,16 @@ impl Frame {
         let payload = u64::from_le_bytes([
             bytes[24], bytes[25], bytes[26], bytes[27], bytes[28], bytes[29], bytes[30], bytes[31],
         ]);
+
+        if pid == 0 || pid == 1 {
+            return Err(DecodeError::BadPid(pid));
+        }
+        if timestamp == u64::MAX {
+            return Err(DecodeError::BadTimestamp(timestamp));
+        }
+        if nonce == NONCE_TERMINAL && status != Status::Critical {
+            return Err(DecodeError::BadNonce { nonce, status });
+        }
 
         Ok(Frame {
             magic,
@@ -213,6 +236,24 @@ pub enum DecodeError {
     /// Status byte did not match any known [`Status`] variant. The inner
     /// value is the offending byte, surfaced for observer-side diagnostics.
     BadStatus(u8),
+    /// Reserved pid: `0` (kernel/scheduler) or `1` (init/systemd). No
+    /// legitimate agent runs at either pid; rejecting closes the "spoof
+    /// init has stalled" recovery-trigger attack on UDP listeners.
+    BadPid(u32),
+    /// Reserved timestamp sentinel `u64::MAX` — the saturation value from
+    /// `varta_client::Varta::beat`'s `.min(u64::MAX as u128) as u64`.
+    /// Reaching it through real elapsed nanoseconds is not physically
+    /// possible.
+    BadTimestamp(u64),
+    /// Protocol invariant violation: `nonce == NONCE_TERMINAL` is reserved
+    /// for the panic hook's terminal frame and MUST be paired with
+    /// [`Status::Critical`]. Carries the violating `status` for diagnostics.
+    BadNonce {
+        /// The terminal-sentinel nonce value observed on the wire.
+        nonce: u64,
+        /// The status byte that was paired with the sentinel nonce.
+        status: Status,
+    },
 }
 
 impl core::fmt::Display for DecodeError {
@@ -222,6 +263,18 @@ impl core::fmt::Display for DecodeError {
             DecodeError::BadVersion => f.write_str("varta-vlp: bad version byte"),
             DecodeError::BadStatus(byte) => {
                 write!(f, "varta-vlp: bad status byte {byte:#04x}")
+            }
+            DecodeError::BadPid(pid) => {
+                write!(f, "varta-vlp: reserved pid {pid}")
+            }
+            DecodeError::BadTimestamp(ts) => {
+                write!(f, "varta-vlp: reserved timestamp sentinel {ts:#x}")
+            }
+            DecodeError::BadNonce { nonce, status } => {
+                write!(
+                    f,
+                    "varta-vlp: terminal nonce {nonce:#x} requires Status::Critical, got {status:?}"
+                )
             }
         }
     }

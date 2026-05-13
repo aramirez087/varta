@@ -370,13 +370,23 @@ fn status_label(s: Status) -> &'static str {
 /// Prometheus `kind` label values for `varta_decode_errors_total`. Indexed
 /// by [`decode_kind_index`]; the array doubles as the canonical ordering
 /// for the exposition output, so series remain stable across scrapes.
-const DECODE_KIND_LABELS: [&str; 3] = ["bad_magic", "bad_version", "bad_status"];
+const DECODE_KIND_LABELS: [&str; 6] = [
+    "bad_magic",
+    "bad_version",
+    "bad_status",
+    "bad_pid",
+    "bad_timestamp",
+    "bad_nonce",
+];
 
 fn decode_kind_index(err: &DecodeError) -> usize {
     match err {
         DecodeError::BadMagic => 0,
         DecodeError::BadVersion => 1,
         DecodeError::BadStatus(_) => 2,
+        DecodeError::BadPid(_) => 3,
+        DecodeError::BadTimestamp(_) => 4,
+        DecodeError::BadNonce { .. } => 5,
     }
 }
 

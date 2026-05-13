@@ -91,20 +91,76 @@ fn every_status_variant_round_trips() {
 
 #[test]
 fn payload_preserved_at_u64_max() {
+    // `timestamp == u64::MAX` is now a reserved sentinel rejected at decode
+    // (see `decode_rejects_timestamp_max`); pick the largest non-sentinel
+    // value to keep this test pinned to the "near-max round-trip" contract
+    // for the other fields.
     let frame = Frame::new(
         Status::Critical,
         u32::MAX,
-        u64::MAX,
+        u64::MAX - 1,
         NONCE_TERMINAL,
         u64::MAX,
     );
     let mut buf = [0u8; 32];
     frame.encode(&mut buf);
-    let decoded = Frame::decode(&buf).expect("u64::MAX frame must decode");
-    assert_eq!(decoded.timestamp, u64::MAX);
+    let decoded = Frame::decode(&buf).expect("u64::MAX-1 frame must decode");
+    assert_eq!(decoded.timestamp, u64::MAX - 1);
     assert_eq!(decoded.nonce, NONCE_TERMINAL);
     assert_eq!(decoded.payload, u64::MAX);
     assert_eq!(decoded.pid, u32::MAX);
+}
+
+#[test]
+fn decode_rejects_pid_zero() {
+    let mut buf = GOLDEN_BYTES;
+    buf[4..8].copy_from_slice(&0u32.to_le_bytes());
+    assert_eq!(Frame::decode(&buf), Err(DecodeError::BadPid(0)));
+}
+
+#[test]
+fn decode_rejects_pid_one() {
+    let mut buf = GOLDEN_BYTES;
+    buf[4..8].copy_from_slice(&1u32.to_le_bytes());
+    assert_eq!(Frame::decode(&buf), Err(DecodeError::BadPid(1)));
+}
+
+#[test]
+fn decode_rejects_timestamp_max() {
+    let mut buf = GOLDEN_BYTES;
+    buf[8..16].copy_from_slice(&u64::MAX.to_le_bytes());
+    assert_eq!(
+        Frame::decode(&buf),
+        Err(DecodeError::BadTimestamp(u64::MAX))
+    );
+}
+
+#[test]
+fn decode_rejects_terminal_nonce_with_non_critical_status() {
+    // GOLDEN_BYTES carries Status::Ok at offset 3; jamming NONCE_TERMINAL
+    // into the nonce slot must trip the protocol-invariant guard.
+    let mut buf = GOLDEN_BYTES;
+    buf[16..24].copy_from_slice(&NONCE_TERMINAL.to_le_bytes());
+    assert_eq!(
+        Frame::decode(&buf),
+        Err(DecodeError::BadNonce {
+            nonce: NONCE_TERMINAL,
+            status: Status::Ok,
+        })
+    );
+}
+
+#[test]
+fn decode_accepts_terminal_nonce_with_critical_status() {
+    // Guards the panic-hook contract: `panic.rs` always pairs
+    // NONCE_TERMINAL with Status::Critical, and that combination MUST
+    // continue to decode cleanly.
+    let frame = Frame::new(Status::Critical, 42, 1_000, NONCE_TERMINAL, 0);
+    let mut buf = [0u8; 32];
+    frame.encode(&mut buf);
+    let decoded = Frame::decode(&buf).expect("Critical + NONCE_TERMINAL must decode");
+    assert_eq!(decoded.status, Status::Critical);
+    assert_eq!(decoded.nonce, NONCE_TERMINAL);
 }
 
 #[test]
@@ -112,9 +168,22 @@ fn decode_error_implements_display_and_error() {
     let bad_magic = format!("{}", DecodeError::BadMagic);
     let bad_version = format!("{}", DecodeError::BadVersion);
     let bad_status = format!("{}", DecodeError::BadStatus(0x42));
+    let bad_pid = format!("{}", DecodeError::BadPid(1));
+    let bad_timestamp = format!("{}", DecodeError::BadTimestamp(u64::MAX));
+    let bad_nonce = format!(
+        "{}",
+        DecodeError::BadNonce {
+            nonce: NONCE_TERMINAL,
+            status: Status::Ok
+        }
+    );
     assert!(!bad_magic.is_empty());
     assert!(!bad_version.is_empty());
     assert!(bad_status.contains("0x42") || bad_status.contains("66"));
+    assert!(bad_pid.contains('1'));
+    assert!(bad_timestamp.contains("ffff") || bad_timestamp.contains("FFFF"));
+    assert!(bad_nonce.contains("Ok"));
 
     let _as_dyn: &dyn core::error::Error = &DecodeError::BadMagic;
+    let _as_dyn_pid: &dyn core::error::Error = &DecodeError::BadPid(0);
 }

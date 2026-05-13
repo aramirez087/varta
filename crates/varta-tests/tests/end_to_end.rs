@@ -59,7 +59,7 @@ fn main() -> ExitCode {
     }
 
     let mut failed = 0u32;
-    eprintln!("running 18 tests");
+    eprintln!("running 19 tests");
     failed += run_one(
         "client_to_observer_to_recovery_full_loop",
         client_to_observer_to_recovery_full_loop,
@@ -114,6 +114,10 @@ fn main() -> ExitCode {
         "iteration_budget_holds_under_slow_scrape_load",
         iteration_budget_holds_under_slow_scrape_load,
     );
+    failed += run_one(
+        "hostile_frame_rejected_at_decode_with_label_emit",
+        hostile_frame_rejected_at_decode_with_label_emit,
+    );
     #[cfg(feature = "udp")]
     {
         failed += run_one(
@@ -129,7 +133,7 @@ fn main() -> ExitCode {
         );
     }
 
-    let total = 18u32
+    let total = 19u32
         + if cfg!(feature = "udp") { 1 } else { 0 }
         + if cfg!(feature = "secure-udp") { 1 } else { 0 };
     let passed = total - failed;
@@ -1975,6 +1979,112 @@ fn iteration_budget_holds_under_slow_scrape_load() {
         le_inf, count,
         "+Inf bucket ({le_inf}) must equal count ({count}); body:\n{body}"
     );
+}
+
+/// `hostile_frame_rejected_at_decode_with_label_emit` (M1 contract).
+///
+/// Spawns the observer, hand-crafts a frame with the reserved `pid = 1`
+/// (init/systemd), and sends it over UDS. Asserts that:
+///   * `varta_decode_errors_total{kind="bad_pid"}` ticks up;
+///   * every new label (`bad_pid`, `bad_timestamp`, `bad_nonce`) is
+///     present in the exposition output even when only `bad_pid` fires
+///     — the stable-label-set contract (cerebrum 2026-05-11);
+///   * no per-pid beat counter is published for `pid=1` (the frame must
+///     never reach the tracker).
+fn hostile_frame_rejected_at_decode_with_label_emit() {
+    use std::os::unix::net::UnixDatagram;
+    use varta_vlp::{Frame, Status};
+
+    let tmp = TempDir::new("hostile-frame");
+    let socket = tmp.path().join("varta.sock");
+
+    let (mut child, prom_addr) = spawn_watch(&[
+        "--socket",
+        socket.to_str().unwrap(),
+        "--threshold-ms",
+        "500",
+        "--prom-addr",
+        "127.0.0.1:0",
+        "--shutdown-after-secs",
+        "10",
+    ]);
+    let _guard = ChildGuard(&mut child);
+
+    assert!(
+        wait_until(|| socket.exists(), Duration::from_secs(3)),
+        "varta-watch did not bind socket within 3s"
+    );
+    assert!(
+        wait_until(
+            || TcpStream::connect(prom_addr).is_ok(),
+            Duration::from_secs(3)
+        ),
+        "/metrics not reachable within 3s"
+    );
+
+    // Hand-craft a frame whose only protocol violation is the reserved
+    // pid=1. Status::Stall is the most dangerous combination — pre-2026-05
+    // it would have been accepted and could have triggered "init has
+    // stalled" recovery on systems where recovery is configured.
+    let hostile = Frame::new(Status::Stall, 1, 1_000, 7, 0);
+    let mut buf = [0u8; 32];
+    hostile.encode(&mut buf);
+
+    let client = UnixDatagram::unbound().expect("unbound");
+    client.connect(&socket).expect("connect");
+    client.send(&buf).expect("send hostile frame");
+
+    // The observer's poll loop reads, decodes, and either records or
+    // rejects on its next tick (~100ms). Poll the counter until it
+    // increments.
+    let bad_pid_count = wait_until_with_timeout(
+        || {
+            let (code, body) = http_get(prom_addr, "/metrics").ok()?;
+            if code != 200 {
+                return None;
+            }
+            let v = parse_metric_value(&body, "varta_decode_errors_total{kind=\"bad_pid\"}")?;
+            if v >= 1 {
+                Some((v, body))
+            } else {
+                None
+            }
+        },
+        Duration::from_secs(5),
+    )
+    .expect("bad_pid counter never observed within 5s");
+
+    let (count, body) = bad_pid_count;
+    assert!(
+        count >= 1,
+        "bad_pid decode-error counter must increment for pid=1"
+    );
+
+    // Stable-label-set contract: all six kinds must be emitted, including
+    // the three new ones, even when only one has fired.
+    for kind in [
+        "bad_magic",
+        "bad_version",
+        "bad_status",
+        "bad_pid",
+        "bad_timestamp",
+        "bad_nonce",
+    ] {
+        let needle = format!("varta_decode_errors_total{{kind=\"{kind}\"}} ");
+        assert!(
+            body.contains(&needle),
+            "missing decode-error label {kind} in /metrics body:\n{body}"
+        );
+    }
+
+    // Tracker invariant: a rejected frame must NEVER surface as a
+    // per-pid beat. Confirm the spoofed pid=1 has no beats_total series.
+    assert!(
+        !body.contains("varta_beats_total{pid=\"1\"}"),
+        "rejected frame leaked to tracker for pid=1; body:\n{body}"
+    );
+
+    eprintln!("hostile_frame_rejected_at_decode_with_label_emit: ok");
 }
 
 /// Parse `<name> <number>\n` out of a Prometheus exposition body.
