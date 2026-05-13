@@ -341,10 +341,42 @@ fn run(cfg: Config) -> std::io::Result<()> {
 
     #[cfg(feature = "udp-core")]
     if let Some(port) = cfg.udp_port {
-        let bind_addr = cfg
-            .udp_bind_addr
-            .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
+        // H4: secure-UDP defaults to loopback (127.0.0.1).  Replay protection
+        // tolerates ≤1024 source addresses; on any reachable network an
+        // attacker who can spoof UDP source ports rotates the eviction
+        // shadow and replays captured frames.  Operators who genuinely need
+        // a non-loopback secure-UDP bind must pass --udp-bind-addr explicitly
+        // AND --i-accept-secure-udp-non-loopback (enforced by Config).
+        // Plaintext UDP retains the historical 0.0.0.0 default — it is
+        // already gated by --i-accept-plaintext-udp.
+        #[cfg(feature = "secure-udp")]
+        let secure_keys_configured = cfg.secure_key_file.is_some()
+            || cfg.accepted_key_file.is_some()
+            || cfg.master_key_file.is_some();
+        #[cfg(not(feature = "secure-udp"))]
+        let secure_keys_configured = false;
+
+        let bind_addr = cfg.udp_bind_addr.unwrap_or(if secure_keys_configured {
+            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
+        } else {
+            std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)
+        });
         let addr = std::net::SocketAddr::new(bind_addr, port);
+
+        // High-visibility warning when the operator has opted out of the
+        // loopback default for secure UDP.  Mirrors the prom-addr non-
+        // loopback warning above.  Skipped for the default (loopback) and
+        // for plaintext UDP (warned elsewhere).
+        if secure_keys_configured && !bind_addr.is_loopback() {
+            varta_warn!(
+                "secure-UDP is bound to non-loopback {addr} \
+                 (--i-accept-secure-udp-non-loopback). The 1-deep replay shadow \
+                 after capacity-forced eviction is inadequate for any reachable \
+                 network; restrict reach via firewall / private VLAN. See \
+                 docs/architecture/vlp-transports.md for the threat-boundary \
+                 derivation."
+            );
+        }
 
         // Listener selection — strict priority:
         //   1. secure-udp feature + keys loaded → SecureUdpListener
@@ -418,9 +450,7 @@ fn run(cfg: Config) -> std::io::Result<()> {
                     varta_watch::TransportTrust::Untrusted
                 };
                 let udp = varta_watch::UdpListener::bind(addr)
-                    .map_err(|e| {
-                        std::io::Error::new(e.kind(), format!("UDP bind {}: {e}", addr))
-                    })?
+                    .map_err(|e| std::io::Error::new(e.kind(), format!("UDP bind {}: {e}", addr)))?
                     .with_recovery_trust(trust);
                 observer.add_listener(Box::new(udp));
                 varta_warn!(

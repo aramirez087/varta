@@ -16,12 +16,15 @@ your environment supports; each catches failure modes the others cannot.
 |---|:---:|:---:|:---:|:---:|
 | Poll loop hangs (stuck in I/O or computation) | ✓ | ✓* | ✗ | ✓ |
 | Process crash (SIGSEGV, stack overflow, OOM) | ✗ | ✓ | ✓† | ✓ |
+| Watchdog thread dies silently (panic, signal) | ✗ | ✓‡ | ✓† | ✓ |
 | Kernel hang / host deadlock | ✗ | ✗ | ✓ | ✗ |
 | Misconfiguration (wrong socket path, wrong user) | ✗ | ✗ | ✗ | ✓ |
 
 *systemd detects a hang only if `WATCHDOG=1` stops arriving; the self-watchdog
 ensures that also stops when the loop wedges.  
-†hardware watchdog fires when the kick loop stops; process crash achieves this.
+†hardware watchdog fires when the kick loop stops; process crash achieves this.  
+‡since H5 the watchdog thread is the *sole* source of `WATCHDOG=1`; if it
+dies, the emission stream stops and systemd's `WatchdogSec=` fires.
 
 ---
 
@@ -40,6 +43,22 @@ varta-watch --self-watchdog-secs 4 ...
   core dumps, and triggers `Restart=on-abort` in systemd units.
 - The deadline should be set to roughly 2× the expected worst-case poll
   latency (typically `--threshold-ms` + reaping time).
+- **H5 (post-2026-05-13):** the watchdog thread is ALSO the sole emitter of
+  systemd `WATCHDOG=1`.  Emission used to live on the main loop, which left
+  a silent-failure window: if the watchdog thread died while the main loop
+  remained healthy, `WATCHDOG=1` kept arriving from the main thread and
+  systemd had no way to notice the in-process abort path was already gone.
+  Now `WATCHDOG=1` emission is moved to the watchdog thread (via a
+  `dup(2)`-ed copy of the notify socket carved off `SdNotify` with
+  `take_watchdog_notifier`).  If the thread dies, the emission stream stops
+  and `WatchdogSec=` fires.  This is the only design where systemd can
+  detect a dead watchdog while the main loop is still alive.
+- **Auto-enable:** when `$WATCHDOG_USEC` is set by the service manager and
+  `--self-watchdog-secs` is *not* passed, the watchdog thread is spawned
+  unconditionally with a 4 s deadline.  Operators with tighter
+  `WatchdogSec=` values can override via the CLI.  This collapses the L1+L2
+  layers structurally: enabling `WatchdogSec=` in the unit automatically
+  buys both the in-process abort path and the WATCHDOG=1 emission stream.
 
 ---
 
@@ -147,9 +166,12 @@ labels:
 non-main thread** in the `varta-watch` binary, and that property is a
 **load-bearing architectural invariant**, not an accident.  All agent beat
 processing, stall detection, recovery spawning, and Prometheus serving happen
-on the main thread.  The watchdog thread only reads two atomics (`SHUTDOWN`
-and `LAST_TICK_NS`) and calls `process::abort()`; it never touches shared
-mutable state.
+on the main thread.  The watchdog thread reads two atomics (`SHUTDOWN`
+and `LAST_TICK_NS`), calls `process::abort()` on wedge, and writes
+`WATCHDOG=1` to its own `dup(2)`-ed `UnixDatagram` fd; it never touches
+shared mutable state.  The dup-ed fd is independent kernel state — both
+threads own their own descriptor and there is no synchronisation between
+them on the notify path.
 
 The single-threaded design is what lets the project preserve its zero-alloc,
 ABI-stable beat contract: a beat is decoded into a stack-allocated

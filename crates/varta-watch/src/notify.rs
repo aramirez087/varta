@@ -308,8 +308,7 @@ mod tests {
         // Build a socketpair: listener side stays here, sender side goes
         // into SdNotify.  No filesystem entry — keeps the test hermetic
         // across parallel runs (no umask interaction; cerebrum 2026-05-13).
-        let (listener, sender) =
-            UnixDatagram::pair().expect("socketpair for hermetic notify test");
+        let (listener, sender) = UnixDatagram::pair().expect("socketpair for hermetic notify test");
         listener
             .set_read_timeout(Some(Duration::from_millis(200)))
             .expect("set read timeout");
@@ -335,12 +334,16 @@ mod tests {
 
         // Tick on the watchdog notifier sends WATCHDOG=1 through the dup-ed fd.
         wdt.tick();
-        let nread = listener.recv(&mut buf).expect("recv WATCHDOG=1 from dup fd");
+        let nread = listener
+            .recv(&mut buf)
+            .expect("recv WATCHDOG=1 from dup fd");
         assert_eq!(&buf[..nread], b"WATCHDOG=1\n");
 
         // STOPPING=1 from the original SdNotify still works.
         n.stopping();
-        let nread = listener.recv(&mut buf).expect("recv STOPPING=1 from main fd");
+        let nread = listener
+            .recv(&mut buf)
+            .expect("recv STOPPING=1 from main fd");
         assert_eq!(&buf[..nread], b"STOPPING=1\n");
     }
 }

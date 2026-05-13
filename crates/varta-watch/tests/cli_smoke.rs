@@ -812,3 +812,139 @@ fn scopeguard(path: &std::path::Path) -> impl Drop + '_ {
     }
     Guard(path)
 }
+
+// ---------------------------------------------------------------------------
+// H4: secure-UDP defaults to loopback; non-loopback binds require explicit
+// --i-accept-secure-udp-non-loopback.  Without that flag, startup must hard-
+// error.  With the flag, startup must succeed AND emit a high-visibility
+// warning to stderr.
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "secure-udp")]
+#[cfg_attr(miri, ignore)] // JUSTIFY: miri cannot model process spawning (Command::new)
+#[test]
+fn cli_secure_udp_non_loopback_without_accept_flag_is_rejected() {
+    let socket = unique_uds_path("h4-noaccept");
+    let port = unused_udp_port().to_string();
+    let key = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
+    let key_path = write_secret_file("h4-noaccept", key, 0o600);
+    let _g = scopeguard(key_path.parent().unwrap());
+
+    let out = Command::new(env!("CARGO_BIN_EXE_varta-watch"))
+        .args([
+            "--socket",
+            socket.as_str(),
+            "--threshold-ms",
+            "100",
+            "--udp-bind-addr",
+            "0.0.0.0",
+            "--udp-port",
+            &port,
+            "--key-file",
+            key_path.to_str().expect("utf-8 key path"),
+            "--shutdown-after-secs",
+            "0",
+        ])
+        .output()
+        .expect("spawn varta-watch with secure UDP + 0.0.0.0");
+
+    assert!(
+        !out.status.success(),
+        "secure UDP on non-loopback without --i-accept-secure-udp-non-loopback must hard-error; \
+         got {:?} (stderr: {})",
+        out.status,
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("--i-accept-secure-udp-non-loopback"),
+        "error must name the accept flag, got: {stderr}"
+    );
+}
+
+#[cfg(feature = "secure-udp")]
+#[cfg_attr(miri, ignore)] // JUSTIFY: miri cannot model process spawning (Command::new)
+#[test]
+fn cli_secure_udp_non_loopback_with_accept_flag_starts_and_warns() {
+    let socket = unique_uds_path("h4-accept");
+    let port = unused_udp_port().to_string();
+    let key = "111213141516171819202122232425262728293031323334353637383940414243";
+    // 64 hex chars exactly; trim if longer.
+    let key = &key[..64];
+    let key_path = write_secret_file("h4-accept", key, 0o600);
+    let _g = scopeguard(key_path.parent().unwrap());
+
+    let out = Command::new(env!("CARGO_BIN_EXE_varta-watch"))
+        .args([
+            "--socket",
+            socket.as_str(),
+            "--threshold-ms",
+            "100",
+            "--udp-bind-addr",
+            "0.0.0.0",
+            "--udp-port",
+            &port,
+            "--key-file",
+            key_path.to_str().expect("utf-8 key path"),
+            "--i-accept-secure-udp-non-loopback",
+            "--shutdown-after-secs",
+            "0",
+        ])
+        .output()
+        .expect("spawn varta-watch with secure UDP + 0.0.0.0 + accept flag");
+
+    assert!(
+        out.status.success(),
+        "secure UDP on non-loopback with accept flag must start; got {:?} (stderr: {})",
+        out.status,
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("non-loopback"),
+        "high-visibility warning must mention 'non-loopback'; stderr was: {stderr}"
+    );
+}
+
+#[cfg(feature = "secure-udp")]
+#[cfg_attr(miri, ignore)] // JUSTIFY: miri cannot model process spawning (Command::new)
+#[test]
+fn cli_secure_udp_defaults_to_loopback_without_bind_addr() {
+    // When --udp-bind-addr is omitted entirely, secure-UDP must default to
+    // 127.0.0.1 without requiring the accept flag.  Startup must succeed
+    // and NOT emit the non-loopback warning.
+    let socket = unique_uds_path("h4-default");
+    let port = unused_udp_port().to_string();
+    let key = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef";
+    let key_path = write_secret_file("h4-default", key, 0o600);
+    let _g = scopeguard(key_path.parent().unwrap());
+
+    let out = Command::new(env!("CARGO_BIN_EXE_varta-watch"))
+        .args([
+            "--socket",
+            socket.as_str(),
+            "--threshold-ms",
+            "100",
+            "--udp-port",
+            &port,
+            "--key-file",
+            key_path.to_str().expect("utf-8 key path"),
+            "--shutdown-after-secs",
+            "0",
+        ])
+        .output()
+        .expect("spawn varta-watch with secure UDP + default bind");
+
+    assert!(
+        out.status.success(),
+        "secure UDP without --udp-bind-addr must default to loopback and start; \
+         got {:?} (stderr: {})",
+        out.status,
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains("non-loopback"),
+        "loopback default must not trigger the non-loopback warning; stderr was: {stderr}"
+    );
+}

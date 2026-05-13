@@ -44,7 +44,12 @@ pub struct AuthError;
 /// `(ciphertext, tag)` where `ciphertext` is 32 bytes and `tag` is 16 bytes.
 /// The transport layer joins these with the caller-provided nonce prefix
 /// for a total of 60 bytes (shared-key) or 64 bytes (master-key).
-pub fn seal(key: &[u8; 32], nonce: &[u8; 12], aad: &[u8], plaintext: &[u8; 32]) -> ([u8; 32], [u8; 16]) {
+pub fn seal(
+    key: &[u8; 32],
+    nonce: &[u8; 12],
+    aad: &[u8],
+    plaintext: &[u8; 32],
+) -> ([u8; 32], [u8; 16]) {
     let cipher = ChaCha20Poly1305::new(chacha20poly1305::Key::from_slice(key));
     let mut ct = *plaintext;
     let tag = match cipher.encrypt_in_place_detached(Nonce::from_slice(nonce), aad, &mut ct) {
@@ -280,10 +285,16 @@ mod tests {
 
         // Wrong AAD must fail.
         let wrong_aad: &[u8] = &[0xFF, 0xFF, 0xFF, 0xFF];
-        assert!(open(&key, &nonce, wrong_aad, &ct, &tag).is_err(), "wrong AAD must fail");
+        assert!(
+            open(&key, &nonce, wrong_aad, &ct, &tag).is_err(),
+            "wrong AAD must fail"
+        );
 
         // Missing AAD (b"") must fail.
-        assert!(open(&key, &nonce, b"", &ct, &tag).is_err(), "missing AAD must fail");
+        assert!(
+            open(&key, &nonce, b"", &ct, &tag).is_err(),
+            "missing AAD must fail"
+        );
     }
 
     #[test]

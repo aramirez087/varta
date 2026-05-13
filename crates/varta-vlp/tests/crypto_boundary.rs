@@ -76,11 +76,17 @@ fn aad_binding_rejects_wrong_aad_at_open() {
     for i in 0..aad.len() {
         let mut bad = aad.to_vec();
         bad[i] ^= 0xFF;
-        assert!(open(&k, &n, &bad, &ct, &tag).is_err(), "mutated AAD byte {i} must fail");
+        assert!(
+            open(&k, &n, &bad, &ct, &tag).is_err(),
+            "mutated AAD byte {i} must fail"
+        );
     }
 
     // Missing AAD must fail.
-    assert!(open(&k, &n, b"", &ct, &tag).is_err(), "empty AAD must fail for non-empty sealed");
+    assert!(
+        open(&k, &n, b"", &ct, &tag).is_err(),
+        "empty AAD must fail for non-empty sealed"
+    );
 }
 
 #[test]

@@ -182,7 +182,8 @@ impl BeatTransport for SecureUdpTransport {
             // authentication.
             let agent_pid = std::process::id();
             let agent_pid_bytes = agent_pid.to_le_bytes();
-            let (ciphertext, tag) = crypto::seal(self.key.as_bytes(), &nonce, &agent_pid_bytes, buf);
+            let (ciphertext, tag) =
+                crypto::seal(self.key.as_bytes(), &nonce, &agent_pid_bytes, buf);
 
             let mut frame = [0u8; SECURE_FRAME_MASTER_LEN];
             frame[0..4].copy_from_slice(&agent_pid_bytes);

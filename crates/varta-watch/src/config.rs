@@ -1258,8 +1258,9 @@ OPTIONAL:
                     udp_bind_addr.unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
                 let udp_addr = format!("{bind_ip}:{port}");
                 // Is a secure-UDP listener being configured (any key file)?
-                let secure_udp =
-                    secure_key_file.is_some() || accepted_key_file.is_some() || master_key_file.is_some();
+                let secure_udp = secure_key_file.is_some()
+                    || accepted_key_file.is_some()
+                    || master_key_file.is_some();
                 // Is a plaintext-UDP listener being configured (no keys, explicit opt-in)?
                 let plaintext_udp = i_accept_plaintext_udp && !secure_udp;
 
@@ -1268,6 +1269,28 @@ OPTIONAL:
                 }
                 if plaintext_udp && !i_accept_recovery_on_plaintext_udp {
                     return Err(ConfigError::RecoveryRequiresAuthenticatedTransport { udp_addr });
+                }
+            }
+        }
+
+        // H4 mitigation — a secure-UDP listener carries only a 1-deep replay
+        // shadow after capacity-forced eviction.  Acceptable for loopback
+        // (only same-host processes can spoof 127.0.0.0/8 source addresses)
+        // but inadequate for any reachable network.  Refuse non-loopback
+        // binds unless the operator explicitly accepts the risk.  Defers to
+        // the runtime layer for the implicit "no --udp-bind-addr +
+        // secure-UDP keys → loopback default" case (resolved in main.rs).
+        if let Some(port) = udp_port {
+            let secure_udp = secure_key_file.is_some()
+                || accepted_key_file.is_some()
+                || master_key_file.is_some();
+            if secure_udp {
+                if let Some(ip) = udp_bind_addr {
+                    if !ip.is_loopback() && !i_accept_secure_udp_non_loopback {
+                        return Err(ConfigError::SecureUdpRequiresLoopbackBind {
+                            udp_addr: format!("{ip}:{port}"),
+                        });
+                    }
                 }
             }
         }
@@ -1361,6 +1384,7 @@ OPTIONAL:
             i_accept_shell_risk,
             i_accept_recovery_on_secure_udp,
             i_accept_recovery_on_plaintext_udp,
+            i_accept_secure_udp_non_loopback,
             allow_cross_namespace_agents,
             strict_namespace_check,
             recovery_audit_file,
@@ -2587,6 +2611,175 @@ mod tests {
         assert!(!cfg.i_accept_recovery_on_secure_udp);
         assert!(!cfg.i_accept_recovery_on_plaintext_udp);
         assert!(cfg.udp_port.is_none());
+    }
+
+    // ----- H4: secure-UDP non-loopback bind requires explicit opt-in -----
+
+    #[test]
+    fn parses_i_accept_secure_udp_non_loopback_flag() {
+        let cfg = Config::from_args(args(&[
+            "--socket",
+            "/s",
+            "--threshold-ms",
+            "100",
+            "--i-accept-secure-udp-non-loopback",
+        ]))
+        .expect("parse");
+        assert!(cfg.i_accept_secure_udp_non_loopback);
+    }
+
+    #[test]
+    fn i_accept_secure_udp_non_loopback_defaults_to_false() {
+        let cfg =
+            Config::from_args(args(&["--socket", "/s", "--threshold-ms", "100"])).expect("parse");
+        assert!(!cfg.i_accept_secure_udp_non_loopback);
+    }
+
+    #[test]
+    fn secure_udp_non_loopback_without_accept_flag_is_rejected() {
+        // H4: any non-loopback --udp-bind-addr + secure-UDP keys must fail.
+        let err = Config::from_args(args(&[
+            "--socket",
+            "/s",
+            "--threshold-ms",
+            "100",
+            "--udp-port",
+            "9000",
+            "--udp-bind-addr",
+            "0.0.0.0",
+            "--key-file",
+            "/nonexistent-key",
+        ]))
+        .expect_err("must reject");
+        match err {
+            ConfigError::SecureUdpRequiresLoopbackBind { ref udp_addr } => {
+                assert!(udp_addr.contains("0.0.0.0:9000"), "udp_addr = {udp_addr}");
+            }
+            other => panic!("expected SecureUdpRequiresLoopbackBind, got {other:?}"),
+        }
+        let msg = err.to_string();
+        assert!(
+            msg.contains("--i-accept-secure-udp-non-loopback"),
+            "error must name the accept flag, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn secure_udp_non_loopback_ipv6_unspecified_is_rejected() {
+        // Defensive: ::0 (IPv6 wildcard) is not a loopback address.
+        let err = Config::from_args(args(&[
+            "--socket",
+            "/s",
+            "--threshold-ms",
+            "100",
+            "--udp-port",
+            "9000",
+            "--udp-bind-addr",
+            "::",
+            "--key-file",
+            "/nonexistent-key",
+        ]))
+        .expect_err("must reject ::");
+        assert!(matches!(
+            err,
+            ConfigError::SecureUdpRequiresLoopbackBind { .. }
+        ));
+    }
+
+    #[test]
+    fn secure_udp_loopback_bind_is_accepted_without_flag() {
+        // 127.0.0.1 (and any 127.0.0.0/8) is the safe default.
+        let cfg = Config::from_args(args(&[
+            "--socket",
+            "/s",
+            "--threshold-ms",
+            "100",
+            "--udp-port",
+            "9000",
+            "--udp-bind-addr",
+            "127.0.0.1",
+            "--key-file",
+            "/nonexistent-key",
+        ]))
+        .expect("loopback bind must parse cleanly");
+        assert_eq!(cfg.udp_port, Some(9000));
+        assert!(!cfg.i_accept_secure_udp_non_loopback);
+    }
+
+    #[test]
+    fn secure_udp_ipv6_loopback_is_accepted_without_flag() {
+        // ::1 is the IPv6 loopback equivalent of 127.0.0.1.
+        let cfg = Config::from_args(args(&[
+            "--socket",
+            "/s",
+            "--threshold-ms",
+            "100",
+            "--udp-port",
+            "9000",
+            "--udp-bind-addr",
+            "::1",
+            "--key-file",
+            "/nonexistent-key",
+        ]))
+        .expect("::1 bind must parse cleanly");
+        assert_eq!(cfg.udp_port, Some(9000));
+    }
+
+    #[test]
+    fn secure_udp_non_loopback_with_accept_flag_succeeds() {
+        let cfg = Config::from_args(args(&[
+            "--socket",
+            "/s",
+            "--threshold-ms",
+            "100",
+            "--udp-port",
+            "9000",
+            "--udp-bind-addr",
+            "0.0.0.0",
+            "--key-file",
+            "/nonexistent-key",
+            "--i-accept-secure-udp-non-loopback",
+        ]))
+        .expect("non-loopback with explicit opt-in must parse");
+        assert!(cfg.i_accept_secure_udp_non_loopback);
+        assert_eq!(cfg.udp_port, Some(9000));
+    }
+
+    #[test]
+    fn plaintext_udp_non_loopback_does_not_require_secure_udp_accept_flag() {
+        // The H4 gate is specific to secure UDP — plaintext is gated by
+        // --i-accept-plaintext-udp regardless of bind address.
+        let cfg = Config::from_args(args(&[
+            "--socket",
+            "/s",
+            "--threshold-ms",
+            "100",
+            "--udp-port",
+            "9000",
+            "--udp-bind-addr",
+            "0.0.0.0",
+            "--i-accept-plaintext-udp",
+        ]))
+        .expect("plaintext UDP non-loopback must parse without secure-UDP flag");
+        assert!(!cfg.i_accept_secure_udp_non_loopback);
+    }
+
+    #[test]
+    fn secure_udp_no_bind_addr_parses_cleanly() {
+        // When --udp-bind-addr is omitted, the Config layer leaves it as
+        // None — main.rs resolves the default (127.0.0.1 for secure UDP).
+        let cfg = Config::from_args(args(&[
+            "--socket",
+            "/s",
+            "--threshold-ms",
+            "100",
+            "--udp-port",
+            "9000",
+            "--key-file",
+            "/nonexistent-key",
+        ]))
+        .expect("absent bind addr must defer to runtime default");
+        assert!(cfg.udp_bind_addr.is_none());
     }
 
     #[test]

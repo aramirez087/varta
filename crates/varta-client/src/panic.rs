@@ -202,7 +202,9 @@ where
             nonce[..8].copy_from_slice(&iv_random);
             nonce[8..12].copy_from_slice(&iv_counter.to_le_bytes());
 
-            let (ciphertext, tag) = crypto::seal(key.as_bytes(), &nonce, &buf);
+            // Shared-key panic frame: AAD is empty (matches the
+            // SecureUdpListener shared-key parse at recv time).
+            let (ciphertext, tag) = crypto::seal(key.as_bytes(), &nonce, b"", &buf);
 
             let mut secure_frame = [0u8; crypto::SECURE_FRAME_BYTES];
             secure_frame[..8].copy_from_slice(&iv_random);

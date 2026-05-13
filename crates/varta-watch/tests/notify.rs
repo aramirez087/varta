@@ -157,6 +157,92 @@ fn sd_notify_emits_ready_watchdog_stopping_on_clean_exit() {
     );
 }
 
+/// H5: with `--self-watchdog-secs` explicitly set, the watchdog thread is
+/// solely responsible for emitting `WATCHDOG=1`.  Asserts that at least one
+/// arrives — proves the take/spawn handoff in `main.rs` wires the cloned
+/// socket into the thread.
+#[test]
+fn watchdog_thread_emits_watchdog_when_self_watchdog_secs_set() {
+    let dir = TmpDir::new("h5-explicit");
+    let notify_path = dir.path("notify.sock");
+    let agent_sock = dir.path("agents.sock");
+
+    let listener = UnixDatagram::bind(&notify_path).expect("bind notify listener");
+    listener
+        .set_read_timeout(Some(Duration::from_millis(50)))
+        .expect("set read timeout");
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_varta-watch"))
+        .args([
+            "--socket",
+            agent_sock.to_str().unwrap(),
+            "--threshold-ms",
+            "100",
+            "--self-watchdog-secs",
+            "4",
+            "--shutdown-after-secs",
+            "1",
+        ])
+        .env("NOTIFY_SOCKET", notify_path.to_str().unwrap())
+        // WATCHDOG_USEC=200000 → half-interval 100 ms; the watchdog thread
+        // sleeps min(half/2, 500ms).max(50ms) = 50 ms and emits every tick.
+        .env("WATCHDOG_USEC", "200000")
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn varta-watch");
+
+    let msgs = collect_messages(&listener, &mut child, Duration::from_secs(5));
+
+    assert!(
+        msgs.iter().any(|m| m == "WATCHDOG=1\n"),
+        "watchdog thread must emit WATCHDOG=1 when --self-watchdog-secs is set; got: {:?}",
+        msgs
+    );
+    // READY must precede; STOPPING must terminate.
+    assert_eq!(msgs.first().map(String::as_str), Some("READY=1\n"));
+    assert_eq!(msgs.last().map(String::as_str), Some("STOPPING=1\n"));
+}
+
+/// H5 auto-enable: when `$WATCHDOG_USEC` is present but `--self-watchdog-secs`
+/// is omitted, the watchdog thread must still be spawned (with the
+/// auto-derived 4 s deadline) and WATCHDOG=1 must still be emitted.
+#[test]
+fn watchdog_auto_enable_emits_watchdog_without_self_watchdog_flag() {
+    let dir = TmpDir::new("h5-auto");
+    let notify_path = dir.path("notify.sock");
+    let agent_sock = dir.path("agents.sock");
+
+    let listener = UnixDatagram::bind(&notify_path).expect("bind notify listener");
+    listener
+        .set_read_timeout(Some(Duration::from_millis(50)))
+        .expect("set read timeout");
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_varta-watch"))
+        .args([
+            "--socket",
+            agent_sock.to_str().unwrap(),
+            "--threshold-ms",
+            "100",
+            // Deliberately NO --self-watchdog-secs.  WATCHDOG_USEC alone must
+            // be enough to trigger auto-enable.
+            "--shutdown-after-secs",
+            "1",
+        ])
+        .env("NOTIFY_SOCKET", notify_path.to_str().unwrap())
+        .env("WATCHDOG_USEC", "200000")
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn varta-watch (auto-enable)");
+
+    let msgs = collect_messages(&listener, &mut child, Duration::from_secs(5));
+
+    assert!(
+        msgs.iter().any(|m| m == "WATCHDOG=1\n"),
+        "auto-enabled watchdog must emit WATCHDOG=1; got: {:?}",
+        msgs
+    );
+}
+
 /// `varta-watch` must start and exit cleanly even when `$NOTIFY_SOCKET` is
 /// unset — sd_notify failures are non-fatal.
 #[test]
