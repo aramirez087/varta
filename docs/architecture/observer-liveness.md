@@ -144,11 +144,100 @@ labels:
 ## Threading note
 
 `--self-watchdog-secs` spawns one background thread.  This is the **only
-non-main thread** in the `varta-watch` binary.  All agent beat processing,
-stall detection, recovery spawning, and Prometheus serving happen on the main
-thread.  The watchdog thread only reads two atomics (`SHUTDOWN` and
-`LAST_TICK_NS`) and calls `process::abort()`; it never touches shared mutable
-state.
+non-main thread** in the `varta-watch` binary, and that property is a
+**load-bearing architectural invariant**, not an accident.  All agent beat
+processing, stall detection, recovery spawning, and Prometheus serving happen
+on the main thread.  The watchdog thread only reads two atomics (`SHUTDOWN`
+and `LAST_TICK_NS`) and calls `process::abort()`; it never touches shared
+mutable state.
+
+The single-threaded design is what lets the project preserve its zero-alloc,
+ABI-stable beat contract: a beat is decoded into a stack-allocated
+`[u8; 32]` and dispatched through the per-pid tracker without locking,
+because nothing else holds a reference.  Moving any phase of the loop to a
+second thread would require a lock-free SPSC ring between threads at the
+ingress and break that contract.  Stall-detection latency under scrape load
+is instead bounded by an explicit per-iteration latency budget — see below.
+
+---
+
+## Latency budget — worst-case poll iteration time
+
+A bounded iteration time guarantees a bounded stall-detection latency.  The
+table below names the phases of the poll loop in `main.rs` and the
+upper-bound source for each:
+
+| Phase                                  | Worst case        | Source / constant                                                                                                 |
+|---|---|---|
+| 1. Drain queued stall events           | O(queue)·~1 µs    | `Observer::poll_pending` — one stack pop per call                                                                 |
+| 2. `Observer::poll()` (one recv each)  | ≤ `read_timeout`·*N* | UDS `recv(2)` blocks up to `--read-timeout-ms` (default 100 ms) per listener; UDP listeners are non-blocking      |
+| 3. Maintenance counter drains          | <1 ms             | Constant work over `observer.drain_*` counters                                                                    |
+| 3. `Recovery::try_reap`                | ~64 µs            | ≤64 `waitpid(2, WNOHANG)` syscalls (bounded outstanding-pids fan)                                                 |
+| 3. `PromExporter::serve_pending`       | ≤200 ms           | 100 ms serve deadline + 100 ms drain deadline (see `exporter.rs`)                                                 |
+| 4. Heartbeat-file atomic write         | <5 ms             | Same-dir write + rename (`write_heartbeat_atomic`)                                                                |
+| 4. `sd_notify` + HW watchdog kicks     | <1 ms             | One `sendmsg(2)` + one `write(2)`                                                                                 |
+| **Iteration total (worst case)**       | **~310 ms**       | UDS read_timeout (100 ms) + serve_pending (≤200 ms) + small fixed work — assuming a single UDS listener           |
+
+Two observations the table makes explicit:
+
+- The UDS read-timeout is the **idle floor**: with no incoming beats and no
+  scrape pressure, every iteration costs about `read_timeout`.  This is
+  intentional — it yields CPU between recvs without busy-spinning.  Lower
+  the floor by lowering `--read-timeout-ms`, at the cost of a tighter idle
+  poll loop.
+- The worst-case **active** iteration is bounded by `read_timeout +
+  serve_pending`, since `recv(2)` returns early as soon as a frame arrives
+  and `serve_pending` is the only other phase that can spend more than a
+  few milliseconds.
+
+The default soft budget is **250 ms** (`--iteration-budget-ms`).  Iterations
+exceeding it increment `varta_observer_iteration_budget_exceeded_total` and
+are visible in the `varta_observer_iteration_seconds` histogram.  The budget
+is advisory: hard wedges (seconds, never returning) remain the responsibility
+of `--self-watchdog-secs`.
+
+The idle sleep at the end of an iteration with no pending I/O (10 ms) is
+**excluded** from the histogram.  Idle time is a throttling primitive, not
+work latency; including it would mask the bad iterations.
+
+### Tuning relationship
+
+For a given `--threshold-ms T`, stall-detection latency is bounded by
+`T + per_iteration_worst_case`.  With defaults
+(`--threshold-ms 5000`, `--read-timeout-ms 100`, default serve_pending bounds)
+the worst case is ~310 ms, so a stalled agent surfaces no later than
+~5.31 s after its last beat.
+
+The soft `--iteration-budget-ms` (default 250 ms) sits between the typical
+case (~100 ms idle floor) and the worst case (~310 ms under scrape storm)
+so the budget-exceeded counter fires only during real scrape pressure, not
+on every active iteration.  Operators with higher `--read-timeout-ms` or
+multiple listeners should raise the budget proportionally
+(`budget ≥ read_timeout × N_listeners + 150 ms`).
+
+`--self-watchdog-secs` should be set such that
+`self_watchdog_secs × 1000 ≥ 4 × iteration_budget_ms` so transient overruns
+during scrape bursts do not trigger false-positive aborts.  The default
+guidance (`--self-watchdog-secs 4` with `--iteration-budget-ms 250`) gives a
+16× margin (4000 ms ÷ 250 ms), well above the worst-case ratio.
+
+### Recommended Prometheus alerts
+
+```promql
+# Warn — more than 10% of recent iterations exceeded the soft budget.
+alert: VartaIterationBudgetOverruns
+expr: rate(varta_observer_iteration_budget_exceeded_total[5m])
+    / rate(varta_observer_iteration_seconds_count[5m]) > 0.10
+for: 5m
+labels: { severity: warning }
+
+# Crit — 99th-percentile iteration time has exceeded 500 ms (twice the budget).
+alert: VartaIterationP99High
+expr: histogram_quantile(0.99,
+        sum by (le) (rate(varta_observer_iteration_seconds_bucket[5m]))) > 0.5
+for: 5m
+labels: { severity: critical }
+```
 
 ---
 

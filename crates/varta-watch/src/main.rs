@@ -565,7 +565,8 @@ fn run(cfg: Config) -> std::io::Result<()> {
                 token,
                 cfg.prom_rate_limit_per_sec,
                 cfg.prom_rate_limit_burst,
-            )?;
+            )?
+            .with_iteration_budget(cfg.iteration_budget);
             if let Ok(bound_addr) = pe.local_addr() {
                 let line = format!("{bound_addr}\n");
                 let _ = std::io::stdout().lock().write_all(line.as_bytes());
@@ -631,6 +632,15 @@ fn run(cfg: Config) -> std::io::Result<()> {
                 break;
             }
         }
+
+        // H5: timestamp the start of the work portion of this iteration so
+        // we can record per-iteration wall time. Captures everything except
+        // the optional idle sleep (step 4) and the test-hooks wedge — those
+        // are throttling primitives / fault injection, not real work, and
+        // including them would pollute the histogram. The heartbeat write,
+        // sd_notify, and HW watchdog kick ARE included because a slow disk
+        // or wedged sd_notify socket would be a real budget event.
+        let iter_start = Instant::now();
 
         // ------ 1. Drain queued stall events before I/O or maintenance ------
         // Surface every pending stall immediately; this prevents a batch of
@@ -815,16 +825,10 @@ fn run(cfg: Config) -> std::io::Result<()> {
             pe.record_loop_tick();
         }
 
-        // ----- 4. Throttle: sleep only when truly idle ------
-        // Avoid busy-waiting when there are no I/O events and no queued
-        // stalls.  If poll() populated new stalls via drain_stalls() the
-        // check below catches them and the next iteration drains them
-        // without a sleep penalty.
-        if !had_io && !observer.has_pending_stalls() {
-            std::thread::sleep(Duration::from_millis(10));
-        }
-
-        // ----- 5. Heartbeat file, self-watchdog tick, and HW watchdog kick ------
+        // ----- 4. Heartbeat file, self-watchdog tick, and HW watchdog kick ------
+        // These run before the iteration histogram capture so a slow disk
+        // (atomic heartbeat write) or a wedged sd_notify socket counts as
+        // a real budget event.
         loop_count = loop_count.wrapping_add(1);
         if let Some(ref hb_path) = cfg.heartbeat_file {
             let ts = observer.now_ns();
@@ -841,6 +845,25 @@ fn run(cfg: Config) -> std::io::Result<()> {
         sd_notify.watchdog_tick();
         if let Some(ref mut hw) = hw_wdt {
             hw.kick();
+        }
+
+        // ----- 5. Record per-iteration wall time ------
+        // H5: capture the duration of the work portion of this iteration
+        // (everything from `iter_start` at the top of the loop body through
+        // the watchdog kicks).  Excludes the idle sleep below and the
+        // test-hooks wedge — those are throttling / fault injection, not
+        // real work.  See `docs/architecture/observer-liveness.md`.
+        if let Some(pe) = prom_export.as_mut() {
+            pe.record_iteration_duration(iter_start.elapsed());
+        }
+
+        // ----- 6. Throttle: sleep only when truly idle ------
+        // Avoid busy-waiting when there are no I/O events and no queued
+        // stalls.  If poll() populated new stalls via drain_stalls() the
+        // check below catches them and the next iteration drains them
+        // without a sleep penalty.
+        if !had_io && !observer.has_pending_stalls() {
+            std::thread::sleep(Duration::from_millis(10));
         }
 
         // [test-hooks] One-shot artificial stall of the poll loop.  Fires on

@@ -414,6 +414,29 @@ const PROM_MAX_CONNECTIONS_PER_SERVE: usize = 8;
 /// connection flood. A hostile client opening thousands of connections
 /// would otherwise fill the backlog and starve legitimate scrapers.
 const PROM_MAX_DRAIN_PER_SERVE: usize = 50;
+
+// --- iteration budget histogram (H5) -----------------------------------
+//
+// Per-iteration wall-time visibility primitive. The observer poll loop is
+// single-threaded by design: beat ingestion, stall detection, recovery
+// reaping, and Prometheus serving all share one thread. The aggregate
+// per-iteration budget is what bounds stall-detection latency under load
+// — see `docs/architecture/observer-liveness.md` for the formal derivation.
+
+/// Cumulative Prometheus histogram cutoffs for observer iteration wall
+/// time (seconds). The implicit `+Inf` bucket is rendered last so the
+/// total bucket count is `ITERATION_BUCKET_BOUNDS_S.len() + 1`. The 0.25
+/// cutoff is aligned to the default `--iteration-budget-ms` so
+/// `le="0.25"` directly answers "what fraction of iterations were over
+/// budget?".
+const ITERATION_BUCKET_BOUNDS_S: [f64; 8] =
+    [0.001, 0.005, 0.010, 0.050, 0.100, 0.250, 0.500, 1.000];
+
+/// Default soft budget for a single observer poll iteration. Overruns
+/// increment `varta_observer_iteration_budget_exceeded_total`; the budget
+/// is advisory — hard wedges remain the responsibility of
+/// `--self-watchdog-secs` (see `docs/architecture/observer-liveness.md`).
+pub const DEFAULT_ITERATION_BUDGET: Duration = Duration::from_millis(250);
 /// Cap on how many bytes [`PromExporter::serve_pending`] reads from a
 /// single request before responding (we discard the request line/headers).
 const PROM_REQUEST_CAP: usize = 4096;
@@ -598,6 +621,29 @@ pub struct PromExporter {
     /// on this to detect when the exporter cannot serve all incoming scrapes
     /// within a single poll tick.
     scrape_budget_exhausted_total: u64,
+    /// Per-bucket count of observer poll iterations, indexed by the matching
+    /// entry in [`ITERATION_BUCKET_BOUNDS_S`] (with the final slot reserved
+    /// for the implicit `+Inf` bucket). Not cumulative: each observation
+    /// increments exactly one slot. The exposition layer walks the array
+    /// with a running total to emit a Prometheus-compliant cumulative
+    /// histogram.
+    iteration_buckets: [u64; ITERATION_BUCKET_BOUNDS_S.len() + 1],
+    /// Sum of observed iteration durations in nanoseconds. Exposed as
+    /// `varta_observer_iteration_seconds_sum` after conversion to seconds.
+    iteration_duration_ns_sum: u64,
+    /// Total number of iterations contributing to the histogram. Exposed
+    /// as `varta_observer_iteration_seconds_count`.
+    iteration_count_total: u64,
+    /// Times an iteration exceeded [`Self::iteration_budget`]. Exposed as
+    /// `varta_observer_iteration_budget_exceeded_total`. Advisory only —
+    /// the daemon never aborts on a soft-budget overrun.
+    iteration_budget_exceeded_total: u64,
+    /// Soft per-iteration budget for the observer poll loop. Configurable
+    /// via `--iteration-budget-ms`; defaults to
+    /// [`DEFAULT_ITERATION_BUDGET`]. See
+    /// `docs/architecture/observer-liveness.md` for the worst-case
+    /// derivation that justifies the default.
+    iteration_budget: Duration,
     /// Per-source-IP token bucket state.  Bounded by
     /// [`MAX_PROM_IP_STATES`]; entries older than [`PROM_IP_STATE_TTL`] are
     /// evicted lazily when the table reaches capacity.
@@ -685,6 +731,11 @@ impl PromExporter {
             recovery_duration_count_total: 0,
             scrape_skipped_total: 0,
             scrape_budget_exhausted_total: 0,
+            iteration_buckets: [0; ITERATION_BUCKET_BOUNDS_S.len() + 1],
+            iteration_duration_ns_sum: 0,
+            iteration_count_total: 0,
+            iteration_budget_exceeded_total: 0,
+            iteration_budget: DEFAULT_ITERATION_BUDGET,
             ip_state: HashMap::new(),
             rate_per_sec,
             rate_burst,
@@ -879,6 +930,42 @@ impl PromExporter {
     /// `varta_watch_last_poll_loop_timestamp_seconds` stays fresh.
     pub fn record_loop_tick(&mut self) {
         self.last_loop_system = SystemTime::now();
+    }
+
+    /// Override the soft per-iteration budget. Builder-style: returns
+    /// `self` so the binary can chain `.bind(...).with_iteration_budget(...)`.
+    pub fn with_iteration_budget(mut self, budget: Duration) -> Self {
+        self.iteration_budget = budget;
+        self
+    }
+
+    /// Record the wall-clock duration of one observer poll iteration.
+    /// Updates the `varta_observer_iteration_seconds` histogram, the
+    /// `_sum` / `_count` companions, and increments
+    /// `varta_observer_iteration_budget_exceeded_total` when `d` exceeds
+    /// [`Self::iteration_budget`]. Buckets are stored non-cumulatively
+    /// here and summed at exposition time.
+    pub fn record_iteration_duration(&mut self, d: Duration) {
+        let secs = d.as_secs_f64();
+        let ns = u64::try_from(d.as_nanos()).unwrap_or(u64::MAX);
+        self.iteration_duration_ns_sum = self.iteration_duration_ns_sum.saturating_add(ns);
+        self.iteration_count_total = self.iteration_count_total.saturating_add(1);
+        let mut placed = false;
+        for (i, &bound) in ITERATION_BUCKET_BOUNDS_S.iter().enumerate() {
+            if secs <= bound {
+                self.iteration_buckets[i] = self.iteration_buckets[i].saturating_add(1);
+                placed = true;
+                break;
+            }
+        }
+        if !placed {
+            let inf_idx = ITERATION_BUCKET_BOUNDS_S.len();
+            self.iteration_buckets[inf_idx] = self.iteration_buckets[inf_idx].saturating_add(1);
+        }
+        if d > self.iteration_budget {
+            self.iteration_budget_exceeded_total =
+                self.iteration_budget_exceeded_total.saturating_add(1);
+        }
     }
 
     /// Record one or more `MSG_CTRUNC` ancillary-data truncation events.
@@ -1291,6 +1378,51 @@ impl PromExporter {
             self.body_buf,
             "varta_scrape_budget_exhausted_total {}",
             self.scrape_budget_exhausted_total
+        );
+        // Observer poll-loop iteration histogram.  Emitted as a Prometheus
+        // histogram (cumulative `_bucket{le=...}` series plus `_sum` and
+        // `_count`).  Every bucket boundary — including `+Inf` — is rendered
+        // on every scrape, even before the first observation, so `absent()`
+        // alert rules and `histogram_quantile()` queries stay green from the
+        // first scrape (same contract as `varta_decode_errors_total`).
+        self.body_buf.push_str(
+            "# HELP varta_observer_iteration_seconds Observer poll-loop iteration wall time (excludes idle sleep and test-hooks wedge).\n",
+        );
+        self.body_buf
+            .push_str("# TYPE varta_observer_iteration_seconds histogram\n");
+        let mut cum: u64 = 0;
+        for (idx, bound) in ITERATION_BUCKET_BOUNDS_S.iter().enumerate() {
+            cum = cum.saturating_add(self.iteration_buckets[idx]);
+            let _ = writeln!(
+                self.body_buf,
+                "varta_observer_iteration_seconds_bucket{{le=\"{bound}\"}} {cum}",
+            );
+        }
+        let inf_idx = ITERATION_BUCKET_BOUNDS_S.len();
+        cum = cum.saturating_add(self.iteration_buckets[inf_idx]);
+        let _ = writeln!(
+            self.body_buf,
+            "varta_observer_iteration_seconds_bucket{{le=\"+Inf\"}} {cum}"
+        );
+        let sum_s = (self.iteration_duration_ns_sum as f64) / 1e9;
+        let _ = writeln!(
+            self.body_buf,
+            "varta_observer_iteration_seconds_sum {sum_s:.9}"
+        );
+        let _ = writeln!(
+            self.body_buf,
+            "varta_observer_iteration_seconds_count {}",
+            self.iteration_count_total
+        );
+        self.body_buf.push_str(
+            "# HELP varta_observer_iteration_budget_exceeded_total Observer poll iterations that exceeded the soft --iteration-budget-ms.\n",
+        );
+        self.body_buf
+            .push_str("# TYPE varta_observer_iteration_budget_exceeded_total counter\n");
+        let _ = writeln!(
+            self.body_buf,
+            "varta_observer_iteration_budget_exceeded_total {}",
+            self.iteration_budget_exceeded_total
         );
         // Authentication failures on /metrics — emit unconditionally
         // (even at zero) so `absent()` alert rules stay green-on-green

@@ -64,6 +64,17 @@ pub const DEFAULT_RECOVERY_CAPTURE_BYTES: u32 = 4096;
 /// non-blocking pipe drain expensive per tick.
 pub const MAX_RECOVERY_CAPTURE_BYTES: u32 = 1024 * 1024;
 
+/// Minimum accepted value for `--iteration-budget-ms`.  Below this the
+/// budget overlaps the noise floor of the work itself — `serve_pending`
+/// alone can spend up to ~200 ms by design — and every iteration would be
+/// flagged as an overrun, making the metric useless.
+pub const MIN_ITERATION_BUDGET_MS: u64 = 50;
+
+/// Maximum accepted value for `--iteration-budget-ms`.  Above this the
+/// soft budget can no longer fire before `--self-watchdog-secs` would
+/// abort the daemon, so the metric ceases to be a useful early signal.
+pub const MAX_ITERATION_BUDGET_MS: u64 = 60_000;
+
 /// Parsed daemon configuration.
 #[derive(Clone, Debug)]
 pub struct Config {
@@ -220,6 +231,14 @@ pub struct Config {
     /// [`DEFAULT_RECOVERY_CAPTURE_BYTES`]. Values larger than
     /// [`MAX_RECOVERY_CAPTURE_BYTES`] are rejected at parse time.
     pub recovery_capture_bytes: u32,
+    /// Soft per-iteration budget for the observer poll loop.  Iterations
+    /// exceeding this increment
+    /// `varta_observer_iteration_budget_exceeded_total` and are visible in
+    /// the `varta_observer_iteration_seconds` histogram.  Advisory only —
+    /// hard wedges are caught by `--self-watchdog-secs`.  Set by
+    /// `--iteration-budget-ms`; defaults to
+    /// [`crate::exporter::DEFAULT_ITERATION_BUDGET`].
+    pub iteration_budget: Duration,
     /// [test-hooks only] Sleep for this many milliseconds on the first poll
     /// iteration, simulating a wedged loop.  Used by the self-watchdog
     /// integration test (`tests/self_watchdog.rs`) to exercise the abort path
@@ -324,6 +343,16 @@ pub enum ConfigError {
         /// The `IP:PORT` of the UDP listener that would have been bound.
         udp_addr: String,
     },
+    /// `--iteration-budget-ms` was outside the accepted range
+    /// (`[MIN_ITERATION_BUDGET_MS, MAX_ITERATION_BUDGET_MS]`).
+    IterationBudgetOutOfRange {
+        /// The value provided.
+        value: u64,
+        /// The minimum allowed value.
+        min: u64,
+        /// The maximum allowed value.
+        max: u64,
+    },
 }
 
 impl core::fmt::Display for ConfigError {
@@ -392,6 +421,10 @@ impl core::fmt::Display for ConfigError {
                  Either remove the recovery command, switch to a UDS-only deployment, or \
                  pass --i-accept-recovery-on-unauthenticated-transport to explicitly accept \
                  this risk."
+            ),
+            ConfigError::IterationBudgetOutOfRange { value, min, max } => write!(
+                f,
+                "--iteration-budget-ms: {value} is outside the accepted range [{min}, {max}] ms"
             ),
         }
     }
@@ -595,6 +628,18 @@ OPTIONAL:
     --recovery-capture-bytes <N>   Total combined byte cap (stdout +
                                      stderr) per child when capture is
                                      enabled. Default 4096; max 1048576.
+    --iteration-budget-ms <MS>     Soft per-iteration budget for the
+                                     observer poll loop. Iterations that
+                                     exceed this increment
+                                     varta_observer_iteration_budget_exceeded_total
+                                     and are visible in the
+                                     varta_observer_iteration_seconds
+                                     histogram. Advisory only — hard
+                                     wedges are caught by
+                                     --self-watchdog-secs.  Default 250.
+                                     Range [50, 60000].  See
+                                     docs/architecture/observer-liveness.md
+                                     for the worst-case derivation.
 
     -h, --help                     Print this message and exit.
 ";
@@ -638,6 +683,7 @@ OPTIONAL:
         let mut recovery_audit_max_bytes: Option<u64> = None;
         let mut recovery_capture_stdio = false;
         let mut recovery_capture_bytes: Option<u32> = None;
+        let mut iteration_budget_ms: Option<u64> = None;
         #[cfg(feature = "test-hooks")]
         let mut inject_wedge_ms: Option<u64> = None;
 
@@ -913,6 +959,12 @@ OPTIONAL:
                             raw: v,
                         })?);
                 }
+                "--iteration-budget-ms" => {
+                    let v = iter
+                        .next()
+                        .ok_or(ConfigError::MissingValue("--iteration-budget-ms"))?;
+                    iteration_budget_ms = Some(parse_u64("--iteration-budget-ms", &v)?);
+                }
                 other => return Err(ConfigError::UnknownFlag(other.to_string())),
             }
         }
@@ -997,6 +1049,25 @@ OPTIONAL:
             }
         }
 
+        // --iteration-budget-ms resolution and bounds check.  The default
+        // lives in the exporter so that production builds without metrics
+        // still link the constant for tests.  Bounds reject the noise-floor
+        // case (every iteration overruns) and the never-fires case (budget
+        // overlaps --self-watchdog-secs).
+        let iteration_budget = match iteration_budget_ms {
+            Some(ms) => {
+                if !(MIN_ITERATION_BUDGET_MS..=MAX_ITERATION_BUDGET_MS).contains(&ms) {
+                    return Err(ConfigError::IterationBudgetOutOfRange {
+                        value: ms,
+                        min: MIN_ITERATION_BUDGET_MS,
+                        max: MAX_ITERATION_BUDGET_MS,
+                    });
+                }
+                Duration::from_millis(ms)
+            }
+            None => crate::exporter::DEFAULT_ITERATION_BUDGET,
+        };
+
         Ok(Config {
             socket,
             threshold: Duration::from_millis(threshold_ms),
@@ -1036,6 +1107,7 @@ OPTIONAL:
             recovery_audit_max_bytes,
             recovery_capture_stdio,
             recovery_capture_bytes: recovery_capture_bytes_resolved,
+            iteration_budget,
             #[cfg(feature = "test-hooks")]
             inject_wedge_ms,
         })

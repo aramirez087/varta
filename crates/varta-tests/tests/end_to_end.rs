@@ -59,7 +59,7 @@ fn main() -> ExitCode {
     }
 
     let mut failed = 0u32;
-    eprintln!("running 17 tests");
+    eprintln!("running 18 tests");
     failed += run_one(
         "client_to_observer_to_recovery_full_loop",
         client_to_observer_to_recovery_full_loop,
@@ -110,6 +110,10 @@ fn main() -> ExitCode {
         "status_degraded_visible_in_metrics",
         status_degraded_visible_in_metrics,
     );
+    failed += run_one(
+        "iteration_budget_holds_under_slow_scrape_load",
+        iteration_budget_holds_under_slow_scrape_load,
+    );
     #[cfg(feature = "udp")]
     {
         failed += run_one(
@@ -125,7 +129,7 @@ fn main() -> ExitCode {
         );
     }
 
-    let total = 17u32
+    let total = 18u32
         + if cfg!(feature = "udp") { 1 } else { 0 }
         + if cfg!(feature = "secure-udp") { 1 } else { 0 };
     let passed = total - failed;
@@ -1797,6 +1801,198 @@ fn run_degraded_child(socket_path: &str) {
         }
     }
     std::thread::sleep(Duration::from_millis(100));
+}
+
+/// `iteration_budget_holds_under_slow_scrape_load` — H5 contract.
+///
+/// Spawn `varta-watch` with a 100 ms soft iteration budget, run one agent
+/// for ~3 s while a pool of 8 deliberately-slow `/metrics` scrapers hammer
+/// the exporter (partial GET, then sleep, then close — hits the per-conn
+/// 10 ms read-deadline path).  After the agent stops we let the threshold
+/// expire so a stall surfaces, then scrape `/metrics` once normally and
+/// assert:
+///
+/// - `varta_stalls_total{pid=<agent>}` ≥ 1 (stall detection NOT starved).
+/// - 99% of recorded iterations fit in the `le="0.5"` bucket
+///   (worst-case-iteration upper bound from observer-liveness.md holds
+///   even under adversarial scrape load).
+/// - `varta_observer_iteration_seconds_count` is greater than zero (the
+///   histogram is being recorded at all).
+///
+/// The point of the test is to pin the contract H5 names: under a storm
+/// of slow scrapers, the documented per-iteration upper bound holds and
+/// stall detection continues to fire.
+fn iteration_budget_holds_under_slow_scrape_load() {
+    let tmp = TempDir::new("iter-budget");
+    let socket = tmp.path().join("varta.sock");
+
+    let (mut child, prom_addr) = spawn_watch(&[
+        "--socket",
+        socket.to_str().unwrap(),
+        "--threshold-ms",
+        "500",
+        "--iteration-budget-ms",
+        "100",
+        // Disable per-IP rate limiting so the slow-scraper pool actually
+        // reaches `serve_one`. The default rate limit (5/s, burst 10) would
+        // drop most of the 8 concurrent scrapers at the IP layer and the
+        // test would only exercise the cheap drain path. burst=0 is the
+        // documented "no limit" escape hatch (see exporter.rs:705).
+        "--prom-rate-limit-burst",
+        "0",
+        "--prom-addr",
+        "127.0.0.1:0",
+        "--shutdown-after-secs",
+        "20",
+    ]);
+    let _guard = ChildGuard(&mut child);
+
+    assert!(
+        wait_until(|| socket.exists(), Duration::from_secs(3)),
+        "varta-watch did not bind socket within 3s"
+    );
+    assert!(
+        wait_until(
+            || TcpStream::connect(prom_addr).is_ok(),
+            Duration::from_secs(3)
+        ),
+        "/metrics not reachable within 3s"
+    );
+
+    // Spawn 8 slow scraper threads.  Each opens a TCP connection, writes a
+    // valid auth header but stops BEFORE the trailing `\r\n\r\n`, sleeps
+    // long enough to exhaust `PROM_READ_DEADLINE` (10 ms), then closes.
+    // The exporter sees these as deadline-exhausted reads and bumps
+    // `scrape_budget_exhausted_total`.  Their queue depth is what drives
+    // the iteration-time histogram toward the upper bound.
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut scraper_handles = Vec::new();
+    for _ in 0..8 {
+        let stop = stop.clone();
+        let addr = prom_addr;
+        scraper_handles.push(std::thread::spawn(move || {
+            while !stop.load(Ordering::Relaxed) {
+                if let Ok(mut s) = TcpStream::connect_timeout(&addr, Duration::from_millis(200)) {
+                    // Write request + auth header, intentionally OMIT the
+                    // body-terminator blank line so the read loop on the
+                    // server hits PROM_READ_DEADLINE waiting for it.
+                    let partial = format!(
+                        "GET /metrics HTTP/1.0\r\nHost: localhost\r\nAuthorization: Bearer {PROM_TOKEN_HEX}\r\n",
+                    );
+                    let _ = s.write_all(partial.as_bytes());
+                    let _ = s.flush();
+                    // Hold the connection open past the 10 ms read deadline,
+                    // then close.
+                    std::thread::sleep(Duration::from_millis(30));
+                    drop(s);
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }));
+    }
+
+    // Drive a real agent for ~3 s while the scraper pool runs in parallel.
+    let agent_pid = std::process::id();
+    let agent_start = Instant::now();
+    {
+        let mut agent = Varta::connect(&socket).expect("Varta::connect");
+        while agent_start.elapsed() < Duration::from_secs(3) {
+            let mut tries = 0u32;
+            loop {
+                match agent.beat(Status::Ok, 0) {
+                    BeatOutcome::Sent => break,
+                    BeatOutcome::Dropped => {
+                        tries += 1;
+                        if tries > 5_000 {
+                            panic!("kernel never accepted a beat within 5000 retries");
+                        }
+                        std::thread::sleep(Duration::from_micros(500));
+                    }
+                    BeatOutcome::Failed(e) => panic!("unexpected hard failure: {e}"),
+                }
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        // drop agent → no further beats
+    }
+
+    // Let the threshold expire so a stall is surfaced.
+    std::thread::sleep(Duration::from_millis(700));
+
+    // Stop the scraper pool BEFORE the assertion scrape so the assertion's
+    // own GET is not blocked behind a backlog of partial connections.
+    stop.store(true, Ordering::Relaxed);
+    for h in scraper_handles {
+        let _ = h.join();
+    }
+    // Give the daemon one more tick to drain its accept queue and refresh
+    // the histogram.
+    std::thread::sleep(Duration::from_millis(200));
+
+    let (status, body) = http_get(prom_addr, "/metrics").expect("final /metrics scrape");
+    assert_eq!(
+        status, 200,
+        "final scrape did not return 200; body:\n{body}"
+    );
+
+    // 1. Stall detection MUST have fired despite the scrape storm.
+    let stalls_needle = format!("varta_stalls_total{{pid=\"{agent_pid}\"}} ");
+    let stall_line = body
+        .lines()
+        .find(|l| l.starts_with(&stalls_needle))
+        .unwrap_or_else(|| panic!("/metrics missing {stalls_needle:?}; body:\n{body}"));
+    let stall_count: u64 = stall_line[stalls_needle.len()..]
+        .trim()
+        .parse()
+        .unwrap_or_else(|_| panic!("could not parse stall count from {stall_line:?}"));
+    assert!(
+        stall_count >= 1,
+        "stall detection starved under scrape load: got {stall_count} stalls; body:\n{body}"
+    );
+
+    // 2. Histogram contract: ≥99% of iterations must fit within the
+    //    documented 0.5 s worst-case upper bound.  Parse the cumulative
+    //    histogram out of the body.
+    let count = parse_metric_value(&body, "varta_observer_iteration_seconds_count")
+        .unwrap_or_else(|| panic!("missing iteration count; body:\n{body}"));
+    assert!(
+        count > 0,
+        "iteration histogram was never updated (count=0); body:\n{body}"
+    );
+    let le_500 = parse_histogram_bucket(&body, "varta_observer_iteration_seconds", "0.5")
+        .unwrap_or_else(|| panic!("missing le=0.5 bucket; body:\n{body}"));
+    // 99% threshold expressed without floats — `99 * count` ≤ `100 * le_500`.
+    assert!(
+        le_500.saturating_mul(100) >= count.saturating_mul(99),
+        "<99% of iterations fit le=0.5 ({le_500} of {count}); body:\n{body}"
+    );
+
+    // 3. +Inf bucket should equal count (sanity — every observation lands
+    //    somewhere).
+    let le_inf = parse_histogram_bucket(&body, "varta_observer_iteration_seconds", "+Inf")
+        .unwrap_or_else(|| panic!("missing le=+Inf bucket; body:\n{body}"));
+    assert_eq!(
+        le_inf, count,
+        "+Inf bucket ({le_inf}) must equal count ({count}); body:\n{body}"
+    );
+}
+
+/// Parse `<name> <number>\n` out of a Prometheus exposition body.
+/// Returns `None` if the line is absent or the value does not parse.
+fn parse_metric_value(body: &str, name: &str) -> Option<u64> {
+    let prefix = format!("{name} ");
+    body.lines()
+        .find_map(|l| l.strip_prefix(&prefix))
+        .and_then(|tail| tail.trim().parse::<u64>().ok())
+}
+
+/// Parse a single `<name>_bucket{le="<bound>"} <count>` series out of a
+/// Prometheus exposition body. Returns `None` if the bucket is absent.
+fn parse_histogram_bucket(body: &str, name: &str, le: &str) -> Option<u64> {
+    let needle = format!("{name}_bucket{{le=\"{le}\"}} ");
+    body.lines()
+        .find_map(|l| l.strip_prefix(&needle))
+        .and_then(|tail| tail.trim().parse::<u64>().ok())
 }
 
 // --- helpers ----------------------------------------------------------------
