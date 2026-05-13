@@ -85,6 +85,10 @@ fn main() -> ExitCode {
         recovery_audit_log_records_spawn_and_complete,
     );
     failed += run_one(
+        "recovery_audit_log_chain_survives_rotation_and_restart",
+        recovery_audit_log_chain_survives_rotation_and_restart,
+    );
+    failed += run_one(
         "max_beat_rate_limits_and_reports_metric",
         max_beat_rate_limits_and_reports_metric,
     );
@@ -1002,9 +1006,25 @@ fn recovery_audit_log_records_spawn_and_complete() {
         "audit log missing spawn+complete for pid {agent_pid}; got:\n{last_body}"
     );
     assert!(
-        last_body.starts_with("# varta-watch recovery audit v1\n"),
+        last_body.starts_with("# varta-watch recovery audit v2\n"),
         "audit log missing schema header; got:\n{last_body}"
     );
+
+    // v2 schema: every record line carries a seq column (first) and a
+    // chain column (last). Confirm both are well-formed for every record
+    // line — boot, spawn, and complete.
+    for line in last_body.lines().filter(|l| !l.starts_with('#')) {
+        let cols: Vec<&str> = line.split('\t').collect();
+        let seq: u64 = cols[0]
+            .parse()
+            .unwrap_or_else(|_| panic!("seq column not numeric: {line}"));
+        assert!(seq >= 1, "seq must be >= 1: {line}");
+        let chain = cols.last().expect("chain column");
+        assert!(
+            *chain == "-" || chain.len() == 64,
+            "chain column must be `-` or 64 hex chars: {line}"
+        );
+    }
 
     // /metrics must expose every recovery outcome label (including zeroes)
     // and at least one spawned + one reaped_zero counter increment.
@@ -1027,6 +1047,220 @@ fn recovery_audit_log_records_spawn_and_complete() {
         metrics_ok,
         "/metrics missing one of the varta_recovery_outcomes_total label values"
     );
+}
+
+/// End-to-end: after a daemon restart, the second session's audit chain
+/// continues from where the first one left off.
+///
+/// 1. Spawn varta-watch with audit + small max_bytes → drive a recovery
+///    (forces at least one record).
+/// 2. SIGKILL the daemon to simulate unclean shutdown (no graceful Drop).
+/// 3. Restart varta-watch on the same audit path.
+/// 4. Drive a second recovery.
+/// 5. Assert: a `resume` (or `corrupt_tail`) boot record appears between
+///    the two sessions, the seq column is strictly monotonic across the
+///    boundary, and the chain column on the new session's boot record
+///    references the prior session's tail when audit-chain is compiled in.
+fn recovery_audit_log_chain_survives_rotation_and_restart() {
+    let tmp = TempDir::new("audit-restart");
+    let socket = tmp.path().join("varta.sock");
+    let audit_path = tmp.path().join("recovery-audit.tsv");
+
+    // ---- Session 1 --------------------------------------------------------
+    let (mut child, _prom_addr) = spawn_watch(&[
+        "--socket",
+        socket.to_str().unwrap(),
+        "--threshold-ms",
+        "200",
+        "--recovery-exec",
+        "/usr/bin/true",
+        "--recovery-debounce-ms",
+        "1000",
+        "--recovery-audit-file",
+        audit_path.to_str().unwrap(),
+        "--prom-addr",
+        "127.0.0.1:0",
+        "--shutdown-after-secs",
+        "10",
+    ]);
+
+    assert!(
+        wait_until(|| socket.exists(), Duration::from_secs(3)),
+        "session 1: varta-watch did not bind socket within 3s"
+    );
+
+    let agent_pid = std::process::id();
+    {
+        let mut agent = Varta::connect(&socket).expect("Varta::connect session 1");
+        for _ in 0..10 {
+            let mut tries = 0u32;
+            loop {
+                match agent.beat(Status::Ok, 0) {
+                    BeatOutcome::Sent => break,
+                    BeatOutcome::Dropped => {
+                        tries += 1;
+                        if tries > 5_000 {
+                            panic!("kernel never accepted a beat within 5000 retries");
+                        }
+                        std::thread::sleep(Duration::from_micros(500));
+                    }
+                    BeatOutcome::Failed(e) => panic!("unexpected hard failure: {e}"),
+                }
+            }
+        }
+    }
+
+    let spawn_needle = format!("\tspawn\t{agent_pid}\t");
+    let complete_needle = format!("\tcomplete\t{agent_pid}\t");
+    assert!(
+        wait_until(
+            || match std::fs::read_to_string(&audit_path) {
+                Ok(b) => b.contains(&spawn_needle) && b.contains(&complete_needle),
+                Err(_) => false,
+            },
+            Duration::from_secs(5),
+        ),
+        "session 1 did not record spawn+complete"
+    );
+
+    // SIGKILL forces an unclean shutdown — the Drop impl that does a
+    // best-effort fsync runs only on the *parent* test, not on the child
+    // process. Whatever the child fdatasync'd during writes is on disk;
+    // everything after the last sync is lost (exactly what we want to
+    // exercise on the resume path).
+    let _ = child.kill();
+    let _ = child.wait();
+
+    // Capture the audit-file contents after session 1.
+    let session1_body = std::fs::read_to_string(&audit_path).expect("read after session 1");
+    assert!(session1_body.starts_with("# varta-watch recovery audit v2\n"));
+    let session1_lines: Vec<&str> = session1_body
+        .lines()
+        .filter(|l| !l.starts_with('#'))
+        .collect();
+    assert!(!session1_lines.is_empty(), "session 1 wrote no records");
+    let last_session1_seq: u64 = session1_lines
+        .last()
+        .unwrap()
+        .split('\t')
+        .next()
+        .unwrap()
+        .parse()
+        .expect("session 1 last seq numeric");
+    let last_session1_chain = session1_lines
+        .last()
+        .unwrap()
+        .split('\t')
+        .next_back()
+        .unwrap()
+        .to_string();
+
+    // ---- Session 2 --------------------------------------------------------
+    // Use a fresh socket path; the old one is left as-is on disk from the
+    // killed child but won't interfere since session 2 binds a new one.
+    let socket2 = tmp.path().join("varta2.sock");
+    let (mut child2, _prom_addr2) = spawn_watch(&[
+        "--socket",
+        socket2.to_str().unwrap(),
+        "--threshold-ms",
+        "200",
+        "--recovery-exec",
+        "/usr/bin/true",
+        "--recovery-debounce-ms",
+        "1000",
+        "--recovery-audit-file",
+        audit_path.to_str().unwrap(),
+        "--prom-addr",
+        "127.0.0.1:0",
+        "--shutdown-after-secs",
+        "10",
+    ]);
+    let _guard2 = ChildGuard(&mut child2);
+
+    assert!(
+        wait_until(|| socket2.exists(), Duration::from_secs(3)),
+        "session 2: varta-watch did not bind socket within 3s"
+    );
+
+    {
+        let mut agent = Varta::connect(&socket2).expect("Varta::connect session 2");
+        for _ in 0..10 {
+            let mut tries = 0u32;
+            loop {
+                match agent.beat(Status::Ok, 0) {
+                    BeatOutcome::Sent => break,
+                    BeatOutcome::Dropped => {
+                        tries += 1;
+                        if tries > 5_000 {
+                            panic!("kernel never accepted a beat within 5000 retries");
+                        }
+                        std::thread::sleep(Duration::from_micros(500));
+                    }
+                    BeatOutcome::Failed(e) => panic!("unexpected hard failure: {e}"),
+                }
+            }
+        }
+    }
+
+    // Wait for at least one more spawn+complete *past* the session-1 tail.
+    assert!(
+        wait_until(
+            || match std::fs::read_to_string(&audit_path) {
+                Ok(b) => {
+                    let s2 = &b[session1_body.len().min(b.len())..];
+                    s2.contains(&spawn_needle) && s2.contains(&complete_needle)
+                }
+                Err(_) => false,
+            },
+            Duration::from_secs(5),
+        ),
+        "session 2 did not record spawn+complete past session 1's tail"
+    );
+
+    let full = std::fs::read_to_string(&audit_path).expect("read full audit");
+    let all_records: Vec<&str> = full.lines().filter(|l| !l.starts_with('#')).collect();
+
+    // 1. Seq is strictly monotonic across the restart.
+    let mut last_seq = 0u64;
+    for rec in &all_records {
+        let seq: u64 = rec.split('\t').next().unwrap().parse().unwrap();
+        assert!(
+            seq > last_seq,
+            "seq must be strictly monotonic across restart: {seq} after {last_seq}"
+        );
+        last_seq = seq;
+    }
+
+    // 2. A boot record exists past session 1's last seq carrying the
+    //    expected reason (`resume` for clean fsync'd tail, or
+    //    `corrupt_tail` for torn).
+    let restart_boot = all_records
+        .iter()
+        .find(|line| {
+            let cols: Vec<&str> = line.split('\t').collect();
+            let seq: u64 = cols[0].parse().unwrap_or(0);
+            seq > last_session1_seq && cols.contains(&"boot")
+        })
+        .expect("session 2 must emit a boot record above session 1's tail seq");
+    let restart_cols: Vec<&str> = restart_boot.split('\t').collect();
+    let reason = restart_cols[6]; // seq ms ns boot pid prev reason chain
+    assert!(
+        reason == "resume" || reason == "corrupt_tail",
+        "restart boot reason must be resume or corrupt_tail; got {reason} in: {restart_boot}"
+    );
+
+    // 3. When audit-chain is compiled in: the restart boot's prev_chain
+    //    column matches the session-1 tail's chain (resume) — or is `-`
+    //    when the tail was torn.
+    if last_session1_chain != "-" && last_session1_chain.len() == 64 {
+        let prev_chain_col = restart_cols[5];
+        if reason == "resume" {
+            assert_eq!(
+                prev_chain_col, last_session1_chain,
+                "resume boot must carry the prior session's last chain as prev_chain"
+            );
+        }
+    }
 }
 
 // ===== A6: --max-beat-rate (rate limiting) E2E ==============================

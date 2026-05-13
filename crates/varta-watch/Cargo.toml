@@ -39,6 +39,13 @@ unsafe-shell-recovery = []
 # and optional context fields (pid, child_pid, error).  Suitable for
 # SIEM / syslog ingestion in hospital IT environments.
 json-log = []
+# Enable tamper-evident SHA-256 hash chaining on the recovery audit log.
+# Required for IEC 62304 Class C (medical / safety-critical) deployments —
+# without it, audit records carry a literal '-' in the chain column and
+# the daemon emits a startup warning that the build is not Class-C-
+# conforming.  Propagates the existing optional crypto deps from
+# `varta-vlp/crypto`; varta-watch itself stays registry-dep-free.
+audit-chain = ["varta-vlp/crypto"]
 # Test-only instrumentation — zero effect on the production code path when
 # absent.  Adds `--inject-wedge-ms <MS>` to artificially stall the poll
 # loop for the self-watchdog integration test.  Never enabled in

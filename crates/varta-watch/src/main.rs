@@ -556,8 +556,48 @@ fn run(cfg: Config) -> std::io::Result<()> {
     // activity world-readable.
     let recovery_audit_sink = match cfg.recovery_audit_file.as_ref() {
         Some(path) => {
-            let sink =
-                varta_watch::audit::RecoveryAuditLog::create(path, cfg.recovery_audit_max_bytes)?;
+            let audit_cfg = varta_watch::audit::AuditConfig {
+                max_bytes: cfg.recovery_audit_max_bytes,
+                sync_every: cfg.recovery_audit_sync_every,
+                daemon_pid: std::process::id(),
+            };
+            let (sink, warnings) = varta_watch::audit::RecoveryAuditLog::create(path, audit_cfg)?;
+            // Surface the warnings the audit sink raised at construction
+            // time. Each is a structural risk an auditor should know about
+            // before the daemon emits its first recovery record.
+            if warnings.chain_disabled {
+                varta_warn!(
+                    "recovery audit chain is DISABLED (build is missing the `audit-chain` \
+                     feature). v2 records will carry a literal `-` in the chain column and \
+                     this build is NOT IEC 62304 Class C-conforming. Rebuild with \
+                     --features audit-chain for tamper-evident audit records."
+                );
+            }
+            if warnings.sync_relaxed {
+                varta_warn!(
+                    "recovery audit fdatasync cadence is relaxed (--recovery-audit-sync-every \
+                     > 1). A power cut can lose up to N-1 records. The Class C-conforming \
+                     value is 1 (every record)."
+                );
+            }
+            if warnings.legacy_v1 {
+                varta_warn!(
+                    "recovery audit file contains a legacy v1 prefix; v2 section begins now \
+                     with a `legacy_v1` boot record."
+                );
+            }
+            if warnings.corrupt_tail {
+                varta_warn!(
+                    "recovery audit file had a torn tail from a prior unclean shutdown; \
+                     truncated to the last newline before resuming."
+                );
+            }
+            if warnings.schema_drift {
+                varta_warn!(
+                    "recovery audit file header does not match v1 or v2; appending a fresh \
+                     v2 section with a `schema_drift` boot record."
+                );
+            }
             Some(sink)
         }
         None => None,
@@ -991,6 +1031,17 @@ fn run(cfg: Config) -> std::io::Result<()> {
         if probe_exhausted > 0 {
             if let Some(pe) = prom_export.as_mut() {
                 pe.record_tracker_pid_index_probe_exhausted(probe_exhausted);
+            }
+        }
+
+        // Drain any latched audit-sink IO error. The audit log latches
+        // failed writes / rotations / fsyncs internally so the recovery
+        // hot path never blocks on disk I/O — but silently dropping audit
+        // failures would itself be an IEC 62304 Class C violation, so we
+        // surface them once per tick.
+        if let Some(rec) = recovery.as_mut() {
+            if let Some(err) = rec.drain_audit_err() {
+                varta_warn!("recovery audit IO error: {err}");
             }
         }
 

@@ -23,9 +23,11 @@
 //! The 12-byte nonce for the AEAD construction is `iv_random || iv_counter`.
 
 pub mod aead;
+pub mod hash;
 pub mod kdf;
 
 pub use aead::{open, seal, AuthError};
+pub use hash::{audit_chain_hash, AUDIT_CHAIN_DOMAIN, AUDIT_CHAIN_OUT_BYTES};
 
 use zeroize::{Zeroize, ZeroizeOnDrop};
 

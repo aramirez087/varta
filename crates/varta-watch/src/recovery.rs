@@ -368,6 +368,20 @@ impl Recovery {
         self
     }
 
+    /// Drain any IO error latched by the audit sink since the previous call.
+    ///
+    /// The audit log latches failed writes / rotations / fsync calls
+    /// internally so the recovery hot path never blocks on disk I/O. For
+    /// IEC 62304 Class C compliance the daemon must surface those latched
+    /// errors — silently dropping audit failures is itself a Class C
+    /// violation. The main loop polls this once per tick and routes any
+    /// `Some(err)` through its existing `varta_warn!` / json-log emit path.
+    ///
+    /// Returns `None` if no sink is configured or no error is pending.
+    pub fn drain_audit_err(&mut self) -> Option<std::io::Error> {
+        self.audit_sink.as_mut().and_then(|s| s.take_pending_err())
+    }
+
     /// Enable bounded stdout/stderr capture for child processes. `cap` is
     /// the combined per-child byte cap (stdout + stderr); a value of `0`
     /// disables capture. Pipes are read non-blockingly each tick to
@@ -1428,7 +1442,8 @@ mod tests {
     fn audit_sink_records_spawn_and_complete_for_exec_mode() {
         let dir = audit_tmpdir("audit-rt");
         let path = dir.join("audit.log");
-        let sink = RecoveryAuditLog::create(&path, None).expect("create audit");
+        let (sink, _) = RecoveryAuditLog::create(&path, crate::audit::AuditConfig::default())
+            .expect("create audit");
 
         let mut rec = Recovery::with_mode(
             RecoveryMode::Exec {
@@ -1462,7 +1477,7 @@ mod tests {
 
         let body = std::fs::read_to_string(&path).expect("read audit");
         let lines: Vec<&str> = body.lines().collect();
-        assert!(lines[0].starts_with("# varta-watch recovery audit v1"));
+        assert!(lines[0].starts_with("# varta-watch recovery audit v2"));
         assert!(
             lines.iter().any(|l| l.contains("\tspawn\t123\t")),
             "expected spawn line for pid 123: {body}"
@@ -1471,6 +1486,18 @@ mod tests {
             lines.iter().any(|l| l.contains("\tcomplete\t123\t")),
             "expected complete line for pid 123: {body}"
         );
+        // v2 schema: every record line carries a seq (first column) and
+        // chain (last column).
+        for line in lines.iter().filter(|l| !l.starts_with('#')) {
+            let cols: Vec<&str> = line.split('\t').collect();
+            let seq: u64 = cols[0].parse().expect("seq column parses");
+            assert!(seq >= 1, "seq must be >= 1");
+            let chain = cols.last().expect("chain column");
+            assert!(
+                *chain == "-" || chain.len() == 64,
+                "chain column must be `-` or 64 hex chars; got {chain:?}"
+            );
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1478,7 +1505,8 @@ mod tests {
     fn capture_records_nonzero_length_for_chatty_child() {
         let dir = audit_tmpdir("capture");
         let path = dir.join("audit.log");
-        let sink = RecoveryAuditLog::create(&path, None).expect("create audit");
+        let (sink, _) = RecoveryAuditLog::create(&path, crate::audit::AuditConfig::default())
+            .expect("create audit");
 
         // Print exactly 64 bytes to stdout, then exit.
         let mut rec = Recovery::with_mode(
@@ -1516,9 +1544,9 @@ mod tests {
             .lines()
             .find(|l| l.contains("\tcomplete\t77\t"))
             .expect("complete line");
-        // stdout_len appears in the 10th tab-separated column (index 9).
+        // v2 layout (seq prepended): stdout_len is at column index 10.
         let cols: Vec<&str> = complete.split('\t').collect();
-        let stdout_len: u32 = cols[9].parse().expect("stdout_len");
+        let stdout_len: u32 = cols[10].parse().expect("stdout_len");
         assert!(
             stdout_len >= 64,
             "expected stdout_len ≥ 64, got {stdout_len}"
@@ -1530,7 +1558,8 @@ mod tests {
     fn capture_truncates_at_per_child_cap() {
         let dir = audit_tmpdir("truncate");
         let path = dir.join("audit.log");
-        let sink = RecoveryAuditLog::create(&path, None).expect("create audit");
+        let (sink, _) = RecoveryAuditLog::create(&path, crate::audit::AuditConfig::default())
+            .expect("create audit");
 
         // Print ~10 KB to stdout; cap at 64 bytes.
         let mut rec = Recovery::with_mode(
@@ -1571,8 +1600,9 @@ mod tests {
             .lines()
             .find(|l| l.contains("\tcomplete\t8\t"))
             .expect("complete line");
+        // v2 layout (seq prepended): truncated is at column index 12.
         let cols: Vec<&str> = complete.split('\t').collect();
-        let truncated = cols[11];
+        let truncated = cols[12];
         assert_eq!(
             truncated, "true",
             "expected truncated=true, got: {complete}"

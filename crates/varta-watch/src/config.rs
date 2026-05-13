@@ -271,6 +271,13 @@ pub struct Config {
     /// file rotates through up to 5 generations (PATH → PATH.1 → … →
     /// PATH.5). Without a cap the file grows unbounded.
     pub recovery_audit_max_bytes: Option<u64>,
+    /// How many records to write between forced `fdatasync(2)` calls on
+    /// the audit file. Default `1` (sync every record) — the only
+    /// IEC 62304 Class C-conforming value. Higher values trade a small
+    /// risk of losing up to N-1 records on power cut for a lower per-
+    /// record cost. Values >1 trigger a startup warning. `0` is rejected
+    /// at parse time.
+    pub recovery_audit_sync_every: u32,
     /// Whether to capture child stdout/stderr non-blockingly for the audit
     /// record. Default off — pipes are inherited from the observer. Opt-in
     /// avoids deadlock risk for operators who alias chatty recovery
@@ -821,6 +828,13 @@ OPTIONAL:
     --recovery-audit-max-bytes <N> Rotate the audit file after every write
                                      that pushes it above N bytes. Up to
                                      5 generations kept.
+    --recovery-audit-sync-every <N> How many records to write between
+                                     forced fdatasync(2) calls on the
+                                     audit file. Default 1 (sync every
+                                     record) — the only IEC 62304
+                                     Class C-conforming value. Values >1
+                                     emit a startup warning. 0 is
+                                     rejected at parse time.
     --recovery-capture-stdio       Capture child stdout/stderr non-
                                      blockingly so its length and
                                      truncation status appear in the audit
@@ -898,6 +912,7 @@ OPTIONAL:
         let mut strict_namespace_check = false;
         let mut recovery_audit_file: Option<PathBuf> = None;
         let mut recovery_audit_max_bytes: Option<u64> = None;
+        let mut recovery_audit_sync_every: Option<u32> = None;
         let mut recovery_capture_stdio = false;
         let mut recovery_capture_bytes: Option<u32> = None;
         let mut iteration_budget_ms: Option<u64> = None;
@@ -1199,6 +1214,22 @@ OPTIONAL:
                         .ok_or(ConfigError::MissingValue("--recovery-audit-max-bytes"))?;
                     recovery_audit_max_bytes = Some(parse_u64("--recovery-audit-max-bytes", &v)?);
                 }
+                "--recovery-audit-sync-every" => {
+                    let v = iter
+                        .next()
+                        .ok_or(ConfigError::MissingValue("--recovery-audit-sync-every"))?;
+                    let parsed = v.parse::<u32>().map_err(|_| ConfigError::BadInteger {
+                        flag: "--recovery-audit-sync-every",
+                        raw: v.clone(),
+                    })?;
+                    if parsed == 0 {
+                        return Err(ConfigError::BadInteger {
+                            flag: "--recovery-audit-sync-every",
+                            raw: v,
+                        });
+                    }
+                    recovery_audit_sync_every = Some(parsed);
+                }
                 "--recovery-capture-stdio" => {
                     recovery_capture_stdio = true;
                 }
@@ -1449,6 +1480,7 @@ OPTIONAL:
             strict_namespace_check,
             recovery_audit_file,
             recovery_audit_max_bytes,
+            recovery_audit_sync_every: recovery_audit_sync_every.unwrap_or(1),
             recovery_capture_stdio,
             recovery_capture_bytes: recovery_capture_bytes_resolved,
             iteration_budget,

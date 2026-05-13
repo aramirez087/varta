@@ -68,6 +68,21 @@ pub fn ct_eq(a: &[u8], b: &[u8]) -> bool {
     diff == 0
 }
 
+/// Encode a 32-byte array as 64 lowercase ASCII hex characters.
+///
+/// The inverse of [`decode_hex_32`]. Used by the `varta-watch` recovery
+/// audit log to serialise the SHA-256 chain hash into a TSV column without
+/// pulling a heap-allocating `hex` crate into the workspace.
+pub fn encode_hex_32(bytes: &[u8; 32]) -> [u8; 64] {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = [0u8; 64];
+    for (i, b) in bytes.iter().enumerate() {
+        out[i * 2] = HEX[(b >> 4) as usize];
+        out[i * 2 + 1] = HEX[(b & 0x0f) as usize];
+    }
+    out
+}
+
 fn hex_val(b: u8) -> Option<u8> {
     match b {
         b'0'..=b'9' => Some(b - b'0'),
@@ -110,6 +125,21 @@ mod tests {
             decode_hex_32(&bad),
             Err(HexDecodeError::InvalidCharacter(3, 'z'))
         ));
+    }
+
+    #[test]
+    fn encode_hex_32_round_trips_with_decode() {
+        let hex = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+        let bytes = decode_hex_32(hex.as_bytes()).expect("valid hex");
+        let round = encode_hex_32(&bytes);
+        assert_eq!(core::str::from_utf8(&round).unwrap(), hex);
+    }
+
+    #[test]
+    fn encode_hex_32_emits_lowercase() {
+        let bytes = [0xab; 32];
+        let hex = encode_hex_32(&bytes);
+        assert!(hex.iter().all(|c| matches!(c, b'0'..=b'9' | b'a'..=b'f')));
     }
 
     #[test]
