@@ -39,6 +39,12 @@ unsafe-shell-recovery = []
 # and optional context fields (pid, child_pid, error).  Suitable for
 # SIEM / syslog ingestion in hospital IT environments.
 json-log = []
+# Test-only instrumentation — zero effect on the production code path when
+# absent.  Adds `--inject-wedge-ms <MS>` to artificially stall the poll
+# loop for the self-watchdog integration test.  Never enabled in
+# production builds; not listed as unsafe-* because it adds no security
+# surface — it merely slows one iteration.
+test-hooks = []
 
 [dependencies.varta-vlp]
 path = "../varta-vlp"

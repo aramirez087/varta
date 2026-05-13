@@ -220,6 +220,13 @@ pub struct Config {
     /// [`DEFAULT_RECOVERY_CAPTURE_BYTES`]. Values larger than
     /// [`MAX_RECOVERY_CAPTURE_BYTES`] are rejected at parse time.
     pub recovery_capture_bytes: u32,
+    /// [test-hooks only] Sleep for this many milliseconds on the first poll
+    /// iteration, simulating a wedged loop.  Used by the self-watchdog
+    /// integration test (`tests/self_watchdog.rs`) to exercise the abort path
+    /// without relying on SIGSTOP (which freezes the watchdog thread too).
+    /// Present only when compiled with `--features test-hooks`.
+    #[cfg(feature = "test-hooks")]
+    pub inject_wedge_ms: Option<u64>,
 }
 
 /// Failure modes for [`Config::from_args`].
@@ -631,6 +638,8 @@ OPTIONAL:
         let mut recovery_audit_max_bytes: Option<u64> = None;
         let mut recovery_capture_stdio = false;
         let mut recovery_capture_bytes: Option<u32> = None;
+        #[cfg(feature = "test-hooks")]
+        let mut inject_wedge_ms: Option<u64> = None;
 
         let mut iter = args.into_iter();
         while let Some(tok) = iter.next() {
@@ -839,6 +848,17 @@ OPTIONAL:
                         .ok_or(ConfigError::MissingValue("--hw-watchdog"))?;
                     hw_watchdog = Some(PathBuf::from(v));
                 }
+                #[cfg(feature = "test-hooks")]
+                "--inject-wedge-ms" => {
+                    let v = iter
+                        .next()
+                        .ok_or(ConfigError::MissingValue("--inject-wedge-ms"))?;
+                    let ms = v.parse::<u64>().map_err(|_| ConfigError::BadInteger {
+                        flag: "--inject-wedge-ms",
+                        raw: v,
+                    })?;
+                    inject_wedge_ms = Some(ms);
+                }
                 "--prom-rate-limit-per-sec" => {
                     let v = iter
                         .next()
@@ -970,8 +990,8 @@ OPTIONAL:
             || recovery_exec_file.is_some();
         if any_recovery_configured && !i_accept_recovery_on_unauthenticated_transport {
             if let Some(port) = udp_port {
-                let bind_ip = udp_bind_addr
-                    .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
+                let bind_ip =
+                    udp_bind_addr.unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
                 let udp_addr = format!("{bind_ip}:{port}");
                 return Err(ConfigError::RecoveryRequiresAuthenticatedTransport { udp_addr });
             }
@@ -1016,6 +1036,8 @@ OPTIONAL:
             recovery_audit_max_bytes,
             recovery_capture_stdio,
             recovery_capture_bytes: recovery_capture_bytes_resolved,
+            #[cfg(feature = "test-hooks")]
+            inject_wedge_ms,
         })
     }
 
@@ -1869,6 +1891,7 @@ mod tests {
         assert!(cfg.recovery_exec_cmd.is_some());
         assert!(cfg.recovery_cmd.is_none());
         let mode = cfg.resolve_recovery_mode().expect("resolve").expect("some");
+        #[allow(unreachable_patterns)]
         match mode {
             crate::recovery::RecoveryMode::Exec { program, args } => {
                 assert_eq!(program, "/usr/bin/kill");
@@ -2022,6 +2045,7 @@ mod tests {
         ]))
         .expect("parse");
         let mode = cfg.resolve_recovery_mode().expect("resolve").expect("some");
+        #[allow(unreachable_patterns)]
         match mode {
             crate::recovery::RecoveryMode::Exec { program, .. } => {
                 assert_eq!(program, "/bin/true");

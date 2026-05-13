@@ -596,9 +596,7 @@ fn run(cfg: Config) -> std::io::Result<()> {
                 let last = LAST_TICK_NS.load(Ordering::Relaxed);
                 let now = observer_now_ns();
                 if watchdog_expired(now, last, deadline_ns) {
-                    eprintln!(
-                        "varta-watch poll loop wedged for >{secs}s; aborting"
-                    );
+                    eprintln!("varta-watch poll loop wedged for >{secs}s; aborting");
                     std::process::abort();
                 }
             })?;
@@ -621,6 +619,9 @@ fn run(cfg: Config) -> std::io::Result<()> {
 
     let started = Instant::now();
     let mut loop_count: u64 = 0;
+    // [test-hooks] One-shot wedge flag extracted from cfg before the loop.
+    #[cfg(feature = "test-hooks")]
+    let mut wedge_once = cfg.inject_wedge_ms;
     loop {
         if SHUTDOWN.load(Ordering::Acquire) {
             break;
@@ -841,6 +842,15 @@ fn run(cfg: Config) -> std::io::Result<()> {
         if let Some(ref mut hw) = hw_wdt {
             hw.kick();
         }
+
+        // [test-hooks] One-shot artificial stall of the poll loop.  Fires on
+        // the first iteration only (take() zeroes the option); the watchdog
+        // thread sees LAST_TICK_NS stop advancing and calls process::abort().
+        // Only compiled when --features test-hooks; absent in production.
+        #[cfg(feature = "test-hooks")]
+        if let Some(ms) = wedge_once.take() {
+            std::thread::sleep(Duration::from_millis(ms));
+        }
     }
 
     // Clean shutdown — disarm hardware watchdog and notify service manager.
@@ -926,7 +936,7 @@ mod tests {
                     let _ = f.read_to_string(&mut buf);
                     // Every successful read must be "<u64> <u64>\n" — two tokens.
                     if !buf.is_empty() {
-                        let parts: Vec<&str> = buf.trim().split_whitespace().collect();
+                        let parts: Vec<&str> = buf.split_whitespace().collect();
                         if parts.len() != 2
                             || parts[0].parse::<u64>().is_err()
                             || parts[1].parse::<u64>().is_err()

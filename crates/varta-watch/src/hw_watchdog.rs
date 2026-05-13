@@ -74,7 +74,6 @@ impl Drop for HwWatchdog {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Read;
 
     fn tmp_path(tag: &str) -> std::path::PathBuf {
         let mut p = std::env::temp_dir();
