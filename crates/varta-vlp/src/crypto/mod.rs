@@ -95,7 +95,18 @@ impl Key {
         Ok(Key { bytes })
     }
 
+    /// Expose the raw key bytes. For use by transport implementations that
+    /// call `seal` / `open` directly.
+    pub fn as_bytes(&self) -> &[u8; KEY_BYTES] {
+        &self.bytes
+    }
+}
+
+#[cfg(feature = "std")]
+impl Key {
     /// Load a key from a file containing a 64-character hex string.
+    ///
+    /// Gated behind the `std` feature so the core protocol stays `no_std`.
     ///
     /// # Errors
     ///
@@ -111,12 +122,6 @@ impl Key {
             )
         })
     }
-
-    /// Expose the raw key bytes. For use by transport implementations that
-    /// call `seal` / `open` directly.
-    pub fn as_bytes(&self) -> &[u8; KEY_BYTES] {
-        &self.bytes
-    }
 }
 
 impl core::fmt::Debug for Key {
@@ -130,6 +135,8 @@ pub use crate::util::{ct_eq, decode_hex_32, HexDecodeError};
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Lib is `#![no_std]`; pull `format!` into scope for tests only.
+    use std::format;
 
     #[test]
     fn key_from_hex_valid() {

@@ -89,6 +89,7 @@ fn prom_exporter_reports_beats_total_per_pid() {
             nonce: n,
             observer_ns: 0,
             origin: varta_watch::BeatOrigin::KernelAttested,
+            pid_ns_inode: None,
         })
         .unwrap();
     }
@@ -110,6 +111,7 @@ fn prom_exporter_reports_stalls_total_per_pid() {
         nonce: 1,
         observer_ns: 0,
         origin: varta_watch::BeatOrigin::KernelAttested,
+        pid_ns_inode: None,
     })
     .unwrap();
     prom.record(&Event::Stall {
@@ -118,6 +120,7 @@ fn prom_exporter_reports_stalls_total_per_pid() {
         last_ns: 0,
         observer_ns: 0,
         origin: varta_watch::BeatOrigin::KernelAttested,
+        pid_ns_inode: None,
     })
     .unwrap();
     let body = http_get(&mut prom, addr, "/metrics");
@@ -230,6 +233,7 @@ fn file_exporter_appends_one_line_per_event() {
             nonce: 1,
             observer_ns: 0,
             origin: varta_watch::BeatOrigin::KernelAttested,
+            pid_ns_inode: None,
         },
         Event::Beat {
             pid: 1,
@@ -238,6 +242,7 @@ fn file_exporter_appends_one_line_per_event() {
             nonce: 2,
             observer_ns: 0,
             origin: varta_watch::BeatOrigin::KernelAttested,
+            pid_ns_inode: None,
         },
         Event::Stall {
             pid: 1,
@@ -245,6 +250,7 @@ fn file_exporter_appends_one_line_per_event() {
             last_ns: 0,
             observer_ns: 0,
             origin: varta_watch::BeatOrigin::KernelAttested,
+            pid_ns_inode: None,
         },
         Event::Decode(DecodeError::BadMagic, 0),
     ];

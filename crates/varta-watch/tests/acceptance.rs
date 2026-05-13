@@ -139,6 +139,7 @@ fn observer_emits_beat_per_received_frame() {
                 payload,
                 observer_ns: _,
                 origin: _,
+                pid_ns_inode: _,
             } => got.push((pid, nonce, status, payload)),
             Event::Decode(e, _) => panic!("unexpected decode error: {e}"),
             Event::Io(e, _) => panic!("unexpected io error: {e}"),
@@ -148,6 +149,9 @@ fn observer_emits_beat_per_received_frame() {
             }
             Event::OriginConflict { .. } => {
                 panic!("unexpected origin-conflict event during beat test")
+            }
+            Event::NamespaceConflict { .. } => {
+                panic!("unexpected namespace-conflict event during beat test")
             }
             Event::CtrlTruncated(e, _) => panic!("unexpected ctrl truncation: {e}"),
         }
@@ -248,6 +252,7 @@ fn tracker_capacity_bounded_to_64_pids() {
             now_ns,
             threshold_ns,
             varta_watch::BeatOrigin::KernelAttested,
+            None,
         );
         assert_eq!(update, Update::Inserted, "pid {pid} should insert");
     }
@@ -260,6 +265,7 @@ fn tracker_capacity_bounded_to_64_pids() {
         now_ns,
         threshold_ns,
         varta_watch::BeatOrigin::KernelAttested,
+        None,
     );
     assert_eq!(result, Update::CapacityExceeded);
     assert_eq!(tracker.len(), 64, "len must not grow past capacity");
@@ -388,6 +394,7 @@ fn tracker_capacity_clamped_to_max_capacity() {
             now_ns,
             threshold_ns,
             varta_watch::BeatOrigin::KernelAttested,
+            None,
         );
         assert!(
             update == Update::Inserted || update == Update::Refreshed,
@@ -406,6 +413,7 @@ fn tracker_capacity_clamped_to_max_capacity() {
         now_ns,
         threshold_ns,
         varta_watch::BeatOrigin::KernelAttested,
+        None,
     );
     assert_eq!(result, Update::CapacityExceeded);
     assert_eq!(

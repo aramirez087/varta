@@ -9,9 +9,14 @@ repository = "https://github.com/aramirez087/Varta"
 
 [features]
 default = []
+# Opt-in std-dependent conveniences (currently: `Key::from_file`). Off by
+# default so the crate is `#![no_std]` + alloc-free out of the box, ready
+# for avionics targets (FreeRTOS, Zephyr) without a libstd port.
+std = []
 # Enables ChaCha20-Poly1305 AEAD for secure VLP transport.
 # Pulls four externally-audited RustCrypto crates (NCC Group audit).
 # These are the only registry deps in varta-vlp and are all optional.
+# All four are `default-features = false` so this feature is no_std-clean.
 crypto = ["dep:chacha20poly1305", "dep:hkdf", "dep:sha2", "dep:zeroize"]
 
 [lints]

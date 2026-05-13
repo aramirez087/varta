@@ -30,6 +30,30 @@ jobs:
       - name: clippy (no-default-features)
         run: cargo clippy --workspace --all-targets --no-default-features -- -D warnings
 
+      - name: varta-vlp no_std build (default features)
+        # Default-feature build of the protocol crate must compile as
+        # `#![no_std]` for avionics targets (FreeRTOS, Zephyr) without libstd.
+        run: cargo build -p varta-vlp --no-default-features
+
+      - name: varta-vlp no_std build (crypto only)
+        # `crypto` must stay no_std-clean — chacha20poly1305 / hkdf / sha2 /
+        # zeroize are all `default-features = false`. This step trips if any
+        # of them inadvertently re-enables `std` in a point release.
+        run: cargo build -p varta-vlp --no-default-features --features crypto
+
+      - name: install no_std target (thumbv7m-none-eabi)
+        if: runner.os == 'Linux'
+        run: rustup target add thumbv7m-none-eabi
+
+      - name: varta-vlp builds for thumbv7m-none-eabi (no_std proof)
+        # Cortex-M3 target — canonical bare-metal Rust target, matches the
+        # FreeRTOS/Zephyr deployment exactly. `cargo build` (no link) is
+        # sufficient for a library crate.
+        if: runner.os == 'Linux'
+        run: |
+          cargo build -p varta-vlp --no-default-features --target thumbv7m-none-eabi
+          cargo build -p varta-vlp --no-default-features --features crypto --target thumbv7m-none-eabi
+
       - name: tests (all-features, -D warnings)
         run: cargo test --workspace --all-features
         env:

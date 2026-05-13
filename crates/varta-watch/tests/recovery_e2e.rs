@@ -54,8 +54,8 @@ mod inner {
         let template = format!("touch {}", marker.as_path().display());
         let mut rec = Recovery::new(template, Duration::from_secs(1));
 
-        let first = rec.on_stall(42, varta_watch::BeatOrigin::KernelAttested);
-        let second = rec.on_stall(42, varta_watch::BeatOrigin::KernelAttested);
+        let first = rec.on_stall(42, varta_watch::BeatOrigin::KernelAttested, false);
+        let second = rec.on_stall(42, varta_watch::BeatOrigin::KernelAttested, false);
 
         match first {
             RecoveryOutcome::Spawned { .. } => {}
@@ -95,7 +95,7 @@ mod inner {
         let template = format!("echo $$:$1 >> {}", log.as_path().display());
         let mut rec = Recovery::new(template, Duration::from_secs(0));
 
-        let outcome = rec.on_stall(12345, varta_watch::BeatOrigin::KernelAttested);
+        let outcome = rec.on_stall(12345, varta_watch::BeatOrigin::KernelAttested, false);
         match outcome {
             RecoveryOutcome::Spawned { .. } => {}
             other => panic!("expected Spawned, got {other:?}"),
@@ -138,7 +138,7 @@ mod inner {
     fn recovery_spawn_returns_within_50ms_for_slow_template() {
         let mut rec = Recovery::new("sleep 1".to_string(), Duration::ZERO);
         let start = Instant::now();
-        let outcome = rec.on_stall(13, varta_watch::BeatOrigin::KernelAttested);
+        let outcome = rec.on_stall(13, varta_watch::BeatOrigin::KernelAttested, false);
         let elapsed = start.elapsed();
         assert!(
             elapsed < Duration::from_millis(50),
@@ -153,7 +153,7 @@ mod inner {
     #[test]
     fn recovery_try_reap_yields_reaped_for_completed_child() {
         let mut rec = Recovery::with_template_and_timeout("true".to_string(), Duration::ZERO, None);
-        let _ = rec.on_stall(99, varta_watch::BeatOrigin::KernelAttested);
+        let _ = rec.on_stall(99, varta_watch::BeatOrigin::KernelAttested, false);
 
         // Allow up to 500 ms for the child to exit and a subsequent
         // `try_reap` call to surface the transition. In green phase this
@@ -190,7 +190,7 @@ mod inner {
             Duration::ZERO,
             Some(Duration::from_millis(50)),
         );
-        let _ = rec.on_stall(7, varta_watch::BeatOrigin::KernelAttested);
+        let _ = rec.on_stall(7, varta_watch::BeatOrigin::KernelAttested, false);
 
         let deadline = Instant::now() + Duration::from_millis(750);
         let mut saw_killed = false;
@@ -221,8 +221,8 @@ mod inner {
     fn recovery_concurrent_pids_run_in_parallel() {
         let mut rec = Recovery::new("sleep 0.5".to_string(), Duration::ZERO);
         let start = Instant::now();
-        let a = rec.on_stall(1, varta_watch::BeatOrigin::KernelAttested);
-        let b = rec.on_stall(2, varta_watch::BeatOrigin::KernelAttested);
+        let a = rec.on_stall(1, varta_watch::BeatOrigin::KernelAttested, false);
+        let b = rec.on_stall(2, varta_watch::BeatOrigin::KernelAttested, false);
         let elapsed = start.elapsed();
         assert!(
             elapsed < Duration::from_millis(750),

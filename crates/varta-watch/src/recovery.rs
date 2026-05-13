@@ -170,6 +170,17 @@ pub enum RecoveryOutcome {
         /// Agent pid whose stall was refused.
         pid: u32,
     },
+    /// Recovery was structurally declined because the stalled agent's
+    /// kernel-attested PID namespace differs from the observer's. The
+    /// numeric pid in this namespace would target a different (or no)
+    /// process, so spawning `kill(2)` / `systemctl restart` against it is
+    /// unsafe. The refusal is logged to the audit sink and counted in
+    /// Prometheus. The operator can opt out via
+    /// `--allow-cross-namespace-agents`.
+    RefusedCrossNamespace {
+        /// Agent pid whose stall was refused.
+        pid: u32,
+    },
 }
 
 /// Bookkeeping slot for one outstanding child.
@@ -244,6 +255,17 @@ pub struct Recovery {
     /// [`Recovery::take_refused_unauthenticated_source`]. Surfaced as
     /// `varta_recovery_refused_total{reason="unauthenticated_transport"}`.
     refused_unauthenticated_source: u64,
+    /// If `true`, [`on_stall`] will spawn the recovery command even when the
+    /// stalled agent's PID namespace differs from the observer's. Controlled
+    /// by `--allow-cross-namespace-agents`. Default `false` — refuse and
+    /// audit-log.
+    ///
+    /// [`on_stall`]: Recovery::on_stall
+    allow_cross_namespace: bool,
+    /// Per-pid count of refused recoveries that fired because the stalled
+    /// agent's PID namespace differed from the observer's. Surfaced as
+    /// `varta_recovery_refused_cross_namespace_total`.
+    refused_cross_namespace: u64,
 }
 
 impl Recovery {
@@ -296,7 +318,27 @@ impl Recovery {
             source: "inline".to_string(),
             allow_unauthenticated_source: false,
             refused_unauthenticated_source: 0,
+            allow_cross_namespace: false,
+            refused_cross_namespace: 0,
         }
+    }
+
+    /// Permit recovery to fire for agents whose kernel-attested PID namespace
+    /// differs from the observer's. Default `false`. Wired from the
+    /// `--allow-cross-namespace-agents` CLI flag. Use only when the operator
+    /// can guarantee a meaningful PID translation (e.g. agents launched with
+    /// `--pid=host`, or an out-of-band translator in the recovery template).
+    pub fn with_allow_cross_namespace(mut self, allow: bool) -> Self {
+        self.allow_cross_namespace = allow;
+        self
+    }
+
+    /// Take and reset the count of recovery refusals that fired because the
+    /// stalled agent's PID namespace differed from the observer's.
+    pub fn take_refused_cross_namespace(&mut self) -> u64 {
+        let n = self.refused_cross_namespace;
+        self.refused_cross_namespace = 0;
+        n
     }
 
     /// Enable spawning the recovery command even when the stalled slot's
@@ -555,7 +597,40 @@ impl Recovery {
     /// command is **not** spawned and [`RecoveryOutcome::RefusedUnauthenticatedSource`]
     /// is returned (and audit-logged) — see the H2 mitigation in
     /// `docs/architecture/peer-authentication.md`.
-    pub fn on_stall(&mut self, pid: u32, origin: BeatOrigin) -> RecoveryOutcome {
+    ///
+    /// `cross_namespace_agent` is `true` iff the caller has determined that
+    /// the stalled agent's kernel-attested PID namespace differs from the
+    /// observer's (Linux only). When true and the operator has not opted in
+    /// via [`Recovery::with_allow_cross_namespace`], recovery is **not**
+    /// spawned and [`RecoveryOutcome::RefusedCrossNamespace`] is returned
+    /// (and audit-logged with `reason="cross_namespace_agent"`). The
+    /// cross-namespace check fires before the unauthenticated-transport check
+    /// because both gates can be satisfied at once (an attacker on UDP **and**
+    /// in a different namespace), and the cross-namespace signal is the more
+    /// specific one when present.
+    pub fn on_stall(
+        &mut self,
+        pid: u32,
+        origin: BeatOrigin,
+        cross_namespace_agent: bool,
+    ) -> RecoveryOutcome {
+        // Cross-namespace gate. Default-safe: refuse recovery when the agent's
+        // PID namespace differs from the observer's. The pid in the frame is
+        // meaningful only inside the agent's namespace; `kill(2)` against it
+        // in the observer's namespace would target the wrong process.
+        if cross_namespace_agent && !self.allow_cross_namespace {
+            self.refused_cross_namespace = self.refused_cross_namespace.saturating_add(1);
+            if let Some(sink) = self.audit_sink.as_mut() {
+                sink.record_refused(&RefusedRecord {
+                    wallclock_ms: RecoveryAuditLog::wallclock_ms_now(),
+                    observer_ns: 0,
+                    agent_pid: pid,
+                    reason: "cross_namespace_agent",
+                });
+            }
+            return RecoveryOutcome::RefusedCrossNamespace { pid };
+        }
+
         // Structural origin gate. Default-safe: refuse recovery when the
         // stalled pid's beat lifetime included a non-kernel-attested
         // transport. The operator can opt out (e.g. for development /
@@ -879,8 +954,8 @@ mod tests {
     #[test]
     fn debounces_repeat_calls_for_same_pid() {
         let mut rec = Recovery::new("true".to_string(), Duration::from_secs(10));
-        let first = rec.on_stall(1, BeatOrigin::KernelAttested);
-        let second = rec.on_stall(1, BeatOrigin::KernelAttested);
+        let first = rec.on_stall(1, BeatOrigin::KernelAttested, false);
+        let second = rec.on_stall(1, BeatOrigin::KernelAttested, false);
         assert!(matches!(first, RecoveryOutcome::Spawned { .. }));
         assert!(matches!(second, RecoveryOutcome::Debounced));
     }
@@ -896,7 +971,7 @@ mod tests {
     fn drop_returns_within_configured_grace() {
         let mut rec = Recovery::new("sleep 30".to_string(), Duration::ZERO)
             .with_shutdown_grace(Duration::from_millis(200));
-        match rec.on_stall(99, BeatOrigin::KernelAttested) {
+        match rec.on_stall(99, BeatOrigin::KernelAttested, false) {
             RecoveryOutcome::Spawned { .. } => {}
             other => panic!("expected first stall to spawn, got {other:?}"),
         }
@@ -913,8 +988,8 @@ mod tests {
     #[test]
     fn debounce_is_per_pid() {
         let mut rec = Recovery::new("true".to_string(), Duration::from_secs(10));
-        let a = rec.on_stall(1, BeatOrigin::KernelAttested);
-        let b = rec.on_stall(2, BeatOrigin::KernelAttested);
+        let a = rec.on_stall(1, BeatOrigin::KernelAttested, false);
+        let b = rec.on_stall(2, BeatOrigin::KernelAttested, false);
         assert!(matches!(a, RecoveryOutcome::Spawned { .. }));
         assert!(matches!(b, RecoveryOutcome::Spawned { .. }));
     }
@@ -927,12 +1002,12 @@ mod tests {
             Duration::ZERO,
             Some(Duration::from_millis(50)),
         );
-        let first_child_pid = match rec.on_stall(7, BeatOrigin::KernelAttested) {
+        let first_child_pid = match rec.on_stall(7, BeatOrigin::KernelAttested, false) {
             RecoveryOutcome::Spawned { child_pid } => child_pid,
             other => panic!("expected first stall to spawn, got {other:?}"),
         };
 
-        let second = rec.on_stall(7, BeatOrigin::KernelAttested);
+        let second = rec.on_stall(7, BeatOrigin::KernelAttested, false);
         assert!(
             matches!(second, RecoveryOutcome::Debounced),
             "same-pid recovery must not replace outstanding child; got {second:?}"
@@ -960,7 +1035,7 @@ mod tests {
             "test \"$1-$1\" = \"7-7\"".to_string(),
             Duration::from_secs(0),
         );
-        match rec.on_stall(7, BeatOrigin::KernelAttested) {
+        match rec.on_stall(7, BeatOrigin::KernelAttested, false) {
             RecoveryOutcome::Spawned { child_pid: _ } => {
                 // Child should exit quickly; reap it.
                 std::thread::sleep(Duration::from_millis(50));
@@ -984,7 +1059,7 @@ mod tests {
     fn spawn_returns_immediately_for_slow_template() {
         let mut rec = Recovery::new("sleep 1".to_string(), Duration::ZERO);
         let start = Instant::now();
-        match rec.on_stall(42, BeatOrigin::KernelAttested) {
+        match rec.on_stall(42, BeatOrigin::KernelAttested, false) {
             RecoveryOutcome::Spawned { .. } => {}
             other => panic!("expected Spawned, got {other:?}"),
         }
@@ -999,7 +1074,7 @@ mod tests {
     #[test]
     fn try_reap_surfaces_reaped_for_fast_child() {
         let mut rec = Recovery::new("true".to_string(), Duration::ZERO);
-        match rec.on_stall(99, BeatOrigin::KernelAttested) {
+        match rec.on_stall(99, BeatOrigin::KernelAttested, false) {
             RecoveryOutcome::Spawned { .. } => {}
             other => panic!("expected Spawned, got {other:?}"),
         }
@@ -1030,7 +1105,7 @@ mod tests {
             Duration::ZERO,
             Some(Duration::from_millis(100)),
         );
-        match rec.on_stall(7, BeatOrigin::KernelAttested) {
+        match rec.on_stall(7, BeatOrigin::KernelAttested, false) {
             RecoveryOutcome::Spawned { .. } => {}
             other => panic!("expected Spawned, got {other:?}"),
         }
@@ -1060,7 +1135,7 @@ mod tests {
         let start = Instant::now();
         {
             let mut rec = Recovery::new("sleep 5".to_string(), Duration::ZERO);
-            match rec.on_stall(999, BeatOrigin::KernelAttested) {
+            match rec.on_stall(999, BeatOrigin::KernelAttested, false) {
                 RecoveryOutcome::Spawned { .. } => {}
                 other => panic!("expected Spawned, got {other:?}"),
             }
@@ -1098,11 +1173,11 @@ mod tests {
         let mut rec = Recovery::new("true".to_string(), debounce);
 
         assert!(matches!(
-            rec.on_stall(1, BeatOrigin::KernelAttested),
+            rec.on_stall(1, BeatOrigin::KernelAttested, false),
             RecoveryOutcome::Spawned { .. }
         ));
         assert!(matches!(
-            rec.on_stall(1, BeatOrigin::KernelAttested),
+            rec.on_stall(1, BeatOrigin::KernelAttested, false),
             RecoveryOutcome::Debounced
         ));
 
@@ -1110,7 +1185,7 @@ mod tests {
         std::thread::sleep(prune_threshold + Duration::from_millis(40));
 
         assert!(matches!(
-            rec.on_stall(1, BeatOrigin::KernelAttested),
+            rec.on_stall(1, BeatOrigin::KernelAttested, false),
             RecoveryOutcome::Spawned { .. }
         ));
     }
@@ -1124,7 +1199,7 @@ mod tests {
             },
             Duration::ZERO,
         );
-        match rec.on_stall(42, BeatOrigin::KernelAttested) {
+        match rec.on_stall(42, BeatOrigin::KernelAttested, false) {
             RecoveryOutcome::Spawned { .. } => {
                 std::thread::sleep(Duration::from_millis(50));
                 let outcomes = rec.try_reap();
@@ -1155,7 +1230,7 @@ mod tests {
             },
             Duration::ZERO,
         );
-        match rec.on_stall(42, BeatOrigin::KernelAttested) {
+        match rec.on_stall(42, BeatOrigin::KernelAttested, false) {
             RecoveryOutcome::Spawned { .. } => {
                 std::thread::sleep(Duration::from_millis(100));
                 let outcomes = rec.try_reap();
@@ -1181,7 +1256,7 @@ mod tests {
             },
             Duration::ZERO,
         );
-        match rec.on_stall(42, BeatOrigin::KernelAttested) {
+        match rec.on_stall(42, BeatOrigin::KernelAttested, false) {
             RecoveryOutcome::Spawned { .. } => {
                 std::thread::sleep(Duration::from_millis(50));
                 let outcomes = rec.try_reap();
@@ -1205,7 +1280,7 @@ mod tests {
             None,
         )
         .with_recovery_env(vec!["FOO=bar".to_string()]);
-        match rec.on_stall(1, BeatOrigin::KernelAttested) {
+        match rec.on_stall(1, BeatOrigin::KernelAttested, false) {
             RecoveryOutcome::Spawned { .. } => {
                 std::thread::sleep(Duration::from_millis(100));
                 let outcomes = rec.try_reap();
@@ -1233,7 +1308,7 @@ mod tests {
             None,
         )
         .with_recovery_env(vec!["MYVAR=hello".to_string(), "OTHER=world".to_string()]);
-        match rec.on_stall(1, BeatOrigin::KernelAttested) {
+        match rec.on_stall(1, BeatOrigin::KernelAttested, false) {
             RecoveryOutcome::Spawned { .. } => {
                 std::thread::sleep(Duration::from_millis(100));
                 let outcomes = rec.try_reap();
@@ -1259,7 +1334,7 @@ mod tests {
             None,
         );
         // Default: recovery_env is empty → inherits observer's environment.
-        match rec.on_stall(1, BeatOrigin::KernelAttested) {
+        match rec.on_stall(1, BeatOrigin::KernelAttested, false) {
             RecoveryOutcome::Spawned { .. } => {
                 std::thread::sleep(Duration::from_millis(100));
                 let outcomes = rec.try_reap();
@@ -1290,7 +1365,7 @@ mod tests {
             None,
         )
         .with_recovery_env(vec!["E1=a".to_string(), "E2=b".to_string()]);
-        match rec.on_stall(1, BeatOrigin::KernelAttested) {
+        match rec.on_stall(1, BeatOrigin::KernelAttested, false) {
             RecoveryOutcome::Spawned { .. } => {
                 std::thread::sleep(Duration::from_millis(100));
                 let outcomes = rec.try_reap();
@@ -1345,7 +1420,7 @@ mod tests {
         )
         .with_audit_sink(Some(sink));
 
-        match rec.on_stall(123, BeatOrigin::KernelAttested) {
+        match rec.on_stall(123, BeatOrigin::KernelAttested, false) {
             RecoveryOutcome::Spawned { .. } => {}
             other => panic!("expected Spawned, got {other:?}"),
         }
@@ -1397,7 +1472,7 @@ mod tests {
         .with_capture(4096)
         .with_audit_sink(Some(sink));
 
-        match rec.on_stall(77, BeatOrigin::KernelAttested) {
+        match rec.on_stall(77, BeatOrigin::KernelAttested, false) {
             RecoveryOutcome::Spawned { .. } => {}
             other => panic!("expected Spawned, got {other:?}"),
         }
@@ -1452,7 +1527,7 @@ mod tests {
         .with_capture(64)
         .with_audit_sink(Some(sink));
 
-        match rec.on_stall(8, BeatOrigin::KernelAttested) {
+        match rec.on_stall(8, BeatOrigin::KernelAttested, false) {
             RecoveryOutcome::Spawned { .. } => {}
             other => panic!("expected Spawned, got {other:?}"),
         }
@@ -1496,7 +1571,7 @@ mod tests {
             },
             Duration::ZERO,
         );
-        match rec.on_stall(1, BeatOrigin::KernelAttested) {
+        match rec.on_stall(1, BeatOrigin::KernelAttested, false) {
             RecoveryOutcome::Spawned { .. } => {}
             other => panic!("expected Spawned, got {other:?}"),
         }
@@ -1516,7 +1591,7 @@ mod tests {
             Duration::ZERO,
         );
 
-        match rec.on_stall(42, BeatOrigin::NetworkUnverified) {
+        match rec.on_stall(42, BeatOrigin::NetworkUnverified, false) {
             RecoveryOutcome::RefusedUnauthenticatedSource { pid } => assert_eq!(pid, 42),
             other => panic!("expected RefusedUnauthenticatedSource, got {other:?}"),
         }
@@ -1538,7 +1613,7 @@ mod tests {
         )
         .with_allow_unauthenticated_source(true);
 
-        match rec.on_stall(42, BeatOrigin::NetworkUnverified) {
+        match rec.on_stall(42, BeatOrigin::NetworkUnverified, false) {
             RecoveryOutcome::Spawned { .. } => {}
             other => panic!("expected Spawned, got {other:?}"),
         }
@@ -1559,13 +1634,76 @@ mod tests {
         );
 
         // First call refused → no debounce entry recorded.
-        let _ = rec.on_stall(7, BeatOrigin::NetworkUnverified);
+        let _ = rec.on_stall(7, BeatOrigin::NetworkUnverified, false);
 
         // A genuine kernel-attested stall for the same pid still spawns —
         // the previous (refused) call did not consume the debounce window.
-        match rec.on_stall(7, BeatOrigin::KernelAttested) {
+        match rec.on_stall(7, BeatOrigin::KernelAttested, false) {
             RecoveryOutcome::Spawned { .. } => {}
             other => panic!("expected Spawned, got {other:?}"),
         }
+    }
+
+    /// M8 default-safe gate: a kernel-attested stall whose agent runs in a
+    /// different PID namespace from the observer must NOT spawn recovery —
+    /// `kill(2)` in the observer's namespace would target the wrong process.
+    #[test]
+    fn refuses_recovery_on_cross_namespace_agent() {
+        let mut rec = Recovery::with_mode(
+            RecoveryMode::Exec {
+                program: "true".to_string(),
+                args: vec![],
+            },
+            Duration::ZERO,
+        );
+
+        match rec.on_stall(42, BeatOrigin::KernelAttested, /* cross_ns */ true) {
+            RecoveryOutcome::RefusedCrossNamespace { pid } => assert_eq!(pid, 42),
+            other => panic!("expected RefusedCrossNamespace, got {other:?}"),
+        }
+        assert_eq!(rec.take_refused_cross_namespace(), 1);
+        assert_eq!(rec.take_refused_cross_namespace(), 0);
+    }
+
+    /// `--allow-cross-namespace-agents` flips the gate off; cross-namespace
+    /// stalls reach the spawn path like same-namespace ones.
+    #[test]
+    fn opt_in_allows_recovery_on_cross_namespace_agent() {
+        let mut rec = Recovery::with_mode(
+            RecoveryMode::Exec {
+                program: "true".to_string(),
+                args: vec![],
+            },
+            Duration::ZERO,
+        )
+        .with_allow_cross_namespace(true);
+
+        match rec.on_stall(42, BeatOrigin::KernelAttested, true) {
+            RecoveryOutcome::Spawned { .. } => {}
+            other => panic!("expected Spawned with opt-in, got {other:?}"),
+        }
+        assert_eq!(rec.take_refused_cross_namespace(), 0);
+    }
+
+    /// Cross-namespace gate takes precedence over the unauthenticated-transport
+    /// gate when both conditions are satisfied — the cross-namespace signal
+    /// is more specific.
+    #[test]
+    fn cross_namespace_gate_precedes_unauth_gate() {
+        let mut rec = Recovery::with_mode(
+            RecoveryMode::Exec {
+                program: "true".to_string(),
+                args: vec![],
+            },
+            Duration::ZERO,
+        );
+
+        match rec.on_stall(42, BeatOrigin::NetworkUnverified, true) {
+            RecoveryOutcome::RefusedCrossNamespace { pid } => assert_eq!(pid, 42),
+            other => panic!("expected RefusedCrossNamespace, got {other:?}"),
+        }
+        assert_eq!(rec.take_refused_cross_namespace(), 1);
+        // The unauth counter must NOT have been bumped — first match wins.
+        assert_eq!(rec.take_refused_unauthenticated_source(), 0);
     }
 }

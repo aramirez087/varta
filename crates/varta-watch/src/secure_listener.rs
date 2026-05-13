@@ -412,6 +412,9 @@ impl BeatListener for SecureUdpListener {
             return RecvResult::Authenticated {
                 peer_pid: 0,
                 peer_uid: 0,
+                // Secure UDP authenticates wire bytes cryptographically but
+                // carries no kernel-attested namespace identity.
+                peer_pid_ns_inode: None,
                 origin: BeatOrigin::NetworkUnverified,
                 data: plaintext,
             };

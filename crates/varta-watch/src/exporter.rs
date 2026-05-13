@@ -185,6 +185,7 @@ impl Exporter for FileExporter {
                 nonce,
                 observer_ns,
                 origin: _,
+                pid_ns_inode: _,
             } => {
                 let label = status_label(*status);
                 decimal_digits(*observer_ns) as u64
@@ -225,7 +226,8 @@ impl Exporter for FileExporter {
             Event::Decode(_, _)
             | Event::Io(_, _)
             | Event::CtrlTruncated(_, _)
-            | Event::OriginConflict { .. } => 0,
+            | Event::OriginConflict { .. }
+            | Event::NamespaceConflict { .. } => 0,
             Event::AuthFailure {
                 claimed_pid,
                 observer_ns,
@@ -252,6 +254,7 @@ impl Exporter for FileExporter {
                 nonce,
                 observer_ns,
                 origin: _,
+                pid_ns_inode: _,
             } => writeln!(
                 self.sink,
                 "{observer_ns}\tbeat\t{pid}\t{nonce}\t{}\t{payload}",
@@ -263,6 +266,7 @@ impl Exporter for FileExporter {
                 last_ns: _,
                 observer_ns,
                 origin: _,
+                pid_ns_inode: _,
             } => writeln!(
                 self.sink,
                 "{observer_ns}\tstall\t{pid}\t{last_nonce}\tstall\t-",
@@ -290,6 +294,16 @@ impl Exporter for FileExporter {
                 writeln!(
                     self.sink,
                     "{observer_ns}\tmismatch\t{claimed_pid}\t-\t-\torigin_conflict",
+                )
+            }
+            Event::NamespaceConflict {
+                claimed_pid,
+                observer_ns,
+                ..
+            } => {
+                writeln!(
+                    self.sink,
+                    "{observer_ns}\tmismatch\t{claimed_pid}\t-\t-\tnamespace_conflict",
                 )
             }
             Event::CtrlTruncated(err, observer_ns) => {
@@ -502,7 +516,7 @@ const DROP_REASON_LABELS: [&str; 3] = ["drain", "rate_limit", "ip_table_full"];
 /// Outcome label values for `varta_recovery_outcomes_total`. Indexed by
 /// [`recovery_outcome_index`]; emitted unconditionally (every value, even
 /// at zero) so `absent()` alert rules stay green.
-const RECOVERY_OUTCOME_LABELS: [&str; 7] = [
+const RECOVERY_OUTCOME_LABELS: [&str; 8] = [
     "spawned",
     "debounced",
     "reaped_zero",
@@ -510,12 +524,14 @@ const RECOVERY_OUTCOME_LABELS: [&str; 7] = [
     "killed",
     "spawn_failed",
     "refused_unauthenticated_transport",
+    "refused_cross_namespace",
 ];
 
 /// Reason label values for `varta_recovery_refused_total`. Indexed by
 /// [`refused_reason_index`]; emitted unconditionally so `absent()` rules
 /// stay green.
-const RECOVERY_REFUSED_REASON_LABELS: [&str; 1] = ["unauthenticated_transport"];
+const RECOVERY_REFUSED_REASON_LABELS: [&str; 2] =
+    ["unauthenticated_transport", "cross_namespace_agent"];
 
 /// Map a [`crate::recovery::RecoveryOutcome`] to a stable index for the
 /// `varta_recovery_outcomes_total` array.
@@ -534,6 +550,7 @@ fn recovery_outcome_index(outcome: &crate::recovery::RecoveryOutcome) -> usize {
         RecoveryOutcome::Killed { .. } => 4,
         RecoveryOutcome::SpawnFailed(_) => 5,
         RecoveryOutcome::RefusedUnauthenticatedSource { .. } => 6,
+        RecoveryOutcome::RefusedCrossNamespace { .. } => 7,
         // ReapFailed is not user-facing here — treat as a reap-nonzero
         // (it implies the child terminated abnormally from our POV).
         RecoveryOutcome::ReapFailed(_) => 3,
@@ -547,11 +564,13 @@ fn recovery_outcome_index(outcome: &crate::recovery::RecoveryOutcome) -> usize {
 #[derive(Clone, Copy, Debug)]
 enum RefusedReason {
     UnauthenticatedTransport,
+    CrossNamespaceAgent,
 }
 
 fn refused_reason_index(r: RefusedReason) -> usize {
     match r {
         RefusedReason::UnauthenticatedTransport => 0,
+        RefusedReason::CrossNamespaceAgent => 1,
     }
 }
 
@@ -627,6 +646,15 @@ pub struct PromExporter {
     /// slot's pinned transport origin disagreed with the beat's origin.
     /// Surfaced as `varta_origin_conflict_total`.
     origin_conflict_total: u64,
+    /// Frames dropped at receive because the peer's PID-namespace inode
+    /// differs from the observer's. Linux-only signal; 0 on other platforms.
+    /// Surfaced as `varta_frame_namespace_mismatch_total`.
+    frame_namespace_mismatch_total: u64,
+    /// Tracker-level namespace conflicts — beats dropped because the slot's
+    /// pinned PID-namespace inode disagreed with the beat's inode
+    /// (first-namespace-wins). Surfaced as
+    /// `varta_tracker_namespace_conflict_total`.
+    tracker_namespace_conflict_total: u64,
     /// Hot-path invariant violations recovered defensively by the tracker.
     /// Surfaced as `varta_tracker_invariant_violations_total`; non-zero
     /// values mean a `.get()` fall-through fired (stale index, OOB slot,
@@ -776,6 +804,8 @@ impl PromExporter {
             recovery_outcomes_total: [0; RECOVERY_OUTCOME_LABELS.len()],
             recovery_refused_total: [0; RECOVERY_REFUSED_REASON_LABELS.len()],
             origin_conflict_total: 0,
+            frame_namespace_mismatch_total: 0,
+            tracker_namespace_conflict_total: 0,
             tracker_invariant_violations_total: 0,
             tracker_pid_index_probe_exhausted_total: 0,
             recovery_duration_ns_sum: 0,
@@ -944,8 +974,10 @@ impl PromExporter {
     /// outcomes), bumps the duration sum + count.
     ///
     /// `RefusedUnauthenticatedSource` outcomes additionally bump
-    /// `varta_recovery_refused_total{reason="unauthenticated_transport"}`
-    /// so operators can alert on the refusal independently of the broader
+    /// `varta_recovery_refused_total{reason="unauthenticated_transport"}`;
+    /// `RefusedCrossNamespace` outcomes bump
+    /// `varta_recovery_refused_total{reason="cross_namespace_agent"}`.
+    /// Operators can alert on either refusal independently of the broader
     /// outcome label.
     pub fn record_recovery_outcome(
         &mut self,
@@ -954,10 +986,18 @@ impl PromExporter {
     ) {
         let idx = recovery_outcome_index(outcome);
         self.recovery_outcomes_total[idx] = self.recovery_outcomes_total[idx].saturating_add(1);
-        if let crate::recovery::RecoveryOutcome::RefusedUnauthenticatedSource { .. } = outcome {
-            let r_idx = refused_reason_index(RefusedReason::UnauthenticatedTransport);
-            self.recovery_refused_total[r_idx] =
-                self.recovery_refused_total[r_idx].saturating_add(1);
+        match outcome {
+            crate::recovery::RecoveryOutcome::RefusedUnauthenticatedSource { .. } => {
+                let r_idx = refused_reason_index(RefusedReason::UnauthenticatedTransport);
+                self.recovery_refused_total[r_idx] =
+                    self.recovery_refused_total[r_idx].saturating_add(1);
+            }
+            crate::recovery::RecoveryOutcome::RefusedCrossNamespace { .. } => {
+                let r_idx = refused_reason_index(RefusedReason::CrossNamespaceAgent);
+                self.recovery_refused_total[r_idx] =
+                    self.recovery_refused_total[r_idx].saturating_add(1);
+            }
+            _ => {}
         }
         if let Some(d) = duration_ns {
             self.recovery_duration_ns_sum = self.recovery_duration_ns_sum.saturating_add(d);
@@ -973,6 +1013,26 @@ impl PromExporter {
     /// `varta_origin_conflict_total`.
     pub fn record_origin_conflicts(&mut self, count: u64) {
         self.origin_conflict_total = self.origin_conflict_total.saturating_add(count);
+    }
+
+    /// Record one or more frame-namespace mismatches — kernel-attested
+    /// datagrams dropped at receive because the peer's PID-namespace inode
+    /// differs from the observer's. See
+    /// [`crate::observer::Observer::drain_cross_namespace_drops`]. Surfaced
+    /// as `varta_frame_namespace_mismatch_total`.
+    pub fn record_frame_namespace_mismatches(&mut self, count: u64) {
+        self.frame_namespace_mismatch_total =
+            self.frame_namespace_mismatch_total.saturating_add(count);
+    }
+
+    /// Record one or more tracker namespace conflicts — beats dropped because
+    /// the slot's pinned PID-namespace inode disagreed with the beat's inode
+    /// (first-namespace-wins). See
+    /// [`crate::tracker::Tracker::take_namespace_conflicts`]. Surfaced as
+    /// `varta_tracker_namespace_conflict_total`.
+    pub fn record_tracker_namespace_conflicts(&mut self, count: u64) {
+        self.tracker_namespace_conflict_total =
+            self.tracker_namespace_conflict_total.saturating_add(count);
     }
 
     /// Record one or more tracker invariant violations recovered by the
@@ -1429,6 +1489,33 @@ impl PromExporter {
             "varta_origin_conflict_total {}",
             self.origin_conflict_total
         );
+        // varta_frame_namespace_mismatch_total — kernel-attested frames
+        // dropped at receive because the peer's PID-namespace inode differs
+        // from the observer's. Linux-only signal; 0 elsewhere. Always emitted
+        // so `absent()` rules stay green-on-green.
+        self.body_buf.push_str(
+            "# HELP varta_frame_namespace_mismatch_total Frames dropped at receive because the peer's PID-namespace inode differs from the observer's.\n",
+        );
+        self.body_buf
+            .push_str("# TYPE varta_frame_namespace_mismatch_total counter\n");
+        let _ = writeln!(
+            self.body_buf,
+            "varta_frame_namespace_mismatch_total {}",
+            self.frame_namespace_mismatch_total
+        );
+        // varta_tracker_namespace_conflict_total — beats dropped because the
+        // slot's pinned PID-namespace inode disagreed with the beat's inode
+        // (first-namespace-wins). Linux-only signal.
+        self.body_buf.push_str(
+            "# HELP varta_tracker_namespace_conflict_total Beats dropped because the slot's pinned PID-namespace inode disagreed with the beat's (first-namespace-wins).\n",
+        );
+        self.body_buf
+            .push_str("# TYPE varta_tracker_namespace_conflict_total counter\n");
+        let _ = writeln!(
+            self.body_buf,
+            "varta_tracker_namespace_conflict_total {}",
+            self.tracker_namespace_conflict_total
+        );
         // Tracker hot-path invariant violations recovered without panic.
         // Always emitted (even at zero) so `absent()` alert rules stay
         // green-on-green; any non-zero scrape is a bug worth investigating.
@@ -1717,6 +1804,11 @@ impl Exporter for PromExporter {
                 // round). This arm just acknowledges the variant for
                 // exhaustiveness.
             }
+            Event::NamespaceConflict { .. } => {
+                // Counted on the per-tick drain via `record_cross_namespace_drops`
+                // and `record_namespace_conflicts`. Acknowledged here for
+                // exhaustive matching.
+            }
             Event::Decode(err, _) => {
                 let idx = decode_kind_index(err);
                 self.decode_errors_total[idx] = self.decode_errors_total[idx].saturating_add(1);
@@ -1922,6 +2014,7 @@ mod tests {
             payload: 0,
             observer_ns: 0,
             origin: crate::peer_cred::BeatOrigin::KernelAttested,
+            pid_ns_inode: None,
         })
         .unwrap();
         prom.record(&Event::Beat {
@@ -1931,6 +2024,7 @@ mod tests {
             payload: 0,
             observer_ns: 0,
             origin: crate::peer_cred::BeatOrigin::KernelAttested,
+            pid_ns_inode: None,
         })
         .unwrap();
         prom.record(&Event::Beat {
@@ -1940,6 +2034,7 @@ mod tests {
             payload: 0,
             observer_ns: 0,
             origin: crate::peer_cred::BeatOrigin::KernelAttested,
+            pid_ns_inode: None,
         })
         .unwrap();
         prom.render_body();
@@ -2168,6 +2263,7 @@ mod tests {
             payload: 0,
             observer_ns: 0,
             origin: crate::peer_cred::BeatOrigin::KernelAttested,
+            pid_ns_inode: None,
         })
         .unwrap();
         assert!(prom.rows.contains_key(&42), "row should exist after beat");
@@ -2200,6 +2296,7 @@ mod tests {
             payload: 0,
             observer_ns: 1,
             origin: crate::peer_cred::BeatOrigin::KernelAttested,
+            pid_ns_inode: None,
         })
         .unwrap();
         prom.record_loop_tick();

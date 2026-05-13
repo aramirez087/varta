@@ -61,7 +61,7 @@ varta-vlp  ←  varta-client  ←  (consumers)
 
 **`varta-client`** — the agent-side API. `Varta::connect()` opens a non-blocking `UnixDatagram`; `beat(status, payload)` encodes on the stack and calls `send(2)`. Returns `BeatOutcome::{Sent, Dropped, Failed}` — `WouldBlock` is `Dropped`, never an error. Optional `panic-handler` feature installs a Rust panic hook that emits a `Critical` beat before unwinding.
 
-**`varta-watch`** — the observer binary and library. Single-threaded poll loop over UDS. Per-pid state machine tracks silence thresholds and debounced recovery commands. Exports TSV files and a Prometheus `/metrics` endpoint.
+**`varta-watch`** — the observer binary and library. Single-threaded poll loop over UDS. Per-pid state machine tracks silence thresholds and debounced recovery commands. Exports TSV files and a Prometheus `/metrics` endpoint. On Linux, the observer detects cross-namespace agents by reading `/proc/<peer_pid>/ns/pid` and refuses beats / recovery for agents whose PID namespace differs from its own (CLI overrides: `--allow-cross-namespace-agents`, `--strict-namespace-check`; see `docs/architecture/namespaces.md`).
 
 **`varta-tests`** — end-to-end contract tests (`harness = false`) that spawn real built binaries and assert against the live Prometheus endpoint. Must be run after `cargo build --release`.
 
@@ -76,3 +76,4 @@ These are load-bearing invariants — do not relax them:
 3. **Non-blocking only** — the agent socket is non-blocking at connect time. Code must never call `set_nonblocking(false)` or add blocking I/O to the beat path.
 4. **Frame layout is ABI-stable.** Any change to the `Frame` field layout requires a VLP version bump and updated integration tests.
 5. **Edition 2021**, toolchain pinned to `stable` via `rust-toolchain.toml`. Do not change the channel without updating all five crates.
+6. **`varta-vlp` is `#![no_std]` by default.** The crate compiles cleanly on `thumbv7m-none-eabi` (and any other bare-metal target) without `alloc`. The optional `std` feature gates `Key::from_file` and `std::path::Path`-typed conveniences for downstream consumers (currently only the `secure_udp` example). The `crypto` feature is `no_std`-clean (RustCrypto crates pinned to `default-features = false`). CI proves both invariants on every push.

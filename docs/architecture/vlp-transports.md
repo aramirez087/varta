@@ -118,9 +118,10 @@ varta-watch --socket /tmp/varta.sock --threshold-ms 500 \
 
 | Crate | Flag | Effect |
 |---|---|---|
-| `varta-vlp` | `crypto` | Enables ChaCha20-Poly1305 AEAD (`seal`, `open`, `Key`) |
+| `varta-vlp` | `crypto` | Enables ChaCha20-Poly1305 AEAD (`seal`, `open`, `Key`). No_std-compatible — all four RustCrypto deps are `default-features = false`. |
+| `varta-vlp` | `std` | Opt-in std-dependent conveniences (`Key::from_file`, `std::path::Path`-typed helpers). **Off by default** so the crate is `#![no_std]` + alloc-free out of the box — ready for FreeRTOS/Zephyr targets. |
 | `varta-client` | `udp` | Enables `UdpTransport`, `Varta::connect_udp()`, `install_panic_handler_udp()` |
-| `varta-client` | `secure-udp` | Enables `SecureUdpTransport`, `Varta::connect_secure_udp()`; implies `udp` |
+| `varta-client` | `secure-udp` | Enables `SecureUdpTransport`, `Varta::connect_secure_udp()`; implies `udp`, `varta-vlp/crypto`, and `varta-vlp/std` (the `secure_udp` example calls `Key::from_file`). |
 | `varta-watch` | `udp` | Enables `UdpListener`, `--udp-port` / `--udp-bind-addr` CLI flags |
 | `varta-watch` | `secure-udp` | Enables `SecureUdpListener`, `--key-file` / `--accepted-key-file` / `--master-key-file`; implies `udp-core` |
 | `varta-tests` | `udp` | Enables UDP integration tests |
@@ -167,11 +168,76 @@ varta-watch --socket /tmp/varta.sock --threshold-ms 500 \
   - `--recovery-cmd-file` / `--recovery-exec-file`: Read templates from files
     with mandatory ownership/permission checks (UID match, mode ≤ 0600).
 
+## Container / PID-namespace semantics
+
+`Frame.pid` carries the agent's PID **in the agent's PID namespace**. The
+observer's kernel-attested peer PID (`SO_PASSCRED` / `LOCAL_PEERTOKEN` /
+`SCM_CREDS`) is in the **observer's** namespace. When the two namespaces
+differ:
+
+- The pid in the frame cannot be used to identify a process the observer can
+  `kill(2)` or `systemctl restart` — the same numeric PID refers to a different
+  process in each namespace.
+- The existing `frame.pid == peer_pid` check at observer ingress catches most
+  cases (different namespaces usually produce different numeric pids), but
+  same-pid collisions across containers (every container's first process is
+  PID 1) are invisible to that gate.
+
+`varta-watch` therefore (Linux only):
+
+1. Reads `/proc/self/ns/pid` once at startup and caches the inode as the
+   observer's namespace identity.
+2. For every kernel-attested beat (UDS), reads `/proc/<peer_pid>/ns/pid` and
+   compares the inode to the observer's. Mismatch ⇒ drop the beat
+   (`varta_frame_namespace_mismatch_total++`) and emit
+   `Event::NamespaceConflict`.
+3. Per-pid tracker slots pin the namespace inode at first beat; a later beat
+   with a different `Some(_)` inode is rejected as `Update::NamespaceConflict`
+   (`varta_tracker_namespace_conflict_total++`).
+4. Recovery commands refuse to spawn for cross-namespace stalls and log an
+   audit record with `reason=cross_namespace_agent`
+   (`varta_recovery_refused_total{reason="cross_namespace_agent"}++`).
+
+### Escape hatch — `--allow-cross-namespace-agents`
+
+When agents are intentionally run with `--pid=host` (containers sharing the
+host PID namespace), the observer's namespace and the agents' namespace agree
+at the kernel level — the gate above is a no-op.
+
+For deployments where the agent runs in a private namespace **and** the
+operator has out-of-band PID translation (e.g. CNI metadata that lets a
+recovery script translate container pids to host pids), pass
+`--allow-cross-namespace-agents`. The audit log and metrics still fire, but
+beats are admitted and recovery is permitted.
+
+### `--strict-namespace-check`
+
+Treat namespace mismatch as a fatal startup error: on the first
+`Event::NamespaceConflict`, the daemon logs a `FATAL` line and exits with a
+non-zero status. Used in environments where the operator wants the daemon to
+fail loudly rather than silently log audit refusals.
+
+### Non-Linux platforms
+
+PID namespaces are a Linux kernel concept. On macOS and the BSDs,
+`observer_pid_namespace_inode()` returns `None` and all comparisons
+short-circuit to "match". The CLI flags are accepted for portability but
+have no runtime effect.
+
+### UDP transports
+
+UDP listeners (plain or secure) have no kernel peer-cred mechanism.
+`peer_pid` is 0; `peer_pid_ns_inode` is `None`. Recovery is already refused
+for `NetworkUnverified` origins by the existing transport gate — namespace
+mismatch adds nothing for UDP. See
+[`peer-authentication.md`](peer-authentication.md) for the full trust model.
+
 ## Cross-references
 
 - [Observer liveness](observer-liveness.md) — the watcher's own liveness story: in-process self-watchdog, systemd `sd_notify`, hardware watchdog, and paired-observer pattern
 - [Safety profiles](safety-profiles.md) — compile-time vs. runtime feature gating for production-safe builds
 - [Peer authentication](peer-authentication.md) — kernel-level PID attestation and transport trust classification
+- [Namespaces](namespaces.md) — dedicated reference for cross-namespace deployments
 
 ---
 

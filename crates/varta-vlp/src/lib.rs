@@ -1,3 +1,4 @@
+#![cfg_attr(not(feature = "std"), no_std)]
 #![deny(missing_docs, unsafe_op_in_unsafe_fn, rust_2018_idioms)]
 #![forbid(clippy::dbg_macro, clippy::print_stdout)]
 
@@ -10,7 +11,17 @@
 //! fixed-size byte arrays so the steady-state path on either side of the
 //! socket is heap-clean.
 //!
+//! The crate compiles as `#![no_std]` by default and pulls in zero allocator
+//! usage; the optional `std` feature enables `Key::from_file` and related
+//! `std::path::Path`-typed conveniences.
+//!
 //! See `docs/architecture/vlp-frame.md` for the byte map and design notes.
+
+// Unit tests live inside the lib crate and use `format!` / `assert_eq!` against
+// dynamic strings; pull `std` in for the test harness only. This does not
+// affect the production library's `#![no_std]` posture in any build mode.
+#[cfg(test)]
+extern crate std;
 
 #[cfg(feature = "crypto")]
 pub mod crypto;

@@ -41,6 +41,10 @@ pub enum Event {
         /// Transport-class classification of the beat (see [`BeatOrigin`]).
         /// Recovery commands consult this to refuse firing on non-kernel-attested origins.
         origin: BeatOrigin,
+        /// Kernel-attested PID-namespace inode of the sender (Linux only).
+        /// `None` for non-Linux platforms, UDP transports, or when the peer's
+        /// `/proc/<pid>/ns/pid` was unreadable.
+        pid_ns_inode: Option<u64>,
         /// Observer-local timestamp (ns since [`Observer`] start) when this
         /// event was produced.
         observer_ns: u64,
@@ -60,6 +64,11 @@ pub enum Event {
         /// explicitly opted in via
         /// `--i-accept-recovery-on-unauthenticated-transport`.
         origin: BeatOrigin,
+        /// PID-namespace inode pinned by the slot's first beat (Linux only).
+        /// Used by main.rs to construct the recovery `StallSource`: a
+        /// `Some(_)` value that differs from the observer's namespace inode
+        /// indicates a cross-namespace agent and gates recovery refusal.
+        pid_ns_inode: Option<u64>,
         /// Observer-local timestamp (ns since [`Observer`] start) when this
         /// stall event was produced.
         observer_ns: u64,
@@ -88,6 +97,25 @@ pub enum Event {
         observed_origin: BeatOrigin,
         /// Origin pinned by the slot (the one that "won" the conflict).
         slot_origin: BeatOrigin,
+        /// Observer-local timestamp (ns since [`Observer`] start) when this
+        /// event was produced.
+        observer_ns: u64,
+    },
+    /// A kernel-attested beat arrived whose peer PID-namespace inode differs
+    /// from the observer's namespace (Linux only). Recovery for the
+    /// associated pid cannot safely fire because the pid is in a different
+    /// namespace — `kill(2)` and `systemctl` would target the wrong process.
+    /// The beat was dropped at receive; the tracker was not modified.
+    NamespaceConflict {
+        /// The pid claimed by the dropped beat.
+        claimed_pid: u32,
+        /// PID-namespace inode of the sender (Linux only; `None` when
+        /// `/proc/<peer_pid>/ns/pid` was unreadable).
+        observed_ns_inode: Option<u64>,
+        /// The observer's own PID-namespace inode (cached at startup; `None`
+        /// when `/proc/self/ns/pid` is unreadable, which usually means the
+        /// platform isn't Linux).
+        observer_ns_inode: Option<u64>,
         /// Observer-local timestamp (ns since [`Observer`] start) when this
         /// event was produced.
         observer_ns: u64,
@@ -122,6 +150,16 @@ pub struct Observer {
     /// Monotonicity guard — last `now_ns()` value, clamped forward-only to
     /// survive TSC drift and VM live migration.
     last_now_ns: u64,
+    /// When true, beats from agents whose kernel-attested PID namespace
+    /// differs from the observer's are admitted into the tracker (and may
+    /// later be passed to recovery). Set by `--allow-cross-namespace-agents`.
+    /// Default `false` — beats from cross-namespace agents are dropped at
+    /// ingress and counted via [`Observer::drain_cross_namespace_drops`].
+    allow_cross_namespace: bool,
+    /// Count of beats dropped at ingress because the kernel-attested peer's
+    /// PID namespace inode differs from the observer's. Linux-only signal;
+    /// 0 on other platforms.
+    cross_namespace_drops: u64,
 }
 
 impl Observer {
@@ -171,7 +209,17 @@ impl Observer {
             rate_limit_interval_ns,
             rate_limited_total: 0,
             last_now_ns: 0,
+            allow_cross_namespace: false,
+            cross_namespace_drops: 0,
         }
+    }
+
+    /// Allow beats from agents whose kernel-attested PID namespace differs
+    /// from the observer's own namespace. Default `false`. Wired from the
+    /// `--allow-cross-namespace-agents` CLI flag.
+    pub fn with_allow_cross_namespace(mut self, allow: bool) -> Self {
+        self.allow_cross_namespace = allow;
+        self
     }
 
     /// Create an observer from a single already-configured listener.
@@ -237,6 +285,7 @@ impl Observer {
                 RecvResult::Authenticated {
                     peer_pid,
                     peer_uid: _,
+                    peer_pid_ns_inode,
                     origin,
                     data,
                 } => {
@@ -260,6 +309,33 @@ impl Observer {
                                 }
                                 continue;
                             }
+                            // Cross-namespace gate (Linux only). When the
+                            // kernel-attested peer's PID namespace inode
+                            // differs from the observer's, the frame.pid
+                            // cannot safely be used to target recovery
+                            // commands. The check is a no-op on non-Linux
+                            // (both inodes are `None`), for UDP transports
+                            // (peer inode is `None`), and when the operator
+                            // has opted in via --allow-cross-namespace-agents.
+                            let observer_ns_inode =
+                                crate::peer_cred::observer_pid_namespace_inode();
+                            let cross_ns = matches!(
+                                (observer_ns_inode, peer_pid_ns_inode),
+                                (Some(a), Some(b)) if a != b
+                            );
+                            if cross_ns && !self.allow_cross_namespace {
+                                self.cross_namespace_drops =
+                                    self.cross_namespace_drops.saturating_add(1);
+                                if first_event.is_none() {
+                                    first_event = Some(Event::NamespaceConflict {
+                                        claimed_pid: frame.pid,
+                                        observed_ns_inode: peer_pid_ns_inode,
+                                        observer_ns_inode,
+                                        observer_ns: now_ns,
+                                    });
+                                }
+                                continue;
+                            }
                             // Per-pid rate limiting: if a minimum inter-beat
                             // interval is configured, skip frames that arrive
                             // too soon from the same pid.
@@ -277,10 +353,13 @@ impl Observer {
                             // the slot was pinned to without an extra lookup
                             // afterwards.
                             let slot_origin_before = self.tracker.origin_of(frame.pid);
-                            match self
-                                .tracker
-                                .record(&frame, now_ns, self.threshold_ns, origin)
-                            {
+                            match self.tracker.record(
+                                &frame,
+                                now_ns,
+                                self.threshold_ns,
+                                origin,
+                                peer_pid_ns_inode,
+                            ) {
                                 Update::Inserted | Update::Refreshed => {
                                     if first_event.is_none() {
                                         first_event = Some(Event::Beat {
@@ -289,6 +368,7 @@ impl Observer {
                                             payload: frame.payload,
                                             nonce: frame.nonce,
                                             origin,
+                                            pid_ns_inode: peer_pid_ns_inode,
                                             observer_ns: now_ns,
                                         });
                                     }
@@ -299,6 +379,19 @@ impl Observer {
                                             claimed_pid: frame.pid,
                                             observed_origin: origin,
                                             slot_origin: slot_origin_before.unwrap_or(origin),
+                                            observer_ns: now_ns,
+                                        });
+                                    }
+                                }
+                                Update::NamespaceConflict => {
+                                    if first_event.is_none() {
+                                        first_event = Some(Event::NamespaceConflict {
+                                            claimed_pid: frame.pid,
+                                            observed_ns_inode: peer_pid_ns_inode,
+                                            observer_ns_inode: self
+                                                .tracker
+                                                .pid_ns_inode_of(frame.pid)
+                                                .flatten(),
                                             observer_ns: now_ns,
                                         });
                                     }
@@ -371,12 +464,13 @@ impl Observer {
         self.tracker.drain_stalled_slots(
             now_ns,
             self.threshold_ns,
-            |pid, last_nonce, last_ns, origin| {
+            |pid, last_nonce, last_ns, origin, pid_ns_inode| {
                 self.stall_queue.push(Some(Event::Stall {
                     pid,
                     last_nonce,
                     last_ns,
                     origin,
+                    pid_ns_inode,
                     observer_ns: now_ns,
                 }));
             },
@@ -418,6 +512,30 @@ impl Observer {
     /// `varta_origin_conflict_total` in the Prometheus exporter.
     pub fn drain_origin_conflicts(&mut self) -> u64 {
         self.tracker.take_origin_conflicts()
+    }
+
+    /// Drain and reset the count of beats dropped at ingress because the
+    /// peer's PID-namespace inode differs from the observer's. Surfaced as
+    /// `varta_frame_namespace_mismatch_total` in the Prometheus exporter.
+    pub fn drain_cross_namespace_drops(&mut self) -> u64 {
+        let n = self.cross_namespace_drops;
+        self.cross_namespace_drops = 0;
+        n
+    }
+
+    /// Drain and reset the per-tracker namespace-conflict counter — beats
+    /// dropped because the beat's namespace inode disagreed with the slot's
+    /// pinned namespace inode (first-namespace-wins). Surfaced as
+    /// `varta_tracker_namespace_conflict_total`.
+    pub fn drain_namespace_conflicts(&mut self) -> u64 {
+        self.tracker.take_namespace_conflicts()
+    }
+
+    /// Observer's own PID-namespace inode (Linux only; cached). Used by
+    /// `main.rs` to construct recovery `StallSource` values that include
+    /// the observer's namespace for the audit record.
+    pub fn observer_pid_namespace_inode(&self) -> Option<u64> {
+        crate::peer_cred::observer_pid_namespace_inode()
     }
 
     /// Drain and reset the tracker invariant-violation counter. Non-zero

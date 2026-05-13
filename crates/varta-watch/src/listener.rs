@@ -343,6 +343,8 @@ mod udp_impl {
                         return RecvResult::Authenticated {
                             peer_pid: 0,
                             peer_uid: 0,
+                            // UDP carries no kernel-attested namespace identity.
+                            peer_pid_ns_inode: None,
                             origin: BeatOrigin::NetworkUnverified,
                             data: buf,
                         };

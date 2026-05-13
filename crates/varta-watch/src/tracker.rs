@@ -315,6 +315,16 @@ pub struct Slot {
     /// one are rejected as [`Update::OriginConflict`] without mutating the
     /// slot. See [`BeatOrigin`] for the trust model.
     pub origin: BeatOrigin,
+    /// PID-namespace inode pinned at the slot's first beat (Linux only).
+    ///
+    /// `None` on non-Linux platforms, for UDP transports (no kernel attestation),
+    /// or when `/proc/<peer_pid>/ns/pid` was unreadable at first contact. A
+    /// later beat carrying a different `Some(_)` namespace inode for the same
+    /// pid is rejected as [`Update::NamespaceConflict`] without mutating the
+    /// slot. A `None → Some(_)` upgrade is permitted exactly once — it
+    /// represents a peer whose namespace became readable after a transient
+    /// failure (e.g. peer died briefly between `recvmsg` and `readlink`).
+    pub pid_ns_inode: Option<u64>,
     /// False iff this slot has never been written; observers treat the
     /// slot's other fields as undefined when `used == false`.
     pub(crate) used: bool,
@@ -345,6 +355,17 @@ pub enum Update {
     /// from "tainting" a slot that legitimately belongs to a kernel-attested
     /// agent (or vice-versa).
     OriginConflict,
+    /// A beat arrived for a pid that is already tracked, but the beat's
+    /// kernel-attested PID-namespace inode disagrees with the inode pinned
+    /// by the slot's first beat (Linux only — see
+    /// [`crate::peer_cred::read_pid_namespace_inode`]). First-namespace-wins:
+    /// the slot is **not** mutated and the beat is dropped. Catches the
+    /// PID-collision case where two containers happen to share a numeric pid
+    /// value (e.g. PID 1 in container A vs PID 1 in container B); the
+    /// existing `frame.pid == peer_pid` gate at the observer fires first for
+    /// most cross-namespace traffic, but a same-pid-different-namespace
+    /// collision is invisible to that gate.
+    NamespaceConflict,
 }
 
 /// Bounded per-pid liveness ledger.
@@ -385,6 +406,10 @@ pub struct Tracker {
     /// the slot's pinned origin (first-origin-wins). Surfaced via
     /// [`Tracker::take_origin_conflicts`] for Prometheus.
     origin_conflicts: u64,
+    /// Count of beats dropped because their kernel-attested PID-namespace
+    /// inode disagreed with the slot's pinned namespace (first-namespace-wins).
+    /// Surfaced via [`Tracker::take_namespace_conflicts`] for Prometheus.
+    namespace_conflicts: u64,
     /// Count of internal invariant violations encountered on the hot path —
     /// e.g. a [`PidIndex`] entry pointed at a slot index outside `entries`,
     /// or `find_evictable_slot` returned a stale index. Each violation is
@@ -423,6 +448,7 @@ impl Tracker {
             eviction_scan_cursor: 0,
             eviction_scan_truncated: 0,
             origin_conflicts: 0,
+            namespace_conflicts: 0,
             invariant_violations: 0,
         }
     }
@@ -442,12 +468,22 @@ impl Tracker {
     /// any UDP variant). The first beat for a pid pins the slot's origin;
     /// subsequent beats from a different origin are dropped without
     /// mutating the slot.
+    ///
+    /// `peer_pid_ns_inode` is the kernel-attested PID-namespace inode of the
+    /// sending process (Linux only; `None` on non-Linux or when
+    /// `/proc/<peer_pid>/ns/pid` was unreadable). The first beat pins the
+    /// slot's namespace inode; a later beat carrying a different `Some(_)`
+    /// inode for the same pid is rejected as [`Update::NamespaceConflict`].
+    /// A `None → Some(_)` upgrade is permitted (peer became readable after a
+    /// transient failure); a `Some(_) → None` regression is treated as a
+    /// conflict.
     pub fn record(
         &mut self,
         frame: &Frame,
         now_ns: u64,
         threshold_ns: u64,
         origin: BeatOrigin,
+        peer_pid_ns_inode: Option<u64>,
     ) -> Update {
         let status = frame.status;
 
@@ -467,6 +503,28 @@ impl Tracker {
                 if slot.origin != origin {
                     self.origin_conflicts = self.origin_conflicts.saturating_add(1);
                     return Update::OriginConflict;
+                }
+                // First-namespace-wins. Same precedence as origin: an actively
+                // disagreeing inode is a conflict; a `None → Some` upgrade
+                // pins the now-known namespace and falls through to refresh;
+                // both-`None` is the non-Linux / unreadable case and is a
+                // no-op.
+                match (slot.pid_ns_inode, peer_pid_ns_inode) {
+                    (Some(a), Some(b)) if a != b => {
+                        self.namespace_conflicts = self.namespace_conflicts.saturating_add(1);
+                        return Update::NamespaceConflict;
+                    }
+                    (Some(_), None) => {
+                        // Regression — pinned-then-lost is a tampering signal.
+                        self.namespace_conflicts = self.namespace_conflicts.saturating_add(1);
+                        return Update::NamespaceConflict;
+                    }
+                    (None, Some(_)) => {
+                        // Forgiving upgrade — fill in the previously-unknown
+                        // inode in place and continue with refresh.
+                        slot.pid_ns_inode = peer_pid_ns_inode;
+                    }
+                    _ => {}
                 }
                 if frame.nonce <= slot.last_nonce {
                     // Detect nonce wrap: agent exhausted u64 nonce space
@@ -524,6 +582,7 @@ impl Tracker {
                     last_ns: now_ns,
                     status,
                     origin,
+                    pid_ns_inode: peer_pid_ns_inode,
                     used: true,
                     stall_emitted: false,
                 };
@@ -560,6 +619,7 @@ impl Tracker {
             last_ns: now_ns,
             status,
             origin,
+            pid_ns_inode: peer_pid_ns_inode,
             used: true,
             stall_emitted: false,
         });
@@ -709,6 +769,20 @@ impl Tracker {
             .map(|s| s.origin)
     }
 
+    /// Return the pinned PID-namespace inode of a tracked pid, if present.
+    ///
+    /// The outer `Option` is `Some` when the pid is tracked at all; the inner
+    /// `Option` is the inode (or `None` for non-Linux / unreadable). Used by
+    /// the observer to populate `Event::NamespaceConflict::slot_ns_inode`
+    /// without an extra slot lookup.
+    pub fn pid_ns_inode_of(&self, pid: u32) -> Option<Option<u64>> {
+        self.pid_to_index
+            .get(pid)
+            .and_then(|idx| self.entries.get(idx))
+            .filter(|s| s.used)
+            .map(|s| s.pid_ns_inode)
+    }
+
     /// True iff no pids are tracked.
     pub fn is_empty(&self) -> bool {
         self.len == 0
@@ -720,14 +794,14 @@ impl Tracker {
     /// `threshold_ns` **and** the observer has not yet surfaced a stall
     /// event for the current silence run (`stall_emitted == false`).
     /// Qualifying slots are marked `stall_emitted = true` and the callback
-    /// is invoked with `(pid, last_nonce, last_ns, origin)` — all within the
-    /// same mutable borrow, closing the TOCTOU window that existed between
-    /// the former `iter_stalled` / `mark_stall_emitted` pair.
+    /// is invoked with `(pid, last_nonce, last_ns, origin, pid_ns_inode)` —
+    /// all within the same mutable borrow, closing the TOCTOU window that
+    /// existed between the former `iter_stalled` / `mark_stall_emitted` pair.
     pub fn drain_stalled_slots(
         &mut self,
         now_ns: u64,
         threshold_ns: u64,
-        mut cb: impl FnMut(u32, u64, u64, BeatOrigin),
+        mut cb: impl FnMut(u32, u64, u64, BeatOrigin, Option<u64>),
     ) {
         // Clamp the slice to actual `entries` length so the slice
         // expression cannot panic even if `len` somehow exceeded it
@@ -744,7 +818,13 @@ impl Tracker {
                 if now_ns.saturating_sub(slot.last_ns) >= threshold_ns {
                     slot.stall_emitted = true;
                     self.stall_emitted_count = self.stall_emitted_count.saturating_add(1);
-                    cb(slot.pid, slot.last_nonce, slot.last_ns, slot.origin);
+                    cb(
+                        slot.pid,
+                        slot.last_nonce,
+                        slot.last_ns,
+                        slot.origin,
+                        slot.pid_ns_inode,
+                    );
                 }
             }
         }
@@ -761,6 +841,18 @@ impl Tracker {
     pub fn take_origin_conflicts(&mut self) -> u64 {
         let count = self.origin_conflicts;
         self.origin_conflicts = 0;
+        count
+    }
+
+    /// Take and reset the namespace-conflict counter.
+    ///
+    /// Surfaced as `varta_tracker_namespace_conflict_total` by the Prometheus
+    /// exporter; non-zero values mean beats for a tracked pid arrived from a
+    /// different PID namespace than the one pinned by the slot's first beat.
+    /// Linux-only signal; on non-Linux platforms this counter stays at 0.
+    pub fn take_namespace_conflicts(&mut self) -> u64 {
+        let count = self.namespace_conflicts;
+        self.namespace_conflicts = 0;
         count
     }
 
@@ -848,7 +940,7 @@ mod tests {
         // Fill at t=0 so silence isn't a factor either.
         for pid in 1u32..=(cap as u32) {
             assert_eq!(
-                t.record(&frame(pid, 1), 0, threshold_ns, ORIGIN),
+                t.record(&frame(pid, 1), 0, threshold_ns, ORIGIN, None),
                 Update::Inserted
             );
         }
@@ -858,7 +950,7 @@ mod tests {
         // Even at very large "now_ns" (silence >> 10× threshold), Strict
         // policy must bail without scanning: no slot has stall_emitted=true.
         let now_ns = threshold_ns * 100;
-        let result = t.record(&frame(99_999, 1), now_ns, threshold_ns, ORIGIN);
+        let result = t.record(&frame(99_999, 1), now_ns, threshold_ns, ORIGIN, None);
         assert_eq!(result, Update::CapacityExceeded);
         // Cursor must NOT have advanced through the table (fast-bail path).
         assert_eq!(t.eviction_scan_cursor, 0);
@@ -874,19 +966,19 @@ mod tests {
 
         for pid in 1u32..=(cap as u32) {
             assert_eq!(
-                t.record(&frame(pid, 1), 0, threshold_ns, ORIGIN),
+                t.record(&frame(pid, 1), 0, threshold_ns, ORIGIN, None),
                 Update::Inserted
             );
         }
         // Time advances past threshold — every slot stalls.
         let now_ns = threshold_ns * 20;
         let mut stalled = 0u32;
-        t.drain_stalled_slots(now_ns, threshold_ns, |_, _, _, _| stalled += 1);
+        t.drain_stalled_slots(now_ns, threshold_ns, |_, _, _, _, _| stalled += 1);
         assert_eq!(stalled, cap as u32);
         assert_eq!(t.stall_emitted_count, cap);
 
         // Silence now exceeds 10× threshold → eviction succeeds.
-        let result = t.record(&frame(9_999, 1), now_ns, threshold_ns, ORIGIN);
+        let result = t.record(&frame(9_999, 1), now_ns, threshold_ns, ORIGIN, None);
         assert_eq!(result, Update::Inserted);
         // The replacing slot is fresh — stall counter decremented once.
         assert_eq!(t.stall_emitted_count, cap - 1);
@@ -898,15 +990,15 @@ mod tests {
         let mut t = Tracker::new(4, EvictionPolicy::Strict);
         let threshold_ns = 100;
         assert_eq!(
-            t.record(&frame(1, 1), 0, threshold_ns, ORIGIN),
+            t.record(&frame(1, 1), 0, threshold_ns, ORIGIN, None),
             Update::Inserted
         );
-        t.drain_stalled_slots(threshold_ns * 2, threshold_ns, |_, _, _, _| {});
+        t.drain_stalled_slots(threshold_ns * 2, threshold_ns, |_, _, _, _, _| {});
         assert_eq!(t.stall_emitted_count, 1);
 
         // New beat with strictly increasing nonce → refresh and clear flag.
         assert_eq!(
-            t.record(&frame(1, 2), threshold_ns * 3, threshold_ns, ORIGIN),
+            t.record(&frame(1, 2), threshold_ns * 3, threshold_ns, ORIGIN, None),
             Update::Refreshed
         );
         assert_eq!(t.stall_emitted_count, 0);
@@ -922,19 +1014,19 @@ mod tests {
         let threshold_ns = 100;
         for pid in 1u32..=(cap as u32) {
             assert_eq!(
-                t.record(&frame(pid, 1), 0, threshold_ns, ORIGIN),
+                t.record(&frame(pid, 1), 0, threshold_ns, ORIGIN, None),
                 Update::Inserted
             );
         }
         // Stall everything.
         let now_ns = threshold_ns * 20;
-        t.drain_stalled_slots(now_ns, threshold_ns, |_, _, _, _| {});
+        t.drain_stalled_slots(now_ns, threshold_ns, |_, _, _, _, _| {});
         assert_eq!(t.stall_emitted_count, cap);
 
         // Each new-pid insert evicts one slot. Cursor must advance by ≤
         // EVICTION_SCAN_WINDOW on every miss, ≤ 1 on every hit.
         let start_cursor = t.eviction_scan_cursor;
-        let _ = t.record(&frame(50_001, 1), now_ns, threshold_ns, ORIGIN);
+        let _ = t.record(&frame(50_001, 1), now_ns, threshold_ns, ORIGIN, None);
         let advanced = t.eviction_scan_cursor.wrapping_sub(start_cursor) % cap;
         assert!(
             advanced <= EVICTION_SCAN_WINDOW,
@@ -951,7 +1043,7 @@ mod tests {
         let threshold_ns = 100;
         for pid in 1u32..=(cap as u32) {
             assert_eq!(
-                t.record(&frame(pid, 1), 0, threshold_ns, ORIGIN),
+                t.record(&frame(pid, 1), 0, threshold_ns, ORIGIN, None),
                 Update::Inserted
             );
         }
@@ -985,12 +1077,12 @@ mod tests {
             match r {
                 0 => {
                     let pid = (next() % 64) as u32 + 1;
-                    let _ = t.record(&frame(pid, now_ns), now_ns, threshold_ns, ORIGIN);
+                    let _ = t.record(&frame(pid, now_ns), now_ns, threshold_ns, ORIGIN, None);
                 }
                 1 => {
                     // Advance and drain (may flip flags to true).
                     now_ns = now_ns.saturating_add(threshold_ns * 2);
-                    t.drain_stalled_slots(now_ns, threshold_ns, |_, _, _, _| {});
+                    t.drain_stalled_slots(now_ns, threshold_ns, |_, _, _, _, _| {});
                 }
                 _ => {
                     // No-op — let other ops dominate.
@@ -1013,13 +1105,19 @@ mod tests {
         let threshold_ns = 100;
         for pid in 1u32..=32 {
             assert_eq!(
-                t.record(&frame(pid, 1), 0, threshold_ns, ORIGIN),
+                t.record(&frame(pid, 1), 0, threshold_ns, ORIGIN, None),
                 Update::Inserted
             );
         }
         // Table full, no stalls emitted → strict bails, balanced not used →
         // counter still increments since we returned None at capacity.
-        let _ = t.record(&frame(99_999, 1), threshold_ns * 100, threshold_ns, ORIGIN);
+        let _ = t.record(
+            &frame(99_999, 1),
+            threshold_ns * 100,
+            threshold_ns,
+            ORIGIN,
+            None,
+        );
         assert_eq!(t.take_eviction_scan_truncated(), 1);
         // Take resets.
         assert_eq!(t.take_eviction_scan_truncated(), 0);
@@ -1035,7 +1133,13 @@ mod tests {
 
         // Beat 1 arrives via UDS (kernel-attested) and pins the slot.
         assert_eq!(
-            t.record(&frame(7, 1), 10, threshold_ns, BeatOrigin::KernelAttested),
+            t.record(
+                &frame(7, 1),
+                10,
+                threshold_ns,
+                BeatOrigin::KernelAttested,
+                None
+            ),
             Update::Inserted
         );
 
@@ -1045,7 +1149,8 @@ mod tests {
                 &frame(7, 2),
                 20,
                 threshold_ns,
-                BeatOrigin::NetworkUnverified
+                BeatOrigin::NetworkUnverified,
+                None,
             ),
             Update::OriginConflict
         );
@@ -1061,7 +1166,13 @@ mod tests {
 
         // Same-origin follow-up still works.
         assert_eq!(
-            t.record(&frame(7, 3), 30, threshold_ns, BeatOrigin::KernelAttested),
+            t.record(
+                &frame(7, 3),
+                30,
+                threshold_ns,
+                BeatOrigin::KernelAttested,
+                None
+            ),
             Update::Refreshed
         );
     }
@@ -1152,7 +1263,7 @@ mod tests {
         let mut now = 0u64;
         for pid in 1u32..=4096 {
             now = now.saturating_add(1);
-            let _ = t.record(&frame(pid, 1), now, threshold_ns, ORIGIN);
+            let _ = t.record(&frame(pid, 1), now, threshold_ns, ORIGIN, None);
         }
         // Under nominal use probe exhaustion is unreachable at load ≤ 0.5.
         assert_eq!(t.take_probe_exhausted(), 0);
@@ -1178,11 +1289,11 @@ mod tests {
             match r {
                 0 => {
                     let pid = (next() % 96) as u32 + 1;
-                    let _ = t.record(&frame(pid, now_ns), now_ns, threshold_ns, ORIGIN);
+                    let _ = t.record(&frame(pid, now_ns), now_ns, threshold_ns, ORIGIN, None);
                 }
                 1 => {
                     now_ns = now_ns.saturating_add(threshold_ns * 2);
-                    t.drain_stalled_slots(now_ns, threshold_ns, |_, _, _, _| {});
+                    t.drain_stalled_slots(now_ns, threshold_ns, |_, _, _, _, _| {});
                 }
                 2 => {
                     let pid = (next() % 96) as u32 + 1;
@@ -1205,7 +1316,13 @@ mod tests {
         let threshold_ns = 100;
 
         assert_eq!(
-            t.record(&frame(11, 1), 0, threshold_ns, BeatOrigin::KernelAttested),
+            t.record(
+                &frame(11, 1),
+                0,
+                threshold_ns,
+                BeatOrigin::KernelAttested,
+                None
+            ),
             Update::Inserted
         );
         assert_eq!(
@@ -1213,13 +1330,14 @@ mod tests {
                 &frame(22, 1),
                 0,
                 threshold_ns,
-                BeatOrigin::NetworkUnverified
+                BeatOrigin::NetworkUnverified,
+                None,
             ),
             Update::Inserted
         );
 
         let mut seen: Vec<(u32, BeatOrigin)> = Vec::new();
-        t.drain_stalled_slots(threshold_ns * 2, threshold_ns, |pid, _, _, origin| {
+        t.drain_stalled_slots(threshold_ns * 2, threshold_ns, |pid, _, _, origin, _| {
             seen.push((pid, origin));
         });
         seen.sort_by_key(|(p, _)| *p);
@@ -1230,5 +1348,133 @@ mod tests {
                 (22, BeatOrigin::NetworkUnverified),
             ]
         );
+    }
+
+    // ---------------------- PID-namespace gate tests ----------------------
+
+    /// First-namespace-wins: a beat with a different `Some(_)` inode for an
+    /// already-tracked pid is rejected as `NamespaceConflict`.
+    #[test]
+    fn namespace_conflict_blocks_rebind() {
+        let mut t = Tracker::new(8, EvictionPolicy::Strict);
+        let threshold_ns = 100;
+        assert_eq!(
+            t.record(
+                &frame(7, 1),
+                0,
+                threshold_ns,
+                BeatOrigin::KernelAttested,
+                Some(4026531836),
+            ),
+            Update::Inserted
+        );
+        let r = t.record(
+            &frame(7, 2),
+            10,
+            threshold_ns,
+            BeatOrigin::KernelAttested,
+            Some(4026531840),
+        );
+        assert_eq!(r, Update::NamespaceConflict);
+        // Slot is untouched.
+        assert_eq!(t.pid_ns_inode_of(7), Some(Some(4026531836)));
+        assert_eq!(t.take_namespace_conflicts(), 1);
+        assert_eq!(t.take_namespace_conflicts(), 0);
+    }
+
+    /// Same inode → normal refresh.
+    #[test]
+    fn namespace_match_passes_through() {
+        let mut t = Tracker::new(8, EvictionPolicy::Strict);
+        let threshold_ns = 100;
+        let _ = t.record(
+            &frame(7, 1),
+            0,
+            threshold_ns,
+            BeatOrigin::KernelAttested,
+            Some(123),
+        );
+        let r = t.record(
+            &frame(7, 2),
+            10,
+            threshold_ns,
+            BeatOrigin::KernelAttested,
+            Some(123),
+        );
+        assert_eq!(r, Update::Refreshed);
+        assert_eq!(t.take_namespace_conflicts(), 0);
+    }
+
+    /// `Some → None` regression on a same-pid rebind is a conflict.
+    #[test]
+    fn namespace_some_to_none_is_conflict() {
+        let mut t = Tracker::new(8, EvictionPolicy::Strict);
+        let threshold_ns = 100;
+        let _ = t.record(
+            &frame(7, 1),
+            0,
+            threshold_ns,
+            BeatOrigin::KernelAttested,
+            Some(123),
+        );
+        let r = t.record(
+            &frame(7, 2),
+            10,
+            threshold_ns,
+            BeatOrigin::KernelAttested,
+            None,
+        );
+        assert_eq!(r, Update::NamespaceConflict);
+        assert_eq!(t.take_namespace_conflicts(), 1);
+    }
+
+    /// `None → Some` upgrade on a same-pid rebind pins the now-known inode
+    /// and falls through to refresh. This is the forgiving case for a peer
+    /// whose `/proc/<pid>/ns/pid` was briefly unreadable at first contact.
+    #[test]
+    fn namespace_none_to_some_upgrades_in_place() {
+        let mut t = Tracker::new(8, EvictionPolicy::Strict);
+        let threshold_ns = 100;
+        let _ = t.record(
+            &frame(7, 1),
+            0,
+            threshold_ns,
+            BeatOrigin::KernelAttested,
+            None,
+        );
+        assert_eq!(t.pid_ns_inode_of(7), Some(None));
+        let r = t.record(
+            &frame(7, 2),
+            10,
+            threshold_ns,
+            BeatOrigin::KernelAttested,
+            Some(999),
+        );
+        assert_eq!(r, Update::Refreshed);
+        assert_eq!(t.pid_ns_inode_of(7), Some(Some(999)));
+        assert_eq!(t.take_namespace_conflicts(), 0);
+    }
+
+    /// Both `None` (non-Linux / unreadable) → refresh, no conflict.
+    #[test]
+    fn namespace_both_none_is_match() {
+        let mut t = Tracker::new(8, EvictionPolicy::Strict);
+        let threshold_ns = 100;
+        let _ = t.record(
+            &frame(7, 1),
+            0,
+            threshold_ns,
+            BeatOrigin::KernelAttested,
+            None,
+        );
+        let r = t.record(
+            &frame(7, 2),
+            10,
+            threshold_ns,
+            BeatOrigin::KernelAttested,
+            None,
+        );
+        assert_eq!(r, Update::Refreshed);
+        assert_eq!(t.take_namespace_conflicts(), 0);
     }
 }

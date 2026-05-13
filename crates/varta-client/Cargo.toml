@@ -13,8 +13,10 @@ panic-handler = []
 # Enable UDP transport backend for network-based agents.
 udp = []
 # Enable secure UDP transport with ChaCha20-Poly1305 AEAD encryption.
-# Implies `udp` and `varta-vlp/crypto`.
-secure-udp = ["udp", "varta-vlp/crypto"]
+# Implies `udp`, `varta-vlp/crypto`, and `varta-vlp/std` — the `secure_udp`
+# example calls `Key::from_file`, which lives behind `varta-vlp/std` so the
+# protocol crate stays `no_std` for embedded consumers.
+secure-udp = ["udp", "varta-vlp/crypto", "varta-vlp/std"]
 
 [lints]
 workspace = true

@@ -223,6 +223,21 @@ pub struct Config {
     /// unless the operator additionally accepts that runtime risk.
     /// Set by `--i-accept-recovery-on-unauthenticated-transport`.
     pub i_accept_recovery_on_unauthenticated_transport: bool,
+    /// Permit beats — and, by extension, recovery commands — for agents
+    /// whose kernel-attested PID namespace differs from the observer's.
+    /// Use only when agents intentionally share the host namespace
+    /// (`--pid=host` containers) or an out-of-band translator is in place.
+    /// Set by `--allow-cross-namespace-agents`. Default `false` — beats from
+    /// cross-namespace agents are dropped at receive (counted via
+    /// `varta_frame_namespace_mismatch_total`), and any stalls that did
+    /// progress before opt-in refuse recovery (counted via
+    /// `varta_recovery_refused_total{reason="cross_namespace_agent"}`).
+    pub allow_cross_namespace_agents: bool,
+    /// Treat a cross-namespace agent as a fatal startup error instead of the
+    /// default refuse-recovery behaviour. Set by `--strict-namespace-check`.
+    /// Useful in environments where the operator wants the daemon to fail
+    /// loudly rather than silently log audit refusals. Default `false`.
+    pub strict_namespace_check: bool,
     /// Optional path the recovery audit TSV is appended to. When set, every
     /// recovery spawn and completion is recorded with wall-clock timestamp,
     /// agent pid, child pid, mode, outcome, exit code, and duration. See
@@ -641,6 +656,24 @@ OPTIONAL:
                                      still refuses UDP-origin recoveries
                                      by default; see
                                      docs/architecture/peer-authentication.md.
+    --allow-cross-namespace-agents UNSAFE: permit beats and recovery for
+                                     agents whose kernel-attested PID
+                                     namespace differs from the observer's.
+                                     Default behaviour drops cross-namespace
+                                     beats at receive and refuses recovery
+                                     with reason=cross_namespace_agent. Use
+                                     only when agents run with --pid=host or
+                                     an out-of-band PID translator is in the
+                                     recovery template — otherwise kill(2)
+                                     would target the wrong process. Linux
+                                     only; no-op on other platforms. See
+                                     docs/architecture/namespaces.md.
+    --strict-namespace-check       Treat a cross-namespace agent as a fatal
+                                     startup error instead of the default
+                                     refuse-recovery behaviour. Useful when
+                                     the operator wants the daemon to fail
+                                     loudly rather than silently log audit
+                                     refusals.
     --recovery-audit-file <PATH>   Append a tab-separated audit record for
                                      every recovery spawn and completion.
                                      Records carry wall-clock + observer
@@ -721,6 +754,8 @@ OPTIONAL:
         let mut i_accept_plaintext_udp = false;
         let mut i_accept_shell_risk = false;
         let mut i_accept_recovery_on_unauthenticated_transport = false;
+        let mut allow_cross_namespace_agents = false;
+        let mut strict_namespace_check = false;
         let mut recovery_audit_file: Option<PathBuf> = None;
         let mut recovery_audit_max_bytes: Option<u64> = None;
         let mut recovery_capture_stdio = false;
@@ -977,6 +1012,12 @@ OPTIONAL:
                 "--i-accept-recovery-on-unauthenticated-transport" => {
                     i_accept_recovery_on_unauthenticated_transport = true;
                 }
+                "--allow-cross-namespace-agents" => {
+                    allow_cross_namespace_agents = true;
+                }
+                "--strict-namespace-check" => {
+                    strict_namespace_check = true;
+                }
                 "--recovery-audit-file" => {
                     let v = iter
                         .next()
@@ -1171,6 +1212,8 @@ OPTIONAL:
             i_accept_plaintext_udp,
             i_accept_shell_risk,
             i_accept_recovery_on_unauthenticated_transport,
+            allow_cross_namespace_agents,
+            strict_namespace_check,
             recovery_audit_file,
             recovery_audit_max_bytes,
             recovery_capture_stdio,
@@ -2233,6 +2276,42 @@ mod tests {
         let cfg =
             Config::from_args(args(&["--socket", "/s", "--threshold-ms", "100"])).expect("parse");
         assert!(!cfg.i_accept_recovery_on_unauthenticated_transport);
+    }
+
+    #[test]
+    fn parses_allow_cross_namespace_agents_flag() {
+        let cfg = Config::from_args(args(&[
+            "--socket",
+            "/s",
+            "--threshold-ms",
+            "100",
+            "--allow-cross-namespace-agents",
+        ]))
+        .expect("parse");
+        assert!(cfg.allow_cross_namespace_agents);
+        assert!(!cfg.strict_namespace_check);
+    }
+
+    #[test]
+    fn parses_strict_namespace_check_flag() {
+        let cfg = Config::from_args(args(&[
+            "--socket",
+            "/s",
+            "--threshold-ms",
+            "100",
+            "--strict-namespace-check",
+        ]))
+        .expect("parse");
+        assert!(cfg.strict_namespace_check);
+        assert!(!cfg.allow_cross_namespace_agents);
+    }
+
+    #[test]
+    fn namespace_flags_default_to_false() {
+        let cfg =
+            Config::from_args(args(&["--socket", "/s", "--threshold-ms", "100"])).expect("parse");
+        assert!(!cfg.allow_cross_namespace_agents);
+        assert!(!cfg.strict_namespace_check);
     }
 
     #[test]

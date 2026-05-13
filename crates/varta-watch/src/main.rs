@@ -310,7 +310,8 @@ fn run(cfg: Config) -> std::io::Result<()> {
         cfg.tracker_capacity,
         cfg.tracker_eviction_policy,
         cfg.max_beat_rate,
-    )?;
+    )?
+    .with_allow_cross_namespace(cfg.allow_cross_namespace_agents);
 
     // On platforms lacking kernel-level per-datagram credential passing
     // (OpenBSD, Solaris, illumos, and other exotic Unixen) the observer
@@ -532,6 +533,7 @@ fn run(cfg: Config) -> std::io::Result<()> {
             .with_source(recovery_source.clone())
             .with_audit_sink(recovery_audit_sink)
             .with_allow_unauthenticated_source(false)
+            .with_allow_cross_namespace(cfg.allow_cross_namespace_agents)
     });
     let mut file_export: Option<FileExporter> = match cfg.file_export.as_ref() {
         Some(path) => Some(FileExporter::create(path, cfg.export_file_max_bytes)?),
@@ -656,9 +658,24 @@ fn run(cfg: Config) -> std::io::Result<()> {
             if let Some(pe) = prom_export.as_mut() {
                 let _ = pe.record(&ev);
             }
-            if let Event::Stall { pid, origin, .. } = &ev {
+            if let Event::Stall {
+                pid,
+                origin,
+                pid_ns_inode,
+                ..
+            } = &ev
+            {
                 if let Some(rec) = recovery.as_mut() {
-                    let outcome = rec.on_stall(*pid, *origin);
+                    // Cross-namespace agent: the slot's pinned PID-namespace
+                    // inode differs from the observer's. Linux-only signal;
+                    // on non-Linux both inodes are None and this is always
+                    // false.
+                    let observer_ns_inode = observer.observer_pid_namespace_inode();
+                    let cross_namespace_agent = matches!(
+                        (observer_ns_inode, *pid_ns_inode),
+                        (Some(a), Some(b)) if a != b
+                    );
+                    let outcome = rec.on_stall(*pid, *origin, cross_namespace_agent);
                     if let Some(pe) = prom_export.as_mut() {
                         pe.record_recovery_outcome(&outcome, None);
                     }
@@ -687,6 +704,16 @@ fn run(cfg: Config) -> std::io::Result<()> {
                                  override at your own risk."
                             );
                         }
+                        RecoveryOutcome::RefusedCrossNamespace { pid } => {
+                            varta_warn!(
+                                "recovery for pid {pid} REFUSED: agent's PID namespace \
+                                 differs from observer's. kill(2) against this pid \
+                                 in the observer's namespace would target the wrong \
+                                 process. Pass --allow-cross-namespace-agents only when \
+                                 agents are run with --pid=host or an out-of-band PID \
+                                 translator is in place."
+                            );
+                        }
                         RecoveryOutcome::Reaped { .. }
                         | RecoveryOutcome::Killed { .. }
                         | RecoveryOutcome::ReapFailed(_) => {
@@ -708,6 +735,23 @@ fn run(cfg: Config) -> std::io::Result<()> {
             }
             if let Some(pe) = prom_export.as_mut() {
                 let _ = pe.record(&ev);
+            }
+            // Strict namespace mode: a cross-namespace agent is a fatal
+            // startup error. The default behaviour is to drop the beat and
+            // refuse recovery (already enforced inside `Observer`); strict
+            // mode escalates to daemon exit so the operator notices.
+            if cfg.strict_namespace_check && !cfg.allow_cross_namespace_agents {
+                if let Event::NamespaceConflict { claimed_pid, .. } = &ev {
+                    varta_error!(
+                        "FATAL --strict-namespace-check: cross-namespace agent \
+                         detected for claimed pid {claimed_pid}; refusing to \
+                         continue. Re-run with --allow-cross-namespace-agents \
+                         only if PID translation is correctly configured."
+                    );
+                    return Err(io::Error::other(
+                        "cross-namespace agent detected under --strict-namespace-check",
+                    ));
+                }
             }
             true
         } else {
@@ -784,6 +828,23 @@ fn run(cfg: Config) -> std::io::Result<()> {
         if origin_conflicts > 0 {
             if let Some(pe) = prom_export.as_mut() {
                 pe.record_origin_conflicts(origin_conflicts);
+            }
+        }
+
+        // Cross-namespace frame drops at receive (Linux-only signal; 0 on
+        // other platforms or when --allow-cross-namespace-agents is set).
+        let frame_ns_mismatches = observer.drain_cross_namespace_drops();
+        if frame_ns_mismatches > 0 {
+            if let Some(pe) = prom_export.as_mut() {
+                pe.record_frame_namespace_mismatches(frame_ns_mismatches);
+            }
+        }
+
+        // Tracker namespace conflicts (rebind with a different inode).
+        let tracker_ns_conflicts = observer.drain_namespace_conflicts();
+        if tracker_ns_conflicts > 0 {
+            if let Some(pe) = prom_export.as_mut() {
+                pe.record_tracker_namespace_conflicts(tracker_ns_conflicts);
             }
         }
 
