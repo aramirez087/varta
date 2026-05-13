@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use varta_watch::tracker::DEFAULT_EVICTION_SCAN_WINDOW;
-use varta_watch::{EvictionPolicy, Observer};
+use varta_watch::{ClockSource, EvictionPolicy, Observer};
 
 static COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -43,6 +43,7 @@ fn bind_succeeds_on_clean_path() {
         EvictionPolicy::Strict,
         DEFAULT_EVICTION_SCAN_WINDOW,
         None,
+        ClockSource::Monotonic,
     )
     .expect("bind on clean path should succeed");
 
@@ -77,6 +78,7 @@ fn bind_fails_when_live_observer_present() {
         EvictionPolicy::Strict,
         DEFAULT_EVICTION_SCAN_WINDOW,
         None,
+        ClockSource::Monotonic,
     )
     .expect("first bind must succeed");
 
@@ -89,6 +91,7 @@ fn bind_fails_when_live_observer_present() {
         EvictionPolicy::Strict,
         DEFAULT_EVICTION_SCAN_WINDOW,
         None,
+        ClockSource::Monotonic,
     )
     .err()
     .expect("second bind on live socket must fail");
@@ -129,6 +132,7 @@ fn bind_cleans_up_stale_socket_file() {
         EvictionPolicy::Strict,
         DEFAULT_EVICTION_SCAN_WINDOW,
         None,
+        ClockSource::Monotonic,
     )
     .expect("bind over stale socket must succeed");
 
@@ -159,6 +163,7 @@ fn bind_preserves_non_socket_file_at_path() {
         EvictionPolicy::Strict,
         DEFAULT_EVICTION_SCAN_WINDOW,
         None,
+        ClockSource::Monotonic,
     )
     .err()
     .expect("bind over regular file must fail");
@@ -191,6 +196,7 @@ fn drop_unlinks_bound_socket() {
         EvictionPolicy::Strict,
         DEFAULT_EVICTION_SCAN_WINDOW,
         None,
+        ClockSource::Monotonic,
     )
     .expect("bind must succeed");
 
@@ -215,6 +221,7 @@ fn drop_swallows_missing_file() {
         EvictionPolicy::Strict,
         DEFAULT_EVICTION_SCAN_WINDOW,
         None,
+        ClockSource::Monotonic,
     )
     .expect("bind must succeed");
 
@@ -239,6 +246,7 @@ fn drop_preserves_foreign_inode() {
         EvictionPolicy::Strict,
         DEFAULT_EVICTION_SCAN_WINDOW,
         None,
+        ClockSource::Monotonic,
     )
     .expect("first bind must succeed");
 
@@ -253,6 +261,7 @@ fn drop_preserves_foreign_inode() {
         EvictionPolicy::Strict,
         DEFAULT_EVICTION_SCAN_WINDOW,
         None,
+        ClockSource::Monotonic,
     )
     .expect("second bind must succeed");
 

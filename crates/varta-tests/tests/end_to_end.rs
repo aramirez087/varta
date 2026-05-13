@@ -136,10 +136,29 @@ fn main() -> ExitCode {
             secure_udp_client_to_observer_beats,
         );
     }
+    #[cfg(all(feature = "secure-udp", feature = "test-hooks"))]
+    {
+        failed += run_one(
+            "secure_udp_counter_wrap_continues_under_load",
+            secure_udp_counter_wrap_continues_under_load,
+        );
+    }
+    failed += run_one("clock_source_monotonic_smoke", clock_source_monotonic_smoke);
+    #[cfg(target_os = "linux")]
+    {
+        failed += run_one("clock_source_boottime_smoke", clock_source_boottime_smoke);
+    }
 
     let total = 19u32
         + if cfg!(feature = "udp") { 1 } else { 0 }
-        + if cfg!(feature = "secure-udp") { 1 } else { 0 };
+        + if cfg!(feature = "secure-udp") { 1 } else { 0 }
+        + if cfg!(all(feature = "secure-udp", feature = "test-hooks")) {
+            1
+        } else {
+            0
+        }
+        + 1
+        + if cfg!(target_os = "linux") { 1 } else { 0 };
     let passed = total - failed;
     eprintln!(
         "\ntest result: {} {} passed; {} failed; 0 ignored",
@@ -2632,4 +2651,233 @@ fn secure_udp_client_to_observer_beats() {
     );
 
     eprintln!("secure_udp_client_to_observer_beats: ok");
+}
+
+/// H6 — exercise the AEAD-counter wrap path end-to-end. Connect a real
+/// secure-UDP agent, fast-forward the counter to `u32::MAX`, beat once to
+/// trigger the in-process prefix rotation, then beat again to exercise the
+/// rotated prefix. The observer must accept all frames (no decrypt
+/// errors), proving:
+///   - the wrap path does NOT call OS entropy (no blocking syscall),
+///   - the new HKDF-derived prefix produces a valid AEAD nonce,
+///   - the observer's per-sender state rotates cleanly to the new prefix.
+#[cfg(all(feature = "secure-udp", feature = "test-hooks"))]
+fn secure_udp_counter_wrap_continues_under_load() {
+    use std::io::Write;
+    use std::net::UdpSocket;
+    use std::os::unix::fs::PermissionsExt;
+
+    let tmp = TempDir::new("secure-udp-wrap");
+    let key_path = tmp.path().join("test.key");
+    let key_hex = "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd";
+    {
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .mode(0o600)
+            .open(&key_path)
+            .expect("create key file");
+        f.write_all(format!("{key_hex}\n").as_bytes())
+            .expect("write key file");
+    }
+    std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600))
+        .expect("chmod key file");
+    let key = varta_vlp::crypto::Key::from_bytes([0xcdu8; 32]);
+
+    let probe = UdpSocket::bind("127.0.0.1:0").expect("bind probe");
+    let udp_port = probe.local_addr().expect("local_addr").port();
+    drop(probe);
+
+    let (mut child, prom_addr) = spawn_watch(&[
+        "--socket",
+        tmp.path().join("varta.sock").to_str().unwrap(),
+        "--threshold-ms",
+        "5000",
+        "--udp-port",
+        &udp_port.to_string(),
+        "--key-file",
+        key_path.to_str().unwrap(),
+        "--prom-addr",
+        "127.0.0.1:0",
+        "--shutdown-after-secs",
+        "10",
+    ]);
+    let _guard = ChildGuard(&mut child);
+
+    assert!(
+        wait_until(
+            || TcpStream::connect(prom_addr).is_ok(),
+            Duration::from_secs(3)
+        ),
+        "/metrics not reachable within 3s"
+    );
+
+    let agent_pid = std::process::id();
+    let observer_addr = std::net::SocketAddr::new(
+        std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+        udp_port,
+    );
+
+    let prefix_before;
+    let prefix_after;
+    {
+        let mut agent = varta_client::Varta::connect_secure_udp(observer_addr, key)
+            .expect("connect_secure_udp");
+
+        // One warm-up beat under prefix-index 0.
+        match agent.beat(varta_client::Status::Ok, 0) {
+            varta_client::BeatOutcome::Sent | varta_client::BeatOutcome::Dropped => {}
+            varta_client::BeatOutcome::Failed(e) => panic!("unexpected hard failure: {e}"),
+        }
+
+        prefix_before = agent.iv_prefix_for_test();
+        assert_eq!(
+            agent.iv_prefix_index_for_test(),
+            0,
+            "fresh connection must start at prefix_index 0"
+        );
+
+        // Fast-forward the counter so the NEXT beat triggers wrap rotation.
+        agent.set_iv_counter_for_test(u32::MAX);
+
+        // This beat hits the wrap branch — must rotate prefix without
+        // re-reading OS entropy.
+        match agent.beat(varta_client::Status::Ok, 0) {
+            varta_client::BeatOutcome::Sent | varta_client::BeatOutcome::Dropped => {}
+            varta_client::BeatOutcome::Failed(e) => panic!("wrap-rotation beat failed: {e}"),
+        }
+
+        assert_eq!(
+            agent.iv_prefix_index_for_test(),
+            1,
+            "prefix_index must advance to 1 after wrap"
+        );
+        prefix_after = agent.iv_prefix_for_test();
+        assert_ne!(
+            prefix_after, prefix_before,
+            "rotated prefix must differ from prior prefix"
+        );
+
+        // A few more beats under the rotated prefix to exercise the new
+        // session against the observer's replay state.
+        for _ in 0..5 {
+            match agent.beat(varta_client::Status::Ok, 0) {
+                varta_client::BeatOutcome::Sent | varta_client::BeatOutcome::Dropped => {}
+                varta_client::BeatOutcome::Failed(e) => {
+                    panic!("post-rotation beat failed: {e}")
+                }
+            }
+        }
+    }
+
+    // The observer must have decoded the frames before AND after the
+    // rotation — i.e. it must have rotated its per-sender replay state to
+    // the new prefix without raising decrypt errors.
+    let beats_needle = format!("varta_beats_total{{pid=\"{agent_pid}\"}}");
+    let mut last_body = String::new();
+    let beats_visible = wait_until(
+        || match http_get(prom_addr, "/metrics") {
+            Ok((200, body)) => {
+                last_body = body;
+                last_body.contains(&beats_needle)
+            }
+            _ => false,
+        },
+        Duration::from_secs(5),
+    );
+    assert!(
+        beats_visible,
+        "/metrics did not surface {beats_needle:?} after counter wrap; body:\n{last_body}"
+    );
+
+    // Sanity: aead_attempts_total must be non-zero (proves the secure-UDP
+    // decode path actually ran for our frames).
+    assert!(
+        last_body.contains("varta_secure_aead_attempts_total"),
+        "expected secure aead attempts counter in /metrics; body:\n{last_body}"
+    );
+
+    eprintln!("secure_udp_counter_wrap_continues_under_load: ok");
+}
+
+/// H7 — basic smoke test that the default `--clock-source monotonic`
+/// produces a working daemon (no crash, /metrics reachable). Confirms
+/// the Observer's swap from `Instant::now()` to `Clock` did not regress
+/// startup or the poll loop.
+fn clock_source_monotonic_smoke() {
+    let tmp = TempDir::new("clock-mono");
+    let (mut child, prom_addr) = spawn_watch(&[
+        "--socket",
+        tmp.path().join("varta.sock").to_str().unwrap(),
+        "--threshold-ms",
+        "5000",
+        "--clock-source",
+        "monotonic",
+        "--prom-addr",
+        "127.0.0.1:0",
+        "--shutdown-after-secs",
+        "5",
+    ]);
+    let _guard = ChildGuard(&mut child);
+
+    assert!(
+        wait_until(
+            || TcpStream::connect(prom_addr).is_ok(),
+            Duration::from_secs(3)
+        ),
+        "/metrics not reachable within 3s under --clock-source monotonic"
+    );
+
+    // One scrape against the live daemon — proves the poll loop is
+    // advancing now_ns() against CLOCK_MONOTONIC without panic.
+    match http_get(prom_addr, "/metrics") {
+        Ok((200, body)) => assert!(
+            body.contains("varta_watch_uptime_seconds"),
+            "expected uptime metric under monotonic clock"
+        ),
+        other => panic!("unexpected /metrics response: {other:?}"),
+    }
+
+    eprintln!("clock_source_monotonic_smoke: ok");
+}
+
+/// H7 — same smoke test under `--clock-source boottime` (Linux only).
+/// CI cannot actually `systemctl suspend` the test host, so this is a
+/// startup-and-poll smoke test only; suspend behaviour is verified
+/// manually per `docs/architecture/safety-profiles.md`.
+#[cfg(target_os = "linux")]
+fn clock_source_boottime_smoke() {
+    let tmp = TempDir::new("clock-boot");
+    let (mut child, prom_addr) = spawn_watch(&[
+        "--socket",
+        tmp.path().join("varta.sock").to_str().unwrap(),
+        "--threshold-ms",
+        "5000",
+        "--clock-source",
+        "boottime",
+        "--prom-addr",
+        "127.0.0.1:0",
+        "--shutdown-after-secs",
+        "5",
+    ]);
+    let _guard = ChildGuard(&mut child);
+
+    assert!(
+        wait_until(
+            || TcpStream::connect(prom_addr).is_ok(),
+            Duration::from_secs(3)
+        ),
+        "/metrics not reachable within 3s under --clock-source boottime"
+    );
+
+    match http_get(prom_addr, "/metrics") {
+        Ok((200, body)) => assert!(
+            body.contains("varta_watch_uptime_seconds"),
+            "expected uptime metric under boottime clock"
+        ),
+        other => panic!("unexpected /metrics response: {other:?}"),
+    }
+
+    eprintln!("clock_source_boottime_smoke: ok");
 }

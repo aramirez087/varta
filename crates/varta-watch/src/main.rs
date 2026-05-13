@@ -20,7 +20,7 @@ use std::fs::OpenOptions;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::time::{Duration, Instant};
 
 use varta_watch::{
@@ -49,6 +49,14 @@ static SHUTDOWN: AtomicBool = AtomicBool::new(false);
 /// Initialised to 0; the watchdog ignores the zero value to avoid spurious
 /// aborts before the first tick.
 static LAST_TICK_NS: AtomicU64 = AtomicU64::new(0);
+
+/// Kernel clock source for `observer_now_ns()`.  Set exactly once in
+/// `run()` before the self-watchdog thread spawns, so both threads agree
+/// on the meaning of `LAST_TICK_NS` and on whether the clock advances
+/// during host suspend.  H7 — see `crates/varta-watch/src/clock.rs`.
+///
+/// Encoding: `ClockSource::as_u8()` / `ClockSource::from_u8()`.
+static CLOCK_SOURCE: AtomicU8 = AtomicU8::new(0);
 
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd",))]
 unsafe fn install_signal_handlers() -> io::Result<()> {
@@ -231,15 +239,27 @@ unsafe fn install_signal_handlers() -> io::Result<()> {
 /// never a partial write.  A `.<pid>.tmp` suffix keeps concurrent observers
 /// (misconfigured onto the same path) from clobbering each other's tempfile.
 /// If the rename fails the tempfile is removed before returning the error.
-/// Monotonic nanosecond clock for the self-watchdog thread.  Uses
-/// `Instant::now()` so it never goes backwards, which is the only
-/// property needed for deadline arithmetic.
+/// Monotonic nanosecond clock for the self-watchdog thread.  Reads the
+/// kernel clock selected by `--clock-source` via the `CLOCK_SOURCE`
+/// atomic — `Monotonic` (CLOCK_MONOTONIC) or `Boottime`
+/// (CLOCK_BOOTTIME, Linux only).
+///
+/// Replaces an earlier `SystemTime::now()` (wall-clock) implementation
+/// which had the foot-gun of going backwards on NTP step.  The new
+/// implementation aligns the watchdog's deadline arithmetic with what
+/// the observer's `now_ns()` perceives — same clock, same semantics —
+/// so a configured medical-device deployment gets watchdog ticks that
+/// also advance during host suspend.
 fn observer_now_ns() -> u64 {
-    use std::time::UNIX_EPOCH;
-    std::time::SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0)
+    let src = varta_watch::clock::ClockSource::from_u8(CLOCK_SOURCE.load(Ordering::Acquire));
+    let clk_id = match src.clk_id() {
+        Some(id) => id,
+        // Unreachable: the CLI parser rejects unsupported sources before
+        // this static is written.  Defensive 0 keeps watchdog_expired's
+        // `last == 0` skip-before-first-tick semantics from misfiring.
+        None => return 0,
+    };
+    varta_watch::clock::clock_gettime_raw(clk_id).unwrap_or(0)
 }
 
 /// Returns `true` when the poll loop has not ticked for longer than
@@ -302,6 +322,13 @@ fn run(cfg: Config) -> std::io::Result<()> {
         install_signal_handlers()?;
     }
 
+    // Publish the configured kernel clock source to `CLOCK_SOURCE` BEFORE
+    // any thread is spawned. The self-watchdog thread reads this atomic on
+    // every tick to decide which `clock_gettime(2)` clk_id to call.
+    // Release ordering pairs with the watchdog's Acquire load in
+    // `observer_now_ns()`.
+    CLOCK_SOURCE.store(cfg.clock_source.as_u8(), Ordering::Release);
+
     let mut observer = Observer::bind(
         &cfg.socket,
         cfg.threshold,
@@ -311,6 +338,7 @@ fn run(cfg: Config) -> std::io::Result<()> {
         cfg.tracker_eviction_policy,
         cfg.eviction_scan_window,
         cfg.max_beat_rate,
+        cfg.clock_source,
     )?
     .with_allow_cross_namespace(cfg.allow_cross_namespace_agents);
 

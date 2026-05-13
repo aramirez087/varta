@@ -67,6 +67,38 @@ pub fn derive_agent_key(master: &Key, agent_id: u32) -> Key {
     Key::from_bytes(okm)
 }
 
+/// Derive an 8-byte IV prefix from a 16-byte session salt and a `u32` index.
+///
+/// Counter-mode KDF: same `(session_salt, prefix_index)` always produces the
+/// same output; different indices (or different salts) produce independent
+/// uniformly-distributed outputs. Used by `SecureUdpTransport` to rotate the
+/// per-session IV prefix without re-reading OS entropy on the beat path
+/// (H6 fix — see `crates/varta-client/src/secure_transport.rs`).
+///
+/// # Security
+///
+/// The session salt is read from OS entropy exactly once at `connect()`
+/// time and held for the agent's lifetime. The 32-bit `prefix_index` gives
+/// 2^32 distinct prefixes per salt; combined with the 32-bit AEAD counter
+/// this yields 2^64 unique nonces per session (~584M years at 1 kHz beat
+/// rate). The info string `varta-iv-prefix-v1` provides domain separation
+/// from `derive_agent_key` and `derive_epoch_key`.
+pub fn derive_iv_prefix(session_salt: &[u8; 16], prefix_index: u32) -> [u8; 8] {
+    let hk = Hkdf::<Sha256>::new(None, session_salt);
+    // info = "varta-iv-prefix-v1\0" (19 bytes) || prefix_index LE (4 bytes)
+    let mut info = [0u8; 23];
+    info[..19].copy_from_slice(b"varta-iv-prefix-v1\0");
+    info[19..].copy_from_slice(&prefix_index.to_le_bytes());
+    let mut okm = [0u8; 8];
+    match hk.expand(&info, &mut okm) {
+        Ok(()) => {}
+        // `hkdf::InvalidLength` fires only when `okm.len() > 255 * 32 = 8160`
+        // bytes. `okm` is a fixed `[u8; 8]`. Unreachable by construction.
+        Err(_) => unreachable!("8-byte HKDF-SHA256 expand is infallible"),
+    }
+    okm
+}
+
 /// Derive an epoch-scoped 256-bit key from an agent key.
 ///
 /// Uses HKDF-SHA256 with the epoch number encoded in the info string.
@@ -160,5 +192,67 @@ mod tests {
         let agent_key = derive_agent_key(&master, 1000);
         let fake_epoch = derive_epoch_key(&master, 1000);
         assert_ne!(agent_key.as_bytes(), fake_epoch.as_bytes());
+    }
+
+    #[test]
+    fn derive_iv_prefix_deterministic() {
+        let salt = [0x42u8; 16];
+        let p1 = derive_iv_prefix(&salt, 0);
+        let p2 = derive_iv_prefix(&salt, 0);
+        assert_eq!(p1, p2);
+    }
+
+    #[test]
+    fn derive_iv_prefix_distinct_indices() {
+        let salt = [0x42u8; 16];
+        let samples = [
+            derive_iv_prefix(&salt, 0),
+            derive_iv_prefix(&salt, 1),
+            derive_iv_prefix(&salt, 2),
+            derive_iv_prefix(&salt, 3),
+            derive_iv_prefix(&salt, 4),
+            derive_iv_prefix(&salt, u32::MAX),
+        ];
+        // All six must be pairwise distinct.
+        for i in 0..samples.len() {
+            for j in (i + 1)..samples.len() {
+                assert_ne!(
+                    samples[i], samples[j],
+                    "collision at indices {i} and {j}: {:?}",
+                    samples[i]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn derive_iv_prefix_distinct_salts() {
+        let salt_a = [0x01u8; 16];
+        let salt_b = [0x02u8; 16];
+        assert_ne!(
+            derive_iv_prefix(&salt_a, 0),
+            derive_iv_prefix(&salt_b, 0),
+            "different salts must produce different prefixes"
+        );
+    }
+
+    #[test]
+    fn derive_iv_prefix_domain_separation() {
+        // A 16-byte salt extended to 32 bytes by zero-padding, used as both
+        // a master key and an agent key, must produce three independent
+        // outputs across the three info-string domains.
+        let salt = [0x42u8; 16];
+        let mut padded = [0u8; 32];
+        padded[..16].copy_from_slice(&salt);
+        let master = Key::from_bytes(padded);
+
+        let iv = derive_iv_prefix(&salt, 0);
+        let agent = derive_agent_key(&master, 0);
+        let epoch = derive_epoch_key(&master, 0);
+
+        // Compare iv (8 bytes) against the first 8 bytes of each derived key.
+        assert_ne!(iv, agent.as_bytes()[..8]);
+        assert_ne!(iv, epoch.as_bytes()[..8]);
+        assert_ne!(agent.as_bytes(), epoch.as_bytes());
     }
 }

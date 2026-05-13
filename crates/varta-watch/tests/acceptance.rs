@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 
 use varta_vlp::{DecodeError, Frame, Status};
 use varta_watch::tracker::{DEFAULT_EVICTION_SCAN_WINDOW, MAX_CAPACITY};
+use varta_watch::ClockSource;
 use varta_watch::EvictionPolicy;
 use varta_watch::{Event, Observer, Tracker, Update};
 
@@ -102,6 +103,7 @@ fn observer_emits_beat_per_received_frame() {
         EvictionPolicy::Strict,
         DEFAULT_EVICTION_SCAN_WINDOW,
         None,
+        ClockSource::Monotonic,
     )
     .expect("bind observer");
     let client = client_socket(path.as_path());
@@ -179,6 +181,7 @@ fn observer_emits_stall_after_threshold_elapses() {
         EvictionPolicy::Strict,
         DEFAULT_EVICTION_SCAN_WINDOW,
         None,
+        ClockSource::Monotonic,
     )
     .expect("bind observer");
     let client = client_socket(path.as_path());
@@ -230,6 +233,7 @@ fn observer_reports_decode_error_for_bad_magic() {
         EvictionPolicy::Strict,
         DEFAULT_EVICTION_SCAN_WINDOW,
         None,
+        ClockSource::Monotonic,
     )
     .expect("bind observer");
     let client = client_socket(path.as_path());
@@ -296,6 +300,7 @@ fn observer_rejects_spoofed_pid_frame() {
         EvictionPolicy::Strict,
         DEFAULT_EVICTION_SCAN_WINDOW,
         None,
+        ClockSource::Monotonic,
     )
     .expect("bind observer");
     let client = client_socket(path.as_path());
@@ -351,6 +356,7 @@ fn observer_counts_truncated_datagrams() {
         EvictionPolicy::Strict,
         DEFAULT_EVICTION_SCAN_WINDOW,
         None,
+        ClockSource::Monotonic,
     )
     .expect("bind observer");
     let client = client_socket(path.as_path());

@@ -362,6 +362,26 @@ impl Varta<SecureUdpTransport> {
             clock_regressions: 0,
         })
     }
+
+    /// Test-only: fast-forward the AEAD counter on the underlying transport
+    /// so the next beat exercises the counter-wrap rotation path without
+    /// emitting 2^32 beats. H6 integration test surface.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn set_iv_counter_for_test(&mut self, value: u32) {
+        self.transport.set_iv_counter_for_test(value);
+    }
+
+    /// Test-only: read the currently-derived 8-byte IV prefix.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn iv_prefix_for_test(&self) -> [u8; 8] {
+        self.transport.iv_prefix_for_test()
+    }
+
+    /// Test-only: read the current prefix index.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn iv_prefix_index_for_test(&self) -> u32 {
+        self.transport.iv_prefix_index_for_test()
+    }
 }
 
 /// Nonce-wraparound warning emitted once per connection lifetime.

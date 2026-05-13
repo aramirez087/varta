@@ -15,6 +15,7 @@
 //! is [`varta_vlp`]; nothing else is on the dependency surface.
 
 pub mod audit;
+pub mod clock;
 pub mod config;
 pub mod exporter;
 pub mod hw_watchdog;
@@ -29,6 +30,7 @@ pub mod tracker;
 #[cfg(feature = "secure-udp")]
 pub mod secure_listener;
 
+pub use clock::{Clock, ClockError, ClockSource};
 pub use config::{Config, ConfigError};
 pub use exporter::{Exporter, FileExporter, PromExporter};
 pub use listener::{BeatListener, TransportTrust, UdsListener};

@@ -9,6 +9,7 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use crate::clock::ClockSource;
 use crate::tracker::{
     EvictionPolicy, DEFAULT_CAPACITY, DEFAULT_EVICTION_SCAN_WINDOW, MAX_EVICTION_SCAN_WINDOW,
     MIN_EVICTION_SCAN_WINDOW,
@@ -303,6 +304,17 @@ pub struct Config {
     /// Present only when compiled with `--features test-hooks`.
     #[cfg(feature = "test-hooks")]
     pub inject_wedge_ms: Option<u64>,
+    /// Kernel clock that backs stall-threshold accounting (H7).
+    ///
+    /// - `Monotonic` (default): `CLOCK_MONOTONIC` — pauses on system
+    ///   suspend. Correct for SRE / cloud deployments.
+    /// - `Boottime` (Linux only): `CLOCK_BOOTTIME` — advances during
+    ///   suspend. Correct for embedded clinical devices that aggressively
+    ///   sleep (insulin pumps, holter monitors).
+    ///
+    /// See `docs/architecture/safety-profiles.md` for the deployment
+    /// matrix. Set by `--clock-source <monotonic|boottime>`.
+    pub clock_source: ClockSource,
 }
 
 /// Failure modes for [`Config::from_args`].
@@ -444,6 +456,15 @@ pub enum ConfigError {
         /// The maximum allowed value.
         max: usize,
     },
+    /// `--clock-source boottime` was requested but the host kernel has no
+    /// equivalent of Linux's `CLOCK_BOOTTIME`. Currently fires on every
+    /// non-Linux target (macOS, *BSD).
+    ClockSourceUnsupported {
+        /// The source the operator requested.
+        source: ClockSource,
+        /// `std::env::consts::OS` for the build target.
+        platform: &'static str,
+    },
 }
 
 impl core::fmt::Display for ConfigError {
@@ -535,6 +556,13 @@ impl core::fmt::Display for ConfigError {
             ConfigError::EvictionScanWindowOutOfRange { value, min, max } => write!(
                 f,
                 "--eviction-scan-window: {value} is outside the accepted range [{min}, {max}]"
+            ),
+            ConfigError::ClockSourceUnsupported { source, platform } => write!(
+                f,
+                "--clock-source {source} is not supported on `{platform}`. \
+                 `boottime` semantics (advance during suspend) require Linux's \
+                 CLOCK_BOOTTIME; macOS / BSD have no equivalent kernel clock. \
+                 Use `--clock-source monotonic` (the default) or switch to a Linux host."
             ),
         }
     }
@@ -638,6 +666,12 @@ OPTIONAL:
                                       stalled agents; balanced falls back to
                                       evicting the oldest active slot to
                                       prevent capacity-exhaustion attacks.
+    --clock-source <MODE>          Kernel clock for stall-threshold
+                                     accounting: monotonic (default; pauses
+                                     on suspend — SRE semantics) or
+                                     boottime (Linux only; advances during
+                                     suspend — medical/embedded semantics).
+                                     See docs/architecture/safety-profiles.md.
     --shutdown-after-secs <SECS>   Exit cleanly after the given uptime
                                      (used by integration tests).
     --udp-port <PORT>              Bind a UDP listener on this port for
@@ -842,6 +876,7 @@ OPTIONAL:
         let mut read_timeout_ms: Option<u64> = None;
         let mut tracker_capacity: Option<usize> = None;
         let mut tracker_eviction_policy: Option<EvictionPolicy> = None;
+        let mut clock_source: Option<ClockSource> = None;
         let mut eviction_scan_window: Option<usize> = None;
         let mut udp_port: Option<u16> = None;
         let mut udp_bind_addr: Option<std::net::IpAddr> = None;
@@ -1005,6 +1040,19 @@ OPTIONAL:
                             })
                         }
                     });
+                }
+                "--clock-source" => {
+                    let v = iter
+                        .next()
+                        .ok_or(ConfigError::MissingValue("--clock-source"))?;
+                    clock_source =
+                        Some(
+                            v.parse::<ClockSource>()
+                                .map_err(|_| ConfigError::BadValue {
+                                    flag: "--clock-source",
+                                    raw: v,
+                                })?,
+                        );
                 }
                 "--shutdown-after-secs" => {
                     let v = iter
@@ -1347,6 +1395,18 @@ OPTIONAL:
             None => DEFAULT_EVICTION_SCAN_WINDOW,
         };
 
+        // H7: reject `--clock-source boottime` on platforms where it has
+        // no kernel equivalent.  This fires before any listener bind so
+        // the operator sees the misconfiguration immediately.
+        if let Some(src) = clock_source {
+            if src.clk_id().is_none() {
+                return Err(ConfigError::ClockSourceUnsupported {
+                    source: src,
+                    platform: std::env::consts::OS,
+                });
+            }
+        }
+
         Ok(Config {
             socket,
             threshold: Duration::from_millis(threshold_ms),
@@ -1395,6 +1455,7 @@ OPTIONAL:
             scrape_budget,
             #[cfg(feature = "test-hooks")]
             inject_wedge_ms,
+            clock_source: clock_source.unwrap_or(ClockSource::Monotonic),
         })
     }
 
@@ -3080,5 +3141,81 @@ mod tests {
             ),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn clock_source_default_is_monotonic() {
+        let args = ["--socket", "/tmp/t.sock", "--threshold-ms", "100"];
+        let cfg = Config::from_args(args.iter().map(|s| s.to_string())).unwrap();
+        assert_eq!(cfg.clock_source, ClockSource::Monotonic);
+    }
+
+    #[test]
+    fn clock_source_parses_monotonic() {
+        let args = [
+            "--socket",
+            "/tmp/t.sock",
+            "--threshold-ms",
+            "100",
+            "--clock-source",
+            "monotonic",
+        ];
+        let cfg = Config::from_args(args.iter().map(|s| s.to_string())).unwrap();
+        assert_eq!(cfg.clock_source, ClockSource::Monotonic);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn clock_source_parses_boottime_on_linux() {
+        let args = [
+            "--socket",
+            "/tmp/t.sock",
+            "--threshold-ms",
+            "100",
+            "--clock-source",
+            "boottime",
+        ];
+        let cfg = Config::from_args(args.iter().map(|s| s.to_string())).unwrap();
+        assert_eq!(cfg.clock_source, ClockSource::Boottime);
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn clock_source_boottime_rejected_on_unsupported_platform() {
+        let args = [
+            "--socket",
+            "/tmp/t.sock",
+            "--threshold-ms",
+            "100",
+            "--clock-source",
+            "boottime",
+        ];
+        let err = Config::from_args(args.iter().map(|s| s.to_string())).unwrap_err();
+        match err {
+            ConfigError::ClockSourceUnsupported { source, .. } => {
+                assert_eq!(source, ClockSource::Boottime);
+            }
+            other => panic!("expected ClockSourceUnsupported, got {other}"),
+        }
+    }
+
+    #[test]
+    fn clock_source_rejects_unknown_value() {
+        let args = [
+            "--socket",
+            "/tmp/t.sock",
+            "--threshold-ms",
+            "100",
+            "--clock-source",
+            "wallclock",
+        ];
+        let err = Config::from_args(args.iter().map(|s| s.to_string())).unwrap_err();
+        match err {
+            ConfigError::BadValue { flag, raw } => {
+                assert_eq!(flag, "--clock-source");
+                assert_eq!(raw, "wallclock");
+            }
+            other => panic!("expected BadValue, got {other}"),
+        }
     }
 }

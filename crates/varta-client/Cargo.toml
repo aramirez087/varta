@@ -17,6 +17,10 @@ udp = []
 # example calls `Key::from_file`, which lives behind `varta-vlp/std` so the
 # protocol crate stays `no_std` for embedded consumers.
 secure-udp = ["udp", "varta-vlp/crypto", "varta-vlp/std"]
+# Test-only injection points (H6 counter-wrap fast-forward, etc.).  Default
+# features remain empty; the feature compiles to nothing when absent.
+# Adds no security surface — does NOT use the `unsafe-` prefix.
+test-hooks = []
 
 [lints]
 workspace = true

@@ -19,6 +19,9 @@ workspace = true
 udp = ["varta-client/udp", "varta-watch/unsafe-plaintext-udp"]
 secure-udp = ["varta-client/secure-udp", "varta-watch/secure-udp"]
 shell-recovery = ["varta-watch/unsafe-shell-recovery"]
+# Forward test-hooks to varta-client (H6 counter-wrap fast-forward) and to
+# varta-watch (existing self-watchdog wedge).
+test-hooks = ["varta-client/test-hooks", "varta-watch/test-hooks"]
 
 [dev-dependencies]
 varta-vlp = { path = "../varta-vlp", features = ["crypto"] }

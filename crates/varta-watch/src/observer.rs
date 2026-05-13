@@ -13,10 +13,11 @@
 
 use std::io;
 use std::path::Path;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use varta_vlp::{DecodeError, Frame, Status};
 
+use crate::clock::{Clock, ClockSource};
 use crate::listener::{BeatListener, UdsListener};
 use crate::peer_cred::{BeatOrigin, RecvResult};
 use crate::tracker::{EvictionPolicy, Tracker, Update};
@@ -137,7 +138,7 @@ pub struct Observer {
     listeners: Vec<Box<dyn BeatListener>>,
     tracker: Tracker,
     threshold_ns: u64,
-    start: Instant,
+    clock: Clock,
     stall_queue: Vec<Option<Event>>,
     stall_cursor: usize,
     /// Next index to start polling from for fair round-robin across listeners.
@@ -187,7 +188,8 @@ impl Observer {
         eviction_policy: EvictionPolicy,
         eviction_scan_window: usize,
         max_beat_rate: Option<u32>,
-    ) -> Self {
+        clock_source: ClockSource,
+    ) -> io::Result<Self> {
         let threshold_ns = threshold.as_nanos().min(u64::MAX as u128) as u64;
         let rate_limit_interval_ns = max_beat_rate.and_then(|rps| {
             if rps == 0 {
@@ -199,11 +201,12 @@ impl Observer {
                 Some(interval_ns)
             }
         });
-        Observer {
+        let clock = Clock::new(clock_source).map_err(io::Error::from)?;
+        Ok(Observer {
             listeners: Vec::new(),
             tracker: Tracker::new(tracker_capacity, eviction_policy, eviction_scan_window),
             threshold_ns,
-            start: Instant::now(),
+            clock,
             stall_queue: Vec::with_capacity(tracker_capacity),
             stall_cursor: 0,
             next_listener_start: 0,
@@ -212,7 +215,7 @@ impl Observer {
             last_now_ns: 0,
             allow_cross_namespace: false,
             cross_namespace_drops: 0,
-        }
+        })
     }
 
     /// Allow beats from agents whose kernel-attested PID namespace differs
@@ -231,16 +234,18 @@ impl Observer {
         eviction_policy: EvictionPolicy,
         eviction_scan_window: usize,
         max_beat_rate: Option<u32>,
-    ) -> Self {
+        clock_source: ClockSource,
+    ) -> io::Result<Self> {
         let mut obs = Self::new(
             threshold,
             tracker_capacity,
             eviction_policy,
             eviction_scan_window,
             max_beat_rate,
-        );
+            clock_source,
+        )?;
         obs.add_listener(Box::new(listener));
-        obs
+        Ok(obs)
     }
 
     /// Bind a Unix datagram socket at `path` and return an [`Observer`]
@@ -259,16 +264,18 @@ impl Observer {
         eviction_policy: EvictionPolicy,
         eviction_scan_window: usize,
         max_beat_rate: Option<u32>,
+        clock_source: ClockSource,
     ) -> io::Result<Self> {
         let listener = UdsListener::bind(path, socket_mode, read_timeout)?;
-        Ok(Self::from_listener(
+        Self::from_listener(
             listener,
             threshold,
             tracker_capacity,
             eviction_policy,
             eviction_scan_window,
             max_beat_rate,
-        ))
+            clock_source,
+        )
     }
 
     /// Add a listener to the observer. The listener is polled in round-robin
@@ -455,14 +462,23 @@ impl Observer {
     /// Observer-local nanosecond timestamp (ns since [`Observer`] start).
     ///
     /// Clamped to never decrease — on some platforms (VMs with TSC drift,
-    /// live-migration pause-and-resume), `Instant::elapsed()` can produce
+    /// live-migration pause-and-resume), the underlying clock can produce
     /// values that appear to go backwards. Without clamping, a forward clock
     /// jump after a backward excursion can cause false stall detections.
+    ///
+    /// The kernel clock backing this reading is selected via
+    /// [`crate::clock::ClockSource`] (`--clock-source` CLI flag); see
+    /// `docs/architecture/safety-profiles.md` for the SRE vs. medical
+    /// deployment matrix.
     pub fn now_ns(&mut self) -> u64 {
-        let elapsed = self.start.elapsed().as_nanos();
-        let raw = elapsed.min(u64::MAX as u128) as u64;
+        let raw = self.clock.now_ns();
         self.last_now_ns = self.last_now_ns.max(raw);
         self.last_now_ns
+    }
+
+    /// Inspect the kernel clock backing this observer's stall accounting.
+    pub fn clock_source(&self) -> ClockSource {
+        self.clock.source()
     }
 
     fn drain_stalls(&mut self) {
@@ -639,6 +655,7 @@ mod tests {
             EvictionPolicy::Strict,
             DEFAULT_EVICTION_SCAN_WINDOW,
             None,
+            ClockSource::Monotonic,
         )
         .expect("bind should succeed on a clean temp path");
         assert!(path.exists(), "socket file must exist after bind");

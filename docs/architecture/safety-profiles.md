@@ -102,6 +102,71 @@ requiring a separate test-filter command.
 
 ---
 
+## Clock source for stall detection
+
+Stall threshold accounting depends on a monotonic time source.  Which "monotonic"
+is *correct* depends on the deployment profile:
+
+| Profile | `--clock-source` | Rationale |
+|---|---|---|
+| SRE / cloud server / VM | `monotonic` (default) | `CLOCK_MONOTONIC` pauses on host suspend, hypervisor pause, and live-migration freeze.  A 30-minute host-suspend-for-maintenance must NOT fan out a stall alert across every agent. |
+| Medical implant / holter / insulin pump | `boottime` (Linux only) | `CLOCK_BOOTTIME` advances during suspend.  A 4-hour deep-sleep IS a 4-hour silence; stall detection MUST fire on wake-up regardless of whether the device suspended itself. |
+| Embedded sensor with deep sleep | `boottime` (Linux only) | Same as medical — battery-conscious devices that aggressively suspend need stall semantics that count the suspended time. |
+
+### Platform support
+
+`boottime` semantics require Linux's `CLOCK_BOOTTIME` clock (clk_id `7`,
+available since 2.6.39).  macOS / iOS / BSD have no kernel equivalent —
+Darwin's `CLOCK_UPTIME_RAW` *excludes* suspend (the opposite semantics).
+The CLI parser therefore rejects `--clock-source boottime` at startup on
+every non-Linux target with `ConfigError::ClockSourceUnsupported`:
+
+```text
+--clock-source boottime is not supported on `macos`. `boottime` semantics
+(advance during suspend) require Linux's CLOCK_BOOTTIME; macOS / BSD have
+no equivalent kernel clock. Use `--clock-source monotonic` (the default)
+or switch to a Linux host.
+```
+
+This is structural enforcement: a misconfigured medical-device deployment
+on macOS exits non-zero rather than silently picking a clock that pauses
+on sleep.
+
+### Self-watchdog alignment
+
+The in-process self-watchdog (`--self-watchdog-secs`) reads the same kernel
+clock as the observer.  An operator who configures `boottime` for the
+observer gets watchdog deadline accounting that also advances during
+suspend; an SRE operator on `monotonic` gets identical-to-historical
+watchdog behaviour minus the previous wall-clock NTP-backward-step
+foot-gun.
+
+### Verification recipe (Linux)
+
+```sh
+# Confirm the configured clock source is in effect.
+journalctl -u varta-watch | grep -i 'clock'   # binary logs no startup banner today;
+                                              # operators can read /proc/<pid>/maps
+                                              # to confirm clock_gettime imports.
+
+# Behavioural smoke test — requires a real suspend / resume cycle:
+systemctl suspend && sleep 60 && systemctl resume
+curl -fsS http://localhost:9090/metrics -H "Authorization: Bearer <hex>" \
+  | grep -E 'varta_(stall_total|beats_total|watch_uptime_seconds)'
+# Expect: with --clock-source boottime, varta_stall_total advanced during the
+# suspend window; with --clock-source monotonic, it did not.
+```
+
+### Cross-reference
+
+The `secure-udp` transport applies the same "no surprises on the beat path"
+posture: the IV-prefix derivation (H6) reads OS entropy only at `connect()`
+and `reconnect()` — every steady-state beat uses a deterministic HKDF
+counter-mode expansion.  Together, H6 + H7 keep the agent and observer
+loops free of any syscall that can block or stall under suspend.
+
+---
+
 ## Cross-references
 
 - [Observer liveness](observer-liveness.md) — defending against `varta-watch`

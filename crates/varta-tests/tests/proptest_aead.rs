@@ -18,6 +18,7 @@
 
 use proptest::array::uniform;
 use proptest::prelude::*;
+use varta_vlp::crypto::kdf::derive_iv_prefix;
 use varta_vlp::crypto::{open, seal};
 
 // ---------------------------------------------------------------------------
@@ -129,5 +130,48 @@ proptest! {
         let (ciphertext, tag) = seal(&key, &n1, b"", &plaintext);
         let result = open(&key, &n2, b"", &ciphertext, &tag);
         prop_assert!(result.is_err(), "wrong nonce must be detected");
+    }
+
+    /// H6 — IV prefixes derived from a session salt + arbitrary prefix
+    /// index must produce nonces that AEAD seal/open correctly. Models the
+    /// `SecureUdpTransport` counter-wrap rotation path: a fresh prefix is
+    /// derived from `(salt, prefix_index)` and combined with a fresh
+    /// `iv_counter`. Every round-trip must succeed.
+    #[test]
+    fn seal_open_roundtrip_after_prefix_rotation(
+        key in uniform::<_, 32>(any::<u8>()),
+        session_salt in uniform::<_, 16>(any::<u8>()),
+        prefix_index in any::<u32>(),
+        iv_counter in any::<u32>(),
+        plaintext in uniform::<_, 32>(any::<u8>()),
+    ) {
+        let prefix = derive_iv_prefix(&session_salt, prefix_index);
+        let mut nonce = [0u8; 12];
+        nonce[..8].copy_from_slice(&prefix);
+        nonce[8..].copy_from_slice(&iv_counter.to_le_bytes());
+
+        let (ciphertext, tag) = seal(&key, &nonce, b"", &plaintext);
+        let decrypted = open(&key, &nonce, b"", &ciphertext, &tag)
+            .expect("rotated-prefix round-trip must decrypt");
+        prop_assert_eq!(&decrypted, &plaintext);
+    }
+
+    /// H6 — distinct prefix indices under the same session salt must
+    /// produce distinct nonces (and therefore distinct ciphertexts for
+    /// the same plaintext + key). Guards against any future regression
+    /// that collapses the index dimension.
+    #[test]
+    fn distinct_prefix_indices_yield_distinct_nonces(
+        session_salt in uniform::<_, 16>(any::<u8>()),
+        idx_a in any::<u32>(),
+        idx_b in any::<u32>(),
+    ) {
+        if idx_a == idx_b {
+            return Ok(());
+        }
+        let p_a = derive_iv_prefix(&session_salt, idx_a);
+        let p_b = derive_iv_prefix(&session_salt, idx_b);
+        // Cryptographically extreme to collide on 64 bits.
+        prop_assert_ne!(p_a, p_b);
     }
 }
