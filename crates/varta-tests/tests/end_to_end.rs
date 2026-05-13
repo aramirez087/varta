@@ -556,6 +556,7 @@ fn recovery_cmd_file_mode() {
     {
         let file = std::fs::OpenOptions::new()
             .create(true)
+            .truncate(true)
             .write(true)
             .mode(0o600)
             .open(&cmd_file)
@@ -629,6 +630,7 @@ fn recovery_exec_file_mode() {
     {
         let file = std::fs::OpenOptions::new()
             .create(true)
+            .truncate(true)
             .write(true)
             .mode(0o600)
             .open(&exec_file)
@@ -755,10 +757,7 @@ fn recovery_timeout_kill_after() {
 
     // Verify observer is still alive by checking /metrics responds
     let alive = wait_until(
-        || match http_get(prom_addr, "/metrics") {
-            Ok((200, _)) => true,
-            _ => false,
-        },
+        || matches!(http_get(prom_addr, "/metrics"), Ok((200, _))),
         Duration::from_secs(3),
     );
     assert!(
@@ -986,7 +985,7 @@ fn file_export_writes_tsv() {
     let socket = tmp.path().join("varta.sock");
     let export = tmp.path().join("events.tsv");
 
-    let mut child = Command::new(&locate_watch_binary())
+    let mut child = Command::new(locate_watch_binary())
         .args([
             "--socket",
             socket.to_str().unwrap(),
@@ -1456,7 +1455,7 @@ fn signal_handling_graceful_shutdown() {
 
     #[cfg(unix)]
     {
-        let mut child = Command::new(&locate_watch_binary())
+        let mut child = Command::new(locate_watch_binary())
             .args([
                 "--socket",
                 socket.to_str().unwrap(),
