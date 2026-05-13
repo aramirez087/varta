@@ -55,12 +55,12 @@ fuzz_target!(|data: &[u8]| {
 
         let frame = varta_vlp::Frame::new(status, pid, timestamp, nonce, 0);
 
-        let _update = tracker.record(&frame, wall, threshold_ns, origin);
+        let _update = tracker.record(&frame, wall, threshold_ns, origin, None);
 
         // Periodically drain stalled slots and counter reads so those code
         // paths see a mixture of populated / empty trackers.
         if offset % 7 < 3 {
-            tracker.drain_stalled_slots(wall, threshold_ns, |_, _, _, _| {});
+            tracker.drain_stalled_slots(wall, threshold_ns, |_, _, _, _, _| {});
             let _ = tracker.take_evictions();
             let _ = tracker.take_capacity_exceeded();
             let _ = tracker.len();
@@ -75,5 +75,5 @@ fuzz_target!(|data: &[u8]| {
     let _ = tracker.take_probe_exhausted();
     let _ = tracker.len();
     let _ = tracker.is_empty();
-    tracker.drain_stalled_slots(wall, 1, |_, _, _, _| {});
+    tracker.drain_stalled_slots(wall, 1, |_, _, _, _, _| {});
 });

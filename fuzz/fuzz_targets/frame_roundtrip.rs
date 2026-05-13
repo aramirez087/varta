@@ -3,7 +3,7 @@
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
-    if data.len() < 32 {
+    if data.len() < 28 {
         return;
     }
 
@@ -23,9 +23,9 @@ fuzz_target!(|data: &[u8]| {
         data[16], data[17], data[18], data[19], data[20], data[21], data[22], data[23],
     ]);
 
-    let payload = u64::from_le_bytes([
-        data[24], data[25], data[26], data[27], data[28], data[29], data[30], data[31],
-    ]);
+    // VLP v0.2: payload is u32 at bytes 24..28; bytes 28..32 carry CRC-32C
+    // over bytes 0..28 (overwritten below regardless of fuzz input).
+    let payload = u32::from_le_bytes([data[24], data[25], data[26], data[27]]);
 
     let status = match varta_vlp::Status::try_from_u8(status_byte) {
         Ok(s) => s,
@@ -42,7 +42,9 @@ fuzz_target!(|data: &[u8]| {
     buf[4..8].copy_from_slice(&pid.to_le_bytes());
     buf[8..16].copy_from_slice(&timestamp.to_le_bytes());
     buf[16..24].copy_from_slice(&nonce.to_le_bytes());
-    buf[24..32].copy_from_slice(&payload.to_le_bytes());
+    buf[24..28].copy_from_slice(&payload.to_le_bytes());
+    let crc = varta_vlp::crc32c::compute(&buf[0..28]);
+    buf[28..32].copy_from_slice(&crc.to_le_bytes());
 
     match varta_vlp::Frame::decode(&buf) {
         Ok(decoded) => {

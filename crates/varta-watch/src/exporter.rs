@@ -198,7 +198,7 @@ impl Exporter for FileExporter {
                     + 1  // \t
                     + label.len() as u64
                     + 1  // \t
-                    + decimal_digits(*payload) as u64
+                    + decimal_digits(*payload as u64) as u64
                     + 1 // \n
             }
             Event::Stall {
@@ -384,7 +384,7 @@ fn status_label(s: Status) -> &'static str {
 /// Prometheus `kind` label values for `varta_decode_errors_total`. Indexed
 /// by [`decode_kind_index`]; the array doubles as the canonical ordering
 /// for the exposition output, so series remain stable across scrapes.
-const DECODE_KIND_LABELS: [&str; 7] = [
+const DECODE_KIND_LABELS: [&str; 8] = [
     "bad_magic",
     "bad_version",
     "bad_status",
@@ -392,6 +392,7 @@ const DECODE_KIND_LABELS: [&str; 7] = [
     "bad_timestamp",
     "bad_nonce",
     "stall_on_wire",
+    "bad_crc",
 ];
 
 fn decode_kind_index(err: &DecodeError) -> usize {
@@ -403,6 +404,7 @@ fn decode_kind_index(err: &DecodeError) -> usize {
         DecodeError::BadTimestamp(_) => 4,
         DecodeError::BadNonce { .. } => 5,
         DecodeError::StallOnWire => 6,
+        DecodeError::BadCrc { .. } => 7,
     }
 }
 

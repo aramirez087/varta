@@ -1782,7 +1782,7 @@ fn run_agent_child(socket_path: &str) {
     for i in 0..MULTI_AGENT_BEATS {
         let mut tries = 0u32;
         loop {
-            match agent.beat(Status::Ok, i as u64) {
+            match agent.beat(Status::Ok, i as u32) {
                 BeatOutcome::Sent => break,
                 BeatOutcome::Dropped => {
                     tries += 1;

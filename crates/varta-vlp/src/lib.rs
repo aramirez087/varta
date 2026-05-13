@@ -26,6 +26,7 @@ extern crate std;
 #[cfg(feature = "crypto")]
 pub mod crypto;
 
+pub mod crc32c;
 pub mod util;
 pub use util::{ct_eq, decode_hex_32, HexDecodeError};
 
@@ -33,10 +34,10 @@ pub use util::{ct_eq, decode_hex_32, HexDecodeError};
 /// hex dumps so a stray byte stream is easy to identify.
 pub const MAGIC: [u8; 2] = [0x56, 0x41];
 
-/// Current Varta Lifeline Protocol version. v0.1.0 ships only `0x01`; any
-/// future on-wire change bumps this byte and adds a [`DecodeError::BadVersion`]
-/// path.
-pub const VERSION: u8 = 0x01;
+/// Current Varta Lifeline Protocol version. v0.2 introduces the CRC-32C
+/// integrity trailer at bytes 28..32 and shrinks `payload` from `u64` to
+/// `u32` to fit it. v0.1 frames decode as [`DecodeError::BadVersion`].
+pub const VERSION: u8 = 0x02;
 
 // Compile-time guard: VLP frame layout is little-endian by specification
 // (see docs/architecture/vlp-frame.md). Building on a big-endian host would
@@ -123,9 +124,12 @@ pub struct Frame {
     /// `Varta::connect`. The panic hook pins this to [`NONCE_TERMINAL`] to
     /// mark a final critical frame. Regular beats wrap to 0 on exhaustion.
     pub nonce: u64,
-    /// Free-form 8-byte payload — application-defined health context (queue
-    /// depth, error code, etc.). Carried opaquely by the protocol.
-    pub payload: u64,
+    /// Free-form 4-byte payload — application-defined health context (queue
+    /// depth, error code, etc.). Carried opaquely by the protocol. Shrunk
+    /// from `u64` to `u32` in VLP v0.2 to fit the CRC-32C trailer in 32
+    /// bytes; the on-wire CRC occupies bytes 28..32 and is not surfaced as
+    /// a struct field — see [`Frame::encode`] / [`Frame::decode`].
+    pub payload: u32,
 }
 
 const _: () = assert!(core::mem::size_of::<Frame>() == 32);
@@ -142,7 +146,7 @@ impl Frame {
     /// Construct a new frame with the canonical [`MAGIC`] prefix and
     /// [`VERSION`] byte already populated. All other fields are
     /// caller-supplied.
-    pub const fn new(status: Status, pid: u32, timestamp: u64, nonce: u64, payload: u64) -> Frame {
+    pub const fn new(status: Status, pid: u32, timestamp: u64, nonce: u64, payload: u32) -> Frame {
         Frame {
             magic: MAGIC,
             version: VERSION,
@@ -157,6 +161,12 @@ impl Frame {
     /// Serialise this frame into a 32-byte buffer in canonical
     /// little-endian layout. The output buffer is overwritten in place; this
     /// method allocates nothing.
+    ///
+    /// Bytes 28..32 are stamped with a CRC-32C computed over bytes 0..28 —
+    /// see [`crate::crc32c`]. The CRC is a wire-format artifact, not a
+    /// struct field; callers must never mutate the buffer between `encode`
+    /// and the on-wire write or the receiver will reject the frame as
+    /// [`DecodeError::BadCrc`].
     pub fn encode(&self, out: &mut [u8; 32]) {
         out[0..2].copy_from_slice(&self.magic);
         out[2] = self.version;
@@ -164,14 +174,24 @@ impl Frame {
         out[4..8].copy_from_slice(&self.pid.to_le_bytes());
         out[8..16].copy_from_slice(&self.timestamp.to_le_bytes());
         out[16..24].copy_from_slice(&self.nonce.to_le_bytes());
-        out[24..32].copy_from_slice(&self.payload.to_le_bytes());
+        out[24..28].copy_from_slice(&self.payload.to_le_bytes());
+        let crc = crc32c::compute(&out[0..28]);
+        out[28..32].copy_from_slice(&crc.to_le_bytes());
     }
 
     /// Decode a 32-byte buffer back into a [`Frame`], validating magic,
-    /// version, status, and field ranges in that order. Returns
+    /// version, CRC, status, and field ranges in that order. Returns
     /// [`DecodeError`] on the first failed check.
     ///
-    /// Field-range rules enforced after the byte-level fields are read:
+    /// Order rationale: `magic` + `version` come first so random bytes
+    /// from a wrong-protocol sender surface as
+    /// [`DecodeError::BadMagic`] / [`DecodeError::BadVersion`] (the
+    /// "this isn't even VLP" diagnostic). The CRC then gates every
+    /// field-range check — a single-bit-flipped status byte must surface
+    /// as [`DecodeError::BadCrc`], not as a valid frame with the wrong
+    /// meaning.
+    ///
+    /// Field-range rules enforced after the CRC passes:
     /// * `status == Status::Stall` is rejected — `Stall` is observer-synthesized
     ///   by `varta-watch` when a pid goes silent past its threshold; no
     ///   legitimate agent emits it on the wire. Accepting a spoofed `Stall`
@@ -197,6 +217,21 @@ impl Frame {
         if version != VERSION {
             return Err(DecodeError::BadVersion);
         }
+
+        // CRC trailer at bytes 28..32 covers bytes 0..28. Verified after
+        // magic/version (so wrong-protocol bytes surface as BadMagic, not
+        // BadCrc) and before any field-range check (so corruption cannot
+        // produce a "well-formed" frame with the wrong meaning).
+        let stored_crc =
+            u32::from_le_bytes([bytes[28], bytes[29], bytes[30], bytes[31]]);
+        let computed_crc = crc32c::compute(&bytes[0..28]);
+        if stored_crc != computed_crc {
+            return Err(DecodeError::BadCrc {
+                expected: computed_crc,
+                actual: stored_crc,
+            });
+        }
+
         let status = Status::try_from_u8(bytes[3])?;
         if status == Status::Stall {
             return Err(DecodeError::StallOnWire);
@@ -212,9 +247,7 @@ impl Frame {
         let nonce = u64::from_le_bytes([
             bytes[16], bytes[17], bytes[18], bytes[19], bytes[20], bytes[21], bytes[22], bytes[23],
         ]);
-        let payload = u64::from_le_bytes([
-            bytes[24], bytes[25], bytes[26], bytes[27], bytes[28], bytes[29], bytes[30], bytes[31],
-        ]);
+        let payload = u32::from_le_bytes([bytes[24], bytes[25], bytes[26], bytes[27]]);
 
         if pid == 0 || pid == 1 {
             return Err(DecodeError::BadPid(pid));
@@ -252,6 +285,19 @@ pub enum DecodeError {
     BadMagic,
     /// Version byte did not equal [`VERSION`].
     BadVersion,
+    /// CRC-32C trailer at bytes 28..32 did not match the value computed
+    /// over bytes 0..28. Indicates wire corruption (cosmic ray / NIC
+    /// firmware / non-ECC RAM bit flip) on the UDS transport, or
+    /// in-process memory corruption between
+    /// [`crate::crypto::open`](crypto::open) and `Frame::decode` on the
+    /// secure-UDP transport. AEAD tag failures stay in the transport
+    /// layer (`crypto::AuthError`) and never surface as `BadCrc`.
+    BadCrc {
+        /// CRC-32C recomputed over bytes 0..28 of the received frame.
+        expected: u32,
+        /// CRC-32C value carried in bytes 28..32 of the received frame.
+        actual: u32,
+    },
     /// Status byte did not match any known [`Status`] variant. The inner
     /// value is the offending byte, surfaced for observer-side diagnostics.
     BadStatus(u8),
@@ -286,6 +332,12 @@ impl core::fmt::Display for DecodeError {
         match self {
             DecodeError::BadMagic => f.write_str("varta-vlp: bad magic prefix"),
             DecodeError::BadVersion => f.write_str("varta-vlp: bad version byte"),
+            DecodeError::BadCrc { expected, actual } => {
+                write!(
+                    f,
+                    "varta-vlp: bad CRC-32C trailer (expected {expected:#010x}, actual {actual:#010x})"
+                )
+            }
             DecodeError::BadStatus(byte) => {
                 write!(f, "varta-vlp: bad status byte {byte:#04x}")
             }

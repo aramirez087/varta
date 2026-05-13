@@ -418,7 +418,7 @@ impl<T: BeatTransport> Varta<T> {
     /// reconnect the socket and retry the send before returning. The retry
     /// path allocates a fresh socket; this is acceptable because observer
     /// restarts are rare and the steady-state path remains allocation-free.
-    pub fn beat(&mut self, status: Status, payload: u64) -> BeatOutcome {
+    pub fn beat(&mut self, status: Status, payload: u32) -> BeatOutcome {
         if self.nonce < NONCE_TERMINAL - 1 {
             self.nonce += 1;
         } else {

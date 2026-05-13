@@ -45,7 +45,7 @@ impl Drop for UdsPath {
 }
 
 /// Build a canonical 32-byte VLP frame for the given pid/nonce/status.
-fn make_frame(pid: u32, nonce: u64, status: Status, payload: u64) -> Frame {
+fn make_frame(pid: u32, nonce: u64, status: Status, payload: u32) -> Frame {
     Frame::new(status, pid, nonce, nonce, payload)
 }
 
@@ -119,7 +119,7 @@ fn observer_emits_beat_per_received_frame() {
     }
 
     let deadline = Duration::from_secs(5);
-    let mut got: Vec<(u32, u64, Status, u64)> = Vec::with_capacity(3);
+    let mut got: Vec<(u32, u64, Status, u32)> = Vec::with_capacity(3);
     let stop = Instant::now() + deadline;
     'outer: while got.len() < 3 && Instant::now() < stop {
         // Check queued stalls first, then I/O events.

@@ -36,7 +36,7 @@ pub enum Event {
         /// Decoded health status of the beat.
         status: Status,
         /// Application-defined payload carried by the beat.
-        payload: u64,
+        payload: u32,
         /// Monotonic nonce of the beat.
         nonce: u64,
         /// Transport-class classification of the beat (see [`BeatOrigin`]).
