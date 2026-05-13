@@ -72,6 +72,114 @@ The ancillary buffer is sized at 256 bytes — sufficient for the 84-byte
 > platforms. Containers that run multiple processes under the same UID
 > should be aware of this limitation.
 
+## UDP transport authentication
+
+For network-based agents that emit beats over UDP, the trust model is
+**cryptographic**, not kernel-attested.  UDP has no peer-credential
+mechanism on any platform — `recvmsg(2)` cannot tell the observer who
+sent a datagram, only where it claims to be from.  Varta therefore
+requires authentication at the AEAD layer, and refuses to bind an
+unauthenticated UDP listener without two layers of explicit opt-in.
+
+### Compile-time features (`crates/varta-watch/Cargo.toml`)
+
+| Cargo feature           | What it enables                                                 | Production posture       |
+|-------------------------|-----------------------------------------------------------------|--------------------------|
+| `secure-udp`            | `SecureUdpListener` (ChaCha20-Poly1305 AEAD + per-sender replay) | **Recommended**          |
+| `unsafe-plaintext-udp`  | `UdpListener` (no authentication)                                | **Forbidden in production** |
+| `udp-core`              | Internal — shared UDP socket wiring                              | (transitive)             |
+
+A build that does not include `unsafe-plaintext-udp` cannot link the
+plaintext path at all.  Passing `--udp-port` without keys to such a build
+hard-errors at startup; there is no warn-and-continue path.
+
+### Runtime selection rules
+
+When `--udp-port` is set, the observer chooses exactly one listener:
+
+1. If `--features secure-udp` is compiled in **and** `--key-file` /
+   `--master-key-file` resolve to a usable key, bind `SecureUdpListener`.
+2. Otherwise, only the plaintext path remains.  It is bound *only* if
+   both `--features unsafe-plaintext-udp` is compiled in **and**
+   `--i-accept-plaintext-udp` was passed on the command line.
+3. Any other configuration is a hard error (`InvalidInput`).
+
+When the plaintext path is taken, a high-visibility `varta_warn!` is
+emitted at startup naming the bound address, so the choice appears in
+SIEM / syslog logs:
+
+> `UDP on <addr> is running WITHOUT authentication (--i-accept-plaintext-udp).`
+> `Any device with network reach to this port can inject heartbeats, suppress`
+> `stall detection, or trigger false recovery commands. NOT for production /`
+> `safety-critical use.`
+
+`--i-accept-plaintext-udp` is intentionally verbose: an operator who
+types it is making an explicit statement that this build is for
+development or testing, not for a hospital VLAN.
+
+### Why no kernel-level UDP credentials
+
+Unix Domain Sockets carry `SCM_CREDENTIALS` / `LOCAL_PEERTOKEN` /
+`SCM_CREDS` per-datagram.  UDP carries none of those.  Even on a single
+host where `--udp-bind-addr 127.0.0.1` is used, any local process can
+send to that port — there is no equivalent of `--socket-mode 0600` for
+network sockets.  AEAD is the only durable defence.
+
+## Recovery command authentication boundary
+
+`--recovery-cmd` (inline shell) and `--recovery-cmd-file` (file-based
+shell) both spawn `/bin/sh -c <template>` with the observer's full
+process authority.  In a safety-critical deployment a recovery template
+like `systemctl restart {service}` or `kill -9 {pid}` can terminate
+unrelated production processes if the template body is mis-edited or if
+shell metacharacters appear unexpectedly.
+
+To prevent accidental shell-mode deployment, **shell mode requires
+`--i-accept-shell-risk` at runtime**.  Without that flag, startup
+hard-errors with a message that recommends `--recovery-exec` (which
+calls `execvp(2)` directly — no shell, no metacharacter interpretation,
+no injection surface).  This applies to both the inline and file-based
+forms; the shell-injection risk is identical regardless of where the
+template comes from.
+
+`--recovery-exec` and `--recovery-exec-file` do **not** require an
+accept flag — they are the default-safe path.
+
+## Prometheus `/metrics` endpoint exposure
+
+The `/metrics` endpoint is HTTP/1.0 plaintext with no authentication.
+The observer applies four layers of protection so that a hostile actor
+on the same network cannot exhaust file descriptors or starve the
+observer's poll loop with a connection flood:
+
+1. **Serve budget** — at most `PROM_MAX_CONNECTIONS_PER_SERVE=8` accepted
+   connections per outer poll tick, and a 100 ms wall-clock deadline.
+2. **Drain budget** — after the serve budget is exhausted, an
+   additional `PROM_MAX_DRAIN_PER_SERVE=50` connections may be accepted
+   and immediately closed, so the kernel accept queue does not back up.
+3. **Per-source-IP token bucket** — every accepted connection (in both
+   serve and drain phases) decrements a per-IP token bucket sized by
+   `--prom-rate-limit-burst` (default 10) and refilled at
+   `--prom-rate-limit-per-sec` (default 5).  Connections from an IP
+   whose bucket is empty are closed without serving and counted as
+   `varta_prom_connections_dropped_total{reason="rate_limit"}`.
+4. **Per-IP table cap** — the per-IP map is bounded to 1024 entries;
+   when full, stale entries (no activity in 60 s) are evicted first,
+   then if necessary the oldest entry is force-evicted and counted as
+   `varta_prom_connections_dropped_total{reason="ip_table_full"}`.
+
+### Bind-address recommendation
+
+`--prom-addr` accepts any local socket address, but for hospital
+deployment the recommended posture is to bind loopback
+(`127.0.0.1:<port>` or `[::1]:<port>`) and expose `/metrics` only
+through a reverse proxy or a firewalled management interface.  The
+observer emits a startup `varta_warn!` whenever the bound address is
+non-loopback, to surface the exposure in audit logs:
+
+> `/metrics is bound to a non-loopback address (<addr>); any host that can`
+> `reach this port can scrape it.`
+
 ## Recovery command environment isolation
 
 When `--recovery-env KEY=VALUE` is specified (repeatable), the recovery
@@ -87,10 +195,11 @@ against environment-variable-based injection vectors (e.g. a malicious
 `LD_PRELOAD` or `IFS` in the observer's environment that could affect
 `/bin/sh -c` behaviour).
 
-When `--recovery-cmd` (inline shell template) is used, the observer
-emits a stderr warning recommending `--recovery-cmd-file` (with
-restrictive file permissions) or `--recovery-exec` (no shell) for
-production deployments.
+Shell-mode recovery is gated by `--i-accept-shell-risk` at startup
+(see the "Recovery command authentication boundary" section above).
+When the flag *is* set, the observer still emits a single audit-trail
+`varta_warn!` at startup so that the choice is captured in any SIEM /
+syslog ingest alongside the other startup banners.
 
 ## Template safety
 
@@ -101,10 +210,11 @@ metacharacters (`;`, `|`, `&`, `$`, `` ` ``, etc.).
 
 ## Metrics
 
-| Metric                          | Type    | Description |
-|---------------------------------|---------|-------------|
-| `varta_frame_auth_failures_total` | counter | Incremented every time a frame's claimed PID does not match the kernel-verified sender PID (Linux only). |
-| `varta_beats_total{pid="..."}`  | counter | Per-PID total of accepted beats (only incremented after authentication passes). |
+| Metric                                                | Type    | Description |
+|-------------------------------------------------------|---------|-------------|
+| `varta_frame_auth_failures_total`                     | counter | Incremented every time a frame's claimed PID does not match the kernel-verified sender PID (Linux only). |
+| `varta_beats_total{pid="..."}`                        | counter | Per-PID total of accepted beats (only incremented after authentication passes). |
+| `varta_prom_connections_dropped_total{reason="..."}` | counter | `/metrics` connections accepted but closed before serving.  Reasons: `drain` (serve budget exhausted), `rate_limit` (per-IP token bucket empty), `ip_table_full` (per-IP state map force-evicted). |
 
 ## Trust model summary
 

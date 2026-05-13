@@ -1402,9 +1402,7 @@ mod tests {
         prom.render_body();
         let body = &prom.body_buf;
         for reason in DROP_REASON_LABELS {
-            let series = format!(
-                "varta_prom_connections_dropped_total{{reason=\"{reason}\"}} 0"
-            );
+            let series = format!("varta_prom_connections_dropped_total{{reason=\"{reason}\"}} 0");
             assert!(
                 body.contains(&series),
                 "missing zero-emission for reason={reason}:\n{body}"
