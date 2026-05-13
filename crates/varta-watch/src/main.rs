@@ -566,7 +566,8 @@ fn run(cfg: Config) -> std::io::Result<()> {
                 cfg.prom_rate_limit_per_sec,
                 cfg.prom_rate_limit_burst,
             )?
-            .with_iteration_budget(cfg.iteration_budget);
+            .with_iteration_budget(cfg.iteration_budget)
+            .with_scrape_budget(cfg.scrape_budget);
             if let Ok(bound_addr) = pe.local_addr() {
                 let line = format!("{bound_addr}\n");
                 let _ = std::io::stdout().lock().write_all(line.as_bytes());
@@ -833,10 +834,19 @@ fn run(cfg: Config) -> std::io::Result<()> {
         }
 
         if let Some(pe) = prom_export.as_mut() {
+            // Bracket serve_pending so its wall time is observable
+            // independently of beat-path latency.  See
+            // `docs/architecture/observer-liveness.md` ("Why /metrics is on
+            // the poll thread") — keeping it on the main thread is a
+            // load-bearing invariant, and the separate histogram is the
+            // observability primitive that lets scrape-storm alarms fire
+            // without polluting beat-path alarms.
+            let serve_start = Instant::now();
             if let Err(e) = pe.serve_pending() {
                 varta_error!("/metrics serve error: {e}");
             }
             pe.record_loop_tick();
+            pe.record_serve_pending_duration(serve_start.elapsed());
         }
 
         // ----- 4. Heartbeat file, self-watchdog tick, and HW watchdog kick ------

@@ -447,6 +447,17 @@ const ITERATION_BUCKET_BOUNDS_S: [f64; 8] =
 /// is advisory — hard wedges remain the responsibility of
 /// `--self-watchdog-secs` (see `docs/architecture/observer-liveness.md`).
 pub const DEFAULT_ITERATION_BUDGET: Duration = Duration::from_millis(250);
+
+/// Default soft budget for a single `serve_pending` call. Overruns increment
+/// `varta_observer_scrape_budget_exceeded_total`. This is the *scrape-only*
+/// component of the total iteration time; separating it from
+/// [`DEFAULT_ITERATION_BUDGET`] lets operators alert on scrape-storm
+/// pressure independently of beat-path slowness.
+///
+/// Mirrors [`DEFAULT_ITERATION_BUDGET`] (250 ms) because `serve_pending`'s
+/// own structural cap is `100 ms serve + 100 ms drain = 200 ms`; a 250 ms
+/// budget gives a small headroom for I/O scheduling jitter before firing.
+pub const DEFAULT_SCRAPE_BUDGET: Duration = Duration::from_millis(250);
 /// Cap on how many bytes [`PromExporter::serve_pending`] reads from a
 /// single request before responding (we discard the request line/headers).
 const PROM_REQUEST_CAP: usize = 4096;
@@ -664,6 +675,24 @@ pub struct PromExporter {
     /// `docs/architecture/observer-liveness.md` for the worst-case
     /// derivation that justifies the default.
     iteration_budget: Duration,
+    /// Per-bucket count of `serve_pending` durations, indexed the same way
+    /// as [`Self::iteration_buckets`] (same [`ITERATION_BUCKET_BOUNDS_S`]
+    /// for cross-histogram coherence). Operators can subtract this
+    /// histogram from `iteration_seconds` to isolate beat-path latency
+    /// from scrape-induced variance.
+    serve_pending_buckets: [u64; ITERATION_BUCKET_BOUNDS_S.len() + 1],
+    /// Sum of observed `serve_pending` durations in nanoseconds. Exposed
+    /// as `varta_observer_serve_pending_seconds_sum`.
+    serve_pending_duration_ns_sum: u64,
+    /// Total `serve_pending` calls observed. Exposed as
+    /// `varta_observer_serve_pending_seconds_count`.
+    serve_pending_count_total: u64,
+    /// Times a single `serve_pending` exceeded [`Self::scrape_budget`].
+    /// Exposed as `varta_observer_scrape_budget_exceeded_total`. Advisory.
+    scrape_budget_exceeded_total: u64,
+    /// Soft per-call budget for `serve_pending`. Configurable via
+    /// `--scrape-budget-ms`; defaults to [`DEFAULT_SCRAPE_BUDGET`].
+    scrape_budget: Duration,
     /// Per-source-IP token bucket state.  Bounded by
     /// [`MAX_PROM_IP_STATES`]; entries older than [`PROM_IP_STATE_TTL`] are
     /// evicted lazily when the table reaches capacity.
@@ -758,6 +787,11 @@ impl PromExporter {
             iteration_count_total: 0,
             iteration_budget_exceeded_total: 0,
             iteration_budget: DEFAULT_ITERATION_BUDGET,
+            serve_pending_buckets: [0; ITERATION_BUCKET_BOUNDS_S.len() + 1],
+            serve_pending_duration_ns_sum: 0,
+            serve_pending_count_total: 0,
+            scrape_budget_exceeded_total: 0,
+            scrape_budget: DEFAULT_SCRAPE_BUDGET,
             ip_state: HashMap::new(),
             rate_per_sec,
             rate_burst,
@@ -976,6 +1010,43 @@ impl PromExporter {
     pub fn with_iteration_budget(mut self, budget: Duration) -> Self {
         self.iteration_budget = budget;
         self
+    }
+
+    /// Override the soft per-call `serve_pending` budget. Builder-style.
+    pub fn with_scrape_budget(mut self, budget: Duration) -> Self {
+        self.scrape_budget = budget;
+        self
+    }
+
+    /// Record the wall-clock duration of one `serve_pending` call.
+    /// Updates the `varta_observer_serve_pending_seconds` histogram (same
+    /// bucket boundaries as `iteration_seconds` for cross-metric
+    /// coherence), the `_sum` / `_count` companions, and increments
+    /// `varta_observer_scrape_budget_exceeded_total` when `d` exceeds
+    /// [`Self::scrape_budget`]. Operators can subtract this histogram
+    /// from `iteration_seconds` to isolate beat-path latency from
+    /// scrape-induced variance.
+    pub fn record_serve_pending_duration(&mut self, d: Duration) {
+        let secs = d.as_secs_f64();
+        let ns = u64::try_from(d.as_nanos()).unwrap_or(u64::MAX);
+        self.serve_pending_duration_ns_sum = self.serve_pending_duration_ns_sum.saturating_add(ns);
+        self.serve_pending_count_total = self.serve_pending_count_total.saturating_add(1);
+        let mut placed = false;
+        for (i, &bound) in ITERATION_BUCKET_BOUNDS_S.iter().enumerate() {
+            if secs <= bound {
+                self.serve_pending_buckets[i] = self.serve_pending_buckets[i].saturating_add(1);
+                placed = true;
+                break;
+            }
+        }
+        if !placed {
+            let inf_idx = ITERATION_BUCKET_BOUNDS_S.len();
+            self.serve_pending_buckets[inf_idx] =
+                self.serve_pending_buckets[inf_idx].saturating_add(1);
+        }
+        if d > self.scrape_budget {
+            self.scrape_budget_exceeded_total = self.scrape_budget_exceeded_total.saturating_add(1);
+        }
     }
 
     /// Record the wall-clock duration of one observer poll iteration.
@@ -1488,6 +1559,53 @@ impl PromExporter {
             self.body_buf,
             "varta_observer_iteration_budget_exceeded_total {}",
             self.iteration_budget_exceeded_total
+        );
+        // Scrape-only latency histogram — `serve_pending` wall time alone.
+        // Same bucket boundaries as `iteration_seconds` so beat-path latency
+        // = iteration_seconds - serve_pending_seconds is meaningful in
+        // PromQL.  Emit every bucket (including `+Inf`) on every scrape so
+        // `absent()` alerts stay green from the first scrape onward.
+        // See `docs/architecture/observer-liveness.md` ("Why /metrics is on
+        // the poll thread") for the rationale for measuring this
+        // separately rather than moving serving to a thread.
+        self.body_buf.push_str(
+            "# HELP varta_observer_serve_pending_seconds Wall time spent in PromExporter::serve_pending per poll-loop tick. Subtract from iteration_seconds to derive beat-path latency.\n",
+        );
+        self.body_buf
+            .push_str("# TYPE varta_observer_serve_pending_seconds histogram\n");
+        let mut cum_sp: u64 = 0;
+        for (idx, bound) in ITERATION_BUCKET_BOUNDS_S.iter().enumerate() {
+            cum_sp = cum_sp.saturating_add(self.serve_pending_buckets[idx]);
+            let _ = writeln!(
+                self.body_buf,
+                "varta_observer_serve_pending_seconds_bucket{{le=\"{bound}\"}} {cum_sp}",
+            );
+        }
+        let inf_idx_sp = ITERATION_BUCKET_BOUNDS_S.len();
+        cum_sp = cum_sp.saturating_add(self.serve_pending_buckets[inf_idx_sp]);
+        let _ = writeln!(
+            self.body_buf,
+            "varta_observer_serve_pending_seconds_bucket{{le=\"+Inf\"}} {cum_sp}"
+        );
+        let sum_s_sp = (self.serve_pending_duration_ns_sum as f64) / 1e9;
+        let _ = writeln!(
+            self.body_buf,
+            "varta_observer_serve_pending_seconds_sum {sum_s_sp:.9}"
+        );
+        let _ = writeln!(
+            self.body_buf,
+            "varta_observer_serve_pending_seconds_count {}",
+            self.serve_pending_count_total
+        );
+        self.body_buf.push_str(
+            "# HELP varta_observer_scrape_budget_exceeded_total serve_pending calls that exceeded the soft --scrape-budget-ms.\n",
+        );
+        self.body_buf
+            .push_str("# TYPE varta_observer_scrape_budget_exceeded_total counter\n");
+        let _ = writeln!(
+            self.body_buf,
+            "varta_observer_scrape_budget_exceeded_total {}",
+            self.scrape_budget_exceeded_total
         );
         // Authentication failures on /metrics — emit unconditionally
         // (even at zero) so `absent()` alert rules stay green-on-green

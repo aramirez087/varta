@@ -159,6 +159,40 @@ second thread would require a lock-free SPSC ring between threads at the
 ingress and break that contract.  Stall-detection latency under scrape load
 is instead bounded by an explicit per-iteration latency budget — see below.
 
+### Why `/metrics` is on the poll thread
+
+> *"Doesn't scrape latency variance steal time from beat ingestion?"*
+
+It can, by up to ~200 ms per iteration — the structural cap of
+`PromExporter::serve_pending` (100 ms serve deadline + 100 ms drain
+deadline, see `exporter.rs`). The obvious mitigation is to spawn a second
+thread that owns `serve_pending` and reads tracker state through a shared
+snapshot. We deliberately do *not* do this. Three reasons:
+
+1. **The beat path would acquire a lock on every tick.** Whether via
+   `Arc<Mutex<PromExporter>>` or an SPSC snapshot ring, every record-side
+   counter increment (`pe.record_beat(...)`, `pe.record_stall(...)`,
+   `pe.record_loop_tick(...)` etc.) becomes either a mutex acquisition or
+   a single-producer write into a wait-free queue. Neither is
+   zero-overhead on the hot path, and both introduce per-architecture
+   memory-ordering questions that the current `&mut self` model
+   eliminates by construction.
+2. **The zero-allocation invariant becomes harder to enforce.** The beat
+   path is currently zero-alloc post-`connect`, enforced by the
+   `varta-tests` guard allocator. A snapshot ring requires either a
+   pre-sized arena (more state on the hot path) or per-snapshot
+   allocation (kills the invariant). Both are worse than what we have.
+3. **The variance is already bounded and now observable.** Scrape work
+   per iteration is capped at ~200 ms by `PROM_READ_DEADLINE = 10 ms`,
+   `PROM_MAX_CONNECTIONS_PER_SERVE = 8`, `PROM_MAX_DRAIN_PER_SERVE = 50`,
+   the 100 ms serve deadline, and the per-IP token bucket. Operators see
+   the variance through `varta_observer_serve_pending_seconds` (new — see
+   "Observing scrape-induced latency" below); beat-path latency is
+   `iteration_seconds - serve_pending_seconds` in PromQL.
+
+Scrape-storm alarms and beat-path alarms therefore route off different
+metrics, and the load-bearing single-thread invariant is preserved.
+
 ---
 
 ## Latency budget — worst-case poll iteration time
@@ -167,16 +201,16 @@ A bounded iteration time guarantees a bounded stall-detection latency.  The
 table below names the phases of the poll loop in `main.rs` and the
 upper-bound source for each:
 
-| Phase                                  | Worst case        | Source / constant                                                                                                 |
-|---|---|---|
-| 1. Drain queued stall events           | O(queue)·~1 µs    | `Observer::poll_pending` — one stack pop per call                                                                 |
-| 2. `Observer::poll()` (one recv each)  | ≤ `read_timeout`·*N* | UDS `recv(2)` blocks up to `--read-timeout-ms` (default 100 ms) per listener; UDP listeners are non-blocking      |
-| 3. Maintenance counter drains          | <1 ms             | Constant work over `observer.drain_*` counters                                                                    |
-| 3. `Recovery::try_reap`                | ~64 µs            | ≤64 `waitpid(2, WNOHANG)` syscalls (bounded outstanding-pids fan)                                                 |
-| 3. `PromExporter::serve_pending`       | ≤200 ms           | 100 ms serve deadline + 100 ms drain deadline (see `exporter.rs`)                                                 |
-| 4. Heartbeat-file atomic write         | <5 ms             | Same-dir write + rename (`write_heartbeat_atomic`)                                                                |
-| 4. `sd_notify` + HW watchdog kicks     | <1 ms             | One `sendmsg(2)` + one `write(2)`                                                                                 |
-| **Iteration total (worst case)**       | **~310 ms**       | UDS read_timeout (100 ms) + serve_pending (≤200 ms) + small fixed work — assuming a single UDS listener           |
+| Phase                                  | Worst case        | Source / constant                                                                                                 | Observable as                                              |
+|---|---|---|---|
+| 1. Drain queued stall events           | O(queue)·~1 µs    | `Observer::poll_pending` — one stack pop per call                                                                 | (subsumed in `iteration_seconds`)                          |
+| 2. `Observer::poll()` (one recv each)  | ≤ `read_timeout`·*N* | UDS `recv(2)` blocks up to `--read-timeout-ms` (default 100 ms) per listener; UDP listeners are non-blocking   | (subsumed in `iteration_seconds`)                          |
+| 3. Maintenance counter drains          | <1 ms             | Constant work over `observer.drain_*` counters                                                                    | (subsumed in `iteration_seconds`)                          |
+| 3. `Recovery::try_reap`                | ~64 µs            | ≤64 `waitpid(2, WNOHANG)` syscalls (bounded outstanding-pids fan)                                                 | (subsumed in `iteration_seconds`)                          |
+| 3. `PromExporter::serve_pending`       | ≤200 ms           | 100 ms serve deadline + 100 ms drain deadline (see `exporter.rs`)                                                 | `varta_observer_serve_pending_seconds` (independent histo) |
+| 4. Heartbeat-file atomic write         | <5 ms             | Same-dir write + rename (`write_heartbeat_atomic`)                                                                | (subsumed in `iteration_seconds`)                          |
+| 4. `sd_notify` + HW watchdog kicks     | <1 ms             | One `sendmsg(2)` + one `write(2)`                                                                                 | (subsumed in `iteration_seconds`)                          |
+| **Iteration total (worst case)**       | **~310 ms**       | UDS read_timeout (100 ms) + serve_pending (≤200 ms) + small fixed work — assuming a single UDS listener           | `varta_observer_iteration_seconds`                         |
 
 Two observations the table makes explicit:
 
@@ -221,6 +255,50 @@ during scrape bursts do not trigger false-positive aborts.  The default
 guidance (`--self-watchdog-secs 4` with `--iteration-budget-ms 250`) gives a
 16× margin (4000 ms ÷ 250 ms), well above the worst-case ratio.
 
+### Observing scrape-induced latency
+
+Three metrics together let an operator separate scrape pressure from
+beat-path slowness:
+
+- **`varta_observer_iteration_seconds`** — wall time for the entire poll
+  iteration (drain → poll → maintenance → recovery reap → serve_pending →
+  heartbeat write → watchdog kicks). Bucketed by
+  `[0.001, 0.005, 0.01, 0.05, 0.1, 0.25, 0.5, 1.0, +Inf]`. Includes
+  serve_pending — unchanged contract.
+- **`varta_observer_serve_pending_seconds`** — wall time for the
+  `serve_pending` phase alone. Same bucket boundaries as
+  `iteration_seconds` so the two are coherent. Configurable soft budget
+  via `--scrape-budget-ms` (default 250 ms); overruns increment
+  `varta_observer_scrape_budget_exceeded_total`.
+- **`varta_observer_iteration_budget_exceeded_total`** — iterations
+  exceeding `--iteration-budget-ms` (default 250 ms). Includes
+  serve_pending time.
+
+Beat-path latency is then a PromQL expression — the difference between
+iteration time and serve-pending time:
+
+```promql
+# P99 beat-path latency = P99(iteration_seconds) − P99(serve_pending_seconds).
+# Note: subtracting quantiles is approximate (P99 of diff ≠ diff of P99s),
+# but in practice serve_pending and the rest of the iteration are weakly
+# correlated, so the approximation is monotonic with the true beat-path
+# latency.  Use sum_by-(le) rate() if you want exact derived histograms
+# (compute beat_path_seconds in a recording rule from the two histos).
+histogram_quantile(0.99,
+  sum by (le) (rate(varta_observer_iteration_seconds_bucket[5m])))
+- histogram_quantile(0.99,
+    sum by (le) (rate(varta_observer_serve_pending_seconds_bucket[5m])))
+```
+
+Alarms that should fire on **beat-path** slowness route off
+`iteration_seconds - serve_pending_seconds` or off
+`iteration_budget_exceeded_total` minus `scrape_budget_exceeded_total`
+when scrape overruns dominate the budget overruns.
+
+Alarms that should fire on **scrape-storm** pressure route off
+`scrape_budget_exceeded_total` and `serve_pending_seconds` quantiles
+directly.
+
 ### Recommended Prometheus alerts
 
 ```promql
@@ -235,6 +313,27 @@ labels: { severity: warning }
 alert: VartaIterationP99High
 expr: histogram_quantile(0.99,
         sum by (le) (rate(varta_observer_iteration_seconds_bucket[5m]))) > 0.5
+for: 5m
+labels: { severity: critical }
+
+# Warn — sustained scrape pressure (≥10% of serve_pending calls over budget).
+# Fires on scrape-storm symptoms specifically, NOT on beat-path slowness.
+alert: VartaScrapeStormPressure
+expr: rate(varta_observer_scrape_budget_exceeded_total[5m])
+    / rate(varta_observer_serve_pending_seconds_count[5m]) > 0.10
+for: 5m
+labels: { severity: warning }
+
+# Crit — beat-path P99 latency exceeds 200 ms.  Derived: subtract scrape
+# time from iteration time so this alarm is immune to scrape storms.
+# (See "Observing scrape-induced latency" for the approximation caveat —
+# put this in a recording rule for production use.)
+alert: VartaBeatPathP99High
+expr: |
+  (histogram_quantile(0.99,
+     sum by (le) (rate(varta_observer_iteration_seconds_bucket[5m])))
+   - histogram_quantile(0.99,
+     sum by (le) (rate(varta_observer_serve_pending_seconds_bucket[5m])))) > 0.2
 for: 5m
 labels: { severity: critical }
 ```

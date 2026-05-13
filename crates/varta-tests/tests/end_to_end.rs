@@ -115,6 +115,10 @@ fn main() -> ExitCode {
         iteration_budget_holds_under_slow_scrape_load,
     );
     failed += run_one(
+        "serve_pending_seconds_separates_scrape_from_beat_path",
+        serve_pending_seconds_separates_scrape_from_beat_path,
+    );
+    failed += run_one(
         "hostile_frame_rejected_at_decode_with_label_emit",
         hostile_frame_rejected_at_decode_with_label_emit,
     );
@@ -1978,6 +1982,181 @@ fn iteration_budget_holds_under_slow_scrape_load() {
     assert_eq!(
         le_inf, count,
         "+Inf bucket ({le_inf}) must equal count ({count}); body:\n{body}"
+    );
+}
+
+/// `serve_pending_seconds_separates_scrape_from_beat_path` — M6 contract.
+///
+/// Under sustained partial-GET scrape pressure with a deliberately tight
+/// `--scrape-budget-ms 5`, the daemon must:
+///
+/// 1. Emit the `varta_observer_serve_pending_seconds_*` histogram with
+///    every bucket label (including `+Inf` literally), and the count must
+///    advance during the run.
+/// 2. Emit `varta_observer_scrape_budget_exceeded_total` and increment it
+///    at least once (the partial-GET pool reliably drives serve_pending
+///    past the 5 ms budget).
+/// 3. Keep recording the iteration histogram in lockstep — every
+///    iteration calls record_serve_pending_duration after our change, so
+///    `iteration_seconds_count` and `serve_pending_seconds_count` must
+///    differ by at most one tick (the bracket order in main.rs writes
+///    serve_pending first, then iteration_duration at the loop end).
+/// 4. The stable-label-set contract on the new histogram must hold from
+///    the first scrape: every `le` label present.
+///
+/// The point is M6's binary outcome: scrape variance is observable
+/// independently of beat-path latency.
+fn serve_pending_seconds_separates_scrape_from_beat_path() {
+    let tmp = TempDir::new("scrape-isolation");
+    let socket = tmp.path().join("varta.sock");
+
+    let (mut child, prom_addr) = spawn_watch(&[
+        "--socket",
+        socket.to_str().unwrap(),
+        "--threshold-ms",
+        "500",
+        "--iteration-budget-ms",
+        "100",
+        "--scrape-budget-ms",
+        "50",
+        "--prom-rate-limit-burst",
+        "0",
+        "--prom-addr",
+        "127.0.0.1:0",
+        "--shutdown-after-secs",
+        "20",
+    ]);
+    let _guard = ChildGuard(&mut child);
+
+    assert!(
+        wait_until(|| socket.exists(), Duration::from_secs(3)),
+        "varta-watch did not bind socket within 3s"
+    );
+    assert!(
+        wait_until(
+            || TcpStream::connect(prom_addr).is_ok(),
+            Duration::from_secs(3)
+        ),
+        "/metrics not reachable within 3s"
+    );
+
+    // Same partial-GET pattern as the H5 test — the canonical recipe
+    // for synthesising scrape pressure on the single-threaded daemon
+    // (cerebrum 2026-05-13 H5).  burst=0 disables per-IP rate limiting so
+    // the 8 scrapers actually queue inside `serve_one`.
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut scraper_handles = Vec::new();
+    for _ in 0..8 {
+        let stop = stop.clone();
+        let addr = prom_addr;
+        scraper_handles.push(std::thread::spawn(move || {
+            while !stop.load(Ordering::Relaxed) {
+                if let Ok(mut s) = TcpStream::connect_timeout(&addr, Duration::from_millis(200)) {
+                    let partial = format!(
+                        "GET /metrics HTTP/1.0\r\nHost: localhost\r\nAuthorization: Bearer {PROM_TOKEN_HEX}\r\n",
+                    );
+                    let _ = s.write_all(partial.as_bytes());
+                    let _ = s.flush();
+                    std::thread::sleep(Duration::from_millis(30));
+                    drop(s);
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }));
+    }
+
+    // Run an agent for ~3 s to populate the iteration histogram with
+    // realistic mixed beat / scrape iterations.
+    let agent_start = Instant::now();
+    {
+        let mut agent = Varta::connect(&socket).expect("Varta::connect");
+        while agent_start.elapsed() < Duration::from_secs(3) {
+            let mut tries = 0u32;
+            loop {
+                match agent.beat(Status::Ok, 0) {
+                    BeatOutcome::Sent => break,
+                    BeatOutcome::Dropped => {
+                        tries += 1;
+                        if tries > 5_000 {
+                            panic!("kernel never accepted a beat within 5000 retries");
+                        }
+                        std::thread::sleep(Duration::from_micros(500));
+                    }
+                    BeatOutcome::Failed(e) => panic!("unexpected hard failure: {e}"),
+                }
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    // Stop scrapers BEFORE the assertion scrape so the assertion's GET
+    // is not queued behind partial connections (cerebrum 2026-05-13 H5).
+    stop.store(true, Ordering::Relaxed);
+    for h in scraper_handles {
+        let _ = h.join();
+    }
+    std::thread::sleep(Duration::from_millis(200));
+
+    let (status, body) = http_get(prom_addr, "/metrics").expect("final /metrics scrape");
+    assert_eq!(
+        status, 200,
+        "final scrape did not return 200; body:\n{body}"
+    );
+
+    // 1. Stable label-set contract: every bucket present, including
+    //    `+Inf` literal.
+    for le in &[
+        "0.001", "0.005", "0.01", "0.05", "0.1", "0.25", "0.5", "1", "+Inf",
+    ] {
+        let needle = format!("varta_observer_serve_pending_seconds_bucket{{le=\"{le}\"}} ");
+        assert!(
+            body.lines().any(|l| l.starts_with(&needle)),
+            "missing serve_pending bucket le={le:?}; body:\n{body}"
+        );
+    }
+
+    // 2. The serve_pending histogram count advances.
+    let sp_count = parse_metric_value(&body, "varta_observer_serve_pending_seconds_count")
+        .unwrap_or_else(|| {
+            panic!("missing varta_observer_serve_pending_seconds_count; body:\n{body}")
+        });
+    assert!(
+        sp_count > 0,
+        "serve_pending histogram never updated (count=0); body:\n{body}"
+    );
+
+    // 3. Bracket order: every iteration records serve_pending first, then
+    //    iteration_duration at the end of the loop body. So
+    //    iteration_count and serve_pending_count are within one tick of
+    //    each other (the binary may have completed serve_pending but not
+    //    yet record_iteration_duration when the scrape's own response
+    //    rendered the body).
+    let iter_count = parse_metric_value(&body, "varta_observer_iteration_seconds_count")
+        .unwrap_or_else(|| panic!("missing iteration_seconds_count; body:\n{body}"));
+    let diff = iter_count.abs_diff(sp_count);
+    assert!(
+        diff <= 1,
+        "iteration_count ({iter_count}) and serve_pending_count ({sp_count}) drifted by {diff}; body:\n{body}"
+    );
+
+    // 4. Scrape-budget exceeded fires under the 50 ms budget. The
+    //    partial-GET pool reliably drives serve_pending to its 200 ms
+    //    structural cap on at least one iteration.
+    let sb_exceeded = parse_metric_value(&body, "varta_observer_scrape_budget_exceeded_total")
+        .unwrap_or_else(|| {
+            panic!("missing varta_observer_scrape_budget_exceeded_total; body:\n{body}")
+        });
+    assert!(
+        sb_exceeded >= 1,
+        "scrape_budget_exceeded_total stayed at 0 under partial-GET pool with 50 ms budget; body:\n{body}"
+    );
+
+    // 5. +Inf bucket equals count — sanity for cumulative histogram.
+    let le_inf = parse_histogram_bucket(&body, "varta_observer_serve_pending_seconds", "+Inf")
+        .unwrap_or_else(|| panic!("missing serve_pending le=+Inf bucket; body:\n{body}"));
+    assert_eq!(
+        le_inf, sp_count,
+        "+Inf bucket ({le_inf}) must equal serve_pending count ({sp_count}); body:\n{body}"
     );
 }
 

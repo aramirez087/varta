@@ -45,9 +45,14 @@ pub struct AuthError;
 pub fn seal(key: &[u8; 32], nonce: &[u8; 12], plaintext: &[u8; 32]) -> ([u8; 32], [u8; 16]) {
     let cipher = ChaCha20Poly1305::new(chacha20poly1305::Key::from_slice(key));
     let mut ct = *plaintext;
-    let tag = cipher
-        .encrypt_in_place_detached(Nonce::from_slice(nonce), b"", &mut ct)
-        .expect("ChaCha20Poly1305 encrypt_in_place_detached is infallible");
+    let tag = match cipher.encrypt_in_place_detached(Nonce::from_slice(nonce), b"", &mut ct) {
+        Ok(t) => t,
+        // `chacha20poly1305::aead::Error` is returned only when the plaintext
+        // length plus AAD length would exceed ChaCha20-Poly1305's 2^32-block
+        // limit. AAD is empty (`b""`), the buffer is a fixed `[u8; 32]`, and
+        // the nonce is a fixed `[u8; 12]`. Unreachable by construction.
+        Err(_) => unreachable!("ChaCha20Poly1305 encrypt is infallible for fixed-size inputs"),
+    };
     let mut tag_bytes = [0u8; 16];
     tag_bytes.copy_from_slice(&tag);
     (ct, tag_bytes)

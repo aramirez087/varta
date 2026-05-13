@@ -50,6 +50,31 @@ jobs:
           # non-optional deps remain forbidden.
           awk '/^\[dependencies\]$/{f=1;next} /^\[/{f=0} f && NF && !/^[[:space:]]*#/ && !/optional[[:space:]]*=[[:space:]]*true/{print "FAIL " FILENAME ": non-optional dep: " $0; exit 1}' crates/varta-vlp/Cargo.toml
 
+      - name: crypto source audit (no hand-rolled primitives)
+        run: |
+          # Hand-rolled crypto in varta-vlp is forbidden. RustCrypto crates are
+          # the only sanctioned source for ChaCha20, Poly1305, SHA-2, HKDF, and
+          # related primitives. Historical hand-rolled files (poly1305.rs,
+          # chacha20.rs) were deleted in the 2026-05-12 RustCrypto migration;
+          # re-introducing them — even as a hand-rolled fallback — is a
+          # regression.
+          # See .wolf/cerebrum.md Do-Not-Repeat 2026-05-12.
+          banned=$(find crates/varta-vlp/src/crypto -type f \
+            \( -name 'poly1305.rs' \
+            -o -name 'chacha20.rs' \
+            -o -name 'salsa20.rs' \
+            -o -name 'blake3.rs' \
+            -o -name '*_handrolled*.rs' \) 2>/dev/null || true)
+          if [ -n "$banned" ]; then
+            echo "FAIL hand-rolled crypto file(s) detected:"
+            echo "$banned"
+            echo
+            echo "Use the RustCrypto crates (chacha20poly1305, hkdf, sha2) instead."
+            echo "See .wolf/cerebrum.md Do-Not-Repeat 2026-05-12."
+            exit 1
+          fi
+          echo "OK no hand-rolled crypto in crates/varta-vlp/src/crypto/"
+
       - name: zero-dep audit (varta-client)
         run: |
           awk '/^\[dependencies\]$/{f=1;next} /^\[/{f=0} f && NF{print "FAIL " FILENAME ": " $0; exit 1}' crates/varta-client/Cargo.toml

@@ -75,6 +75,17 @@ pub const MIN_ITERATION_BUDGET_MS: u64 = 50;
 /// abort the daemon, so the metric ceases to be a useful early signal.
 pub const MAX_ITERATION_BUDGET_MS: u64 = 60_000;
 
+/// Minimum accepted value for `--scrape-budget-ms`.  Below this the budget
+/// overlaps the structural cap of `serve_pending` itself (100 ms serve +
+/// 100 ms drain = 200 ms worst case), so it would fire spuriously.  Bounds
+/// chosen on the same logic as `--iteration-budget-ms`.
+pub const MIN_SCRAPE_BUDGET_MS: u64 = 50;
+
+/// Maximum accepted value for `--scrape-budget-ms`.  Above this the
+/// scrape budget can no longer fire before `--self-watchdog-secs` would
+/// abort the daemon, so the metric ceases to be a useful signal.
+pub const MAX_SCRAPE_BUDGET_MS: u64 = 60_000;
+
 /// Parsed daemon configuration.
 #[derive(Clone, Debug)]
 pub struct Config {
@@ -239,6 +250,14 @@ pub struct Config {
     /// `--iteration-budget-ms`; defaults to
     /// [`crate::exporter::DEFAULT_ITERATION_BUDGET`].
     pub iteration_budget: Duration,
+    /// Soft per-call budget for `PromExporter::serve_pending`.  Calls
+    /// exceeding this increment
+    /// `varta_observer_scrape_budget_exceeded_total` and are visible in
+    /// the `varta_observer_serve_pending_seconds` histogram.  Lets
+    /// operators alert on scrape-storm pressure separately from beat-path
+    /// slowness.  Set by `--scrape-budget-ms`; defaults to
+    /// [`crate::exporter::DEFAULT_SCRAPE_BUDGET`].
+    pub scrape_budget: Duration,
     /// [test-hooks only] Sleep for this many milliseconds on the first poll
     /// iteration, simulating a wedged loop.  Used by the self-watchdog
     /// integration test (`tests/self_watchdog.rs`) to exercise the abort path
@@ -353,6 +372,16 @@ pub enum ConfigError {
         /// The maximum allowed value.
         max: u64,
     },
+    /// `--scrape-budget-ms` was outside the accepted range
+    /// (`[MIN_SCRAPE_BUDGET_MS, MAX_SCRAPE_BUDGET_MS]`).
+    ScrapeBudgetOutOfRange {
+        /// The value provided.
+        value: u64,
+        /// The minimum allowed value.
+        min: u64,
+        /// The maximum allowed value.
+        max: u64,
+    },
 }
 
 impl core::fmt::Display for ConfigError {
@@ -425,6 +454,10 @@ impl core::fmt::Display for ConfigError {
             ConfigError::IterationBudgetOutOfRange { value, min, max } => write!(
                 f,
                 "--iteration-budget-ms: {value} is outside the accepted range [{min}, {max}] ms"
+            ),
+            ConfigError::ScrapeBudgetOutOfRange { value, min, max } => write!(
+                f,
+                "--scrape-budget-ms: {value} is outside the accepted range [{min}, {max}] ms"
             ),
         }
     }
@@ -640,6 +673,15 @@ OPTIONAL:
                                      Range [50, 60000].  See
                                      docs/architecture/observer-liveness.md
                                      for the worst-case derivation.
+    --scrape-budget-ms <MS>        Soft per-call budget for serve_pending
+                                     (the /metrics serving phase of one
+                                     poll iteration). Overruns increment
+                                     varta_observer_scrape_budget_exceeded_total
+                                     and are visible in
+                                     varta_observer_serve_pending_seconds.
+                                     Separates scrape-storm alarms from
+                                     beat-path slowness. Default 250.
+                                     Range [50, 60000].
 
     -h, --help                     Print this message and exit.
 ";
@@ -684,6 +726,7 @@ OPTIONAL:
         let mut recovery_capture_stdio = false;
         let mut recovery_capture_bytes: Option<u32> = None;
         let mut iteration_budget_ms: Option<u64> = None;
+        let mut scrape_budget_ms: Option<u64> = None;
         #[cfg(feature = "test-hooks")]
         let mut inject_wedge_ms: Option<u64> = None;
 
@@ -965,6 +1008,12 @@ OPTIONAL:
                         .ok_or(ConfigError::MissingValue("--iteration-budget-ms"))?;
                     iteration_budget_ms = Some(parse_u64("--iteration-budget-ms", &v)?);
                 }
+                "--scrape-budget-ms" => {
+                    let v = iter
+                        .next()
+                        .ok_or(ConfigError::MissingValue("--scrape-budget-ms"))?;
+                    scrape_budget_ms = Some(parse_u64("--scrape-budget-ms", &v)?);
+                }
                 other => return Err(ConfigError::UnknownFlag(other.to_string())),
             }
         }
@@ -1068,6 +1117,25 @@ OPTIONAL:
             None => crate::exporter::DEFAULT_ITERATION_BUDGET,
         };
 
+        // --scrape-budget-ms — same bounds story as --iteration-budget-ms:
+        // reject the noise-floor case (overlaps serve_pending's own 200 ms
+        // structural cap) and the never-fires case (overlaps the self-
+        // watchdog).  The two budgets are independent: scrape-storm alarms
+        // fire on scrape_budget; beat-path alarms fire on iteration_budget.
+        let scrape_budget = match scrape_budget_ms {
+            Some(ms) => {
+                if !(MIN_SCRAPE_BUDGET_MS..=MAX_SCRAPE_BUDGET_MS).contains(&ms) {
+                    return Err(ConfigError::ScrapeBudgetOutOfRange {
+                        value: ms,
+                        min: MIN_SCRAPE_BUDGET_MS,
+                        max: MAX_SCRAPE_BUDGET_MS,
+                    });
+                }
+                Duration::from_millis(ms)
+            }
+            None => crate::exporter::DEFAULT_SCRAPE_BUDGET,
+        };
+
         Ok(Config {
             socket,
             threshold: Duration::from_millis(threshold_ms),
@@ -1108,6 +1176,7 @@ OPTIONAL:
             recovery_capture_stdio,
             recovery_capture_bytes: recovery_capture_bytes_resolved,
             iteration_budget,
+            scrape_budget,
             #[cfg(feature = "test-hooks")]
             inject_wedge_ms,
         })

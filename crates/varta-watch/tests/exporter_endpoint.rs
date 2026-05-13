@@ -127,6 +127,97 @@ fn prom_exporter_reports_stalls_total_per_pid() {
     );
 }
 
+/// Bucket boundaries duplicated locally because the constant is private to
+/// the exporter module.  If these drift, update both sites — the doc and
+/// the alert recipes in `observer-liveness.md` also reference these
+/// boundaries by value.
+const EXPECTED_BUCKET_LE: &[&str] = &[
+    "0.001", "0.005", "0.01", "0.05", "0.1", "0.25", "0.5", "1", "+Inf",
+];
+
+#[test]
+fn prom_exporter_emits_serve_pending_seconds_buckets_at_zero_on_first_scrape() {
+    // Contract: every bucket label (including `+Inf`, literally — not `inf`)
+    // must appear on the first scrape with count zero so `absent()` alert
+    // rules and `histogram_quantile()` queries stay green from the first
+    // observation.  Same discipline as `iteration_seconds`,
+    // `decode_errors_total`, and `prom_connections_dropped_total`.
+    let mut prom = PromExporter::bind("127.0.0.1:0".parse().unwrap(), TEST_TOKEN).expect("bind");
+    let addr = prom.local_addr().expect("local_addr");
+    let body = http_get(&mut prom, addr, "/metrics");
+    for le in EXPECTED_BUCKET_LE {
+        let needle = format!("varta_observer_serve_pending_seconds_bucket{{le=\"{le}\"}} 0");
+        assert!(
+            body.contains(&needle),
+            "missing serve_pending bucket `le={le}` at zero:\n{body}"
+        );
+    }
+    assert!(
+        body.contains("varta_observer_serve_pending_seconds_count 0"),
+        "missing serve_pending_seconds_count:\n{body}"
+    );
+    assert!(
+        body.contains("varta_observer_serve_pending_seconds_sum 0.000000000"),
+        "missing serve_pending_seconds_sum at zero:\n{body}"
+    );
+}
+
+#[test]
+fn prom_exporter_emits_scrape_budget_exceeded_at_zero_on_first_scrape() {
+    let mut prom = PromExporter::bind("127.0.0.1:0".parse().unwrap(), TEST_TOKEN).expect("bind");
+    let addr = prom.local_addr().expect("local_addr");
+    let body = http_get(&mut prom, addr, "/metrics");
+    assert!(
+        body.contains("varta_observer_scrape_budget_exceeded_total 0"),
+        "missing scrape_budget_exceeded_total at zero:\n{body}"
+    );
+}
+
+#[test]
+fn prom_exporter_serve_pending_histogram_records_observed_durations() {
+    let mut prom = PromExporter::bind("127.0.0.1:0".parse().unwrap(), TEST_TOKEN).expect("bind");
+    let addr = prom.local_addr().expect("local_addr");
+    // Record three observations directly — http_get itself calls
+    // serve_pending() but the test helper does NOT call
+    // record_serve_pending_duration (only the daemon's main loop does).
+    // So the histogram count should be exactly 3.
+    prom.record_serve_pending_duration(Duration::from_micros(50));
+    prom.record_serve_pending_duration(Duration::from_micros(150));
+    prom.record_serve_pending_duration(Duration::from_micros(300));
+    let body = http_get(&mut prom, addr, "/metrics");
+    assert!(
+        body.contains("varta_observer_serve_pending_seconds_count 3"),
+        "expected count=3:\n{body}"
+    );
+    // All three observations are well below 1 ms, so they should all land
+    // in the first bucket and be cumulative-counted in every higher bucket.
+    assert!(
+        body.contains("varta_observer_serve_pending_seconds_bucket{le=\"0.001\"} 3"),
+        "expected `le=\"0.001\"` bucket = 3:\n{body}"
+    );
+    assert!(
+        body.contains("varta_observer_serve_pending_seconds_bucket{le=\"+Inf\"} 3"),
+        "expected +Inf bucket = 3 (cumulative):\n{body}"
+    );
+}
+
+#[test]
+fn prom_exporter_scrape_budget_exceeded_increments_when_observation_exceeds_budget() {
+    let mut prom = PromExporter::bind("127.0.0.1:0".parse().unwrap(), TEST_TOKEN)
+        .expect("bind")
+        .with_scrape_budget(Duration::from_millis(10));
+    let addr = prom.local_addr().expect("local_addr");
+    // One in-budget, two over-budget.
+    prom.record_serve_pending_duration(Duration::from_millis(1));
+    prom.record_serve_pending_duration(Duration::from_millis(20));
+    prom.record_serve_pending_duration(Duration::from_millis(50));
+    let body = http_get(&mut prom, addr, "/metrics");
+    assert!(
+        body.contains("varta_observer_scrape_budget_exceeded_total 2"),
+        "expected scrape_budget_exceeded_total = 2:\n{body}"
+    );
+}
+
 #[test]
 fn file_exporter_appends_one_line_per_event() {
     let path = unique_tmp("export");

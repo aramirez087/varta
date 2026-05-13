@@ -57,8 +57,13 @@ pub fn derive_agent_key(master: &Key, agent_id: u32) -> Key {
     info[..15].copy_from_slice(b"varta-agent-v1\0");
     info[15..].copy_from_slice(&agent_id.to_le_bytes());
     let mut okm = [0u8; 32];
-    hk.expand(&info, &mut okm)
-        .expect("32-byte HKDF-SHA256 output is always valid");
+    match hk.expand(&info, &mut okm) {
+        Ok(()) => {}
+        // `hkdf::InvalidLength` fires only when `okm.len() > 255 * 32 = 8160`
+        // bytes (HKDF-SHA256's expansion limit). `okm` is a fixed `[u8; 32]`.
+        // Unreachable by construction.
+        Err(_) => unreachable!("32-byte HKDF-SHA256 expand is infallible"),
+    }
     Key::from_bytes(okm)
 }
 
@@ -81,8 +86,12 @@ pub fn derive_epoch_key(agent_key: &Key, epoch: u64) -> Key {
     info[..15].copy_from_slice(b"varta-epoch-v1\0");
     info[15..].copy_from_slice(&epoch.to_le_bytes());
     let mut okm = [0u8; 32];
-    hk.expand(&info, &mut okm)
-        .expect("32-byte HKDF-SHA256 output is always valid");
+    match hk.expand(&info, &mut okm) {
+        Ok(()) => {}
+        // Same reasoning as `derive_agent_key`: `okm` is a fixed `[u8; 32]`,
+        // far below HKDF-SHA256's 8160-byte expansion limit. Unreachable.
+        Err(_) => unreachable!("32-byte HKDF-SHA256 expand is infallible"),
+    }
     Key::from_bytes(okm)
 }
 
