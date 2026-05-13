@@ -54,9 +54,3 @@ test = false
 doc = false
 bench = false
 
-[[bin]]
-name = "poly1305_mac"
-path = "fuzz_targets/poly1305_mac.rs"
-test = false
-doc = false
-bench = false

@@ -2,7 +2,9 @@
 //!
 //! Feature-gated behind `crypto`. Provides symmetric authenticated encryption
 //! for 32-byte VLP frames. All operations are stack-allocated and allocation-free
-//! on the steady-state path.
+//! on the steady-state path. Primitives are provided by the externally-audited
+//! `chacha20poly1305` crate (RustCrypto, NCC Group audit 2020); no hand-rolled
+//! crypto exists in this module.
 //!
 //! # Wire format
 //!
@@ -15,11 +17,11 @@
 //! The 12-byte nonce for the AEAD construction is `iv_random || iv_counter`.
 
 pub mod aead;
-pub mod chacha20;
 pub mod kdf;
-pub mod poly1305;
 
 pub use aead::{open, seal, AuthError};
+
+use zeroize::{Zeroize, ZeroizeOnDrop};
 
 /// Length of the pre-shared symmetric key (256 bits).
 pub const KEY_BYTES: usize = 32;
@@ -62,10 +64,10 @@ impl core::fmt::Display for KeyError {
 /// Created from a hex string (64 characters) or raw bytes. Both the agent
 /// and observer must share the same key.
 ///
-/// `Key` is intentionally **not** `Copy`. The [`Drop`] impl volatile-zeros
-/// the secret bytes; an implicit copy would defeat that wipe by leaving a
-/// silent duplicate behind in some other stack frame.
-#[derive(Clone)]
+/// `Key` is intentionally **not** `Copy`. The `ZeroizeOnDrop` impl zeroes
+/// the secret bytes on drop; an implicit copy would defeat that wipe by
+/// leaving a silent duplicate behind in some other stack frame.
+#[derive(Clone, Zeroize, ZeroizeOnDrop)]
 pub struct Key {
     pub(crate) bytes: [u8; KEY_BYTES],
 }
@@ -120,28 +122,6 @@ impl Key {
 impl core::fmt::Debug for Key {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("Key").finish_non_exhaustive()
-    }
-}
-
-// Secure zeroization of a 256-bit secret requires volatile writes so the
-// compiler cannot dead-store-eliminate the wipe after the value is no longer
-// observed. The volatile-write intrinsic is `unsafe` even though its inputs
-// here are trivially safe (a valid `&mut u8` from this stack frame). The
-// workspace-wide `unsafe_code = "deny"` is suppressed only on this single
-// item; no other unsafe usage is introduced elsewhere in `varta-vlp`.
-#[allow(unsafe_code)]
-impl Drop for Key {
-    fn drop(&mut self) {
-        for b in &mut self.bytes {
-            // SAFETY: `b` is a valid, non-null `&mut u8` from this Key's
-            // own buffer. `write_volatile` only requires a properly aligned
-            // pointer to allocated memory of the right size; a `&mut u8`
-            // satisfies all of these.
-            unsafe { core::ptr::write_volatile(b as *mut u8, 0) };
-        }
-        // Order the wipe before any later side effect that might reuse the
-        // backing memory (e.g. stack frame reuse for the next call).
-        core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
     }
 }
 

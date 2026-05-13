@@ -71,7 +71,7 @@ varta-vlp  ←  varta-client  ←  (consumers)
 
 These are load-bearing invariants — do not relax them:
 
-1. **Zero registry dependencies** in production crates (`varta-vlp`, `varta-client`, `varta-watch`). `[dependencies]` must remain empty or path-only.
+1. **Zero registry dependencies** in production crates (`varta-client`, `varta-watch`). `[dependencies]` must remain empty or path-only. **Exception:** `varta-vlp` may carry **optional, feature-gated** registry deps under the `crypto` feature (`chacha20poly1305`, `hkdf`, `sha2`, `zeroize`). Non-optional deps in `varta-vlp` and any deps in `varta-client`/`varta-watch` remain forbidden. The CI zero-dep audit permits `optional = true` lines in `varta-vlp/Cargo.toml`.
 2. **Zero heap allocation** on the `beat()` path after `Varta::connect()`. All steady-state code operates on stack buffers. The guard-allocator test in `varta-tests` enforces this.
 3. **Non-blocking only** — the agent socket is non-blocking at connect time. Code must never call `set_nonblocking(false)` or add blocking I/O to the beat path.
 4. **Frame layout is ABI-stable.** Any change to the `Frame` field layout requires a VLP version bump and updated integration tests.

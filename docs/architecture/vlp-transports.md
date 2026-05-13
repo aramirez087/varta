@@ -128,12 +128,17 @@ varta-watch --socket /tmp/varta.sock --threshold-ms 500 \
   established at the network layer — firewall rules, VPC boundaries.
 
 - **UDP (secure)**: Every frame is encrypted with ChaCha20-Poly1305 (RFC 8439)
-  using a 256-bit key. Two key modes are available:
+  using a 256-bit key. Primitives are provided by the `chacha20poly1305` crate
+  (RustCrypto, NCC Group audit 2020) — no hand-rolled crypto. Key derivation
+  uses HKDF-SHA256 (RFC 5869) via the `hkdf` + `sha2` crates. Two key modes:
   - **Shared key**: A single pre-shared key for all agents (`--key-file`).
-  - **Master key**: Per-agent keys derived from the agent's PID via ChaCha20-based
-    KDF (`--master-key-file`). The PID is embedded in the `iv_random` prefix so
+  - **Master key**: Per-agent keys derived from the agent's PID via HKDF-SHA256
+    (`--master-key-file`). The PID is embedded in the `iv_random` prefix so
     the observer can derive the correct agent key before decryption. Compromise
     of one agent's key does not reveal other agents' keys or the master key.
+    **Note:** the HKDF-based KDF is incompatible with the ChaCha20-PRF KDF used
+    in earlier releases — agents must re-key when upgrading from a pre-RustCrypto
+    build if master-key mode was in use.
   - Replay attacks are blocked by enforcing monotonic IV counters per sender.
     Key rotation is supported via `--accepted-key-file` (no downtime required).
   - **Panic-hook entropy**: `install_panic_handler_secure_udp` reads entropy at

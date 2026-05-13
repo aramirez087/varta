@@ -46,7 +46,9 @@ jobs:
 
       - name: zero-dep audit (varta-vlp)
         run: |
-          awk '/^\[dependencies\]$/{f=1;next} /^\[/{f=0} f && NF{print "FAIL " FILENAME ": " $0; exit 1}' crates/varta-vlp/Cargo.toml
+          # varta-vlp: optional crypto deps are allowed under --features crypto;
+          # non-optional deps remain forbidden.
+          awk '/^\[dependencies\]$/{f=1;next} /^\[/{f=0} f && NF && !/^[[:space:]]*#/ && !/optional[[:space:]]*=[[:space:]]*true/{print "FAIL " FILENAME ": non-optional dep: " $0; exit 1}' crates/varta-vlp/Cargo.toml
 
       - name: zero-dep audit (varta-client)
         run: |
@@ -119,9 +121,6 @@ jobs:
 
       - name: fuzz aead_roundtrip (30 s)
         run: cargo fuzz run aead_roundtrip fuzz/corpus/aead_roundtrip -- -max_total_time=30
-
-      - name: fuzz poly1305_mac (30 s)
-        run: cargo fuzz run poly1305_mac fuzz/corpus/poly1305_mac -- -max_total_time=30
 
       - name: fuzz tracker_record (30 s)
         run: cargo fuzz run tracker_record -- -max_total_time=30

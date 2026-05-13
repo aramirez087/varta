@@ -1,17 +1,11 @@
 //! ChaCha20-Poly1305 AEAD construction — RFC 8439 §2.8.
 //!
 //! Implements `seal` (encrypt + authenticate) and `open` (verify + decrypt)
-//! for 32-byte fixed-size plaintexts. This is the cipher used by
-//! `SecureUdpTransport` and `SecureUdpListener`.
+//! for 32-byte fixed-size plaintexts. Backed by the externally-audited
+//! `chacha20poly1305` crate (RustCrypto, NCC Group audit 2020).
 //!
-//! # Construction
-//!
-//! 1. Generate one-time Poly1305 key from ChaCha20 block with counter=0.
-//! 2. Encrypt plaintext with ChaCha20 keystream starting at counter=1.
-//! 3. Authenticate the ciphertext (plus encoded lengths) with Poly1305.
-//!
-//! No additional authenticated data (AAD) is used — the nonce itself binds
-//! the encrypted frame to the specific message context.
+//! Constant-time tag verification is provided by the upstream crate.
+//! No hand-rolled crypto exists in this file.
 //!
 //! # Wire format
 //!
@@ -25,8 +19,10 @@
 //!
 //! See [`varta_vlp::crypto`] for the wire format constant.
 
-use super::chacha20::{chacha20_block, chacha20_xor};
-use super::poly1305::poly1305_mac;
+use chacha20poly1305::{
+    aead::{AeadInPlace, KeyInit},
+    ChaCha20Poly1305, Nonce, Tag,
+};
 
 /// AEAD authentication failure — the tag did not verify.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -47,28 +43,14 @@ pub struct AuthError;
 /// The transport layer joins these with the caller-provided nonce prefix
 /// for a total of 60 bytes.
 pub fn seal(key: &[u8; 32], nonce: &[u8; 12], plaintext: &[u8; 32]) -> ([u8; 32], [u8; 16]) {
-    // Step 1: Generate one-time Poly1305 key (first 32 bytes of keystream
-    // block at counter 0).
-    let block0 = chacha20_block(key, 0, nonce);
-    let mut otk = [0u8; 32];
-    otk.copy_from_slice(&block0[..32]);
-
-    // Step 2: Encrypt plaintext (block counter starts at 1).
-    let mut ciphertext = *plaintext;
-    chacha20_xor(key, 1, nonce, &mut ciphertext);
-
-    // Step 3: Construct Poly1305 message:
-    //   mac_data = pad(ciphertext) || le64(0) || le64(32)
-    // Since ciphertext is exactly 32 bytes (a multiple of 16), no padding
-    // is needed. AAD length is 0.
-    let mut mac_data = [0u8; 48];
-    mac_data[..32].copy_from_slice(&ciphertext);
-    // le64(0) = already zeros at [32..40]
-    mac_data[40..48].copy_from_slice(&32u64.to_le_bytes());
-
-    let tag = poly1305_mac(&otk, &mac_data);
-
-    (ciphertext, tag)
+    let cipher = ChaCha20Poly1305::new(chacha20poly1305::Key::from_slice(key));
+    let mut ct = *plaintext;
+    let tag = cipher
+        .encrypt_in_place_detached(Nonce::from_slice(nonce), b"", &mut ct)
+        .expect("ChaCha20Poly1305 encrypt_in_place_detached is infallible");
+    let mut tag_bytes = [0u8; 16];
+    tag_bytes.copy_from_slice(&tag);
+    (ct, tag_bytes)
 }
 
 /// Verify and decrypt a ChaCha20-Poly1305 AEAD ciphertext.
@@ -85,42 +67,29 @@ pub fn seal(key: &[u8; 32], nonce: &[u8; 12], plaintext: &[u8; 32]) -> ([u8; 32]
 ///
 /// `Ok(plaintext)` on successful authentication and decryption, or
 /// `Err(AuthError)` if the tag does not verify (indicating tampering,
-/// wrong key, or corrupted data).
+/// wrong key, or corrupted data). Tag comparison is constant-time.
 pub fn open(
     key: &[u8; 32],
     nonce: &[u8; 12],
     ciphertext: &[u8; 32],
     tag: &[u8; 16],
 ) -> Result<[u8; 32], AuthError> {
-    // Step 1: Regenerate one-time Poly1305 key.
-    let block0 = chacha20_block(key, 0, nonce);
-    let mut otk = [0u8; 32];
-    otk.copy_from_slice(&block0[..32]);
-
-    // Step 2: Verify the authentication tag.
-    let mut mac_data = [0u8; 48];
-    mac_data[..32].copy_from_slice(ciphertext);
-    mac_data[40..48].copy_from_slice(&32u64.to_le_bytes());
-
-    let computed_tag = poly1305_mac(&otk, &mac_data);
-
-    // Constant-time tag verification — see `crate::util::ct_eq`.
-    if !crate::util::ct_eq(tag, &computed_tag) {
-        return Err(AuthError);
-    }
-
-    // Step 3: Decrypt ciphertext.
-    let mut plaintext = *ciphertext;
-    chacha20_xor(key, 1, nonce, &mut plaintext);
-
-    Ok(plaintext)
+    let cipher = ChaCha20Poly1305::new(chacha20poly1305::Key::from_slice(key));
+    let mut pt = *ciphertext;
+    cipher
+        .decrypt_in_place_detached(
+            Nonce::from_slice(nonce),
+            b"",
+            &mut pt,
+            Tag::from_slice(tag),
+        )
+        .map_err(|_| AuthError)?;
+    Ok(pt)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::crypto::chacha20::{chacha20_block, chacha20_xor};
-    use crate::crypto::poly1305::poly1305_mac;
 
     // Known-answer test: validate that seal() matches manually-composed
     // primitive output.  The chacha20 and poly1305 primitives are each
@@ -138,25 +107,11 @@ mod tests {
         ];
         let plaintext = [0xdeu8; 32];
 
-        // Compute expected via primitives (RFC-verified independently)
-        let block0 = chacha20_block(&key, 0, &nonce);
-        let mut otk = [0u8; 32];
-        otk.copy_from_slice(&block0[..32]);
-
-        let mut expected_ct = plaintext;
-        chacha20_xor(&key, 1, &nonce, &mut expected_ct);
-
-        let mut mac_data = [0u8; 48];
-        mac_data[..32].copy_from_slice(&expected_ct);
-        mac_data[40..48].copy_from_slice(&32u64.to_le_bytes());
-        let expected_tag = poly1305_mac(&otk, &mac_data);
-
         let (ct, tag) = seal(&key, &nonce, &plaintext);
-        assert_eq!(
-            ct, expected_ct,
-            "ciphertext must match primitive composition"
-        );
-        assert_eq!(tag, expected_tag, "tag must match primitive composition");
+
+        // Verify via open — round-trip proves seal produces a valid AEAD frame.
+        let decrypted = open(&key, &nonce, &ct, &tag).expect("round-trip must succeed");
+        assert_eq!(decrypted, plaintext);
     }
 
     #[test]
@@ -171,7 +126,6 @@ mod tests {
             0x07, 0x00, 0x00, 0x00, 0x40, 0x41, 0x42, 0x43, 0x44, 0x45, 0x46, 0x47,
         ];
 
-        // Roundtrip with 32-byte plaintext using the known test vector parameters
         let plaintext = [
             0x4c, 0x61, 0x64, 0x69, 0x65, 0x73, 0x20, 0x61, 0x6e, 0x64, 0x20, 0x47, 0x65, 0x6e,
             0x74, 0x6c, 0x65, 0x6d, 0x65, 0x6e, 0x20, 0x6f, 0x66, 0x20, 0x74, 0x68, 0x65, 0x20,
@@ -184,6 +138,9 @@ mod tests {
         assert_eq!(decrypted, plaintext);
     }
 
+    // Load-bearing test: validates that our wrapper produces the exact RFC 8439
+    // ciphertext and tag bytes. A regression here means we changed the
+    // key-schedule, nonce-handling, or AAD-layout in an incompatible way.
     #[test]
     fn aead_known_answer_matches_rfc8439_chacha20_poly1305() {
         let key: [u8; 32] = [
