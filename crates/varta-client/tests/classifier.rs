@@ -5,7 +5,7 @@
 
 use std::io::{self, Write};
 
-use varta_client::{classify_send_error, BeatOutcome};
+use varta_client::{classify_send_error, BeatError, BeatOutcome};
 
 // The ENOBUFS constant is module-private in client.rs, so it is replicated
 // here with identical cfg guards. If the numeric value ever changes it must
@@ -169,7 +169,40 @@ fn permission_denied_classifies_as_failed() {
     // EPERM (1) is not in the Dropped list — must surface as Failed.
     let err = io::Error::from_raw_os_error(1);
     assert!(
-        matches!(classify_send_error(&err), BeatOutcome::Failed(_)),
-        "EPERM should classify as Failed, not Dropped"
+        matches!(
+            classify_send_error(&err),
+            BeatOutcome::Failed(BeatError { errno: 1, .. })
+        ),
+        "EPERM should classify as Failed(BeatError {{ errno: 1 }}), not Dropped"
     );
+}
+
+#[test]
+fn beat_error_impl_error() {
+    // Compile-time assertion: BeatError satisfies std::error::Error for `?` propagation.
+    const _: fn() = || {
+        fn req_err<E: std::error::Error>() {}
+        req_err::<BeatError>();
+    };
+}
+
+#[test]
+fn beat_error_to_io_error_roundtrip() {
+    let be = BeatError {
+        errno: 1,
+        kind: io::ErrorKind::PermissionDenied,
+    };
+    let io_err = be.to_io_error();
+    assert_eq!(io_err.raw_os_error(), Some(1));
+}
+
+#[test]
+fn beat_error_unknown_errno_uses_kind() {
+    let be = BeatError {
+        errno: BeatError::UNKNOWN_ERRNO,
+        kind: io::ErrorKind::WouldBlock,
+    };
+    let io_err = be.to_io_error();
+    assert_eq!(io_err.kind(), io::ErrorKind::WouldBlock);
+    assert_eq!(io_err.raw_os_error(), None);
 }

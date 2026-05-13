@@ -63,8 +63,7 @@ compile_error!("ENOBUFS value is unknown for this target — add it to the cfg g
 ///
 /// Checks the raw OS error code before the `ErrorKind` match so that
 /// `ENOBUFS` (kernel buffer pressure, transient) is caught even when the
-/// toolchain maps it to `ErrorKind::Other`. The `Failed` branch constructs
-/// the returned error without heap allocation.
+/// toolchain maps it to `ErrorKind::Other`.
 pub fn classify_send_error(e: &io::Error) -> BeatOutcome {
     // (a) Raw-OS path first — catches ENOBUFS even when libstd has not
     //     minted a dedicated ErrorKind for it on this toolchain.
@@ -84,26 +83,76 @@ pub fn classify_send_error(e: &io::Error) -> BeatOutcome {
         | io::ErrorKind::BrokenPipe
         | io::ErrorKind::StorageFull => BeatOutcome::Dropped,
 
-        // (c) Unexpected error: clone and escalate.
-        //     This is on the Failed path (not steady-state), so a possible
-        //     allocation inside io::Error is acceptable.
-        _ => {
-            let cloned = match e.raw_os_error() {
-                // Repr::Os(i32) — platform-alloc-free.
-                Some(code) => io::Error::from_raw_os_error(code),
-                // Repr::Simple(kind) or Repr::Custom — may allocate.
-                None => io::Error::from(e.kind()),
-            };
-            BeatOutcome::Failed(cloned)
+        // (c) Unexpected error: capture as a Copy POD that cannot allocate.
+        _ => BeatOutcome::Failed(BeatError::from_io(e)),
+    }
+}
+
+/// Payload of [`BeatOutcome::Failed`].
+///
+/// `Copy` by construction: allocating a `BeatError` is structurally
+/// impossible, so the [`Varta::beat`] slow path is allocation-free
+/// regardless of how the underlying `io::Error` was represented.
+/// Callers wanting a full `io::Error` can call [`Self::to_io_error`].
+#[derive(Copy, Clone, Eq, PartialEq)]
+pub struct BeatError {
+    /// Raw OS errno when the failure came from a syscall;
+    /// [`BeatError::UNKNOWN_ERRNO`] (0) when not OS-derived.
+    /// POSIX guarantees errno is never 0 on a real syscall failure.
+    pub errno: i32,
+    /// The libstd [`io::ErrorKind`] classification. Always populated.
+    pub kind: io::ErrorKind,
+}
+
+impl BeatError {
+    /// Sentinel value used when no OS error number is available.
+    pub const UNKNOWN_ERRNO: i32 = 0;
+
+    /// Capture the failure shape from an `io::Error` without cloning or allocating.
+    pub fn from_io(e: &io::Error) -> Self {
+        Self {
+            errno: e.raw_os_error().unwrap_or(Self::UNKNOWN_ERRNO),
+            kind: e.kind(),
+        }
+    }
+
+    /// Reconstruct an `io::Error`. Allocation-free when `errno != 0` (uses
+    /// `Repr::Os`); falls back to `Repr::Simple(kind)` otherwise.
+    pub fn to_io_error(self) -> io::Error {
+        if self.errno != Self::UNKNOWN_ERRNO {
+            io::Error::from_raw_os_error(self.errno)
+        } else {
+            io::Error::from(self.kind)
         }
     }
 }
+
+impl fmt::Debug for BeatError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("BeatError")
+            .field("errno", &self.errno)
+            .field("kind", &self.kind)
+            .finish()
+    }
+}
+
+impl fmt::Display for BeatError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.errno != Self::UNKNOWN_ERRNO {
+            write!(f, "send failed: {:?} (errno={})", self.kind, self.errno)
+        } else {
+            write!(f, "send failed: {:?}", self.kind)
+        }
+    }
+}
+
+impl std::error::Error for BeatError {}
 
 /// Result of a single [`Varta::beat`] call.
 ///
 /// `beat()` never blocks and never panics; the kernel's view of the send is
 /// translated into one of three steady-state outcomes. `Failed` carries the
-/// underlying error untouched for higher layers that wish to log or escalate.
+/// underlying error for higher layers that wish to log or escalate.
 #[must_use]
 pub enum BeatOutcome {
     /// The 32-byte datagram was accepted by the kernel.
@@ -113,11 +162,9 @@ pub enum BeatOutcome {
     /// socket file vanished, or the per-socket queue is full
     /// (`WouldBlock` under non-blocking I/O).
     Dropped,
-    /// An unexpected I/O error surfaced from the underlying `send(2)`. The
-    /// inner [`io::Error`] is forwarded verbatim; constructing it does not
-    /// allocate on the heap. Callers must inspect the error rather than
-    /// silently discarding it with `Failed(_)`.
-    Failed(io::Error),
+    /// An unexpected I/O error surfaced from the underlying `send(2)`.
+    /// Callers wanting an `io::Error` can call [`BeatError::to_io_error`].
+    Failed(BeatError),
 }
 
 impl fmt::Debug for BeatOutcome {
@@ -125,7 +172,7 @@ impl fmt::Debug for BeatOutcome {
         match self {
             Self::Sent => write!(f, "Sent"),
             Self::Dropped => write!(f, "Dropped"),
-            Self::Failed(_) => write!(f, "Failed(<io::Error>)"),
+            Self::Failed(e) => write!(f, "Failed({e:?})"),
         }
     }
 }

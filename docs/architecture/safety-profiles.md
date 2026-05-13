@@ -85,6 +85,23 @@ with no shell involved; shell metacharacters have no effect.
 
 ---
 
+## Miri policy
+
+Miri (`cargo miri test`) runs on every push under `-Zmiri-strict-provenance` and covers
+the three unsafe-code clusters that cannot be audited by reading alone:
+
+| Cluster | Miri target | What it proves |
+|---|---|---|
+| `peer_cred` cmsg pointer-walk | `cargo miri test -p varta-watch --lib peer_cred` | No UB in the hand-written `cmsghdr` traversal; synthetic buffers only — no syscalls |
+| Tracker slot-index arithmetic | `cargo miri test -p varta-watch --lib tracker` | No out-of-bounds indexing or stale pointer reads in the fixed-capacity slot array |
+| Client classifier | `cargo miri test -p varta-client --test classifier` | `BeatError` is `Copy`-safe and `errno` extraction has no provenance issues |
+
+Tests that require real syscalls (Unix datagram bind, `recvmsg`, process spawn) carry
+`#[cfg_attr(miri, ignore)]` so they are silently skipped when Miri runs, without
+requiring a separate test-filter command.
+
+---
+
 ## Cross-references
 
 - [Observer liveness](observer-liveness.md) — defending against `varta-watch`

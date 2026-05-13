@@ -11,7 +11,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use varta_vlp::{DecodeError, Frame, Status};
-use varta_watch::tracker::MAX_CAPACITY;
+use varta_watch::tracker::{DEFAULT_EVICTION_SCAN_WINDOW, MAX_CAPACITY};
 use varta_watch::EvictionPolicy;
 use varta_watch::{Event, Observer, Tracker, Update};
 
@@ -89,6 +89,7 @@ where
     None
 }
 
+#[cfg_attr(miri, ignore)] // JUSTIFY: miri cannot model Unix datagram bind/send/recv syscalls
 #[test]
 fn observer_emits_beat_per_received_frame() {
     let path = unique_uds_path("beats");
@@ -99,6 +100,7 @@ fn observer_emits_beat_per_received_frame() {
         Duration::from_millis(100),
         64,
         EvictionPolicy::Strict,
+        DEFAULT_EVICTION_SCAN_WINDOW,
         None,
     )
     .expect("bind observer");
@@ -163,6 +165,7 @@ fn observer_emits_beat_per_received_frame() {
     assert_eq!(got[2], (pid, 3, Status::Degraded, 0xA3));
 }
 
+#[cfg_attr(miri, ignore)] // JUSTIFY: miri cannot model Unix datagram bind/send/recv syscalls
 #[test]
 fn observer_emits_stall_after_threshold_elapses() {
     let path = unique_uds_path("stall");
@@ -174,6 +177,7 @@ fn observer_emits_stall_after_threshold_elapses() {
         Duration::from_millis(100),
         64,
         EvictionPolicy::Strict,
+        DEFAULT_EVICTION_SCAN_WINDOW,
         None,
     )
     .expect("bind observer");
@@ -213,6 +217,7 @@ fn observer_emits_stall_after_threshold_elapses() {
     );
 }
 
+#[cfg_attr(miri, ignore)] // JUSTIFY: miri cannot model Unix datagram bind/send/recv syscalls
 #[test]
 fn observer_reports_decode_error_for_bad_magic() {
     let path = unique_uds_path("decode");
@@ -223,6 +228,7 @@ fn observer_reports_decode_error_for_bad_magic() {
         Duration::from_millis(100),
         64,
         EvictionPolicy::Strict,
+        DEFAULT_EVICTION_SCAN_WINDOW,
         None,
     )
     .expect("bind observer");
@@ -241,7 +247,7 @@ fn observer_reports_decode_error_for_bad_magic() {
 
 #[test]
 fn tracker_capacity_bounded_to_64_pids() {
-    let mut tracker = Tracker::new(64, EvictionPolicy::Strict);
+    let mut tracker = Tracker::new(64, EvictionPolicy::Strict, DEFAULT_EVICTION_SCAN_WINDOW);
     let now_ns: u64 = 1_000;
     let threshold_ns: u64 = 100;
 
@@ -277,6 +283,7 @@ fn tracker_capacity_bounded_to_64_pids() {
 /// version and whether `LOCAL_PEERTOKEN` / `LOCAL_PEERPID` succeeds),
 /// so the frame may be accepted as a beat or rejected — the test
 /// accepts either outcome.
+#[cfg_attr(miri, ignore)] // JUSTIFY: miri cannot model Unix datagram bind/send/recv syscalls
 #[test]
 fn observer_rejects_spoofed_pid_frame() {
     let path = unique_uds_path("spoof");
@@ -287,6 +294,7 @@ fn observer_rejects_spoofed_pid_frame() {
         Duration::from_millis(100),
         64,
         EvictionPolicy::Strict,
+        DEFAULT_EVICTION_SCAN_WINDOW,
         None,
     )
     .expect("bind observer");
@@ -330,6 +338,7 @@ fn observer_rejects_spoofed_pid_frame() {
 
 /// Send datagrams shorter than 32 bytes to the observer and verify they are
 /// silently counted as truncated without crashing or emitting beat events.
+#[cfg_attr(miri, ignore)] // JUSTIFY: miri cannot model Unix datagram bind/send/recv syscalls
 #[test]
 fn observer_counts_truncated_datagrams() {
     let path = unique_uds_path("trunc");
@@ -340,6 +349,7 @@ fn observer_counts_truncated_datagrams() {
         Duration::from_millis(100),
         64,
         EvictionPolicy::Strict,
+        DEFAULT_EVICTION_SCAN_WINDOW,
         None,
     )
     .expect("bind observer");
@@ -380,7 +390,11 @@ fn observer_counts_truncated_datagrams() {
 #[test]
 fn tracker_capacity_clamped_to_max_capacity() {
     // Clamping: requests above MAX_CAPACITY are silently capped.
-    let mut over = Tracker::new(MAX_CAPACITY + 1000, EvictionPolicy::Strict);
+    let mut over = Tracker::new(
+        MAX_CAPACITY + 1000,
+        EvictionPolicy::Strict,
+        DEFAULT_EVICTION_SCAN_WINDOW,
+    );
     let now_ns: u64 = 1_000;
     let threshold_ns: u64 = 100;
 

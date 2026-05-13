@@ -631,10 +631,19 @@ pub struct PromExporter {
     rate_limited_total: u64,
     nonce_wrap_total: u64,
     /// Count of bounded eviction-scan calls that ran the full
-    /// `EVICTION_SCAN_WINDOW` without finding a victim. Surfaced as
+    /// `eviction_scan_window` without finding a victim. Surfaced as
     /// `varta_tracker_eviction_scan_truncated_total`; non-zero values prove
     /// the per-frame work cap engaged under a unique-pid flood.
     eviction_scan_truncated_total: u64,
+    /// Configured tracker capacity. Set once at startup via
+    /// [`PromExporter::set_tracker_config`]; emitted as
+    /// `varta_tracker_capacity` (gauge) so dashboards can derive fill %.
+    tracker_capacity_cfg: usize,
+    /// Configured eviction scan window. Set once at startup via
+    /// [`PromExporter::set_tracker_config`]; emitted as
+    /// `varta_tracker_eviction_scan_window_max` (gauge) so operators can
+    /// compute the WCET bound: `ceil(capacity / eviction_scan_window_max)` calls.
+    eviction_scan_window_max: usize,
     /// Per-outcome recovery counters, indexed by [`recovery_outcome_index`].
     /// Emitted in full at every scrape so dashboards/alerts stay green-on-green.
     recovery_outcomes_total: [u64; RECOVERY_OUTCOME_LABELS.len()],
@@ -801,6 +810,8 @@ impl PromExporter {
             rate_limited_total: 0,
             nonce_wrap_total: 0,
             eviction_scan_truncated_total: 0,
+            tracker_capacity_cfg: 0,
+            eviction_scan_window_max: 0,
             recovery_outcomes_total: [0; RECOVERY_OUTCOME_LABELS.len()],
             recovery_refused_total: [0; RECOVERY_REFUSED_REASON_LABELS.len()],
             origin_conflict_total: 0,
@@ -961,11 +972,18 @@ impl PromExporter {
     }
 
     /// Record one or more bounded eviction-scan calls that exhausted the
-    /// `EVICTION_SCAN_WINDOW` without finding a victim. See
+    /// `eviction_scan_window` without finding a victim. See
     /// [`crate::tracker::Tracker::take_eviction_scan_truncated`].
     pub fn record_eviction_scan_truncated(&mut self, count: u64) {
         self.eviction_scan_truncated_total =
             self.eviction_scan_truncated_total.saturating_add(count);
+    }
+
+    /// Set the tracker capacity and eviction-scan-window config values emitted
+    /// as startup gauges. Call once at daemon startup before the first scrape.
+    pub fn set_tracker_config(&mut self, capacity: usize, eviction_scan_window: usize) {
+        self.tracker_capacity_cfg = capacity;
+        self.eviction_scan_window_max = eviction_scan_window;
     }
 
     /// Record a recovery outcome and optional duration. Increments the
@@ -1424,6 +1442,22 @@ impl PromExporter {
             self.body_buf,
             "varta_tracker_eviction_scan_truncated_total {}",
             self.eviction_scan_truncated_total
+        );
+        self.body_buf.push_str("# HELP varta_tracker_capacity Configured tracker capacity (max distinct agent pids).\n");
+        self.body_buf
+            .push_str("# TYPE varta_tracker_capacity gauge\n");
+        let _ = writeln!(
+            self.body_buf,
+            "varta_tracker_capacity {}",
+            self.tracker_capacity_cfg
+        );
+        self.body_buf.push_str("# HELP varta_tracker_eviction_scan_window_max Configured eviction scan window; per-frame WCET = ceil(capacity / window_max) calls.\n");
+        self.body_buf
+            .push_str("# TYPE varta_tracker_eviction_scan_window_max gauge\n");
+        let _ = writeln!(
+            self.body_buf,
+            "varta_tracker_eviction_scan_window_max {}",
+            self.eviction_scan_window_max
         );
         // Recovery outcome counters — emit every label value at zero from the
         // first scrape so `absent()` rules stay green even before the first

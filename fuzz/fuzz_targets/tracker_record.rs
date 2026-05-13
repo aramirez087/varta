@@ -2,7 +2,7 @@
 
 use libfuzzer_sys::fuzz_target;
 use varta_watch::peer_cred::BeatOrigin;
-use varta_watch::tracker::{EvictionPolicy, Tracker};
+use varta_watch::tracker::{EvictionPolicy, Tracker, DEFAULT_EVICTION_SCAN_WINDOW};
 
 fuzz_target!(|data: &[u8]| {
     // Each record call consumes 38 bytes of input:
@@ -15,7 +15,7 @@ fuzz_target!(|data: &[u8]| {
 
     // Capacity between 1 and 65 — exercises full, near-full, and tiny trackers.
     let capacity = 1 + (data[0] as usize % 65);
-    let mut tracker = Tracker::new(capacity, EvictionPolicy::Strict);
+    let mut tracker = Tracker::new(capacity, EvictionPolicy::Strict, DEFAULT_EVICTION_SCAN_WINDOW);
     let mut offset: usize = 1;
     let mut wall: u64 = 0;
 

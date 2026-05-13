@@ -49,6 +49,7 @@ fn unused_udp_port() -> u16 {
         .port()
 }
 
+#[cfg_attr(miri, ignore)] // JUSTIFY: miri cannot model process spawning (Command::new)
 #[test]
 fn cli_help_lists_every_documented_flag() {
     let out = Command::new(env!("CARGO_BIN_EXE_varta-watch"))
@@ -91,6 +92,7 @@ fn cli_help_lists_every_documented_flag() {
 
 /// `varta-watch --help` must list `--recovery-timeout-ms` once Session
 /// 03 lands. In Session 01 the HELP text is unchanged so this fails.
+#[cfg_attr(miri, ignore)] // JUSTIFY: miri cannot model process spawning (Command::new)
 #[test]
 fn cli_help_lists_recovery_timeout_ms_flag() {
     let out = Command::new(env!("CARGO_BIN_EXE_varta-watch"))
@@ -112,6 +114,7 @@ fn cli_help_lists_recovery_timeout_ms_flag() {
 
 /// `varta-watch --recovery-timeout-ms <MS>` must parse cleanly. Session
 /// 01 leaves the parser unchanged so this exits 2 (UnknownFlag).
+#[cfg_attr(miri, ignore)] // JUSTIFY: miri cannot model process spawning (Command::new)
 #[test]
 fn cli_parses_recovery_timeout_ms() {
     let path = unique_uds_path("recovery-timeout");
@@ -138,6 +141,7 @@ fn cli_parses_recovery_timeout_ms() {
 
 /// `varta-watch --socket-mode <OCTAL>` must parse cleanly and the
 /// binary must start (implying chmod succeeded).
+#[cfg_attr(miri, ignore)] // JUSTIFY: miri cannot model process spawning (Command::new)
 #[test]
 fn cli_parses_socket_mode() {
     let path = unique_uds_path("sockmode");
@@ -170,6 +174,7 @@ fn cli_parses_socket_mode() {
 // ---------------------------------------------------------------------------
 
 #[cfg(feature = "unsafe-plaintext-udp")]
+#[cfg_attr(miri, ignore)] // JUSTIFY: miri cannot model process spawning (Command::new)
 #[test]
 fn cli_plaintext_udp_without_accept_flag_is_rejected() {
     let path = unique_uds_path("plaintext-no-accept");
@@ -206,6 +211,7 @@ fn cli_plaintext_udp_without_accept_flag_is_rejected() {
 }
 
 #[cfg(feature = "unsafe-plaintext-udp")]
+#[cfg_attr(miri, ignore)] // JUSTIFY: miri cannot model process spawning (Command::new)
 #[test]
 fn cli_plaintext_udp_with_accept_flag_starts() {
     let path = unique_uds_path("plaintext-accept");
@@ -243,6 +249,7 @@ fn cli_plaintext_udp_with_accept_flag_starts() {
 }
 
 #[cfg(not(feature = "unsafe-plaintext-udp"))]
+#[cfg_attr(miri, ignore)] // JUSTIFY: miri cannot model process spawning (Command::new)
 #[test]
 fn cli_plaintext_udp_not_compiled_in_is_rejected() {
     let path = unique_uds_path("plaintext-not-built");
@@ -283,6 +290,7 @@ fn cli_plaintext_udp_not_compiled_in_is_rejected() {
 // ---------------------------------------------------------------------------
 
 #[cfg(feature = "unsafe-shell-recovery")]
+#[cfg_attr(miri, ignore)] // JUSTIFY: miri cannot model process spawning (Command::new)
 #[test]
 fn cli_recovery_cmd_without_accept_flag_is_rejected() {
     let path = unique_uds_path("shell-no-accept");
@@ -318,6 +326,7 @@ fn cli_recovery_cmd_without_accept_flag_is_rejected() {
 /// `--recovery-cmd` even with `--i-accept-shell-risk`, directing the operator
 /// to rebuild with the feature or switch to `--recovery-exec`.
 #[cfg(not(feature = "unsafe-shell-recovery"))]
+#[cfg_attr(miri, ignore)] // JUSTIFY: miri cannot model process spawning (Command::new)
 #[test]
 fn cli_recovery_cmd_without_feature_is_rejected() {
     let path = unique_uds_path("shell-no-feature");
@@ -350,6 +359,7 @@ fn cli_recovery_cmd_without_feature_is_rejected() {
     );
 }
 
+#[cfg_attr(miri, ignore)] // JUSTIFY: miri cannot model process spawning (Command::new)
 #[test]
 fn cli_recovery_exec_does_not_require_accept_flag() {
     let path = unique_uds_path("exec-no-flag");
@@ -377,6 +387,7 @@ fn cli_recovery_exec_does_not_require_accept_flag() {
 }
 
 #[cfg(feature = "secure-udp")]
+#[cfg_attr(miri, ignore)] // JUSTIFY: miri cannot model process spawning (Command::new)
 #[test]
 fn cli_secure_udp_binds_single_listener_for_udp_port() {
     use std::io::Write;
@@ -433,6 +444,7 @@ fn cli_secure_udp_binds_single_listener_for_udp_port() {
     );
 }
 
+#[cfg_attr(miri, ignore)] // JUSTIFY: miri cannot model process spawning (Command::new)
 #[test]
 fn cli_key_env_flag_is_rejected_with_migration_hint() {
     let path = unique_uds_path("key-env-removed");
@@ -496,6 +508,7 @@ fn write_secret_file(tag: &str, content: &str, mode: u32) -> std::path::PathBuf 
 }
 
 #[cfg(feature = "secure-udp")]
+#[cfg_attr(miri, ignore)] // JUSTIFY: miri cannot model process spawning (Command::new)
 #[test]
 fn cli_key_file_with_world_readable_mode_is_rejected() {
     let socket = unique_uds_path("key-file-perm");
@@ -530,6 +543,7 @@ fn cli_key_file_with_world_readable_mode_is_rejected() {
     );
 }
 
+#[cfg_attr(miri, ignore)] // JUSTIFY: miri cannot model process spawning (Command::new)
 #[test]
 fn cli_prom_addr_without_token_file_is_rejected() {
     let socket = unique_uds_path("prom-noauth");
@@ -556,6 +570,7 @@ fn cli_prom_addr_without_token_file_is_rejected() {
     );
 }
 
+#[cfg_attr(miri, ignore)] // JUSTIFY: miri cannot model process spawning (Command::new)
 #[test]
 fn cli_prom_token_file_with_world_readable_mode_is_rejected() {
     let socket = unique_uds_path("prom-tok-perm");
@@ -588,6 +603,7 @@ fn cli_prom_token_file_with_world_readable_mode_is_rejected() {
 
 // ---- H2 mitigation: recovery + UDP requires explicit operator opt-in -------
 
+#[cfg_attr(miri, ignore)] // JUSTIFY: miri cannot model process spawning (Command::new)
 #[test]
 fn cli_recovery_plus_udp_port_without_accept_flag_is_rejected() {
     // Cross-flag invariant from docs/architecture/peer-authentication.md:
@@ -622,6 +638,7 @@ fn cli_recovery_plus_udp_port_without_accept_flag_is_rejected() {
     );
 }
 
+#[cfg_attr(miri, ignore)] // JUSTIFY: miri cannot model process spawning (Command::new)
 #[test]
 fn cli_recovery_plus_udp_port_with_accept_flag_parses() {
     // Same combo, with the opt-in flag: --help should now also list the
@@ -650,6 +667,7 @@ fn cli_recovery_plus_udp_port_with_accept_flag_parses() {
 /// On a clean shutdown (`--shutdown-after-secs`), `varta-watch` must kick the
 /// watchdog at least once and then write the magic-close byte `'V'` to disarm
 /// it.
+#[cfg_attr(miri, ignore)] // JUSTIFY: miri cannot model process spawning (Command::new)
 #[test]
 fn cli_hw_watchdog_kicks_and_writes_magic_close_on_clean_shutdown() {
     use std::fs::OpenOptions;
@@ -722,6 +740,7 @@ fn cli_hw_watchdog_kicks_and_writes_magic_close_on_clean_shutdown() {
 /// magic-close byte must NOT appear, leaving the watchdog armed so the kernel
 /// would reboot.
 #[cfg(unix)]
+#[cfg_attr(miri, ignore)] // JUSTIFY: miri cannot model process spawning (Command::new)
 #[test]
 fn cli_hw_watchdog_does_not_write_magic_close_on_abrupt_kill() {
     use std::fs::OpenOptions;

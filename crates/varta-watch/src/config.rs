@@ -9,7 +9,10 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use crate::tracker::{EvictionPolicy, DEFAULT_CAPACITY};
+use crate::tracker::{
+    EvictionPolicy, DEFAULT_CAPACITY, DEFAULT_EVICTION_SCAN_WINDOW, MAX_EVICTION_SCAN_WINDOW,
+    MIN_EVICTION_SCAN_WINDOW,
+};
 
 /// Default per-pid debounce window applied when `--recovery-cmd` is set
 /// without an explicit `--recovery-debounce-ms`.
@@ -154,6 +157,9 @@ pub struct Config {
     /// Eviction policy applied when the tracker is at capacity and a
     /// new pid arrives. Defaults to [`EvictionPolicy::Strict`].
     pub tracker_eviction_policy: EvictionPolicy,
+    /// Maximum slots scanned per eviction attempt.
+    /// Defaults to [`DEFAULT_EVICTION_SCAN_WINDOW`].
+    pub eviction_scan_window: usize,
     /// Optional UDP port for network-based observers. When set, the observer
     /// also binds a UDP listener alongside the UDS socket.
     pub udp_port: Option<u16>,
@@ -397,6 +403,16 @@ pub enum ConfigError {
         /// The maximum allowed value.
         max: u64,
     },
+    /// `--eviction-scan-window` was outside the accepted range
+    /// (`[MIN_EVICTION_SCAN_WINDOW, MAX_EVICTION_SCAN_WINDOW]`).
+    EvictionScanWindowOutOfRange {
+        /// The value provided.
+        value: usize,
+        /// The minimum allowed value.
+        min: usize,
+        /// The maximum allowed value.
+        max: usize,
+    },
 }
 
 impl core::fmt::Display for ConfigError {
@@ -473,6 +489,10 @@ impl core::fmt::Display for ConfigError {
             ConfigError::ScrapeBudgetOutOfRange { value, min, max } => write!(
                 f,
                 "--scrape-budget-ms: {value} is outside the accepted range [{min}, {max}] ms"
+            ),
+            ConfigError::EvictionScanWindowOutOfRange { value, min, max } => write!(
+                f,
+                "--eviction-scan-window: {value} is outside the accepted range [{min}, {max}]"
             ),
         }
     }
@@ -566,6 +586,11 @@ OPTIONAL:
                                       tracked concurrently (default 256).
                                       Beats for new pids beyond this limit are
                                       dropped.
+    --eviction-scan-window <N>      Maximum slots scanned per eviction
+                                      attempt (default 256). Smaller = lower
+                                      per-frame upper bound; a full table
+                                      sweep takes ceil(tracker_capacity / N)
+                                      calls. Range [1, 4096].
     --tracker-eviction-policy <P>   Eviction policy when tracker is full:
                                       strict (default) evicts only confirmed-
                                       stalled agents; balanced falls back to
@@ -740,6 +765,7 @@ OPTIONAL:
         let mut read_timeout_ms: Option<u64> = None;
         let mut tracker_capacity: Option<usize> = None;
         let mut tracker_eviction_policy: Option<EvictionPolicy> = None;
+        let mut eviction_scan_window: Option<usize> = None;
         let mut udp_port: Option<u16> = None;
         let mut udp_bind_addr: Option<std::net::IpAddr> = None;
         let mut secure_key_file: Option<PathBuf> = None;
@@ -873,6 +899,16 @@ OPTIONAL:
                     tracker_capacity =
                         Some(v.parse::<usize>().map_err(|_| ConfigError::BadInteger {
                             flag: "--tracker-capacity",
+                            raw: v,
+                        })?);
+                }
+                "--eviction-scan-window" => {
+                    let v = iter
+                        .next()
+                        .ok_or(ConfigError::MissingValue("--eviction-scan-window"))?;
+                    eviction_scan_window =
+                        Some(v.parse::<usize>().map_err(|_| ConfigError::BadInteger {
+                            flag: "--eviction-scan-window",
                             raw: v,
                         })?);
                 }
@@ -1177,6 +1213,20 @@ OPTIONAL:
             None => crate::exporter::DEFAULT_SCRAPE_BUDGET,
         };
 
+        let eviction_scan_window_resolved = match eviction_scan_window {
+            Some(v) => {
+                if !(MIN_EVICTION_SCAN_WINDOW..=MAX_EVICTION_SCAN_WINDOW).contains(&v) {
+                    return Err(ConfigError::EvictionScanWindowOutOfRange {
+                        value: v,
+                        min: MIN_EVICTION_SCAN_WINDOW,
+                        max: MAX_EVICTION_SCAN_WINDOW,
+                    });
+                }
+                v
+            }
+            None => DEFAULT_EVICTION_SCAN_WINDOW,
+        };
+
         Ok(Config {
             socket,
             threshold: Duration::from_millis(threshold_ms),
@@ -1197,6 +1247,7 @@ OPTIONAL:
             read_timeout: Duration::from_millis(read_timeout_ms.unwrap_or(DEFAULT_READ_TIMEOUT_MS)),
             tracker_capacity: tracker_capacity.unwrap_or(DEFAULT_CAPACITY),
             tracker_eviction_policy: tracker_eviction_policy.unwrap_or(EvictionPolicy::Strict),
+            eviction_scan_window: eviction_scan_window_resolved,
             udp_port,
             udp_bind_addr,
             secure_key_file,
@@ -2619,5 +2670,59 @@ mod tests {
         writer.join().expect("writer thread");
         eprintln!("toctou_stress: {iters} validate calls");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn parses_eviction_scan_window() {
+        let args = [
+            "--socket",
+            "/tmp/t.sock",
+            "--threshold-ms",
+            "100",
+            "--eviction-scan-window",
+            "64",
+        ];
+        let cfg = Config::from_args(args.iter().map(|s| s.to_string())).unwrap();
+        assert_eq!(cfg.eviction_scan_window, 64);
+    }
+
+    #[test]
+    fn rejects_eviction_scan_window_zero() {
+        let args = [
+            "--socket",
+            "/tmp/t.sock",
+            "--threshold-ms",
+            "100",
+            "--eviction-scan-window",
+            "0",
+        ];
+        let err = Config::from_args(args.iter().map(|s| s.to_string())).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ConfigError::EvictionScanWindowOutOfRange { value: 0, .. }
+            ),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_eviction_scan_window_above_max() {
+        let args = [
+            "--socket",
+            "/tmp/t.sock",
+            "--threshold-ms",
+            "100",
+            "--eviction-scan-window",
+            "9999",
+        ];
+        let err = Config::from_args(args.iter().map(|s| s.to_string())).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ConfigError::EvictionScanWindowOutOfRange { value: 9999, .. }
+            ),
+            "unexpected error: {err}"
+        );
     }
 }

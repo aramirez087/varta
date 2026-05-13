@@ -185,6 +185,7 @@ impl Observer {
         threshold: Duration,
         tracker_capacity: usize,
         eviction_policy: EvictionPolicy,
+        eviction_scan_window: usize,
         max_beat_rate: Option<u32>,
     ) -> Self {
         let threshold_ns = threshold.as_nanos().min(u64::MAX as u128) as u64;
@@ -200,7 +201,7 @@ impl Observer {
         });
         Observer {
             listeners: Vec::new(),
-            tracker: Tracker::new(tracker_capacity, eviction_policy),
+            tracker: Tracker::new(tracker_capacity, eviction_policy, eviction_scan_window),
             threshold_ns,
             start: Instant::now(),
             stall_queue: Vec::with_capacity(tracker_capacity),
@@ -228,9 +229,16 @@ impl Observer {
         threshold: Duration,
         tracker_capacity: usize,
         eviction_policy: EvictionPolicy,
+        eviction_scan_window: usize,
         max_beat_rate: Option<u32>,
     ) -> Self {
-        let mut obs = Self::new(threshold, tracker_capacity, eviction_policy, max_beat_rate);
+        let mut obs = Self::new(
+            threshold,
+            tracker_capacity,
+            eviction_policy,
+            eviction_scan_window,
+            max_beat_rate,
+        );
         obs.add_listener(Box::new(listener));
         obs
     }
@@ -241,6 +249,7 @@ impl Observer {
     /// This is the backward-compatible convenience constructor for the common
     /// single-UDS case. For multi-transport setups, use [`Observer::new`]
     /// followed by [`Observer::add_listener`].
+    #[allow(clippy::too_many_arguments)]
     pub fn bind(
         path: impl AsRef<Path>,
         threshold: Duration,
@@ -248,6 +257,7 @@ impl Observer {
         read_timeout: Duration,
         tracker_capacity: usize,
         eviction_policy: EvictionPolicy,
+        eviction_scan_window: usize,
         max_beat_rate: Option<u32>,
     ) -> io::Result<Self> {
         let listener = UdsListener::bind(path, socket_mode, read_timeout)?;
@@ -256,6 +266,7 @@ impl Observer {
             threshold,
             tracker_capacity,
             eviction_policy,
+            eviction_scan_window,
             max_beat_rate,
         ))
     }
@@ -586,6 +597,7 @@ impl Observer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tracker::DEFAULT_EVICTION_SCAN_WINDOW;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -613,6 +625,7 @@ mod tests {
             Duration::from_millis(100),
             64,
             EvictionPolicy::Strict,
+            DEFAULT_EVICTION_SCAN_WINDOW,
             None,
         )
         .expect("bind should succeed on a clean temp path");

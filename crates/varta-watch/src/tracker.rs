@@ -39,7 +39,7 @@ pub const MAX_CAPACITY: usize = 4096;
 /// `stall_emitted` on every beat.
 const EVICTION_MULTIPLIER: u32 = 10;
 
-/// Maximum number of slots scanned per [`Tracker::find_evictable_slot`] call.
+/// Default maximum number of slots scanned per [`Tracker::find_evictable_slot`] call.
 ///
 /// The eviction scan used to be O(`len`) — at [`MAX_CAPACITY`] = 4096 that
 /// meant up to 4096 slot reads on **every** new-pid frame once the table was
@@ -47,16 +47,28 @@ const EVICTION_MULTIPLIER: u32 = 10;
 /// therefore force O(n) work per arriving frame on the single-threaded
 /// observer poll loop.
 ///
-/// The scan is now bounded to this window, with a rotating cursor
-/// ([`Tracker::eviction_scan_cursor`]) that resumes where the previous call
-/// left off. First-fit eviction inside the window is correct under capacity
-/// pressure (any slot whose silence exceeds `threshold * EVICTION_MULTIPLIER`
-/// is a valid victim — they are by definition not actively beating).
+/// The scan is now bounded to `Tracker::eviction_scan_window` (configurable
+/// via `--eviction-scan-window`, defaulting to this constant), with a rotating
+/// cursor ([`Tracker::eviction_scan_cursor`]) that resumes where the previous
+/// call left off. A full sweep takes `ceil(capacity / eviction_scan_window)`
+/// consecutive calls. First-fit eviction inside the window is correct under
+/// capacity pressure (any slot whose silence exceeds
+/// `threshold * EVICTION_MULTIPLIER` is a valid victim — they are by
+/// definition not actively beating).
 ///
 /// 256 was chosen as a compromise: large enough that a single call typically
 /// finds a victim on tables of 1–2 k pids, small enough that the per-frame
 /// upper bound stays well under the existing observer-tick budget.
-const EVICTION_SCAN_WINDOW: usize = 256;
+pub const DEFAULT_EVICTION_SCAN_WINDOW: usize = 256;
+
+/// Minimum allowed value for `--eviction-scan-window`. Window = 1 is
+/// degenerate but correct; only window = 0 breaks the algorithm.
+pub const MIN_EVICTION_SCAN_WINDOW: usize = 1;
+
+/// Maximum allowed value for `--eviction-scan-window`. Capped at
+/// [`MAX_CAPACITY`] so a table scan in one call is bounded by the maximum
+/// tracker size.
+pub const MAX_EVICTION_SCAN_WINDOW: usize = MAX_CAPACITY;
 
 /// Threshold for nonce wrap detection. When the tracker's `last_nonce` for a
 /// pid is within this distance of `u64::MAX` and an incoming frame carries a
@@ -392,11 +404,16 @@ pub struct Tracker {
     /// realistic DoS profile where an attacker fills the tracker faster
     /// than the stall threshold can elapse.
     stall_emitted_count: usize,
+    /// Maximum slots inspected per [`Tracker::scan_window`] call.
+    /// Configurable via `--eviction-scan-window`; defaults to
+    /// [`DEFAULT_EVICTION_SCAN_WINDOW`]. A full table sweep takes
+    /// `ceil(len / eviction_scan_window)` consecutive calls.
+    eviction_scan_window: usize,
     /// Round-robin cursor into `entries` for the bounded eviction scan.
     /// Persists across `find_evictable_slot` calls so a sequence of N
-    /// failed evictions covers the whole table in `ceil(len / WINDOW)`
-    /// calls without ever scanning more than [`EVICTION_SCAN_WINDOW`]
-    /// slots in a single call.
+    /// failed evictions covers the whole table in
+    /// `ceil(len / eviction_scan_window)` calls without ever scanning more
+    /// than `eviction_scan_window` slots in a single call.
     eviction_scan_cursor: usize,
     /// Number of times the bounded eviction scan reached its window cap
     /// without finding a victim while the table was full. Surfaced via
@@ -423,7 +440,11 @@ pub struct Tracker {
 
 impl Default for Tracker {
     fn default() -> Self {
-        Self::new(DEFAULT_CAPACITY, EvictionPolicy::Strict)
+        Self::new(
+            DEFAULT_CAPACITY,
+            EvictionPolicy::Strict,
+            DEFAULT_EVICTION_SCAN_WINDOW,
+        )
     }
 }
 
@@ -433,8 +454,19 @@ impl Tracker {
     /// The slot table is pre-allocated to `capacity` entries; pushing
     /// beyond that boundary yields [`Update::CapacityExceeded`] rather
     /// than reallocating.
-    pub fn new(capacity: usize, eviction_policy: EvictionPolicy) -> Self {
+    ///
+    /// `eviction_scan_window` caps the number of slots inspected per
+    /// eviction attempt. Values outside
+    /// `[MIN_EVICTION_SCAN_WINDOW, MAX_EVICTION_SCAN_WINDOW]` are clamped
+    /// as defense in depth; the config layer rejects out-of-range values
+    /// loudly at startup.
+    pub fn new(
+        capacity: usize,
+        eviction_policy: EvictionPolicy,
+        eviction_scan_window: usize,
+    ) -> Self {
         let cap = capacity.min(MAX_CAPACITY);
+        let window = eviction_scan_window.clamp(MIN_EVICTION_SCAN_WINDOW, MAX_EVICTION_SCAN_WINDOW);
         Tracker {
             entries: Vec::with_capacity(cap),
             len: 0,
@@ -445,6 +477,7 @@ impl Tracker {
             last_evicted_pid: None,
             eviction_policy,
             stall_emitted_count: 0,
+            eviction_scan_window: window,
             eviction_scan_cursor: 0,
             eviction_scan_truncated: 0,
             origin_conflicts: 0,
@@ -692,7 +725,7 @@ impl Tracker {
         if n == 0 {
             return None;
         }
-        let window = EVICTION_SCAN_WINDOW.min(n);
+        let window = self.eviction_scan_window.min(n);
         let start = self.eviction_scan_cursor % n;
         for i in 0..window {
             let idx = (start + i) % n;
@@ -935,7 +968,7 @@ mod tests {
     #[test]
     fn find_evictable_slot_returns_none_when_no_stalls_emitted() {
         let cap = 64;
-        let mut t = Tracker::new(cap, EvictionPolicy::Strict);
+        let mut t = Tracker::new(cap, EvictionPolicy::Strict, DEFAULT_EVICTION_SCAN_WINDOW);
         let threshold_ns = 1_000;
         // Fill at t=0 so silence isn't a factor either.
         for pid in 1u32..=(cap as u32) {
@@ -961,7 +994,7 @@ mod tests {
     #[test]
     fn stall_counter_enables_eviction_after_drain() {
         let cap = 8;
-        let mut t = Tracker::new(cap, EvictionPolicy::Strict);
+        let mut t = Tracker::new(cap, EvictionPolicy::Strict, DEFAULT_EVICTION_SCAN_WINDOW);
         let threshold_ns = 100;
 
         for pid in 1u32..=(cap as u32) {
@@ -987,7 +1020,7 @@ mod tests {
     /// A fresh beat on a previously-stalled slot must decrement the counter.
     #[test]
     fn stall_counter_decrements_on_refresh() {
-        let mut t = Tracker::new(4, EvictionPolicy::Strict);
+        let mut t = Tracker::new(4, EvictionPolicy::Strict, DEFAULT_EVICTION_SCAN_WINDOW);
         let threshold_ns = 100;
         assert_eq!(
             t.record(&frame(1, 1), 0, threshold_ns, ORIGIN, None),
@@ -1006,11 +1039,11 @@ mod tests {
 
     /// The bounded scan window must cap per-call work. Fill 4096 slots
     /// at t=0, stall them all, then verify each find_evictable_slot call
-    /// advances the cursor by at most WINDOW slots.
+    /// advances the cursor by at most the configured window.
     #[test]
     fn find_evictable_slot_scan_is_bounded_to_window() {
         let cap = MAX_CAPACITY;
-        let mut t = Tracker::new(cap, EvictionPolicy::Strict);
+        let mut t = Tracker::new(cap, EvictionPolicy::Strict, DEFAULT_EVICTION_SCAN_WINDOW);
         let threshold_ns = 100;
         for pid in 1u32..=(cap as u32) {
             assert_eq!(
@@ -1023,14 +1056,43 @@ mod tests {
         t.drain_stalled_slots(now_ns, threshold_ns, |_, _, _, _, _| {});
         assert_eq!(t.stall_emitted_count, cap);
 
-        // Each new-pid insert evicts one slot. Cursor must advance by ≤
-        // EVICTION_SCAN_WINDOW on every miss, ≤ 1 on every hit.
+        // Each new-pid insert evicts one slot. Cursor must advance by ≤ window.
+        let window = t.eviction_scan_window;
         let start_cursor = t.eviction_scan_cursor;
         let _ = t.record(&frame(50_001, 1), now_ns, threshold_ns, ORIGIN, None);
         let advanced = t.eviction_scan_cursor.wrapping_sub(start_cursor) % cap;
         assert!(
-            advanced <= EVICTION_SCAN_WINDOW,
-            "cursor advanced by {advanced}, expected ≤ {EVICTION_SCAN_WINDOW}"
+            advanced <= window,
+            "cursor advanced by {advanced}, expected ≤ {window}"
+        );
+    }
+
+    /// A Tracker constructed with a small eviction_scan_window must honour
+    /// that window, not the default.
+    #[test]
+    fn eviction_scan_window_is_plumbed_through() {
+        let cap = 16;
+        let window = 4;
+        let mut t = Tracker::new(cap, EvictionPolicy::Strict, window);
+        assert_eq!(t.eviction_scan_window, window);
+        let threshold_ns = 100;
+        for pid in 1u32..=(cap as u32) {
+            assert_eq!(
+                t.record(&frame(pid, 1), 0, threshold_ns, ORIGIN, None),
+                Update::Inserted
+            );
+        }
+        // Stall everything so every slot is eviction-eligible.
+        let now_ns = threshold_ns * 20;
+        t.drain_stalled_slots(now_ns, threshold_ns, |_, _, _, _, _| {});
+        assert_eq!(t.stall_emitted_count, cap);
+        // Force an eviction attempt and confirm the cursor advanced by ≤ window.
+        let start = t.eviction_scan_cursor;
+        let _ = t.record(&frame(9_999, 1), now_ns, threshold_ns, ORIGIN, None);
+        let advanced = t.eviction_scan_cursor.wrapping_sub(start) % cap;
+        assert!(
+            advanced <= window,
+            "cursor advanced {advanced}, expected ≤ {window} (configured window)"
         );
     }
 
@@ -1039,7 +1101,7 @@ mod tests {
     #[test]
     fn scan_window_cursor_wraps_correctly() {
         let cap = 4;
-        let mut t = Tracker::new(cap, EvictionPolicy::Strict);
+        let mut t = Tracker::new(cap, EvictionPolicy::Strict, DEFAULT_EVICTION_SCAN_WINDOW);
         let threshold_ns = 100;
         for pid in 1u32..=(cap as u32) {
             assert_eq!(
@@ -1060,7 +1122,7 @@ mod tests {
     /// call, so this test exercises the invariant.
     #[test]
     fn stall_emitted_count_invariant_holds_across_random_ops() {
-        let mut t = Tracker::new(32, EvictionPolicy::Balanced);
+        let mut t = Tracker::new(32, EvictionPolicy::Balanced, DEFAULT_EVICTION_SCAN_WINDOW);
         let threshold_ns = 100;
         let mut now_ns: u64 = 0;
         // Simple deterministic PRNG (xorshift64) — no rand dep.
@@ -1101,7 +1163,7 @@ mod tests {
     /// run the full window without finding a victim.
     #[test]
     fn scan_truncated_counter_increments_on_dry_scan() {
-        let mut t = Tracker::new(32, EvictionPolicy::Strict);
+        let mut t = Tracker::new(32, EvictionPolicy::Strict, DEFAULT_EVICTION_SCAN_WINDOW);
         let threshold_ns = 100;
         for pid in 1u32..=32 {
             assert_eq!(
@@ -1128,7 +1190,7 @@ mod tests {
     /// slot or incrementing the slot's `last_ns`.
     #[test]
     fn origin_conflict_first_origin_wins() {
-        let mut t = Tracker::new(8, EvictionPolicy::Strict);
+        let mut t = Tracker::new(8, EvictionPolicy::Strict, DEFAULT_EVICTION_SCAN_WINDOW);
         let threshold_ns = 100;
 
         // Beat 1 arrives via UDS (kernel-attested) and pins the slot.
@@ -1258,7 +1320,7 @@ mod tests {
         // safety we verify the rollback path: a forced-error scenario is
         // not realistically reachable through normal API use, so we instead
         // assert that under heavy churn the counter stays at 0.
-        let mut t = Tracker::new(32, EvictionPolicy::Balanced);
+        let mut t = Tracker::new(32, EvictionPolicy::Balanced, DEFAULT_EVICTION_SCAN_WINDOW);
         let threshold_ns = 100;
         let mut now = 0u64;
         for pid in 1u32..=4096 {
@@ -1273,7 +1335,7 @@ mod tests {
     fn invariant_violations_stays_zero_under_random_ops() {
         // Mirrors `stall_emitted_count_invariant_holds_across_random_ops`
         // but asserts the new invariant_violations counter never ticks.
-        let mut t = Tracker::new(32, EvictionPolicy::Balanced);
+        let mut t = Tracker::new(32, EvictionPolicy::Balanced, DEFAULT_EVICTION_SCAN_WINDOW);
         let threshold_ns = 100;
         let mut now_ns: u64 = 0;
         let mut s: u64 = 0xDEADBEEF;
@@ -1312,7 +1374,7 @@ mod tests {
     /// trust.
     #[test]
     fn drain_stalled_slots_emits_pinned_origin() {
-        let mut t = Tracker::new(4, EvictionPolicy::Strict);
+        let mut t = Tracker::new(4, EvictionPolicy::Strict, DEFAULT_EVICTION_SCAN_WINDOW);
         let threshold_ns = 100;
 
         assert_eq!(
@@ -1356,7 +1418,7 @@ mod tests {
     /// already-tracked pid is rejected as `NamespaceConflict`.
     #[test]
     fn namespace_conflict_blocks_rebind() {
-        let mut t = Tracker::new(8, EvictionPolicy::Strict);
+        let mut t = Tracker::new(8, EvictionPolicy::Strict, DEFAULT_EVICTION_SCAN_WINDOW);
         let threshold_ns = 100;
         assert_eq!(
             t.record(
@@ -1385,7 +1447,7 @@ mod tests {
     /// Same inode → normal refresh.
     #[test]
     fn namespace_match_passes_through() {
-        let mut t = Tracker::new(8, EvictionPolicy::Strict);
+        let mut t = Tracker::new(8, EvictionPolicy::Strict, DEFAULT_EVICTION_SCAN_WINDOW);
         let threshold_ns = 100;
         let _ = t.record(
             &frame(7, 1),
@@ -1408,7 +1470,7 @@ mod tests {
     /// `Some → None` regression on a same-pid rebind is a conflict.
     #[test]
     fn namespace_some_to_none_is_conflict() {
-        let mut t = Tracker::new(8, EvictionPolicy::Strict);
+        let mut t = Tracker::new(8, EvictionPolicy::Strict, DEFAULT_EVICTION_SCAN_WINDOW);
         let threshold_ns = 100;
         let _ = t.record(
             &frame(7, 1),
@@ -1433,7 +1495,7 @@ mod tests {
     /// whose `/proc/<pid>/ns/pid` was briefly unreadable at first contact.
     #[test]
     fn namespace_none_to_some_upgrades_in_place() {
-        let mut t = Tracker::new(8, EvictionPolicy::Strict);
+        let mut t = Tracker::new(8, EvictionPolicy::Strict, DEFAULT_EVICTION_SCAN_WINDOW);
         let threshold_ns = 100;
         let _ = t.record(
             &frame(7, 1),
@@ -1458,7 +1520,7 @@ mod tests {
     /// Both `None` (non-Linux / unreadable) → refresh, no conflict.
     #[test]
     fn namespace_both_none_is_match() {
-        let mut t = Tracker::new(8, EvictionPolicy::Strict);
+        let mut t = Tracker::new(8, EvictionPolicy::Strict, DEFAULT_EVICTION_SCAN_WINDOW);
         let threshold_ns = 100;
         let _ = t.record(
             &frame(7, 1),

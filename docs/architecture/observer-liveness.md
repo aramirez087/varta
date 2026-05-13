@@ -340,6 +340,40 @@ labels: { severity: critical }
 
 ---
 
+## Tracker bounded-work guarantee
+
+Each beat frame triggers at most one call to `find_evictable_slot` when the
+tracker is at capacity.  That call scans at most `eviction_scan_window` slots
+(default 256, configurable via `--eviction-scan-window`).
+
+**Per-frame slot reads ≤ eviction_scan_window.**
+
+A full table sweep — confirming every slot is ineligible — takes at most:
+
+```
+ceil(tracker_capacity / eviction_scan_window)
+```
+
+consecutive `record()` calls (the rotating cursor resumes where it stopped).
+
+With defaults (capacity = 256, window = 256) this is 1 call.  With
+`--tracker-capacity 4096 --eviction-scan-window 16` the sweep takes 256 calls —
+each individual call still reads ≤ 16 slots, so the per-frame beat-path cost
+stays bounded.
+
+The `varta_tracker_eviction_scan_window_max` gauge (set once at startup) exposes
+the configured window so dashboards can derive the worst-case sweep depth.
+Operators alert on `varta_tracker_eviction_scan_truncated_total` to detect when
+the cap engages under a unique-pid flood.
+
+Combine this bound with the iteration-budget WCET derivation above:
+
+```
+iteration_max ≤ read_timeout × N_listeners + eviction_scan_window × slot_read_ns
+```
+
+---
+
 ## Cross-references
 
 - [Safety profiles](safety-profiles.md) — compile-time vs. runtime feature

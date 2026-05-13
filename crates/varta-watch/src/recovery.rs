@@ -51,6 +51,25 @@ const O_NONBLOCK_FCNTL: i32 = 0x800;
     target_os = "dragonfly",
 ))]
 const O_NONBLOCK_FCNTL: i32 = 0x0004;
+
+#[cfg(any(target_os = "solaris", target_os = "illumos"))]
+const O_NONBLOCK_FCNTL: i32 = 0x80;
+
+#[cfg(not(any(
+    target_os = "linux",
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    target_os = "dragonfly",
+    target_os = "solaris",
+    target_os = "illumos",
+)))]
+compile_error!("O_NONBLOCK_FCNTL value is unknown for this target — add it to the cfg gates above");
+
+// F_GETFL = 3, F_SETFL = 4: IEEE Std 1003.1-2017 §<fcntl.h>. These values
+// are historically stable across every Unix in the wild; no cfg gating needed.
 const F_GETFL: i32 = 3;
 const F_SETFL: i32 = 4;
 

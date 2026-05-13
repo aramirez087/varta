@@ -44,6 +44,7 @@ mod inner {
         }
     }
 
+    #[cfg_attr(miri, ignore)] // JUSTIFY: miri cannot model process spawning (sh -c)
     #[test]
     fn recovery_cmd_fires_once_per_stall_within_debounce() {
         let marker = unique_tmp("marker");
@@ -89,6 +90,7 @@ mod inner {
         );
     }
 
+    #[cfg_attr(miri, ignore)] // JUSTIFY: miri cannot model process spawning (sh -c)
     #[test]
     fn recovery_cmd_template_receives_pid_as_dollar_one() {
         let log = unique_tmp("log");
@@ -134,6 +136,7 @@ mod inner {
     /// `on_stall` must return without waiting on the child. A template that
     /// would block for ≥ 1 s must still hand control back to the observer
     /// within 50 ms.
+    #[cfg_attr(miri, ignore)] // JUSTIFY: miri cannot model process spawning (sh -c)
     #[test]
     fn recovery_spawn_returns_within_50ms_for_slow_template() {
         let mut rec = Recovery::new("sleep 1".to_string(), Duration::ZERO);
@@ -150,6 +153,7 @@ mod inner {
     /// After a fast child exits, `try_reap` must surface a `Reaped` outcome
     /// whose `status` reflects success. The observer never blocks waiting
     /// for this transition.
+    #[cfg_attr(miri, ignore)] // JUSTIFY: miri cannot model process spawning (sh -c)
     #[test]
     fn recovery_try_reap_yields_reaped_for_completed_child() {
         let mut rec = Recovery::with_template_and_timeout("true".to_string(), Duration::ZERO, None);
@@ -183,6 +187,7 @@ mod inner {
     /// A child that outlives the configured `recovery_timeout` must be
     /// killed by `try_reap` and surface a `Killed` outcome carrying the
     /// child's pid.
+    #[cfg_attr(miri, ignore)] // JUSTIFY: miri cannot model process spawning (sh -c)
     #[test]
     fn recovery_try_reap_kills_after_timeout() {
         let mut rec = Recovery::with_template_and_timeout(
@@ -217,6 +222,7 @@ mod inner {
     /// Two distinct stalled pids spawned back-to-back must run in parallel:
     /// the wall-clock for the pair should be bounded by the slowest single
     /// child, not by the sum of their durations.
+    #[cfg_attr(miri, ignore)] // JUSTIFY: miri cannot model process spawning (sh -c)
     #[test]
     fn recovery_concurrent_pids_run_in_parallel() {
         let mut rec = Recovery::new("sleep 0.5".to_string(), Duration::ZERO);

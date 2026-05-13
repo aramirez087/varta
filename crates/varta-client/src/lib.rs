@@ -23,7 +23,7 @@ pub mod secure_transport;
 #[cfg(feature = "panic-handler")]
 pub mod panic;
 
-pub use client::{classify_send_error, BeatOutcome, Varta};
+pub use client::{classify_send_error, BeatError, BeatOutcome, Varta};
 pub use transport::{BeatTransport, UdsTransport};
 
 #[cfg(feature = "udp")]

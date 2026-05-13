@@ -309,6 +309,7 @@ fn run(cfg: Config) -> std::io::Result<()> {
         cfg.read_timeout,
         cfg.tracker_capacity,
         cfg.tracker_eviction_policy,
+        cfg.eviction_scan_window,
         cfg.max_beat_rate,
     )?
     .with_allow_cross_namespace(cfg.allow_cross_namespace_agents);
@@ -562,7 +563,7 @@ fn run(cfg: Config) -> std::io::Result<()> {
                     "internal: --prom-addr without --prom-token-file slipped past Config validation",
                 )
             })?;
-            let pe = PromExporter::bind_with_rate_limit(
+            let mut pe = PromExporter::bind_with_rate_limit(
                 addr,
                 token,
                 cfg.prom_rate_limit_per_sec,
@@ -570,6 +571,7 @@ fn run(cfg: Config) -> std::io::Result<()> {
             )?
             .with_iteration_budget(cfg.iteration_budget)
             .with_scrape_budget(cfg.scrape_budget);
+            pe.set_tracker_config(cfg.tracker_capacity, cfg.eviction_scan_window);
             if let Ok(bound_addr) = pe.local_addr() {
                 let line = format!("{bound_addr}\n");
                 let _ = std::io::stdout().lock().write_all(line.as_bytes());
