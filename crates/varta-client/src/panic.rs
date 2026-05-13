@@ -130,16 +130,16 @@ pub fn install_panic_handler_udp(addr: std::net::SocketAddr) {
 /// [`std::panic::take_hook`] and invokes it after firing the secure VLP frame.
 #[cfg(all(feature = "panic-handler", feature = "secure-udp"))]
 pub fn install_panic_handler_secure_udp(addr: std::net::SocketAddr, key: Key) {
-    use crate::secure_transport::{lcg_iv_random, read_iv_random};
+    use crate::secure_transport::{fallback_iv_random, read_iv_random};
     use varta_vlp::crypto::{self, NONCE_BYTES};
 
     let start = Instant::now();
     // Pre-compute the IV random prefix at install time — /dev/urandom
     // reads are not async-signal-safe and must not happen inside the
-    // panic hook.  If /dev/urandom is unavailable the multi-source
-    // lcg_iv_random() fallback is used — far stronger than a
-    // deterministic LCG but still not cryptographically secure.
-    let iv_random: [u8; 8] = read_iv_random().unwrap_or_else(|_| lcg_iv_random());
+    // panic hook.  If both getrandom/getentropy and /dev/urandom are
+    // unavailable, fallback_iv_random() provides a best-effort mix of
+    // time, PID, TID, and a counter — not cryptographically secure.
+    let iv_random: [u8; 8] = read_iv_random().unwrap_or_else(|_| fallback_iv_random());
     let prev = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         let _ = (|| {

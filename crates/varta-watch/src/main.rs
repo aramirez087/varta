@@ -16,7 +16,9 @@
 //! go to stderr — either plain `eprintln!` format (default) or JSON lines
 //! when the `json-log` feature is enabled.
 
-use std::io::Write;
+use std::fs::OpenOptions;
+use std::io::{self, Write};
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -43,7 +45,7 @@ use varta_watch::{
 static SHUTDOWN: AtomicBool = AtomicBool::new(false);
 
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd",))]
-unsafe fn install_signal_handlers() {
+unsafe fn install_signal_handlers() -> io::Result<()> {
     const SIGINT: i32 = 2;
     const SIGTERM: i32 = 15;
 
@@ -154,27 +156,44 @@ unsafe fn install_signal_handlers() {
         (*act.as_mut_ptr()).sa_flags = SA_RESTART;
     }
     let act = unsafe { act.assume_init() };
-    unsafe {
-        let _ = sigaction(SIGINT, &act, std::ptr::null_mut());
-        let _ = sigaction(SIGTERM, &act, std::ptr::null_mut());
-    }
+
+    let install = |sig: i32| -> io::Result<()> {
+        // SAFETY: `act` is a fully-initialised SigAction on the stack;
+        // passing null for oldact is permitted by POSIX.
+        let rc = unsafe { sigaction(sig, &act, std::ptr::null_mut()) };
+        if rc == -1 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(())
+        }
+    };
+    install(SIGINT)?;
+    install(SIGTERM)?;
+    Ok(())
 }
 
 #[cfg(all(
     unix,
     not(any(target_os = "linux", target_os = "macos", target_os = "freebsd",)),
 ))]
-unsafe fn install_signal_handlers() {
+unsafe fn install_signal_handlers() -> io::Result<()> {
     const SIGINT: i32 = 2;
     const SIGTERM: i32 = 15;
 
     extern "C" {
-        fn signal(signum: i32, handler: extern "C" fn(i32)) -> extern "C" fn(i32);
+        // Declared as *const () so we can compare against SIG_ERR = -1isize
+        // as a raw pointer value without a function-pointer-to-integer cast.
+        fn signal(signum: i32, handler: *const ()) -> *const ();
     }
 
     extern "C" fn handle(_sig: i32) {
         SHUTDOWN.store(true, Ordering::Release);
     }
+
+    // SIG_ERR is defined as `(void(*)(int))-1` in C99 §7.14.1.1 and POSIX.
+    // The all-ones pointer value is portable across the exotic-Unix set this
+    // branch covers.
+    let sig_err: *const () = (-1isize) as usize as *const ();
 
     // SAFETY: signal(2) fallback for exotic Unix targets whose sigaction(2)
     // struct layout is unknown (NetBSD, OpenBSD, illumos, etc.). On SysV
@@ -182,15 +201,51 @@ unsafe fn install_signal_handlers() {
     // but the shutdown latch stays set after the first signal — a repeated
     // signal becomes a SIG_DFL termination, which is acceptable during
     // shutdown.
-    unsafe {
-        let _ = signal(SIGINT, handle);
-        let _ = signal(SIGTERM, handle);
+    let prev = unsafe { signal(SIGINT, handle as *const ()) };
+    if prev == sig_err {
+        return Err(io::Error::last_os_error());
     }
+    let prev = unsafe { signal(SIGTERM, handle as *const ()) };
+    if prev == sig_err {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 #[cfg(not(unix))]
-unsafe fn install_signal_handlers() {
+unsafe fn install_signal_handlers() -> io::Result<()> {
     // No-op on non-Unix; --shutdown-after-secs remains the only exit path.
+    Ok(())
+}
+
+/// Write `contents` to `path` atomically via a same-directory tempfile + rename.
+///
+/// `rename(2)` is atomic on POSIX-compliant filesystems; a reader of `path`
+/// will observe either the previous complete file or the new complete file,
+/// never a partial write.  A `.<pid>.tmp` suffix keeps concurrent observers
+/// (misconfigured onto the same path) from clobbering each other's tempfile.
+/// If the rename fails the tempfile is removed before returning the error.
+fn write_heartbeat_atomic(path: &Path, contents: &[u8]) -> io::Result<()> {
+    let pid = std::process::id();
+    let mut tmp_os = path.as_os_str().to_owned();
+    tmp_os.push(format!(".{pid}.tmp"));
+    let tmp_path = PathBuf::from(tmp_os);
+
+    let result = (|| -> io::Result<()> {
+        let mut f = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&tmp_path)?;
+        f.write_all(contents)?;
+        drop(f);
+        std::fs::rename(&tmp_path, path)
+    })();
+
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp_path);
+    }
+    result
 }
 
 fn main() -> ExitCode {
@@ -220,7 +275,7 @@ fn run(cfg: Config) -> std::io::Result<()> {
     // the sole entry point of a single-threaded binary with no other libraries
     // that install their own SIGINT/SIGTERM handlers.
     unsafe {
-        install_signal_handlers();
+        install_signal_handlers()?;
     }
 
     let mut observer = Observer::bind(
@@ -665,7 +720,7 @@ fn run(cfg: Config) -> std::io::Result<()> {
         if let Some(ref hb_path) = cfg.heartbeat_file {
             let ts = observer.now_ns();
             let line = format!("{loop_count} {ts}\n");
-            if let Err(e) = std::fs::write(hb_path, line.as_bytes()) {
+            if let Err(e) = write_heartbeat_atomic(hb_path, line.as_bytes()) {
                 varta_error!("heartbeat file write error: {e}");
             }
         }
@@ -675,4 +730,116 @@ fn run(cfg: Config) -> std::io::Result<()> {
         let _ = fe.flush();
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::io::Read;
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    fn mk_tmpdir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("varta_hb_{}_{}", tag, std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        // Ensure the directory is accessible regardless of process umask.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        dir
+    }
+
+    #[test]
+    fn heartbeat_write_overwrites_existing() {
+        let dir = mk_tmpdir("overwrite");
+        let path = dir.join("hb.txt");
+        write_heartbeat_atomic(&path, b"1 100\n").unwrap();
+        write_heartbeat_atomic(&path, b"2 200\n").unwrap();
+        let contents = fs::read_to_string(&path).unwrap();
+        assert_eq!(contents, "2 200\n");
+    }
+
+    #[test]
+    fn heartbeat_write_is_atomic_under_reader_contention() {
+        let dir = mk_tmpdir("atomic");
+        let path = dir.join("hb.txt");
+        // Seed the file so the reader doesn't race a missing file.
+        write_heartbeat_atomic(&path, b"0 0\n").unwrap();
+
+        let bad_reads: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let bad_reads_r = bad_reads.clone();
+        let path_r = path.clone();
+
+        let reader = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + Duration::from_millis(300);
+            while std::time::Instant::now() < deadline {
+                let mut buf = String::new();
+                if let Ok(mut f) = fs::File::open(&path_r) {
+                    let _ = f.read_to_string(&mut buf);
+                    // Every successful read must be "<u64> <u64>\n" — two tokens.
+                    if !buf.is_empty() {
+                        let parts: Vec<&str> = buf.trim().split_whitespace().collect();
+                        if parts.len() != 2
+                            || parts[0].parse::<u64>().is_err()
+                            || parts[1].parse::<u64>().is_err()
+                        {
+                            bad_reads_r.lock().unwrap().push(buf.clone());
+                        }
+                    }
+                }
+                std::hint::spin_loop();
+            }
+        });
+
+        let deadline = std::time::Instant::now() + Duration::from_millis(300);
+        let mut n: u64 = 1;
+        while std::time::Instant::now() < deadline {
+            let line = format!("{n} {}\n", n * 1000);
+            write_heartbeat_atomic(&path, line.as_bytes()).unwrap();
+            n += 1;
+        }
+
+        reader.join().unwrap();
+        let bad = bad_reads.lock().unwrap();
+        assert!(
+            bad.is_empty(),
+            "saw {} truncated/malformed heartbeat read(s): {:?}",
+            bad.len(),
+            &*bad
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn signal_handler_returns_ok_under_normal_conditions() {
+        // Verifies the new error-propagation path doesn't misclassify success.
+        // SAFETY: single-threaded test process; no other signal handlers active.
+        let result = unsafe { install_signal_handlers() };
+        assert!(
+            result.is_ok(),
+            "install_signal_handlers failed: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn heartbeat_tempfile_cleaned_on_rename_failure() {
+        let dir = mk_tmpdir("cleanup");
+        // Point the target path at a directory that doesn't exist so the
+        // rename will fail (the parent dir is missing).
+        let target = dir.join("nonexistent_subdir").join("hb.txt");
+        let result = write_heartbeat_atomic(&target, b"1 100\n");
+        assert!(result.is_err());
+        // The tempfile should have been removed.
+        let pid = std::process::id();
+        let tmp = PathBuf::from(format!("{}.{pid}.tmp", target.display()));
+        assert!(
+            !tmp.exists(),
+            "stale tempfile left behind: {}",
+            tmp.display()
+        );
+    }
 }

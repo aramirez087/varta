@@ -955,16 +955,14 @@ fn recovery_audit_log_records_spawn_and_complete() {
     let complete_needle = format!("\tcomplete\t{agent_pid}\t");
     let mut last_body = String::new();
     let satisfied = wait_until(
-        || {
-            match std::fs::read_to_string(&audit_path) {
-                Ok(body) => {
-                    let has_spawn = body.contains(&spawn_needle);
-                    let has_complete = body.contains(&complete_needle);
-                    last_body = body;
-                    has_spawn && has_complete
-                }
-                Err(_) => false,
+        || match std::fs::read_to_string(&audit_path) {
+            Ok(body) => {
+                let has_spawn = body.contains(&spawn_needle);
+                let has_complete = body.contains(&complete_needle);
+                last_body = body;
+                has_spawn && has_complete
             }
+            Err(_) => false,
         },
         Duration::from_secs(5),
     );

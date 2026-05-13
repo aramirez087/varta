@@ -190,13 +190,98 @@ impl BeatTransport for SecureUdpTransport {
     }
 }
 
-/// Read a cryptographically-random 8-byte IV prefix from `/dev/urandom`.
+// --- OS-level random bytes via kernel syscall ---------------------------
+//
+// `os_random` tries the most direct kernel interface first (`getrandom(2)`
+// on Linux, `getentropy(3)` on macOS/BSD).  These do not require a mounted
+// `/dev`, so they work inside chroots and stripped containers where
+// `/dev/urandom` may be absent.  `read_iv_random` falls through to
+// `/dev/urandom` only when `os_random` fails.
+
+#[cfg(target_os = "linux")]
+#[allow(unsafe_code)]
+fn os_random(buf: &mut [u8]) -> io::Result<()> {
+    extern "C" {
+        // glibc 2.25+ / musl 1.1.20+ wraps the getrandom(2) syscall.
+        fn getrandom(buf: *mut u8, buflen: usize, flags: u32) -> isize;
+    }
+    // flags = 0: block until the entropy pool is initialised (correct for
+    // connect-time calls that are never on the beat path). EINTR is retried;
+    // ENOSYS (kernel < 3.17) propagates and the caller falls through to
+    // /dev/urandom.
+    //
+    // SAFETY: `buf` is a valid slice of `buf.len()` bytes; getrandom writes
+    // at most `buflen` bytes and returns the number written on success.
+    let mut filled = 0usize;
+    while filled < buf.len() {
+        let n = unsafe { getrandom(buf.as_mut_ptr().add(filled), buf.len() - filled, 0) };
+        if n < 0 {
+            let e = io::Error::last_os_error();
+            if e.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(e);
+        }
+        filled += n as usize;
+    }
+    Ok(())
+}
+
+#[cfg(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    target_os = "dragonfly",
+))]
+#[allow(unsafe_code)]
+fn os_random(buf: &mut [u8]) -> io::Result<()> {
+    extern "C" {
+        // Available since macOS 10.12, FreeBSD 12, NetBSD 10, OpenBSD 5.6.
+        fn getentropy(buf: *mut u8, buflen: usize) -> i32;
+    }
+    // getentropy(3) requires buflen <= 256.  Both call sites request 4 or 8
+    // bytes, so this assertion is always satisfied.
+    assert!(buf.len() <= 256, "getentropy: buflen must be <= 256");
+    // SAFETY: `buf` is a valid slice; getentropy writes exactly `buflen`
+    // bytes on success.
+    let rc = unsafe { getentropy(buf.as_mut_ptr(), buf.len()) };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+#[cfg(not(any(
+    target_os = "linux",
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    target_os = "dragonfly",
+)))]
+fn os_random(_buf: &mut [u8]) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "no OS random source on this platform",
+    ))
+}
+
+// -----------------------------------------------------------------------
+
+/// Read a cryptographically-random 8-byte IV prefix.
 ///
 /// Called once at `connect()` / `reconnect()` time — never on the beat path.
-/// The returned `[u8; 8]` is suitable as the `iv_random` prefix for ChaCha20-
-/// Poly1305 AEAD nonce construction.
+/// Tries `getrandom(2)` / `getentropy(3)` first (no `/dev` mount required),
+/// then falls back to `/dev/urandom`.
 pub(crate) fn read_iv_random() -> io::Result<[u8; 8]> {
     let mut buf = [0u8; 8];
+    if os_random(&mut buf).is_ok() {
+        return Ok(buf);
+    }
     std::fs::File::open("/dev/urandom").and_then(|mut f| {
         use std::io::Read;
         f.read_exact(&mut buf)
@@ -204,49 +289,64 @@ pub(crate) fn read_iv_random() -> io::Result<[u8; 8]> {
     Ok(buf)
 }
 
-/// Read 4 cryptographically-random bytes from `/dev/urandom`.
+/// Read 4 cryptographically-random bytes for the master-key IV prefix.
 ///
-/// Used for the random component of the IV prefix in master-key mode,
-/// alongside the 4-byte PID prefix.
+/// Used alongside the 4-byte PID prefix in master-key mode. Tries
+/// `getrandom(2)` / `getentropy(3)` first, then falls back to `/dev/urandom`.
 fn read_iv_random_prefix_4() -> io::Result<[u8; 4]> {
     let mut buf = [0u8; 4];
+    if os_random(&mut buf).is_ok() {
+        return Ok(buf);
+    }
     std::fs::File::open("/dev/urandom").and_then(|mut f| {
         use std::io::Read;
         f.read_exact(&mut buf)
     })?;
     Ok(buf)
 }
-/// Deterministic 8-byte IV prefix for non-cryptographic use.
+
+/// Hashed 8-byte IV prefix — last-resort fallback for the panic hook.
 ///
-/// This is the panic-hook fallback used when `/dev/urandom` is unavailable
-/// (e.g. inside a chroot or container without `/dev`).  It mixes multiple
-/// entropy sources through Rust's `DefaultHasher` (SipHash-2-4 with a
-/// per-thread `RandomState` key seeded from OS entropy) to produce IVs
-/// that are unpredictable to an observer who cannot see the process's
-/// address space.
+/// Reached only when both `getrandom(2)`/`getentropy(3)` and `/dev/urandom`
+/// fail (typically: extremely constrained embedded environments).  Mixes
+/// multiple entropy sources through a `RandomState`-keyed SipHash-2-4
+/// hasher:
 ///
-/// **Not cryptographically secure** — the `RandomState` key is a fixed
-/// per-thread secret, not a stream cipher.  Deployments that rely on
-/// secure-UDP confidentiality **must** ensure `/dev/urandom` is
-/// available.  This fallback is a last-resort measure that is far
-/// stronger than the previously-used deterministic LCG.
-pub(crate) fn lcg_iv_random() -> [u8; 8] {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
+/// * `RandomState::new()` uses OS entropy for its key on most platforms; even
+///   where it falls back to a deterministic startup seed, the time deltas and
+///   counter below keep successive calls distinct.
+/// * Monotonic elapsed time since the first call (high-resolution).
+/// * Wall-clock nanos (independent entropy axis).
+/// * PID + TID + monotonic call counter.
+///
+/// **Stack-address entropy deliberately omitted**: it contributes zero bits on
+/// no-ASLR platforms (QNX, VxWorks, some RTOS), which are exactly the
+/// deployments that reach this fallback.
+///
+/// **Not cryptographically secure.**  Use only when the above sources are
+/// unavailable.
+pub(crate) fn fallback_iv_random() -> [u8; 8] {
+    use std::collections::hash_map::RandomState;
+    use std::hash::{BuildHasher, Hash, Hasher};
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::OnceLock;
+    use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
     static SEQ: AtomicU64 = AtomicU64::new(0);
+    static START: OnceLock<Instant> = OnceLock::new();
 
-    let mut hasher = DefaultHasher::new();
-    // PID — varies per process.
+    let mut hasher = RandomState::new().build_hasher();
     std::process::id().hash(&mut hasher);
-    // Atomic counter — unique across calls within this process.
-    SEQ.fetch_add(1, Ordering::Relaxed).hash(&mut hasher);
-    // Address of a stack variable — ASLR entropy.
-    let stack_dummy: u8 = 0;
-    (&stack_dummy as *const u8 as usize).hash(&mut hasher);
-    // Thread ID — per-thread uniqueness.
     std::thread::current().id().hash(&mut hasher);
+    SEQ.fetch_add(1, Ordering::Relaxed).hash(&mut hasher);
+    START
+        .get_or_init(Instant::now)
+        .elapsed()
+        .as_nanos()
+        .hash(&mut hasher);
+    if let Ok(d) = SystemTime::now().duration_since(UNIX_EPOCH) {
+        d.as_nanos().hash(&mut hasher);
+    }
 
     hasher.finish().to_le_bytes()
 }
@@ -262,5 +362,35 @@ mod tests {
         let key = Key::from_bytes([0x42; 32]);
         let result = SecureUdpTransport::connect(addr, key);
         assert!(result.is_ok(), "IPv6 connect failed: {:?}", result.err());
+    }
+
+    #[test]
+    fn fallback_iv_random_unique_across_calls() {
+        use std::collections::HashSet;
+        let outputs: HashSet<[u8; 8]> = (0..1000).map(|_| fallback_iv_random()).collect();
+        assert_eq!(
+            outputs.len(),
+            1000,
+            "collisions detected in fallback_iv_random"
+        );
+    }
+
+    #[test]
+    fn os_random_yields_distinct_outputs() {
+        let mut a = [0u8; 32];
+        let mut b = [0u8; 32];
+        match (os_random(&mut a), os_random(&mut b)) {
+            (Ok(()), Ok(())) => assert_ne!(a, b, "os_random returned identical outputs"),
+            (Err(e), _) | (_, Err(e)) if e.kind() == io::ErrorKind::Unsupported => {}
+            (Err(e), _) | (_, Err(e)) => panic!("os_random failed: {e}"),
+        }
+    }
+
+    #[test]
+    fn read_iv_random_succeeds() {
+        assert!(
+            read_iv_random().is_ok(),
+            "read_iv_random failed on this platform"
+        );
     }
 }
