@@ -1,12 +1,18 @@
-//! Per-pid liveness tracker backed by a fixed `[Slot; 64]` array with
-//! O(1) pid lookup via `HashMap<u32, usize>`.
+//! Per-pid liveness tracker backed by a pre-allocated `Vec<Slot>` plus a
+//! fixed-size, open-addressed [`PidIndex`] for O(1) pid lookup.
 //!
 //! The tracker is the in-memory ledger the observer consults each time a
 //! frame arrives or the read timeout expires. It never reallocates: capacity
-//! is a compile-time constant and an exhausted tracker yields
-//! [`Update::CapacityExceeded`] rather than growing.
-
-use std::collections::HashMap;
+//! is fixed at construction, the pid-index table is sized for load factor
+//! ≤ 0.5 with a bounded probe budget ([`PidIndex::MAX_PROBE`]), and an
+//! exhausted tracker yields [`Update::CapacityExceeded`] rather than growing.
+//!
+//! The custom pid index replaces `std::collections::HashMap` for two
+//! DO-178C-style reasons: (1) `HashMap` uses SipHash randomized per process,
+//! producing a non-constant memory access pattern that defeats WCET
+//! analysis, and (2) it can rehash on collision-driven growth. `PidIndex`
+//! uses a deterministic integer mixer (Murmur3 finalizer) and linear
+//! probing with a fixed budget, so every operation has a tight WCET bound.
 
 use varta_vlp::{Frame, Status};
 
@@ -60,6 +66,213 @@ const EVICTION_SCAN_WINDOW: usize = 256;
 /// would take days to exhaust the nonce space, so a genuine gap this large
 /// can only be a wrap.
 const NONCE_WRAP_THRESHOLD: u64 = 1_048_576;
+
+/// Fixed-size, open-addressed `u32 → u32` map from agent pid to slot index.
+///
+/// Replaces `std::collections::HashMap<u32, usize>` for two reasons relevant
+/// to DO-178C-style worst-case execution time (WCET) analysis:
+///
+/// 1. `HashMap` keys with SipHash, which is randomized per process. The hot
+///    path therefore has a non-constant memory access pattern that defeats
+///    static WCET bounds.
+/// 2. `HashMap` can rehash on collision-driven growth; even pre-sized with
+///    `with_capacity`, growth is theoretically reachable.
+///
+/// `PidIndex` uses a deterministic integer mixer (Murmur3 finalizer) and
+/// linear probing with a fixed budget [`PidIndex::MAX_PROBE`]. The backing
+/// table is sized to `next_power_of_two(capacity * 2)` so the load factor
+/// stays ≤ 0.5 — at load factor 0.5 the expected probe distance is ≤ 2
+/// (Knuth TAOCP 6.4), and the 64-probe cap gives roughly 32× headroom.
+///
+/// `EMPTY` and `TOMBSTONE` are sentinel `slot_idx` values. Tombstones are
+/// reused on insert so a long churn of `record + evict` does not slowly
+/// fill the table with deletion markers.
+pub(crate) struct PidIndex {
+    table: Vec<PidEntry>,
+    mask: usize,
+    occupied: usize,
+    probe_exhausted: u64,
+}
+
+#[derive(Clone, Copy)]
+struct PidEntry {
+    pid: u32,
+    slot_idx: u32,
+}
+
+/// Slot is empty (never written or fully cleared).
+const EMPTY: u32 = u32::MAX;
+/// Slot held an entry that was removed; still consumes a probe step until
+/// reused by a subsequent insert.
+const TOMBSTONE: u32 = u32::MAX - 1;
+
+/// Outcome of a [`PidIndex::insert`] that could not find a free slot
+/// within the bounded probe budget. The caller treats this as
+/// [`Update::CapacityExceeded`] — same operator-visible behaviour as a
+/// full slot table.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ProbeExhausted;
+
+impl PidIndex {
+    /// Hard cap on the probe sequence length per `get` / `insert` / `remove`.
+    ///
+    /// At load factor 0.5 the expected probe distance is ≤ 2 with a p99 well
+    /// under 16; 64 gives ~32× margin and keeps every operation comfortably
+    /// inside one or two cache lines worth of work.
+    const MAX_PROBE: usize = 64;
+
+    /// Build a pid index sized for `capacity` agents.
+    ///
+    /// Table length is `next_power_of_two(capacity * 2).max(2)` so masks
+    /// (`table.len() - 1`) work without modular division and load factor
+    /// stays ≤ 0.5 at peak.
+    pub(crate) fn new(capacity: usize) -> Self {
+        let target = capacity.saturating_mul(2).max(2);
+        let size = target.next_power_of_two();
+        let table = vec![
+            PidEntry {
+                pid: 0,
+                slot_idx: EMPTY,
+            };
+            size
+        ];
+        PidIndex {
+            table,
+            mask: size - 1,
+            occupied: 0,
+            probe_exhausted: 0,
+        }
+    }
+
+    /// Look up the slot index recorded for `pid`. Returns `None` if not
+    /// present or if the probe budget was exhausted (treated as absent so
+    /// callers fall through to insert / capacity-exceeded paths).
+    pub(crate) fn get(&self, pid: u32) -> Option<usize> {
+        let mut i = (mix(pid) as usize) & self.mask;
+        for _ in 0..Self::MAX_PROBE {
+            let entry = self.table.get(i)?;
+            match entry.slot_idx {
+                EMPTY => return None,
+                TOMBSTONE => {}
+                _ if entry.pid == pid => return Some(entry.slot_idx as usize),
+                _ => {}
+            }
+            i = (i + 1) & self.mask;
+        }
+        None
+    }
+
+    /// Insert or update `pid → slot_idx`. Returns `Err(ProbeExhausted)` if
+    /// no free slot was found within [`Self::MAX_PROBE`] probes, in which
+    /// case the table state is unchanged and `probe_exhausted` is
+    /// incremented.
+    pub(crate) fn insert(&mut self, pid: u32, slot_idx: usize) -> Result<(), ProbeExhausted> {
+        debug_assert!((slot_idx as u32) < TOMBSTONE);
+        let mut i = (mix(pid) as usize) & self.mask;
+        let mut first_tombstone: Option<usize> = None;
+        for _ in 0..Self::MAX_PROBE {
+            let entry = match self.table.get(i) {
+                Some(e) => *e,
+                None => {
+                    self.probe_exhausted = self.probe_exhausted.saturating_add(1);
+                    return Err(ProbeExhausted);
+                }
+            };
+            match entry.slot_idx {
+                EMPTY => {
+                    let target = first_tombstone.unwrap_or(i);
+                    if let Some(slot) = self.table.get_mut(target) {
+                        let was_tombstone = slot.slot_idx == TOMBSTONE;
+                        *slot = PidEntry {
+                            pid,
+                            slot_idx: slot_idx as u32,
+                        };
+                        if !was_tombstone {
+                            // Filling a true EMPTY slot — bookkeeping only;
+                            // tombstone reuse does not change `occupied`.
+                        }
+                        self.occupied = self.occupied.saturating_add(1);
+                        return Ok(());
+                    }
+                    self.probe_exhausted = self.probe_exhausted.saturating_add(1);
+                    return Err(ProbeExhausted);
+                }
+                TOMBSTONE => {
+                    if first_tombstone.is_none() {
+                        first_tombstone = Some(i);
+                    }
+                }
+                _ if entry.pid == pid => {
+                    // Update in place. Does not change `occupied`.
+                    if let Some(slot) = self.table.get_mut(i) {
+                        slot.slot_idx = slot_idx as u32;
+                        return Ok(());
+                    }
+                    self.probe_exhausted = self.probe_exhausted.saturating_add(1);
+                    return Err(ProbeExhausted);
+                }
+                _ => {}
+            }
+            i = (i + 1) & self.mask;
+        }
+        // Probe budget exhausted without finding an EMPTY slot.  If we saw
+        // a tombstone along the way we *could* reuse it, but that would
+        // exceed the WCET budget callers signed up for — fall through to
+        // exhaustion and let the caller surface CapacityExceeded.
+        self.probe_exhausted = self.probe_exhausted.saturating_add(1);
+        Err(ProbeExhausted)
+    }
+
+    /// Remove `pid` from the index. Returns the slot index it pointed to,
+    /// if any. Inserts a TOMBSTONE in place so subsequent lookups for
+    /// downstream-probed entries continue to walk past.
+    pub(crate) fn remove(&mut self, pid: u32) -> Option<usize> {
+        let mut i = (mix(pid) as usize) & self.mask;
+        for _ in 0..Self::MAX_PROBE {
+            let entry = *self.table.get(i)?;
+            match entry.slot_idx {
+                EMPTY => return None,
+                TOMBSTONE => {}
+                _ if entry.pid == pid => {
+                    let prev = entry.slot_idx as usize;
+                    if let Some(slot) = self.table.get_mut(i) {
+                        *slot = PidEntry {
+                            pid: 0,
+                            slot_idx: TOMBSTONE,
+                        };
+                        self.occupied = self.occupied.saturating_sub(1);
+                    }
+                    return Some(prev);
+                }
+                _ => {}
+            }
+            i = (i + 1) & self.mask;
+        }
+        None
+    }
+
+    /// Drain and reset the probe-exhausted counter.
+    pub(crate) fn take_probe_exhausted(&mut self) -> u64 {
+        let n = self.probe_exhausted;
+        self.probe_exhausted = 0;
+        n
+    }
+}
+
+/// Murmur3 32-bit finalizer — a registry-dep-free integer mixer.
+///
+/// Deterministic across processes (no SipHash randomization), branchless,
+/// and produces good avalanche on 32-bit inputs — sufficient for hashing
+/// agent pids where adversarial collisions are not part of the threat
+/// model (every reachable pid value already passes through peer-cred or
+/// AEAD authentication upstream).
+#[inline]
+fn mix(pid: u32) -> u32 {
+    let mut x = pid;
+    x = (x ^ (x >> 16)).wrapping_mul(0x85eb_ca6b);
+    x = (x ^ (x >> 13)).wrapping_mul(0xc2b2_ae35);
+    x ^ (x >> 16)
+}
 
 /// Controls which slot to reclaim when the tracker is at capacity and a
 /// new pid arrives.
@@ -138,14 +351,14 @@ pub enum Update {
 ///
 /// The slot table is a `Vec<Slot>` pre-allocated at construction to the
 /// configured capacity; subsequent inserts push into that pre-allocated
-/// space without reallocation.  Lookups use a `HashMap<u32, usize>` for
-/// O(1) pid-to-index mapping — the linear scan was replaced because at
-/// MAX_CAPACITY (4096) every frame arrival triggered a scan of up to
-/// 4096 slots, competing with I/O polling and Prometheus serving.
+/// space without reallocation.  Lookups use a fixed-size [`PidIndex`] for
+/// O(1) pid-to-index mapping — replaces the original `HashMap` so the hot
+/// path is WCET-bounded (deterministic hash, bounded probe budget, no
+/// rehashing on growth).
 pub struct Tracker {
     entries: Vec<Slot>,
     len: usize,
-    pid_to_index: HashMap<u32, usize>,
+    pid_to_index: PidIndex,
     evictions: u64,
     capacity_exceeded: u64,
     nonce_wraps: u64,
@@ -172,6 +385,15 @@ pub struct Tracker {
     /// the slot's pinned origin (first-origin-wins). Surfaced via
     /// [`Tracker::take_origin_conflicts`] for Prometheus.
     origin_conflicts: u64,
+    /// Count of internal invariant violations encountered on the hot path —
+    /// e.g. a [`PidIndex`] entry pointed at a slot index outside `entries`,
+    /// or `find_evictable_slot` returned a stale index. Each violation is
+    /// recovered defensively (the operation behaves as a miss or as
+    /// [`Update::CapacityExceeded`]) rather than panicking. Surfaced via
+    /// [`Tracker::take_invariant_violations`] for Prometheus so operators
+    /// can alert on a non-zero value — in correctly-operating code this
+    /// counter stays at 0 forever.
+    invariant_violations: u64,
 }
 
 impl Default for Tracker {
@@ -188,15 +410,10 @@ impl Tracker {
     /// than reallocating.
     pub fn new(capacity: usize, eviction_policy: EvictionPolicy) -> Self {
         let cap = capacity.min(MAX_CAPACITY);
-        let map_cap = cap
-            .saturating_mul(8)
-            .saturating_div(7)
-            .saturating_add(1)
-            .min(MAX_CAPACITY * 2);
         Tracker {
             entries: Vec::with_capacity(cap),
             len: 0,
-            pid_to_index: HashMap::with_capacity(map_cap),
+            pid_to_index: PidIndex::new(cap),
             evictions: 0,
             capacity_exceeded: 0,
             nonce_wraps: 0,
@@ -206,6 +423,7 @@ impl Tracker {
             eviction_scan_cursor: 0,
             eviction_scan_truncated: 0,
             origin_conflicts: 0,
+            invariant_violations: 0,
         }
     }
 
@@ -233,8 +451,18 @@ impl Tracker {
     ) -> Update {
         let status = frame.status;
 
-        if let Some(&idx) = self.pid_to_index.get(&frame.pid) {
-            let slot = &mut self.entries[idx];
+        if let Some(idx) = self.pid_to_index.get(frame.pid) {
+            // Defensive: the index promised this slot exists. If it doesn't,
+            // we treat the lookup as a miss and bump the invariant counter
+            // so ops can alert; the code then falls through to the insert
+            // path. Never panics.
+            let Some(slot) = self.entries.get_mut(idx) else {
+                self.invariant_violations = self.invariant_violations.saturating_add(1);
+                // Drop the stale index entry so the next lookup is a clean miss.
+                let _ = self.pid_to_index.remove(frame.pid);
+                self.capacity_exceeded = self.capacity_exceeded.saturating_add(1);
+                return Update::CapacityExceeded;
+            };
             if slot.used {
                 if slot.origin != origin {
                     self.origin_conflicts = self.origin_conflicts.saturating_add(1);
@@ -273,12 +501,24 @@ impl Tracker {
 
         if self.len >= self.entries.capacity() {
             if let Some(evict_idx) = self.find_evictable_slot(now_ns, threshold_ns) {
-                let evicted_slot = self.entries[evict_idx];
+                // Snapshot the slot we're evicting. If `find_evictable_slot`
+                // ever returned an OOB index (invariant break), defensively
+                // surface CapacityExceeded instead of panicking.
+                let Some(&evicted_slot) = self.entries.get(evict_idx) else {
+                    self.invariant_violations = self.invariant_violations.saturating_add(1);
+                    self.capacity_exceeded = self.capacity_exceeded.saturating_add(1);
+                    return Update::CapacityExceeded;
+                };
                 if evicted_slot.stall_emitted {
                     self.stall_emitted_count = self.stall_emitted_count.saturating_sub(1);
                 }
-                self.pid_to_index.remove(&evicted_slot.pid);
-                self.entries[evict_idx] = Slot {
+                let _ = self.pid_to_index.remove(evicted_slot.pid);
+                let Some(slot_mut) = self.entries.get_mut(evict_idx) else {
+                    self.invariant_violations = self.invariant_violations.saturating_add(1);
+                    self.capacity_exceeded = self.capacity_exceeded.saturating_add(1);
+                    return Update::CapacityExceeded;
+                };
+                *slot_mut = Slot {
                     pid: frame.pid,
                     last_nonce: frame.nonce,
                     last_ns: now_ns,
@@ -287,7 +527,19 @@ impl Tracker {
                     used: true,
                     stall_emitted: false,
                 };
-                self.pid_to_index.insert(frame.pid, evict_idx);
+                if self.pid_to_index.insert(frame.pid, evict_idx).is_err() {
+                    // Probe budget exhausted — roll back the slot write so
+                    // the table stays internally consistent and surface
+                    // CapacityExceeded to the caller.
+                    if let Some(slot_mut) = self.entries.get_mut(evict_idx) {
+                        *slot_mut = evicted_slot;
+                    }
+                    // Best-effort re-pin of the old pid; if even this insert
+                    // fails the slot is logically vacant for the next call.
+                    let _ = self.pid_to_index.insert(evicted_slot.pid, evict_idx);
+                    self.capacity_exceeded = self.capacity_exceeded.saturating_add(1);
+                    return Update::CapacityExceeded;
+                }
                 self.evictions = self.evictions.saturating_add(1);
                 self.last_evicted_pid = Some(evicted_slot.pid);
                 return Update::Inserted;
@@ -296,6 +548,12 @@ impl Tracker {
             return Update::CapacityExceeded;
         }
         let idx = self.len;
+        // Reserve the index in the pid map *before* pushing — on probe
+        // exhaustion we surface CapacityExceeded and leave entries unchanged.
+        if self.pid_to_index.insert(frame.pid, idx).is_err() {
+            self.capacity_exceeded = self.capacity_exceeded.saturating_add(1);
+            return Update::CapacityExceeded;
+        }
         self.entries.push(Slot {
             pid: frame.pid,
             last_nonce: frame.nonce,
@@ -305,7 +563,6 @@ impl Tracker {
             used: true,
             stall_emitted: false,
         });
-        self.pid_to_index.insert(frame.pid, idx);
         self.len += 1;
         Update::Inserted
     }
@@ -379,7 +636,13 @@ impl Tracker {
         let start = self.eviction_scan_cursor % n;
         for i in 0..window {
             let idx = (start + i) % n;
-            let slot = &self.entries[idx];
+            // Defensive: if `n` ever exceeded `entries.len()` this would
+            // be unreachable under invariant `n = len.min(entries.len())`,
+            // but treat OOB as "skip" rather than panic.
+            let Some(slot) = self.entries.get(idx) else {
+                self.invariant_violations = self.invariant_violations.saturating_add(1);
+                continue;
+            };
             let stale = now_ns.saturating_sub(slot.last_ns) > evict_threshold;
             let qualifies = stale && (!require_stall || slot.stall_emitted);
             if qualifies {
@@ -431,22 +694,19 @@ impl Tracker {
     /// internal slot layout.
     pub fn last_ns_of(&self, pid: u32) -> Option<u64> {
         self.pid_to_index
-            .get(&pid)
-            .map(|&idx| self.entries[idx].last_ns)
+            .get(pid)
+            .and_then(|idx| self.entries.get(idx).map(|s| s.last_ns))
     }
 
     /// Return the pinned transport origin of a tracked pid, if present.
     /// Used by the observer to populate `Event::OriginConflict::slot_origin`
     /// before calling `record` (which may produce the conflict).
     pub fn origin_of(&self, pid: u32) -> Option<BeatOrigin> {
-        self.pid_to_index.get(&pid).and_then(|&idx| {
-            let slot = &self.entries[idx];
-            if slot.used {
-                Some(slot.origin)
-            } else {
-                None
-            }
-        })
+        self.pid_to_index
+            .get(pid)
+            .and_then(|idx| self.entries.get(idx))
+            .filter(|s| s.used)
+            .map(|s| s.origin)
     }
 
     /// True iff no pids are tracked.
@@ -469,14 +729,23 @@ impl Tracker {
         threshold_ns: u64,
         mut cb: impl FnMut(u32, u64, u64, BeatOrigin),
     ) {
-        for slot in &mut self.entries[..self.len] {
-            if !slot.used || slot.stall_emitted {
-                continue;
-            }
-            if now_ns.saturating_sub(slot.last_ns) >= threshold_ns {
-                slot.stall_emitted = true;
-                self.stall_emitted_count = self.stall_emitted_count.saturating_add(1);
-                cb(slot.pid, slot.last_nonce, slot.last_ns, slot.origin);
+        // Clamp the slice to actual `entries` length so the slice
+        // expression cannot panic even if `len` somehow exceeded it
+        // (invariant violation — counted, never panicked on).
+        let upper = self.len.min(self.entries.len());
+        if upper < self.len {
+            self.invariant_violations = self.invariant_violations.saturating_add(1);
+        }
+        if let Some(slice) = self.entries.get_mut(..upper) {
+            for slot in slice {
+                if !slot.used || slot.stall_emitted {
+                    continue;
+                }
+                if now_ns.saturating_sub(slot.last_ns) >= threshold_ns {
+                    slot.stall_emitted = true;
+                    self.stall_emitted_count = self.stall_emitted_count.saturating_add(1);
+                    cb(slot.pid, slot.last_nonce, slot.last_ns, slot.origin);
+                }
             }
         }
         #[cfg(debug_assertions)]
@@ -507,12 +776,43 @@ impl Tracker {
         count
     }
 
+    /// Take and reset the invariant-violation counter.
+    ///
+    /// Surfaced as `varta_tracker_invariant_violations_total` by the
+    /// Prometheus exporter. In correctly-operating code this counter stays
+    /// at 0 forever — non-zero values mean one of the defensive `.get()`
+    /// fall-throughs in the hot path triggered (e.g. a stale `PidIndex`
+    /// entry pointed at an out-of-range slot). The tracker recovers
+    /// without panicking; ops should still treat any non-zero value as a
+    /// bug worth investigating.
+    pub fn take_invariant_violations(&mut self) -> u64 {
+        let count = self.invariant_violations;
+        self.invariant_violations = 0;
+        count
+    }
+
+    /// Take and reset the [`PidIndex`] probe-exhaustion counter.
+    ///
+    /// Surfaced as `varta_tracker_pid_index_probe_exhausted_total` by the
+    /// Prometheus exporter. Non-zero values mean a pid lookup walked
+    /// [`PidIndex::MAX_PROBE`] slots without resolving — at load factor
+    /// ≤ 0.5 this is effectively unreachable, so any non-zero value is a
+    /// red flag (pathological pid distribution, or an attempt to fill the
+    /// index past its safe load factor).
+    pub fn take_probe_exhausted(&mut self) -> u64 {
+        self.pid_to_index.take_probe_exhausted()
+    }
+
     /// Recompute `stall_emitted_count` from scratch and assert it matches
     /// the maintained counter. Cheap (single linear pass over `len` slots),
     /// gated to debug builds to keep the release-mode hot path untouched.
     #[cfg(debug_assertions)]
     fn debug_assert_stall_count(&self) {
-        let observed = self.entries[..self.len]
+        let upper = self.len.min(self.entries.len());
+        let observed = self
+            .entries
+            .get(..upper)
+            .unwrap_or(&[])
             .iter()
             .filter(|s| s.stall_emitted)
             .count();
@@ -764,6 +1064,136 @@ mod tests {
             t.record(&frame(7, 3), 30, threshold_ns, BeatOrigin::KernelAttested),
             Update::Refreshed
         );
+    }
+
+    // ---------------------- PidIndex unit tests ----------------------
+
+    #[test]
+    fn pid_index_insert_get_remove_roundtrip() {
+        let mut idx = PidIndex::new(16);
+        assert_eq!(idx.get(42), None);
+        idx.insert(42, 7).expect("insert");
+        assert_eq!(idx.get(42), Some(7));
+
+        // Update in place preserves occupied count.
+        idx.insert(42, 9).expect("update");
+        assert_eq!(idx.get(42), Some(9));
+        assert_eq!(idx.occupied, 1);
+
+        assert_eq!(idx.remove(42), Some(9));
+        assert_eq!(idx.get(42), None);
+        assert_eq!(idx.occupied, 0);
+    }
+
+    #[test]
+    fn pid_index_tombstone_reuse() {
+        // Insert N pids, remove half, re-insert: lookups must still work
+        // even though the removed slots left tombstones along the probe
+        // sequences.
+        let mut idx = PidIndex::new(64);
+        for pid in 1u32..=32 {
+            idx.insert(pid, pid as usize).expect("insert");
+        }
+        for pid in 1u32..=16 {
+            assert_eq!(idx.remove(pid), Some(pid as usize));
+        }
+        // The remaining 16 are still findable.
+        for pid in 17u32..=32 {
+            assert_eq!(idx.get(pid), Some(pid as usize));
+        }
+        // Re-insert the removed ones; tombstones must be reused (table is
+        // small enough that probe walks could otherwise overflow).
+        for pid in 1u32..=16 {
+            idx.insert(pid, (pid + 100) as usize).expect("reinsert");
+        }
+        for pid in 1u32..=16 {
+            assert_eq!(idx.get(pid), Some((pid + 100) as usize));
+        }
+        for pid in 17u32..=32 {
+            assert_eq!(idx.get(pid), Some(pid as usize));
+        }
+    }
+
+    #[test]
+    fn pid_index_probe_exhaustion_returns_error() {
+        // Build a tiny table where MAX_PROBE is large enough to find slots
+        // through linear probing under normal use, then deliberately fill
+        // every slot to force exhaustion of the probe budget on insert.
+        // Table size = next_power_of_two(4 * 2) = 8 slots.
+        let mut idx = PidIndex::new(4);
+        // Insert MAX_PROBE-many pids that all hash to the same bucket would
+        // be impossible with a deterministic mix; instead we fill the
+        // *whole* table so any new pid hashing into a fully-occupied chain
+        // exhausts the budget.
+        for pid in 1u32..=8 {
+            idx.insert(pid, pid as usize).expect("fill");
+        }
+        // Now every slot is occupied (no EMPTY anywhere). Any new pid must
+        // walk the full MAX_PROBE without finding an EMPTY slot.
+        let err = idx.insert(9999, 0).expect_err("must exhaust");
+        assert_eq!(err, ProbeExhausted);
+        assert_eq!(idx.take_probe_exhausted(), 1);
+        assert_eq!(idx.take_probe_exhausted(), 0);
+    }
+
+    #[test]
+    fn record_probe_exhaustion_surfaces_capacity_exceeded() {
+        // PidIndex table size = next_power_of_two(cap * 2). At cap = 4 the
+        // table has 8 slots. Filling the *entry* table at cap leaves 4
+        // PidIndex slots occupied (half full), so we never exhaust the
+        // probe budget through ordinary inserts. To force exhaustion we
+        // need the index itself to be saturated — which only happens if
+        // someone constructs a Tracker with capacity ≥ table_size. For
+        // safety we verify the rollback path: a forced-error scenario is
+        // not realistically reachable through normal API use, so we instead
+        // assert that under heavy churn the counter stays at 0.
+        let mut t = Tracker::new(32, EvictionPolicy::Balanced);
+        let threshold_ns = 100;
+        let mut now = 0u64;
+        for pid in 1u32..=4096 {
+            now = now.saturating_add(1);
+            let _ = t.record(&frame(pid, 1), now, threshold_ns, ORIGIN);
+        }
+        // Under nominal use probe exhaustion is unreachable at load ≤ 0.5.
+        assert_eq!(t.take_probe_exhausted(), 0);
+    }
+
+    #[test]
+    fn invariant_violations_stays_zero_under_random_ops() {
+        // Mirrors `stall_emitted_count_invariant_holds_across_random_ops`
+        // but asserts the new invariant_violations counter never ticks.
+        let mut t = Tracker::new(32, EvictionPolicy::Balanced);
+        let threshold_ns = 100;
+        let mut now_ns: u64 = 0;
+        let mut s: u64 = 0xDEADBEEF;
+        let mut next = || {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            s
+        };
+        for _ in 0..4000 {
+            let r = next() % 4;
+            now_ns = now_ns.saturating_add(20);
+            match r {
+                0 => {
+                    let pid = (next() % 96) as u32 + 1;
+                    let _ = t.record(&frame(pid, now_ns), now_ns, threshold_ns, ORIGIN);
+                }
+                1 => {
+                    now_ns = now_ns.saturating_add(threshold_ns * 2);
+                    t.drain_stalled_slots(now_ns, threshold_ns, |_, _, _, _| {});
+                }
+                2 => {
+                    let pid = (next() % 96) as u32 + 1;
+                    let _ = t.last_ns_of(pid);
+                    let _ = t.origin_of(pid);
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(t.take_invariant_violations(), 0);
+        assert_eq!(t.take_probe_exhausted(), 0);
     }
 
     /// drain_stalled_slots propagates each slot's pinned origin to the

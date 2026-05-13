@@ -786,6 +786,20 @@ fn run(cfg: Config) -> std::io::Result<()> {
             }
         }
 
+        let tracker_invariants = observer.drain_invariant_violations();
+        if tracker_invariants > 0 {
+            if let Some(pe) = prom_export.as_mut() {
+                pe.record_tracker_invariant_violations(tracker_invariants);
+            }
+        }
+
+        let probe_exhausted = observer.drain_pid_index_probe_exhausted();
+        if probe_exhausted > 0 {
+            if let Some(pe) = prom_export.as_mut() {
+                pe.record_tracker_pid_index_probe_exhausted(probe_exhausted);
+            }
+        }
+
         // Reap completed or timeout-exceeded children each tick.
         if let Some(rec) = recovery.as_mut() {
             for outcome in rec.try_reap() {

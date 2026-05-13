@@ -420,6 +420,21 @@ impl Observer {
         self.tracker.take_origin_conflicts()
     }
 
+    /// Drain and reset the tracker invariant-violation counter. Non-zero
+    /// values surface that a defensive fall-through in the hot path
+    /// triggered (e.g. a stale `PidIndex` entry pointed at an out-of-range
+    /// slot). Exposed as `varta_tracker_invariant_violations_total`.
+    pub fn drain_invariant_violations(&mut self) -> u64 {
+        self.tracker.take_invariant_violations()
+    }
+
+    /// Drain and reset the `PidIndex` probe-exhaustion counter — number of
+    /// times a pid lookup ran the full `MAX_PROBE` budget without finding
+    /// a match. Surfaced as `varta_tracker_pid_index_probe_exhausted_total`.
+    pub fn drain_pid_index_probe_exhausted(&mut self) -> u64 {
+        self.tracker.take_probe_exhausted()
+    }
+
     /// Drain and reset the rate-limited counter.
     pub fn drain_rate_limited(&mut self) -> u64 {
         let n = self.rate_limited_total;

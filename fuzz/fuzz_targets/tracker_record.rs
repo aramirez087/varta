@@ -1,12 +1,13 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use varta_watch::tracker::{EvictionPolicy, Tracker, Update};
+use varta_watch::peer_cred::BeatOrigin;
+use varta_watch::tracker::{EvictionPolicy, Tracker};
 
 fuzz_target!(|data: &[u8]| {
-    // Each record call consumes 37 bytes of input:
-    //   pid(4) + nonce(8) + status_raw(1) + timestamp(8) + now_ns(8) + threshold_ns(8)
-    const RECORD_BYTES: usize = 37;
+    // Each record call consumes 38 bytes of input:
+    //   pid(4) + nonce(8) + status_raw(1) + timestamp(8) + now_ns(8) + threshold_ns(8) + origin(1)
+    const RECORD_BYTES: usize = 38;
 
     if data.is_empty() {
         return;
@@ -42,17 +43,24 @@ fuzz_target!(|data: &[u8]| {
             chunk[29], chunk[30], chunk[31], chunk[32],
             chunk[33], chunk[34], chunk[35], chunk[36],
         ]);
+        // Derive transport origin from the last byte so both variants are
+        // reachable and first-origin-wins / OriginConflict paths are exercised.
+        let origin = if chunk[37] & 0x01 == 0 {
+            BeatOrigin::KernelAttested
+        } else {
+            BeatOrigin::NetworkUnverified
+        };
 
         wall = wall.wrapping_add(1).max(now_ns);
 
         let frame = varta_vlp::Frame::new(status, pid, timestamp, nonce, 0);
 
-        let _update = tracker.record(&frame, wall, threshold_ns);
+        let _update = tracker.record(&frame, wall, threshold_ns, origin);
 
-        // Periodically drain stall iterators and counter reads so those
-        // code paths see a mixture of populated / empty trackers.
+        // Periodically drain stalled slots and counter reads so those code
+        // paths see a mixture of populated / empty trackers.
         if offset % 7 < 3 {
-            let _: Vec<_> = tracker.iter_stalled(wall, threshold_ns).collect();
+            tracker.drain_stalled_slots(wall, threshold_ns, |_, _, _, _| {});
             let _ = tracker.take_evictions();
             let _ = tracker.take_capacity_exceeded();
             let _ = tracker.len();
@@ -63,7 +71,9 @@ fuzz_target!(|data: &[u8]| {
     // Final invariants: counter reads must never panic on any tracker state.
     let _ = tracker.take_evictions();
     let _ = tracker.take_capacity_exceeded();
+    let _ = tracker.take_invariant_violations();
+    let _ = tracker.take_probe_exhausted();
     let _ = tracker.len();
     let _ = tracker.is_empty();
-    let _ = tracker.iter_stalled(wall, 1).collect::<Vec<_>>();
+    tracker.drain_stalled_slots(wall, 1, |_, _, _, _| {});
 });

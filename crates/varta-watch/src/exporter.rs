@@ -616,6 +616,16 @@ pub struct PromExporter {
     /// slot's pinned transport origin disagreed with the beat's origin.
     /// Surfaced as `varta_origin_conflict_total`.
     origin_conflict_total: u64,
+    /// Hot-path invariant violations recovered defensively by the tracker.
+    /// Surfaced as `varta_tracker_invariant_violations_total`; non-zero
+    /// values mean a `.get()` fall-through fired (stale index, OOB slot,
+    /// etc.) — the tracker recovered without panicking, but ops should
+    /// investigate.
+    tracker_invariant_violations_total: u64,
+    /// `PidIndex` lookups / inserts that walked the full `MAX_PROBE` budget
+    /// without resolving. Surfaced as
+    /// `varta_tracker_pid_index_probe_exhausted_total`.
+    tracker_pid_index_probe_exhausted_total: u64,
     /// Sum of recovery child wall-clock durations in ns. Used together with
     /// `recovery_duration_count_total` to compute an average runtime.
     recovery_duration_ns_sum: u64,
@@ -737,6 +747,8 @@ impl PromExporter {
             recovery_outcomes_total: [0; RECOVERY_OUTCOME_LABELS.len()],
             recovery_refused_total: [0; RECOVERY_REFUSED_REASON_LABELS.len()],
             origin_conflict_total: 0,
+            tracker_invariant_violations_total: 0,
+            tracker_pid_index_probe_exhausted_total: 0,
             recovery_duration_ns_sum: 0,
             recovery_duration_count_total: 0,
             scrape_skipped_total: 0,
@@ -927,6 +939,23 @@ impl PromExporter {
     /// `varta_origin_conflict_total`.
     pub fn record_origin_conflicts(&mut self, count: u64) {
         self.origin_conflict_total = self.origin_conflict_total.saturating_add(count);
+    }
+
+    /// Record one or more tracker invariant violations recovered by the
+    /// defensive `.get()` fall-throughs on the hot path. See
+    /// [`crate::tracker::Tracker::take_invariant_violations`].
+    pub fn record_tracker_invariant_violations(&mut self, count: u64) {
+        self.tracker_invariant_violations_total = self
+            .tracker_invariant_violations_total
+            .saturating_add(count);
+    }
+
+    /// Record one or more `PidIndex` probe-exhaustion events. See
+    /// [`crate::tracker::Tracker::take_probe_exhausted`].
+    pub fn record_tracker_pid_index_probe_exhausted(&mut self, count: u64) {
+        self.tracker_pid_index_probe_exhausted_total = self
+            .tracker_pid_index_probe_exhausted_total
+            .saturating_add(count);
     }
 
     /// Record one or more scrapes served from cache (scrape arrived before
@@ -1328,6 +1357,32 @@ impl PromExporter {
             self.body_buf,
             "varta_origin_conflict_total {}",
             self.origin_conflict_total
+        );
+        // Tracker hot-path invariant violations recovered without panic.
+        // Always emitted (even at zero) so `absent()` alert rules stay
+        // green-on-green; any non-zero scrape is a bug worth investigating.
+        self.body_buf.push_str(
+            "# HELP varta_tracker_invariant_violations_total Tracker hot-path invariant violations recovered by defensive .get() fall-throughs (e.g. stale PidIndex entry pointing at an OOB slot). Non-zero = bug, not a panic.\n",
+        );
+        self.body_buf
+            .push_str("# TYPE varta_tracker_invariant_violations_total counter\n");
+        let _ = writeln!(
+            self.body_buf,
+            "varta_tracker_invariant_violations_total {}",
+            self.tracker_invariant_violations_total
+        );
+        // PidIndex probe-exhaustion — pid lookup / insert walked the full
+        // MAX_PROBE budget without resolving. At load factor ≤ 0.5 this is
+        // effectively unreachable.
+        self.body_buf.push_str(
+            "# HELP varta_tracker_pid_index_probe_exhausted_total PidIndex lookups/inserts that ran the full MAX_PROBE budget. Should stay at 0 at load factor ≤ 0.5.\n",
+        );
+        self.body_buf
+            .push_str("# TYPE varta_tracker_pid_index_probe_exhausted_total counter\n");
+        let _ = writeln!(
+            self.body_buf,
+            "varta_tracker_pid_index_probe_exhausted_total {}",
+            self.tracker_pid_index_probe_exhausted_total
         );
         self.body_buf.push_str(
             "# HELP varta_frame_decrypt_failures_total Total AEAD decryption/tag-verification failures.\n",
