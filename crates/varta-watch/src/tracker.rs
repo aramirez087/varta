@@ -439,16 +439,14 @@ impl Tracker {
     /// Used by the observer to populate `Event::OriginConflict::slot_origin`
     /// before calling `record` (which may produce the conflict).
     pub fn origin_of(&self, pid: u32) -> Option<BeatOrigin> {
-        self.pid_to_index
-            .get(&pid)
-            .and_then(|&idx| {
-                let slot = &self.entries[idx];
-                if slot.used {
-                    Some(slot.origin)
-                } else {
-                    None
-                }
-            })
+        self.pid_to_index.get(&pid).and_then(|&idx| {
+            let slot = &self.entries[idx];
+            if slot.used {
+                Some(slot.origin)
+            } else {
+                None
+            }
+        })
     }
 
     /// True iff no pids are tracked.
@@ -549,7 +547,10 @@ mod tests {
         let threshold_ns = 1_000;
         // Fill at t=0 so silence isn't a factor either.
         for pid in 1u32..=(cap as u32) {
-            assert_eq!(t.record(&frame(pid, 1), 0, threshold_ns, ORIGIN), Update::Inserted);
+            assert_eq!(
+                t.record(&frame(pid, 1), 0, threshold_ns, ORIGIN),
+                Update::Inserted
+            );
         }
         assert_eq!(t.len(), cap);
         assert_eq!(t.stall_emitted_count, 0);
@@ -572,7 +573,10 @@ mod tests {
         let threshold_ns = 100;
 
         for pid in 1u32..=(cap as u32) {
-            assert_eq!(t.record(&frame(pid, 1), 0, threshold_ns, ORIGIN), Update::Inserted);
+            assert_eq!(
+                t.record(&frame(pid, 1), 0, threshold_ns, ORIGIN),
+                Update::Inserted
+            );
         }
         // Time advances past threshold — every slot stalls.
         let now_ns = threshold_ns * 20;
@@ -593,7 +597,10 @@ mod tests {
     fn stall_counter_decrements_on_refresh() {
         let mut t = Tracker::new(4, EvictionPolicy::Strict);
         let threshold_ns = 100;
-        assert_eq!(t.record(&frame(1, 1), 0, threshold_ns, ORIGIN), Update::Inserted);
+        assert_eq!(
+            t.record(&frame(1, 1), 0, threshold_ns, ORIGIN),
+            Update::Inserted
+        );
         t.drain_stalled_slots(threshold_ns * 2, threshold_ns, |_, _, _, _| {});
         assert_eq!(t.stall_emitted_count, 1);
 
@@ -614,7 +621,10 @@ mod tests {
         let mut t = Tracker::new(cap, EvictionPolicy::Strict);
         let threshold_ns = 100;
         for pid in 1u32..=(cap as u32) {
-            assert_eq!(t.record(&frame(pid, 1), 0, threshold_ns, ORIGIN), Update::Inserted);
+            assert_eq!(
+                t.record(&frame(pid, 1), 0, threshold_ns, ORIGIN),
+                Update::Inserted
+            );
         }
         // Stall everything.
         let now_ns = threshold_ns * 20;
@@ -640,7 +650,10 @@ mod tests {
         let mut t = Tracker::new(cap, EvictionPolicy::Strict);
         let threshold_ns = 100;
         for pid in 1u32..=(cap as u32) {
-            assert_eq!(t.record(&frame(pid, 1), 0, threshold_ns, ORIGIN), Update::Inserted);
+            assert_eq!(
+                t.record(&frame(pid, 1), 0, threshold_ns, ORIGIN),
+                Update::Inserted
+            );
         }
         // Force the cursor to advance past `len` by calling scan_window
         // many times with no qualifying slots (threshold not exceeded).
@@ -699,7 +712,10 @@ mod tests {
         let mut t = Tracker::new(32, EvictionPolicy::Strict);
         let threshold_ns = 100;
         for pid in 1u32..=32 {
-            assert_eq!(t.record(&frame(pid, 1), 0, threshold_ns, ORIGIN), Update::Inserted);
+            assert_eq!(
+                t.record(&frame(pid, 1), 0, threshold_ns, ORIGIN),
+                Update::Inserted
+            );
         }
         // Table full, no stalls emitted → strict bails, balanced not used →
         // counter still increments since we returned None at capacity.
@@ -725,7 +741,12 @@ mod tests {
 
         // Beat 2 arrives via UDP with the same pid — must be rejected.
         assert_eq!(
-            t.record(&frame(7, 2), 20, threshold_ns, BeatOrigin::NetworkUnverified),
+            t.record(
+                &frame(7, 2),
+                20,
+                threshold_ns,
+                BeatOrigin::NetworkUnverified
+            ),
             Update::OriginConflict
         );
 
@@ -758,7 +779,12 @@ mod tests {
             Update::Inserted
         );
         assert_eq!(
-            t.record(&frame(22, 1), 0, threshold_ns, BeatOrigin::NetworkUnverified),
+            t.record(
+                &frame(22, 1),
+                0,
+                threshold_ns,
+                BeatOrigin::NetworkUnverified
+            ),
             Update::Inserted
         );
 

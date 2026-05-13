@@ -125,6 +125,76 @@ host where `--udp-bind-addr 127.0.0.1` is used, any local process can
 send to that port — there is no equivalent of `--socket-mode 0600` for
 network sockets.  AEAD is the only durable defence.
 
+## Recovery eligibility and transport-origin gating
+
+Recovery commands (`--recovery-cmd` / `--recovery-exec` and the `*-file`
+variants) take the **stalled agent's `frame.pid`** and substitute it into
+the spawned process (`kill -9 {pid}`, `systemctl restart agent@{pid}.service`,
+etc.).  That makes recovery a privileged action that targets an arbitrary
+process by id — and means the wire-level `frame.pid` must be tied back to
+the *real* sending process, not just to whoever holds an AEAD key.
+
+### The trust invariant
+
+A recovery command MUST NEVER fire for a pid whose beat lifetime is not
+**kernel-attested**.  In practice that means:
+
+| Transport     | Kernel-attested?         | Recovery-eligible by default? |
+|---------------|--------------------------|-------------------------------|
+| UDS           | Yes — `SO_PASSCRED` / `LOCAL_PEERTOKEN` / `SCM_CREDS` | **Yes**                       |
+| Plaintext UDP | No — `peer_pid` is always 0                          | No                            |
+| Secure UDP    | No — frame is *cryptographically* authenticated but the kernel does not attest the sending process; a holder of the AEAD key (or a per-agent key derived from a leaked master key) can forge a beat for any pid | No                            |
+
+Internally each beat is tagged with a `BeatOrigin`
+(`KernelAttested` vs `NetworkUnverified`).  The tracker pins the origin on
+the slot's first beat and rejects subsequent beats from a different
+origin as `Event::OriginConflict` (counter:
+`varta_origin_conflict_total`).  First-origin-wins prevents an attacker on
+an untrusted transport from "tainting" a slot that legitimately belongs to
+a kernel-attested agent.
+
+### Two-layer enforcement
+
+1. **Startup hard-error.**  If any `--recovery-cmd` / `--recovery-cmd-file` /
+   `--recovery-exec` / `--recovery-exec-file` is configured *and* `--udp-port`
+   is set, the daemon refuses to start with
+   `ConfigError::RecoveryRequiresAuthenticatedTransport`.  Operators must
+   pass `--i-accept-recovery-on-unauthenticated-transport` to proceed.
+   The flag is verbose by design (matches the `--i-accept-<risk>`
+   convention) and shows up in `cargo tree` / startup banners.
+
+2. **Runtime origin gate.**  Even with the accept flag, `Recovery::on_stall`
+   refuses to spawn the recovery command when the stalled slot's pinned
+   origin is `NetworkUnverified`.  The refusal returns the typed
+   `RecoveryOutcome::RefusedUnauthenticatedSource { pid }`, increments
+   `varta_recovery_refused_total{reason="unauthenticated_transport"}`, and
+   emits a structured `refused` record into the recovery audit log
+   (`--recovery-audit-file`).  To enable UDP-origin recovery the operator
+   must construct the `Recovery` with
+   `with_allow_unauthenticated_source(true)` — a second, conscious choice
+   on top of the startup flag.
+
+### Why secure-UDP isn't enough
+
+The secure-UDP master-key mode binds `frame.pid` to the 4-byte PID prefix
+in `iv_random[0..4]` and derives a per-agent key from the master key.
+That is a useful *cryptographic* binding for the UDP threat model — a
+holder of a single derived agent key cannot forge frames for *other*
+pids.  But the binding lives at the protocol layer, not at the kernel
+layer:
+
+- A leak of the **shared key** lets anyone forge any pid.
+- A leak of the **master key** lets anyone derive any agent key.
+- A leak of **any per-agent key** still lets that agent forge its own pid
+  to misbehave (e.g. stop sending → trigger recovery against its own pid
+  during legitimate maintenance windows).
+
+Kernel attestation has no such failure mode: the kernel knows which
+process owns the socket fd, and that knowledge cannot be forged by any
+amount of key material.  This is why Varta classifies all UDP variants
+(plain and secure) as `NetworkUnverified` for the recovery-eligibility
+decision.
+
 ## Recovery command authentication boundary
 
 `--recovery-cmd` (inline shell) and `--recovery-cmd-file` (file-based
@@ -323,6 +393,8 @@ metacharacters (`;`, `|`, `&`, `$`, `` ` ``, etc.).
 | `varta_beats_total{pid="..."}`                        | counter | Per-PID total of accepted beats (only incremented after authentication passes). |
 | `varta_prom_connections_dropped_total{reason="..."}` | counter | `/metrics` connections accepted but closed before serving.  Reasons: `drain` (serve budget exhausted), `rate_limit` (per-IP token bucket empty), `ip_table_full` (per-IP state map force-evicted). |
 | `varta_prom_auth_failures_total`                     | counter | `/metrics` scrapes that arrived without `Authorization: Bearer <hex>` or with a wrong token.  Always emitted on every scrape (even at zero), so `absent()` alert rules stay green-on-green until the first incident. |
+| `varta_recovery_refused_total{reason="..."}`         | counter | Recovery commands NOT spawned because of a structural safety gate. Only reason currently defined: `unauthenticated_transport` (stalled slot's pinned origin was `NetworkUnverified` and the operator did not enable UDP-origin recovery). Emitted at zero on every scrape. |
+| `varta_origin_conflict_total`                        | counter | Beats dropped because the slot's pinned transport origin disagreed with the beat's origin (first-origin-wins). Non-zero values indicate either operator misconfiguration (same pid emitted from two transports) or an active spoofing attempt. |
 
 ## Trust model summary
 
@@ -391,3 +463,11 @@ Protocol correctness depends on the host being little-endian (all tier-1
 targets — x86_64 and aarch64 — satisfy this). Building on a big-endian
 host is a compile error. See `docs/architecture/vlp-frame.md` for design
 rationale.
+
+---
+
+## Cross-references
+
+- [Safety profiles](safety-profiles.md) — compile-time feature gating for dangerous recovery paths; production-safe build verification recipe
+- [Observer liveness](observer-liveness.md) — defending against `varta-watch` itself crashing or hanging
+- [VLP transports](vlp-transports.md) — transport-level trust classification and `BeatOrigin` semantics

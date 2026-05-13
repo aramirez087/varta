@@ -39,6 +39,13 @@ const AUDIT_ROTATION_GENERATIONS: u32 = 5;
 
 /// Header line written to a freshly-created audit file. Wrapped in a v1 tag
 /// so future schema changes are detectable by consumers.
+///
+/// **v1 schema additions (compatible).** The original v1 schema documented
+/// `spawn` and `complete` records. A third record kind, `refused`, was added
+/// while the schema tag stayed at v1 because the format is TSV-with-fixed
+/// columns-per-record-kind: an old reader keying on the third column
+/// (`spawn` / `complete`) will see `refused` lines and ignore them or surface
+/// them as "unknown record kind" without misparsing the other lines.
 const AUDIT_HEADER: &str = "# varta-watch recovery audit v1\n";
 
 /// Outcome category surfaced in the `complete` record.
@@ -117,6 +124,26 @@ pub struct CompleteRecord {
     pub truncated: bool,
 }
 
+/// One refusal record — recovery was structurally declined for an agent
+/// even though the stall threshold was met.
+///
+/// Currently fired by the transport-origin gate: a `NetworkUnverified` stall
+/// (any UDP variant) is refused unless the operator has explicitly opted in
+/// via `--i-accept-recovery-on-unauthenticated-transport`.  See
+/// `docs/architecture/peer-authentication.md` for the trust model.
+#[derive(Debug)]
+pub struct RefusedRecord<'a> {
+    /// Wall-clock time of the refusal, milliseconds since UNIX epoch.
+    pub wallclock_ms: u64,
+    /// Observer-local monotonic ns at refusal time (matches event stream).
+    pub observer_ns: u64,
+    /// Agent pid whose stall triggered the refused recovery.
+    pub agent_pid: u32,
+    /// Stable, short token describing why recovery was refused.
+    /// Example: `"unauthenticated_transport"`.
+    pub reason: &'a str,
+}
+
 /// Append-only audit sink. One file descriptor held for the daemon's life,
 /// reopened on rotation. Writes never block the recovery path: on IO error
 /// the failure is latched in `pending_err` and the daemon's normal logging
@@ -185,6 +212,30 @@ impl RecoveryAuditLog {
             program = sanitize(rec.program),
             source = sanitize(rec.source),
             tlen = rec.template_len,
+        );
+        self.write_line(&line);
+    }
+
+    /// Emit one "refused" record — the daemon detected a stall but the
+    /// recovery command was *not* spawned because of a structural safety
+    /// gate (e.g. unauthenticated transport origin).
+    ///
+    /// Schema (third column = `refused`):
+    /// ```text
+    /// wallclock_ms\tobserver_ns\trefused\tagent_pid\treason
+    /// ```
+    ///
+    /// `reason` is a short stable token (e.g. `unauthenticated_transport`)
+    /// so SIEM consumers can alert on it without parsing free text.
+    pub fn record_refused(&mut self, rec: &RefusedRecord<'_>) {
+        let mut line = String::with_capacity(96);
+        let _ = writeln!(
+            line,
+            "{ms}\t{ns}\trefused\t{apid}\t{reason}",
+            ms = rec.wallclock_ms,
+            ns = rec.observer_ns,
+            apid = rec.agent_pid,
+            reason = sanitize(rec.reason),
         );
         self.write_line(&line);
     }

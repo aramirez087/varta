@@ -158,6 +158,16 @@ pub struct Config {
     /// writes a timestamp + loop-counter line on every poll iteration,
     /// allowing external watchdogs to detect observer stalls.
     pub heartbeat_file: Option<PathBuf>,
+    /// If `Some`, a background watchdog thread is spawned that calls
+    /// `process::abort()` if the poll loop has not ticked for longer than
+    /// this duration.  Catches hung poll loops that signal-based supervisors
+    /// cannot detect.  Set by `--self-watchdog-secs`.
+    pub self_watchdog: Option<Duration>,
+    /// If `Some`, the path to a hardware watchdog device (e.g.
+    /// `/dev/watchdog`) that is opened at startup and kicked once per poll
+    /// iteration.  On clean shutdown the magic-close byte `'V'` is written to
+    /// disarm the watchdog.  Set by `--hw-watchdog`.
+    pub hw_watchdog: Option<PathBuf>,
     /// Per-source-IP refill rate (connections per second) for the
     /// Prometheus `/metrics` endpoint.  Defaults to
     /// [`DEFAULT_PROM_RATE_LIMIT_PER_SEC`].
@@ -178,6 +188,19 @@ pub struct Config {
     /// production deployments use `--recovery-exec` (no shell, no injection
     /// surface).  Set by `--i-accept-shell-risk`.
     pub i_accept_shell_risk: bool,
+    /// Operator opt-in required to combine a UDP listener with a recovery
+    /// command.  UDP transports (plain and secure) lack kernel attestation
+    /// of the sending process, so a `frame.pid` field on the wire is not
+    /// tied back to a verified sender — any holder of a shared PSK (or a
+    /// per-agent key derived from a leaked master key) can forge a beat
+    /// claiming any pid, then stop sending to trigger a recovery command
+    /// targeting an arbitrary process.  Without this flag, startup refuses
+    /// to proceed when both `--udp-port` and a recovery template are set.
+    /// Even with this flag, the runtime origin gate (Recovery's
+    /// `allow_unauthenticated_source`) still refuses UDP-origin stalls
+    /// unless the operator additionally accepts that runtime risk.
+    /// Set by `--i-accept-recovery-on-unauthenticated-transport`.
+    pub i_accept_recovery_on_unauthenticated_transport: bool,
     /// Optional path the recovery audit TSV is appended to. When set, every
     /// recovery spawn and completion is recorded with wall-clock timestamp,
     /// agent pid, child pid, mode, outcome, exit code, and duration. See
@@ -278,6 +301,22 @@ pub enum ConfigError {
         /// The minimum allowed value.
         min: u64,
     },
+    /// Shell-mode recovery flags were passed but this binary was compiled
+    /// without the `unsafe-shell-recovery` Cargo feature.  Rebuild with
+    /// `--features unsafe-shell-recovery` or use `--recovery-exec` instead.
+    ShellRecoveryNotCompiledIn,
+    /// A recovery command (`--recovery-cmd` / `--recovery-cmd-file` /
+    /// `--recovery-exec` / `--recovery-exec-file`) was configured at the
+    /// same time as a UDP listener (`--udp-port`), without the operator's
+    /// explicit acknowledgement.  UDP transports cannot attest the sending
+    /// process — an attacker holding the AEAD key (or a derived per-agent
+    /// key) can forge a beat claiming any pid, then stop sending to
+    /// trigger the recovery command against the chosen pid.  Pass
+    /// `--i-accept-recovery-on-unauthenticated-transport` to proceed.
+    RecoveryRequiresAuthenticatedTransport {
+        /// The `IP:PORT` of the UDP listener that would have been bound.
+        udp_addr: String,
+    },
 }
 
 impl core::fmt::Display for ConfigError {
@@ -332,6 +371,21 @@ impl core::fmt::Display for ConfigError {
                 "--recovery-capture-stdio requires --recovery-cmd, --recovery-cmd-file, \
                  --recovery-exec, or --recovery-exec-file",
             ),
+            ConfigError::ShellRecoveryNotCompiledIn => f.write_str(
+                "shell-mode recovery (--recovery-cmd / --recovery-cmd-file) is not available \
+                 in this build; rebuild with --features unsafe-shell-recovery, or use \
+                 --recovery-exec instead",
+            ),
+            ConfigError::RecoveryRequiresAuthenticatedTransport { udp_addr } => write!(
+                f,
+                "recovery command is configured alongside a UDP listener on {udp_addr}. \
+                 UDP transports cannot attest the sending process — a holder of the AEAD key \
+                 (or a per-agent key derived from a leaked master key) can forge a beat \
+                 claiming any pid, then stop sending to trigger recovery against the chosen pid. \
+                 Either remove the recovery command, switch to a UDS-only deployment, or \
+                 pass --i-accept-recovery-on-unauthenticated-transport to explicitly accept \
+                 this risk."
+            ),
         }
     }
 }
@@ -354,11 +408,12 @@ REQUIRED:
 
 OPTIONAL:
     --recovery-cmd <TEMPLATE>      Shell fragment run on each unique stall
-                                     via /bin/sh -c with the stalled pid
-                                     passed as $1. SECURITY: the template
-                                     body is under full operator control;
-                                     never accept it from an untrusted
-                                     source.
+                                     via the system shell with the stalled
+                                     pid passed as $1. SECURITY: the
+                                     template body is under full operator
+                                     control; never accept it from an
+                                     untrusted source. Requires --features
+                                     unsafe-shell-recovery at build time.
     --recovery-exec <CMD>          Command and arguments invoked via execvp
                                      on each unique stall. Split on
                                      whitespace into argv; {pid} in any
@@ -369,6 +424,8 @@ OPTIONAL:
     --recovery-cmd-file <PATH>     Read --recovery-cmd template from a file.
                                      File must be owned by the observer's
                                      UID and mode 0600 or stricter.
+                                     Requires --features
+                                     unsafe-shell-recovery at build time.
     --recovery-exec-file <PATH>    Read --recovery-exec command from a file
                                      with the same permission requirements
                                      as --recovery-cmd-file.
@@ -451,6 +508,16 @@ OPTIONAL:
                                      this file on every poll iteration.
                                      External watchdogs can monitor the file
                                      mtime to detect observer stalls.
+    --self-watchdog-secs <SECS>    Spawn a background thread that calls
+                                     process::abort() if the poll loop has
+                                     not ticked for longer than SECS seconds.
+                                     Catches hung poll loops. Triggers
+                                     systemd Restart=on-abort. Minimum 1.
+    --hw-watchdog <PATH>           Open a hardware watchdog device (e.g.
+                                     /dev/watchdog) and kick it once per
+                                     poll iteration. On clean shutdown the
+                                     magic-close byte 'V' is written to
+                                     disarm the watchdog.
     --prom-rate-limit-per-sec <N>  Per-source-IP refill rate for the
                                      /metrics endpoint token bucket
                                      (default 5).  Scrapes from any single
@@ -479,10 +546,28 @@ OPTIONAL:
                                      Required to use shell-mode at all;
                                      without this flag, only --recovery-exec
                                      / --recovery-exec-file are permitted.
-                                     Shell mode spawns /bin/sh -c with
-                                     root-equivalent process authority —
-                                     prefer --recovery-exec for any
-                                     production deployment.
+                                     Shell mode spawns the system shell
+                                     with root-equivalent process authority
+                                     — prefer --recovery-exec for any
+                                     production deployment. Build must also
+                                     include --features unsafe-shell-recovery.
+    --i-accept-recovery-on-unauthenticated-transport
+                                   UNSAFE: explicitly accept the security
+                                     risk of running a recovery command
+                                     while a UDP listener is bound.  UDP
+                                     transports (plain or secure) have no
+                                     kernel attestation of the sending
+                                     process — a holder of the AEAD key
+                                     (or a per-agent key derived from a
+                                     leaked master key) can forge a beat
+                                     claiming any pid, then stop sending
+                                     to trigger recovery against that pid.
+                                     Without this flag, --udp-port plus
+                                     any recovery-command flag is rejected
+                                     at startup.  The runtime origin gate
+                                     still refuses UDP-origin recoveries
+                                     by default; see
+                                     docs/architecture/peer-authentication.md.
     --recovery-audit-file <PATH>   Append a tab-separated audit record for
                                      every recovery spawn and completion.
                                      Records carry wall-clock + observer
@@ -535,10 +620,13 @@ OPTIONAL:
         let mut master_key_file: Option<PathBuf> = None;
         let mut max_beat_rate: Option<u32> = None;
         let mut heartbeat_file: Option<PathBuf> = None;
+        let mut self_watchdog: Option<Duration> = None;
+        let mut hw_watchdog: Option<PathBuf> = None;
         let mut prom_rate_limit_per_sec: Option<u32> = None;
         let mut prom_rate_limit_burst: Option<u32> = None;
         let mut i_accept_plaintext_udp = false;
         let mut i_accept_shell_risk = false;
+        let mut i_accept_recovery_on_unauthenticated_transport = false;
         let mut recovery_audit_file: Option<PathBuf> = None;
         let mut recovery_audit_max_bytes: Option<u64> = None;
         let mut recovery_capture_stdio = false;
@@ -735,6 +823,22 @@ OPTIONAL:
                         .ok_or(ConfigError::MissingValue("--heartbeat-file"))?;
                     heartbeat_file = Some(PathBuf::from(v));
                 }
+                "--self-watchdog-secs" => {
+                    let v = iter
+                        .next()
+                        .ok_or(ConfigError::MissingValue("--self-watchdog-secs"))?;
+                    let secs = v.parse::<u64>().map_err(|_| ConfigError::BadInteger {
+                        flag: "--self-watchdog-secs",
+                        raw: v,
+                    })?;
+                    self_watchdog = Some(Duration::from_secs(secs));
+                }
+                "--hw-watchdog" => {
+                    let v = iter
+                        .next()
+                        .ok_or(ConfigError::MissingValue("--hw-watchdog"))?;
+                    hw_watchdog = Some(PathBuf::from(v));
+                }
                 "--prom-rate-limit-per-sec" => {
                     let v = iter
                         .next()
@@ -760,6 +864,9 @@ OPTIONAL:
                 }
                 "--i-accept-shell-risk" => {
                     i_accept_shell_risk = true;
+                }
+                "--i-accept-recovery-on-unauthenticated-transport" => {
+                    i_accept_recovery_on_unauthenticated_transport = true;
                 }
                 "--recovery-audit-file" => {
                     let v = iter
@@ -846,6 +953,30 @@ OPTIONAL:
             return Err(ConfigError::RecoveryCaptureRequiresRecovery);
         }
 
+        // H2 mitigation — recovery commands are operator-controlled actions
+        // (`kill -9 {pid}`, `systemctl restart agent@{pid}.service`).  UDP
+        // transports (plain *and* secure) cannot attest the sending process;
+        // any holder of the AEAD key (or a per-agent key derived from a
+        // leaked master key) can forge a beat claiming any pid, then stop
+        // sending to trigger the recovery command against that pid.  Refuse
+        // to start when both are configured unless the operator passes
+        // `--i-accept-recovery-on-unauthenticated-transport`.  Per
+        // docs/architecture/peer-authentication.md, even with the flag the
+        // runtime gate in Recovery still refuses UDP-origin stalls unless
+        // wired to explicitly allow them.
+        let any_recovery_configured = recovery_cmd.is_some()
+            || recovery_exec_cmd.is_some()
+            || recovery_cmd_file.is_some()
+            || recovery_exec_file.is_some();
+        if any_recovery_configured && !i_accept_recovery_on_unauthenticated_transport {
+            if let Some(port) = udp_port {
+                let bind_ip = udp_bind_addr
+                    .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
+                let udp_addr = format!("{bind_ip}:{port}");
+                return Err(ConfigError::RecoveryRequiresAuthenticatedTransport { udp_addr });
+            }
+        }
+
         Ok(Config {
             socket,
             threshold: Duration::from_millis(threshold_ms),
@@ -873,11 +1004,14 @@ OPTIONAL:
             master_key_file,
             max_beat_rate,
             heartbeat_file,
+            self_watchdog,
+            hw_watchdog,
             prom_rate_limit_per_sec: prom_rate_limit_per_sec
                 .unwrap_or(DEFAULT_PROM_RATE_LIMIT_PER_SEC),
             prom_rate_limit_burst: prom_rate_limit_burst.unwrap_or(DEFAULT_PROM_RATE_LIMIT_BURST),
             i_accept_plaintext_udp,
             i_accept_shell_risk,
+            i_accept_recovery_on_unauthenticated_transport,
             recovery_audit_file,
             recovery_audit_max_bytes,
             recovery_capture_stdio,
@@ -909,18 +1043,21 @@ OPTIONAL:
         let shell_any = has_cmd || has_cmd_file;
         let exec_any = has_exec || has_exec_file;
 
-        // Shell mode — inline OR file-based — spawns /bin/sh -c with
+        // Shell mode — inline OR file-based — spawns the system shell with
         // root-equivalent process authority.  A template-injection vector
         // can terminate any process the observer can reach.  Refuse to
         // proceed unless the operator has explicitly acknowledged the
         // risk; recommend the safer --recovery-exec path.  The check sits
         // before mutual-exclusion enforcement so the more actionable
         // diagnostic wins when both forms of misconfiguration are present.
+        // Only compiled in when the feature is present; without it the
+        // cfg(not) branch below fires first.
+        #[cfg(feature = "unsafe-shell-recovery")]
         if shell_any && !self.i_accept_shell_risk {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
-                "shell-mode recovery (--recovery-cmd / --recovery-cmd-file) spawns \
-                 /bin/sh -c with root-equivalent process authority. For production, \
+                "shell-mode recovery (--recovery-cmd / --recovery-cmd-file) runs \
+                 the system shell with root-equivalent process authority. For production, \
                  use --recovery-exec (no shell, no injection surface). To proceed \
                  with shell mode anyway, pass --i-accept-shell-risk.",
             ));
@@ -960,13 +1097,25 @@ OPTIONAL:
             ));
         }
 
-        // Shell mode
-        if let Some(ref tpl) = self.recovery_cmd {
-            return Ok(Some(RecoveryMode::Shell(tpl.clone())));
+        // Shell mode — only reachable when the feature is compiled in.
+        // Without the feature, the variant doesn't exist; error here so
+        // the operator gets a clear message pointing to --recovery-exec.
+        #[cfg(feature = "unsafe-shell-recovery")]
+        {
+            if let Some(ref tpl) = self.recovery_cmd {
+                return Ok(Some(RecoveryMode::Shell(tpl.clone())));
+            }
+            if let Some(ref path) = self.recovery_cmd_file {
+                let template = validate_recovery_file(path)?;
+                return Ok(Some(RecoveryMode::Shell(template)));
+            }
         }
-        if let Some(ref path) = self.recovery_cmd_file {
-            let template = validate_recovery_file(path)?;
-            return Ok(Some(RecoveryMode::Shell(template)));
+        #[cfg(not(feature = "unsafe-shell-recovery"))]
+        if shell_any {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                ConfigError::ShellRecoveryNotCompiledIn,
+            ));
         }
 
         // Exec mode
@@ -1771,6 +1920,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "unsafe-shell-recovery")]
     #[test]
     fn resolve_shell_mode_from_cmd_flag() {
         let cfg = Config::from_args(args(&[
@@ -1790,6 +1940,32 @@ mod tests {
         }
     }
 
+    #[cfg(not(feature = "unsafe-shell-recovery"))]
+    #[test]
+    fn shell_recovery_not_compiled_in_is_rejected() {
+        let cfg = Config::from_args(args(&[
+            "--socket",
+            "/s",
+            "--threshold-ms",
+            "100",
+            "--recovery-cmd",
+            "echo $1",
+            "--i-accept-shell-risk",
+        ]))
+        .expect("parse");
+        let err = cfg.resolve_recovery_mode().expect_err("must reject");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("unsafe-shell-recovery"),
+            "error must name the feature, got: {msg}"
+        );
+        assert!(
+            msg.contains("--recovery-exec"),
+            "error must recommend --recovery-exec, got: {msg}"
+        );
+    }
+
+    #[cfg(feature = "unsafe-shell-recovery")]
     #[test]
     fn shell_mode_inline_without_accept_flag_is_rejected() {
         let cfg = Config::from_args(args(&[
@@ -1814,6 +1990,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "unsafe-shell-recovery")]
     #[test]
     fn shell_mode_file_without_accept_flag_is_rejected() {
         // The file does not need to exist — the accept-flag check runs
@@ -1871,6 +2048,87 @@ mod tests {
         let cfg =
             Config::from_args(args(&["--socket", "/s", "--threshold-ms", "100"])).expect("parse");
         assert!(!cfg.i_accept_plaintext_udp);
+    }
+
+    #[test]
+    fn parses_i_accept_recovery_on_unauthenticated_transport_flag() {
+        let cfg = Config::from_args(args(&[
+            "--socket",
+            "/s",
+            "--threshold-ms",
+            "100",
+            "--i-accept-recovery-on-unauthenticated-transport",
+        ]))
+        .expect("parse");
+        assert!(cfg.i_accept_recovery_on_unauthenticated_transport);
+    }
+
+    #[test]
+    fn i_accept_recovery_on_unauthenticated_transport_defaults_to_false() {
+        let cfg =
+            Config::from_args(args(&["--socket", "/s", "--threshold-ms", "100"])).expect("parse");
+        assert!(!cfg.i_accept_recovery_on_unauthenticated_transport);
+    }
+
+    #[test]
+    fn recovery_plus_udp_port_without_accept_flag_is_rejected() {
+        // H2 mitigation: combining a recovery command with a UDP listener
+        // is structurally unsafe (UDP cannot attest the sending process).
+        // Without --i-accept-recovery-on-unauthenticated-transport, startup
+        // must hard-error.
+        let err = Config::from_args(args(&[
+            "--socket",
+            "/s",
+            "--threshold-ms",
+            "100",
+            "--udp-port",
+            "9000",
+            "--recovery-exec",
+            "/bin/true",
+        ]))
+        .expect_err("must reject");
+        match err {
+            ConfigError::RecoveryRequiresAuthenticatedTransport { ref udp_addr } => {
+                assert!(udp_addr.contains(":9000"), "udp_addr = {udp_addr}");
+            }
+            other => panic!("expected RecoveryRequiresAuthenticatedTransport, got {other:?}"),
+        }
+        assert!(err
+            .to_string()
+            .contains("--i-accept-recovery-on-unauthenticated-transport"));
+    }
+
+    #[test]
+    fn recovery_plus_udp_port_with_accept_flag_succeeds() {
+        let cfg = Config::from_args(args(&[
+            "--socket",
+            "/s",
+            "--threshold-ms",
+            "100",
+            "--udp-port",
+            "9000",
+            "--recovery-exec",
+            "/bin/true",
+            "--i-accept-recovery-on-unauthenticated-transport",
+        ]))
+        .expect("parse");
+        assert!(cfg.i_accept_recovery_on_unauthenticated_transport);
+        assert_eq!(cfg.udp_port, Some(9000));
+    }
+
+    #[test]
+    fn recovery_without_udp_port_does_not_require_accept_flag() {
+        let cfg = Config::from_args(args(&[
+            "--socket",
+            "/s",
+            "--threshold-ms",
+            "100",
+            "--recovery-exec",
+            "/bin/true",
+        ]))
+        .expect("parse");
+        assert!(!cfg.i_accept_recovery_on_unauthenticated_transport);
+        assert!(cfg.udp_port.is_none());
     }
 
     #[test]

@@ -138,12 +138,16 @@ fn observer_emits_beat_per_received_frame() {
                 status,
                 payload,
                 observer_ns: _,
+                origin: _,
             } => got.push((pid, nonce, status, payload)),
             Event::Decode(e, _) => panic!("unexpected decode error: {e}"),
             Event::Io(e, _) => panic!("unexpected io error: {e}"),
             Event::Stall { .. } => panic!("unexpected stall during beat test"),
             Event::AuthFailure { .. } => {
                 panic!("unexpected auth failure during beat test")
+            }
+            Event::OriginConflict { .. } => {
+                panic!("unexpected origin-conflict event during beat test")
             }
             Event::CtrlTruncated(e, _) => panic!("unexpected ctrl truncation: {e}"),
         }
@@ -239,14 +243,24 @@ fn tracker_capacity_bounded_to_64_pids() {
 
     for pid in 1u32..=64 {
         let f = make_frame(pid, 1, Status::Ok, 0);
-        let update = tracker.record(&f, now_ns, threshold_ns);
+        let update = tracker.record(
+            &f,
+            now_ns,
+            threshold_ns,
+            varta_watch::BeatOrigin::KernelAttested,
+        );
         assert_eq!(update, Update::Inserted, "pid {pid} should insert");
     }
     assert_eq!(tracker.len(), 64, "tracker should be full at 64 pids");
 
     // Without any stalled slots, overflow should still be CapacityExceeded
     let overflow = make_frame(65, 1, Status::Ok, 0);
-    let result = tracker.record(&overflow, now_ns, threshold_ns);
+    let result = tracker.record(
+        &overflow,
+        now_ns,
+        threshold_ns,
+        varta_watch::BeatOrigin::KernelAttested,
+    );
     assert_eq!(result, Update::CapacityExceeded);
     assert_eq!(tracker.len(), 64, "len must not grow past capacity");
 }
@@ -369,7 +383,12 @@ fn tracker_capacity_clamped_to_max_capacity() {
     // pid must yield CapacityExceeded.
     for pid in 1u32..=MAX_CAPACITY as u32 {
         let f = make_frame(pid, 1, Status::Ok, 0);
-        let update = over.record(&f, now_ns, threshold_ns);
+        let update = over.record(
+            &f,
+            now_ns,
+            threshold_ns,
+            varta_watch::BeatOrigin::KernelAttested,
+        );
         assert!(
             update == Update::Inserted || update == Update::Refreshed,
             "pid {pid} should fit within MAX_CAPACITY"
@@ -382,7 +401,12 @@ fn tracker_capacity_clamped_to_max_capacity() {
     );
 
     let overflow = make_frame(MAX_CAPACITY as u32 + 1, 1, Status::Ok, 0);
-    let result = over.record(&overflow, now_ns, threshold_ns);
+    let result = over.record(
+        &overflow,
+        now_ns,
+        threshold_ns,
+        varta_watch::BeatOrigin::KernelAttested,
+    );
     assert_eq!(result, Update::CapacityExceeded);
     assert_eq!(
         over.len(),

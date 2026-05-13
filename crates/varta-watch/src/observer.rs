@@ -276,8 +276,7 @@ impl Observer {
                             // any) so an OriginConflict event can report what
                             // the slot was pinned to without an extra lookup
                             // afterwards.
-                            let slot_origin_before =
-                                self.tracker.origin_of(frame.pid);
+                            let slot_origin_before = self.tracker.origin_of(frame.pid);
                             match self
                                 .tracker
                                 .record(&frame, now_ns, self.threshold_ns, origin)
@@ -299,8 +298,7 @@ impl Observer {
                                         first_event = Some(Event::OriginConflict {
                                             claimed_pid: frame.pid,
                                             observed_origin: origin,
-                                            slot_origin: slot_origin_before
-                                                .unwrap_or(origin),
+                                            slot_origin: slot_origin_before.unwrap_or(origin),
                                             observer_ns: now_ns,
                                         });
                                     }

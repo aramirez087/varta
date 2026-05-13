@@ -60,12 +60,23 @@ a `UdpListener` is added alongside the UDS listener.
 |---|---|---|---|---|
 | **Addressing** | Filesystem path | `IP:PORT` | `IP:PORT` |
 | **Encryption** | None (kernel isolation) | None | ChaCha20-Poly1305 AEAD |
-| **Authentication** | Kernel PID + UID via `SO_PASSCRED` (Linux) / `LOCAL_PEERTOKEN` (macOS) | None | Poly1305 tag + PID in IV prefix (master-key mode) |
+| **Authentication** | Kernel PID + UID via `SO_PASSCRED` (Linux) / `LOCAL_PEERTOKEN` (macOS) | None | Poly1305 tag + PID in IV prefix (master-key mode) — wire-content only, not the sending process |
 | **Replay protection** | None (local IPC) | None | Per-sender IV counter monotonicity |
 | **Trust model** | Filesystem permissions + kernel credential attestation | Network segmentation | 256-bit pre-shared or per-agent derived key |
+| **Origin classification** | `KernelAttested` | `NetworkUnverified` | `NetworkUnverified` (cryptographic binding ≠ kernel attestation) |
+| **Recovery-eligible by default?** | **Yes** | **No** (see [peer-authentication.md → Recovery eligibility]) | **No** (same gate; even master-key derivation cannot replace kernel attestation) |
 | **Frame size** | 32 bytes | 32 bytes | 60 bytes (AEAD overhead) |
 | **Socket cleanup** | `UdsListener::drop` unlinks socket | Kernel reclaims port | Kernel reclaims port |
 | **Use case** | Local IPC, process monitoring | IoT/edge, microservices | Anything crossing untrusted networks |
+
+> **Recovery-on-UDP is structurally rejected by default.** Combining any
+> recovery flag (`--recovery-cmd` / `--recovery-exec` / `*-file`) with
+> `--udp-port` is a startup hard-error unless the operator passes
+> `--i-accept-recovery-on-unauthenticated-transport`.  Even with the flag,
+> the runtime origin gate still refuses to fire recovery for UDP-origin
+> stalls — flipping `Recovery::with_allow_unauthenticated_source(true)` is
+> a separate, conscious choice.  See
+> `docs/architecture/peer-authentication.md` for the full threat model.
 
 ## CLI additions
 
@@ -155,6 +166,14 @@ varta-watch --socket /tmp/varta.sock --threshold-ms 500 \
     with `{pid}` replaced in arguments. No shell is involved.
   - `--recovery-cmd-file` / `--recovery-exec-file`: Read templates from files
     with mandatory ownership/permission checks (UID match, mode ≤ 0600).
+
+## Cross-references
+
+- [Observer liveness](observer-liveness.md) — the watcher's own liveness story: in-process self-watchdog, systemd `sd_notify`, hardware watchdog, and paired-observer pattern
+- [Safety profiles](safety-profiles.md) — compile-time vs. runtime feature gating for production-safe builds
+- [Peer authentication](peer-authentication.md) — kernel-level PID attestation and transport trust classification
+
+---
 
 ## Future transports
 

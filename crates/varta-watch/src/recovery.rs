@@ -36,7 +36,8 @@ use std::os::unix::io::AsRawFd;
 use std::process::{Child, ChildStderr, ChildStdout, Command, Stdio};
 use std::time::{Duration, Instant};
 
-use crate::audit::{CompleteOutcome, CompleteRecord, RecoveryAuditLog, SpawnRecord};
+use crate::audit::{CompleteOutcome, CompleteRecord, RecoveryAuditLog, RefusedRecord, SpawnRecord};
+use crate::peer_cred::BeatOrigin;
 
 // fcntl(2) flags. Hand-rolled to avoid pulling `libc` into a production crate.
 #[cfg(target_os = "linux")]
@@ -97,7 +98,8 @@ fn take_capture_handles(
 ///
 /// * [`RecoveryMode::Shell`] — `/bin/sh -c <template>` with the pid
 ///   passed as `$1`. Backward compatible; the template body is under
-///   full operator control.
+///   full operator control. Requires the `unsafe-shell-recovery` Cargo
+///   feature.
 /// * [`RecoveryMode::Exec`] — `execvp(argv[0], argv[1..])`. `{pid}` in
 ///   any argument is replaced with the numeric PID. No shell is
 ///   involved, so shell metacharacters have no effect.
@@ -106,6 +108,11 @@ pub enum RecoveryMode {
     /// Execute via `/bin/sh -c <template>`. The stalled pid is passed
     /// as positional argument `$1` (appended after the template and
     /// the `$0` sentinel `"varta-recovery"`).
+    ///
+    /// Requires the `unsafe-shell-recovery` Cargo feature. Even with
+    /// the feature enabled, `--i-accept-shell-risk` is required at
+    /// runtime.
+    #[cfg(feature = "unsafe-shell-recovery")]
     Shell(String),
     /// Execute a command directly via `execvp(2)` — no shell is spawned,
     /// so shell injection is structurally impossible. Any argument
@@ -123,9 +130,9 @@ pub enum RecoveryMode {
 /// Outcome of [`Recovery::on_stall`] or [`Recovery::try_reap`].
 #[derive(Debug)]
 pub enum RecoveryOutcome {
-    /// `/bin/sh -c <rendered>` was forked successfully and the child is
-    /// now outstanding. The observer has NOT waited on it; the child
-    /// will be reaped on a later tick via [`Recovery::try_reap`].
+    /// A recovery child was forked successfully and is now outstanding.
+    /// The observer has NOT waited on it; the child will be reaped on a
+    /// later tick via [`Recovery::try_reap`].
     Spawned {
         /// OS process id of the freshly-spawned child shell.
         child_pid: u32,
@@ -133,8 +140,8 @@ pub enum RecoveryOutcome {
     /// The previous invocation for this pid is still inside the debounce
     /// window; nothing was spawned.
     Debounced,
-    /// `Command::spawn` failed before the shell could run (e.g. fork or
-    /// `/bin/sh` missing). The error is surfaced verbatim.
+    /// `Command::spawn` failed before the child could run (e.g. fork
+    /// failure or missing executable). The error is surfaced verbatim.
     SpawnFailed(std::io::Error),
     /// A previously-spawned child has exited and was reaped on this tick.
     Reaped {
@@ -152,6 +159,17 @@ pub enum RecoveryOutcome {
     /// `try_wait` or `kill` failed for an outstanding child. The pid is
     /// still tracked; the observer will retry on the next tick.
     ReapFailed(std::io::Error),
+    /// Recovery was structurally declined because the stalled pid's beat
+    /// lifetime included a non-kernel-attested transport (any UDP variant),
+    /// and the operator did not pass
+    /// `--i-accept-recovery-on-unauthenticated-transport`. No child was
+    /// spawned. The refusal is logged to the audit sink and counted in
+    /// Prometheus so operators can detect both legitimate misconfiguration
+    /// and active spoofing attempts.
+    RefusedUnauthenticatedSource {
+        /// Agent pid whose stall was refused.
+        pid: u32,
+    },
 }
 
 /// Bookkeeping slot for one outstanding child.
@@ -211,6 +229,21 @@ pub struct Recovery {
     /// Source descriptor recorded into the spawn audit row: either
     /// `"inline"` or the operator-supplied template-file path.
     source: String,
+    /// If `true`, [`on_stall`] will spawn the recovery command even when the
+    /// stalled slot's pinned origin is [`BeatOrigin::NetworkUnverified`].
+    /// Controlled by `--i-accept-recovery-on-unauthenticated-transport`.
+    ///
+    /// Default `false`: refuse recovery for any non-kernel-attested origin
+    /// and emit a structured audit entry instead. This is the safety-critical
+    /// default — see `docs/architecture/peer-authentication.md` for the
+    /// trust model.
+    ///
+    /// [`on_stall`]: Recovery::on_stall
+    allow_unauthenticated_source: bool,
+    /// Per-pid count of refused recoveries since the last call to
+    /// [`Recovery::take_refused_unauthenticated_source`]. Surfaced as
+    /// `varta_recovery_refused_total{reason="unauthenticated_transport"}`.
+    refused_unauthenticated_source: u64,
 }
 
 impl Recovery {
@@ -218,6 +251,9 @@ impl Recovery {
     /// `debounce` window.
     ///
     /// Equivalent to [`Recovery::with_timeout(template, debounce, None)`].
+    ///
+    /// Requires the `unsafe-shell-recovery` Cargo feature.
+    #[cfg(feature = "unsafe-shell-recovery")]
     pub fn new(template: String, debounce: Duration) -> Self {
         Self::with_timeout(RecoveryMode::Shell(template), debounce, None)
     }
@@ -258,7 +294,32 @@ impl Recovery {
             audit_sink: None,
             capture_cap: 0,
             source: "inline".to_string(),
+            allow_unauthenticated_source: false,
+            refused_unauthenticated_source: 0,
         }
+    }
+
+    /// Enable spawning the recovery command even when the stalled slot's
+    /// pinned transport origin is [`BeatOrigin::NetworkUnverified`] (any UDP
+    /// variant). Default `false` — recovery refuses non-kernel-attested
+    /// sources, treats them as audit-only stalls.
+    ///
+    /// Wired from `--i-accept-recovery-on-unauthenticated-transport`. The
+    /// flag is intentionally verbose: an operator who types it is making an
+    /// explicit statement that this build is not for safety-critical use.
+    pub fn with_allow_unauthenticated_source(mut self, allow: bool) -> Self {
+        self.allow_unauthenticated_source = allow;
+        self
+    }
+
+    /// Take and reset the count of recovery refusals that fired because the
+    /// stalled slot's origin was [`BeatOrigin::NetworkUnverified`] and the
+    /// operator did not pass
+    /// `--i-accept-recovery-on-unauthenticated-transport`.
+    pub fn take_refused_unauthenticated_source(&mut self) -> u64 {
+        let n = self.refused_unauthenticated_source;
+        self.refused_unauthenticated_source = 0;
+        n
     }
 
     /// Attach a recovery audit sink. Every spawn and completion will be
@@ -312,6 +373,9 @@ impl Recovery {
     ///
     /// Kept for backward compatibility with callers that hold a
     /// `template: String`.
+    ///
+    /// Requires the `unsafe-shell-recovery` Cargo feature.
+    #[cfg(feature = "unsafe-shell-recovery")]
     #[doc(hidden)]
     pub fn with_template_and_timeout(
         template: String,
@@ -483,7 +547,33 @@ impl Recovery {
     /// In shell mode the template receives the stalling pid as `$1`. In exec
     /// mode `{pid}` in any argument is replaced with the numeric PID.
     /// A per-pid debounce window suppresses repeat invocations.
-    pub fn on_stall(&mut self, pid: u32) -> RecoveryOutcome {
+    ///
+    /// `origin` is the transport-class classification of the slot whose
+    /// stall is being reported. When `origin == NetworkUnverified` and the
+    /// operator has not opted in via
+    /// [`Recovery::with_allow_unauthenticated_source`], the recovery
+    /// command is **not** spawned and [`RecoveryOutcome::RefusedUnauthenticatedSource`]
+    /// is returned (and audit-logged) — see the H2 mitigation in
+    /// `docs/architecture/peer-authentication.md`.
+    pub fn on_stall(&mut self, pid: u32, origin: BeatOrigin) -> RecoveryOutcome {
+        // Structural origin gate. Default-safe: refuse recovery when the
+        // stalled pid's beat lifetime included a non-kernel-attested
+        // transport. The operator can opt out (e.g. for development /
+        // testing) via `--i-accept-recovery-on-unauthenticated-transport`.
+        if origin == BeatOrigin::NetworkUnverified && !self.allow_unauthenticated_source {
+            self.refused_unauthenticated_source =
+                self.refused_unauthenticated_source.saturating_add(1);
+            if let Some(sink) = self.audit_sink.as_mut() {
+                sink.record_refused(&RefusedRecord {
+                    wallclock_ms: RecoveryAuditLog::wallclock_ms_now(),
+                    observer_ns: 0,
+                    agent_pid: pid,
+                    reason: "unauthenticated_transport",
+                });
+            }
+            return RecoveryOutcome::RefusedUnauthenticatedSource { pid };
+        }
+
         let now = Instant::now();
 
         let prune_threshold = self.debounce.saturating_mul(10);
@@ -520,6 +610,7 @@ impl Recovery {
         let wallclock_ms = RecoveryAuditLog::wallclock_ms_now();
 
         match &self.mode {
+            #[cfg(feature = "unsafe-shell-recovery")]
             RecoveryMode::Shell(template) => {
                 let template_len = template.len() as u32;
                 let mut cmd = Command::new("/bin/sh");
@@ -784,11 +875,12 @@ mod tests {
     use super::*;
     use std::time::Instant;
 
+    #[cfg(feature = "unsafe-shell-recovery")]
     #[test]
     fn debounces_repeat_calls_for_same_pid() {
         let mut rec = Recovery::new("true".to_string(), Duration::from_secs(10));
-        let first = rec.on_stall(1);
-        let second = rec.on_stall(1);
+        let first = rec.on_stall(1, BeatOrigin::KernelAttested);
+        let second = rec.on_stall(1, BeatOrigin::KernelAttested);
         assert!(matches!(first, RecoveryOutcome::Spawned { .. }));
         assert!(matches!(second, RecoveryOutcome::Debounced));
     }
@@ -799,11 +891,12 @@ mod tests {
     /// time the unwind.  The deadline gives SIGKILL ample headroom over
     /// the grace itself; the test fails if Drop blocked for the full
     /// 30-second sleep.
+    #[cfg(feature = "unsafe-shell-recovery")]
     #[test]
     fn drop_returns_within_configured_grace() {
         let mut rec = Recovery::new("sleep 30".to_string(), Duration::ZERO)
             .with_shutdown_grace(Duration::from_millis(200));
-        match rec.on_stall(99) {
+        match rec.on_stall(99, BeatOrigin::KernelAttested) {
             RecoveryOutcome::Spawned { .. } => {}
             other => panic!("expected first stall to spawn, got {other:?}"),
         }
@@ -816,15 +909,17 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "unsafe-shell-recovery")]
     #[test]
     fn debounce_is_per_pid() {
         let mut rec = Recovery::new("true".to_string(), Duration::from_secs(10));
-        let a = rec.on_stall(1);
-        let b = rec.on_stall(2);
+        let a = rec.on_stall(1, BeatOrigin::KernelAttested);
+        let b = rec.on_stall(2, BeatOrigin::KernelAttested);
         assert!(matches!(a, RecoveryOutcome::Spawned { .. }));
         assert!(matches!(b, RecoveryOutcome::Spawned { .. }));
     }
 
+    #[cfg(feature = "unsafe-shell-recovery")]
     #[test]
     fn does_not_replace_outstanding_child_for_same_pid() {
         let mut rec = Recovery::with_template_and_timeout(
@@ -832,12 +927,12 @@ mod tests {
             Duration::ZERO,
             Some(Duration::from_millis(50)),
         );
-        let first_child_pid = match rec.on_stall(7) {
+        let first_child_pid = match rec.on_stall(7, BeatOrigin::KernelAttested) {
             RecoveryOutcome::Spawned { child_pid } => child_pid,
             other => panic!("expected first stall to spawn, got {other:?}"),
         };
 
-        let second = rec.on_stall(7);
+        let second = rec.on_stall(7, BeatOrigin::KernelAttested);
         assert!(
             matches!(second, RecoveryOutcome::Debounced),
             "same-pid recovery must not replace outstanding child; got {second:?}"
@@ -858,13 +953,14 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "unsafe-shell-recovery")]
     #[test]
     fn template_receives_pid_as_dollar_one() {
         let mut rec = Recovery::new(
             "test \"$1-$1\" = \"7-7\"".to_string(),
             Duration::from_secs(0),
         );
-        match rec.on_stall(7) {
+        match rec.on_stall(7, BeatOrigin::KernelAttested) {
             RecoveryOutcome::Spawned { child_pid: _ } => {
                 // Child should exit quickly; reap it.
                 std::thread::sleep(Duration::from_millis(50));
@@ -883,11 +979,12 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "unsafe-shell-recovery")]
     #[test]
     fn spawn_returns_immediately_for_slow_template() {
         let mut rec = Recovery::new("sleep 1".to_string(), Duration::ZERO);
         let start = Instant::now();
-        match rec.on_stall(42) {
+        match rec.on_stall(42, BeatOrigin::KernelAttested) {
             RecoveryOutcome::Spawned { .. } => {}
             other => panic!("expected Spawned, got {other:?}"),
         }
@@ -898,10 +995,11 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "unsafe-shell-recovery")]
     #[test]
     fn try_reap_surfaces_reaped_for_fast_child() {
         let mut rec = Recovery::new("true".to_string(), Duration::ZERO);
-        match rec.on_stall(99) {
+        match rec.on_stall(99, BeatOrigin::KernelAttested) {
             RecoveryOutcome::Spawned { .. } => {}
             other => panic!("expected Spawned, got {other:?}"),
         }
@@ -924,6 +1022,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "unsafe-shell-recovery")]
     #[test]
     fn try_reap_kills_after_timeout() {
         let mut rec = Recovery::with_template_and_timeout(
@@ -931,7 +1030,7 @@ mod tests {
             Duration::ZERO,
             Some(Duration::from_millis(100)),
         );
-        match rec.on_stall(7) {
+        match rec.on_stall(7, BeatOrigin::KernelAttested) {
             RecoveryOutcome::Spawned { .. } => {}
             other => panic!("expected Spawned, got {other:?}"),
         }
@@ -952,6 +1051,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "unsafe-shell-recovery")]
     #[test]
     fn drop_kills_and_reaps_still_running_children() {
         // Spawn a long-running child with no timeout — the child will
@@ -960,7 +1060,7 @@ mod tests {
         let start = Instant::now();
         {
             let mut rec = Recovery::new("sleep 5".to_string(), Duration::ZERO);
-            match rec.on_stall(999) {
+            match rec.on_stall(999, BeatOrigin::KernelAttested) {
                 RecoveryOutcome::Spawned { .. } => {}
                 other => panic!("expected Spawned, got {other:?}"),
             }
@@ -980,6 +1080,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "unsafe-shell-recovery")]
     #[test]
     fn with_timeout_constructor_accepts_optional_duration() {
         let _none = Recovery::with_template_and_timeout("true".to_string(), Duration::ZERO, None);
@@ -990,18 +1091,28 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "unsafe-shell-recovery")]
     #[test]
     fn last_fired_hashmap_is_pruned_after_debounce_times_ten() {
         let debounce = Duration::from_millis(10);
         let mut rec = Recovery::new("true".to_string(), debounce);
 
-        assert!(matches!(rec.on_stall(1), RecoveryOutcome::Spawned { .. }));
-        assert!(matches!(rec.on_stall(1), RecoveryOutcome::Debounced));
+        assert!(matches!(
+            rec.on_stall(1, BeatOrigin::KernelAttested),
+            RecoveryOutcome::Spawned { .. }
+        ));
+        assert!(matches!(
+            rec.on_stall(1, BeatOrigin::KernelAttested),
+            RecoveryOutcome::Debounced
+        ));
 
         let prune_threshold = debounce.saturating_mul(10);
         std::thread::sleep(prune_threshold + Duration::from_millis(40));
 
-        assert!(matches!(rec.on_stall(1), RecoveryOutcome::Spawned { .. }));
+        assert!(matches!(
+            rec.on_stall(1, BeatOrigin::KernelAttested),
+            RecoveryOutcome::Spawned { .. }
+        ));
     }
 
     #[test]
@@ -1013,7 +1124,7 @@ mod tests {
             },
             Duration::ZERO,
         );
-        match rec.on_stall(42) {
+        match rec.on_stall(42, BeatOrigin::KernelAttested) {
             RecoveryOutcome::Spawned { .. } => {
                 std::thread::sleep(Duration::from_millis(50));
                 let outcomes = rec.try_reap();
@@ -1044,7 +1155,7 @@ mod tests {
             },
             Duration::ZERO,
         );
-        match rec.on_stall(42) {
+        match rec.on_stall(42, BeatOrigin::KernelAttested) {
             RecoveryOutcome::Spawned { .. } => {
                 std::thread::sleep(Duration::from_millis(100));
                 let outcomes = rec.try_reap();
@@ -1070,7 +1181,7 @@ mod tests {
             },
             Duration::ZERO,
         );
-        match rec.on_stall(42) {
+        match rec.on_stall(42, BeatOrigin::KernelAttested) {
             RecoveryOutcome::Spawned { .. } => {
                 std::thread::sleep(Duration::from_millis(50));
                 let outcomes = rec.try_reap();
@@ -1085,6 +1196,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "unsafe-shell-recovery")]
     #[test]
     fn env_isolation_clears_inherited_environment() {
         let mut rec = Recovery::with_timeout(
@@ -1093,7 +1205,7 @@ mod tests {
             None,
         )
         .with_recovery_env(vec!["FOO=bar".to_string()]);
-        match rec.on_stall(1) {
+        match rec.on_stall(1, BeatOrigin::KernelAttested) {
             RecoveryOutcome::Spawned { .. } => {
                 std::thread::sleep(Duration::from_millis(100));
                 let outcomes = rec.try_reap();
@@ -1110,6 +1222,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "unsafe-shell-recovery")]
     #[test]
     fn env_isolation_passes_explicit_variables() {
         let mut rec = Recovery::with_timeout(
@@ -1120,7 +1233,7 @@ mod tests {
             None,
         )
         .with_recovery_env(vec!["MYVAR=hello".to_string(), "OTHER=world".to_string()]);
-        match rec.on_stall(1) {
+        match rec.on_stall(1, BeatOrigin::KernelAttested) {
             RecoveryOutcome::Spawned { .. } => {
                 std::thread::sleep(Duration::from_millis(100));
                 let outcomes = rec.try_reap();
@@ -1137,6 +1250,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "unsafe-shell-recovery")]
     #[test]
     fn no_env_isolation_preserves_inherited_env() {
         let mut rec = Recovery::with_timeout(
@@ -1145,7 +1259,7 @@ mod tests {
             None,
         );
         // Default: recovery_env is empty → inherits observer's environment.
-        match rec.on_stall(1) {
+        match rec.on_stall(1, BeatOrigin::KernelAttested) {
             RecoveryOutcome::Spawned { .. } => {
                 std::thread::sleep(Duration::from_millis(100));
                 let outcomes = rec.try_reap();
@@ -1176,7 +1290,7 @@ mod tests {
             None,
         )
         .with_recovery_env(vec!["E1=a".to_string(), "E2=b".to_string()]);
-        match rec.on_stall(1) {
+        match rec.on_stall(1, BeatOrigin::KernelAttested) {
             RecoveryOutcome::Spawned { .. } => {
                 std::thread::sleep(Duration::from_millis(100));
                 let outcomes = rec.try_reap();
@@ -1231,7 +1345,7 @@ mod tests {
         )
         .with_audit_sink(Some(sink));
 
-        match rec.on_stall(123) {
+        match rec.on_stall(123, BeatOrigin::KernelAttested) {
             RecoveryOutcome::Spawned { .. } => {}
             other => panic!("expected Spawned, got {other:?}"),
         }
@@ -1283,7 +1397,7 @@ mod tests {
         .with_capture(4096)
         .with_audit_sink(Some(sink));
 
-        match rec.on_stall(77) {
+        match rec.on_stall(77, BeatOrigin::KernelAttested) {
             RecoveryOutcome::Spawned { .. } => {}
             other => panic!("expected Spawned, got {other:?}"),
         }
@@ -1338,7 +1452,7 @@ mod tests {
         .with_capture(64)
         .with_audit_sink(Some(sink));
 
-        match rec.on_stall(8) {
+        match rec.on_stall(8, BeatOrigin::KernelAttested) {
             RecoveryOutcome::Spawned { .. } => {}
             other => panic!("expected Spawned, got {other:?}"),
         }
@@ -1382,10 +1496,76 @@ mod tests {
             },
             Duration::ZERO,
         );
-        match rec.on_stall(1) {
+        match rec.on_stall(1, BeatOrigin::KernelAttested) {
             RecoveryOutcome::Spawned { .. } => {}
             other => panic!("expected Spawned, got {other:?}"),
         }
         // No audit_sink configured → nothing to assert beyond "still works".
+    }
+
+    /// H2 default-safe gate: a `NetworkUnverified` stall must NOT spawn the
+    /// recovery command. The counter increments and the outcome is the new
+    /// `RefusedUnauthenticatedSource` variant.
+    #[test]
+    fn refuses_recovery_on_unauthenticated_origin_by_default() {
+        let mut rec = Recovery::with_mode(
+            RecoveryMode::Exec {
+                program: "true".to_string(),
+                args: vec![],
+            },
+            Duration::ZERO,
+        );
+
+        match rec.on_stall(42, BeatOrigin::NetworkUnverified) {
+            RecoveryOutcome::RefusedUnauthenticatedSource { pid } => assert_eq!(pid, 42),
+            other => panic!("expected RefusedUnauthenticatedSource, got {other:?}"),
+        }
+        assert_eq!(rec.take_refused_unauthenticated_source(), 1);
+        // Counter resets after take.
+        assert_eq!(rec.take_refused_unauthenticated_source(), 0);
+    }
+
+    /// `--i-accept-recovery-on-unauthenticated-transport` flips the gate
+    /// off — `NetworkUnverified` stalls spawn like UDS ones.
+    #[test]
+    fn accept_flag_allows_unauthenticated_recovery() {
+        let mut rec = Recovery::with_mode(
+            RecoveryMode::Exec {
+                program: "true".to_string(),
+                args: vec![],
+            },
+            Duration::ZERO,
+        )
+        .with_allow_unauthenticated_source(true);
+
+        match rec.on_stall(42, BeatOrigin::NetworkUnverified) {
+            RecoveryOutcome::Spawned { .. } => {}
+            other => panic!("expected Spawned, got {other:?}"),
+        }
+        assert_eq!(rec.take_refused_unauthenticated_source(), 0);
+    }
+
+    /// The refusal path must NOT mutate debounce state — a second stall for
+    /// the same pid (regardless of origin) is still allowed to advance to
+    /// the legitimate gate.
+    #[test]
+    fn refusal_does_not_burn_debounce_window() {
+        let mut rec = Recovery::with_mode(
+            RecoveryMode::Exec {
+                program: "true".to_string(),
+                args: vec![],
+            },
+            Duration::from_secs(60),
+        );
+
+        // First call refused → no debounce entry recorded.
+        let _ = rec.on_stall(7, BeatOrigin::NetworkUnverified);
+
+        // A genuine kernel-attested stall for the same pid still spawns —
+        // the previous (refused) call did not consume the debounce window.
+        match rec.on_stall(7, BeatOrigin::KernelAttested) {
+            RecoveryOutcome::Spawned { .. } => {}
+            other => panic!("expected Spawned, got {other:?}"),
+        }
     }
 }

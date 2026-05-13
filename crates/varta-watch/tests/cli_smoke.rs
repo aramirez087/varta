@@ -277,9 +277,11 @@ fn cli_plaintext_udp_not_compiled_in_is_rejected() {
 
 // ---------------------------------------------------------------------------
 // Shell-mode recovery (--recovery-cmd / --recovery-cmd-file) must require
-// --i-accept-shell-risk.  Regression for security issue C2.
+// --i-accept-shell-risk (when feature is compiled in) or produce a
+// "not compiled in" error (when feature is absent).
 // ---------------------------------------------------------------------------
 
+#[cfg(feature = "unsafe-shell-recovery")]
 #[test]
 fn cli_recovery_cmd_without_accept_flag_is_rejected() {
     let path = unique_uds_path("shell-no-accept");
@@ -308,6 +310,42 @@ fn cli_recovery_cmd_without_accept_flag_is_rejected() {
     assert!(
         stderr.contains("--i-accept-shell-risk") && stderr.contains("--recovery-exec"),
         "error must name both --i-accept-shell-risk and the safer --recovery-exec, got: {stderr}"
+    );
+}
+
+/// When compiled without `unsafe-shell-recovery`, the binary must refuse
+/// `--recovery-cmd` even with `--i-accept-shell-risk`, directing the operator
+/// to rebuild with the feature or switch to `--recovery-exec`.
+#[cfg(not(feature = "unsafe-shell-recovery"))]
+#[test]
+fn cli_recovery_cmd_without_feature_is_rejected() {
+    let path = unique_uds_path("shell-no-feature");
+    let out = Command::new(env!("CARGO_BIN_EXE_varta-watch"))
+        .args([
+            "--socket",
+            path.as_str(),
+            "--threshold-ms",
+            "100",
+            "--recovery-cmd",
+            "true",
+            "--i-accept-shell-risk",
+            "--shutdown-after-secs",
+            "0",
+        ])
+        .output()
+        .expect("spawn varta-watch with --recovery-cmd + accept but no feature");
+
+    assert!(
+        !out.status.success(),
+        "shell-mode recovery without unsafe-shell-recovery feature must hard-error; \
+         got {:?} (stderr: {})",
+        out.status,
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("unsafe-shell-recovery"),
+        "error must name the feature, got: {stderr}"
     );
 }
 
@@ -544,5 +582,60 @@ fn cli_prom_token_file_with_world_readable_mode_is_rejected() {
     assert!(
         stderr.contains("insecure permissions") || stderr.contains("0600"),
         "error must explain the 0600 requirement; got: {stderr}"
+    );
+}
+
+// ---- H2 mitigation: recovery + UDP requires explicit operator opt-in -------
+
+#[test]
+fn cli_recovery_plus_udp_port_without_accept_flag_is_rejected() {
+    // Cross-flag invariant from docs/architecture/peer-authentication.md:
+    // UDP transports cannot attest the sending process; combining a recovery
+    // command with --udp-port is structurally unsafe and must hard-error at
+    // startup unless --i-accept-recovery-on-unauthenticated-transport is
+    // passed. This is the structural-enforcement layer behind the H2 fix.
+    let socket = unique_uds_path("h2-no-accept");
+    let out = Command::new(env!("CARGO_BIN_EXE_varta-watch"))
+        .args([
+            "--socket",
+            socket.as_str(),
+            "--threshold-ms",
+            "100",
+            "--udp-port",
+            "9001",
+            "--recovery-exec",
+            "/bin/true",
+        ])
+        .output()
+        .expect("spawn varta-watch");
+    assert!(
+        !out.status.success(),
+        "recovery + --udp-port without accept flag must hard-error; \
+         got status {:?}",
+        out.status
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("--i-accept-recovery-on-unauthenticated-transport"),
+        "error must name the opt-in flag; got: {stderr}"
+    );
+}
+
+#[test]
+fn cli_recovery_plus_udp_port_with_accept_flag_parses() {
+    // Same combo, with the opt-in flag: --help should now also list the
+    // flag, and the parser must accept the combination without error.
+    // We invoke --help (already validated above) plus a config-only path:
+    // start the daemon for ~0 seconds via --shutdown-after-secs=0 only on
+    // platforms where binding an ephemeral UDP port is cheap.
+    let out = Command::new(env!("CARGO_BIN_EXE_varta-watch"))
+        .arg("--help")
+        .output()
+        .expect("spawn varta-watch --help");
+    assert!(out.status.success(), "--help should exit 0");
+    let s = String::from_utf8(out.stdout).expect("--help stdout utf8");
+    assert!(
+        s.contains("--i-accept-recovery-on-unauthenticated-transport"),
+        "--help must list the new opt-in flag; full output:\n{s}"
     );
 }

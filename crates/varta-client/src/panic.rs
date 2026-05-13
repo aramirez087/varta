@@ -37,7 +37,10 @@ impl core::fmt::Display for PanicInstallError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             PanicInstallError::EntropyUnavailable(e) => {
-                write!(f, "varta: panic-hook install failed — entropy unavailable: {e}")
+                write!(
+                    f,
+                    "varta: panic-hook install failed — entropy unavailable: {e}"
+                )
             }
         }
     }

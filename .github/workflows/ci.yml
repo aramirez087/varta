@@ -133,3 +133,31 @@ jobs:
 
       - name: assert no fuzz artifacts (reproducer = CI failure)
         run: test -z "$(find fuzz/artifacts -type f 2>/dev/null)"
+
+  safety-profiles:
+    name: safety-profiles (production-safe binary audit)
+    runs-on: ubuntu-latest
+    steps:
+      - name: checkout
+        uses: actions/checkout@v4
+
+      - name: rust toolchain (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: production-safe build (default features)
+        run: cargo build -p varta-watch --release
+
+      - name: verify no /bin/sh in production binary
+        run: |
+          strings target/release/varta-watch | grep -F "/bin/sh" \
+            && { echo "FAIL: /bin/sh found in production-safe binary"; exit 1; } \
+            || echo "OK: no /bin/sh in production-safe binary"
+
+      - name: unsafe-shell-recovery feature compiles
+        run: cargo build -p varta-watch --release --features unsafe-shell-recovery
+
+      - name: unsafe-shell-recovery unit tests
+        run: cargo test -p varta-watch --features unsafe-shell-recovery
+
+      - name: unsafe-shell-recovery integration tests
+        run: cargo test -p varta-tests --features shell-recovery

@@ -20,7 +20,7 @@ use std::fs::OpenOptions;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use varta_watch::{
@@ -43,6 +43,12 @@ use varta_watch::{
 /// signal handlers by Linux `signal-safety(7)` and Apple `sigaction(2)`.
 /// `SA_RESTART` is set so the observer's `recvmsg(2)` never returns `EINTR`.
 static SHUTDOWN: AtomicBool = AtomicBool::new(false);
+
+/// Nanosecond timestamp of the most recent poll loop iteration, written by
+/// the main thread each tick and read by the self-watchdog thread.
+/// Initialised to 0; the watchdog ignores the zero value to avoid spurious
+/// aborts before the first tick.
+static LAST_TICK_NS: AtomicU64 = AtomicU64::new(0);
 
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd",))]
 unsafe fn install_signal_handlers() -> io::Result<()> {
@@ -225,6 +231,24 @@ unsafe fn install_signal_handlers() -> io::Result<()> {
 /// never a partial write.  A `.<pid>.tmp` suffix keeps concurrent observers
 /// (misconfigured onto the same path) from clobbering each other's tempfile.
 /// If the rename fails the tempfile is removed before returning the error.
+/// Monotonic nanosecond clock for the self-watchdog thread.  Uses
+/// `Instant::now()` so it never goes backwards, which is the only
+/// property needed for deadline arithmetic.
+fn observer_now_ns() -> u64 {
+    use std::time::UNIX_EPOCH;
+    std::time::SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0)
+}
+
+/// Returns `true` when the poll loop has not ticked for longer than
+/// `deadline_ns` nanoseconds.  `last == 0` means "not yet started"; skip
+/// until the first real tick to avoid false aborts at startup.
+fn watchdog_expired(now_ns: u64, last_ns: u64, deadline_ns: u64) -> bool {
+    last_ns != 0 && now_ns.saturating_sub(last_ns) > deadline_ns
+}
+
 fn write_heartbeat_atomic(path: &Path, contents: &[u8]) -> io::Result<()> {
     let pid = std::process::id();
     let mut tmp_os = path.as_os_str().to_owned();
@@ -444,9 +468,10 @@ fn run(cfg: Config) -> std::io::Result<()> {
     // is configured without the flag, so reaching here with the flag set
     // means the choice was deliberate — log it once so it appears in any
     // SIEM / syslog ingest alongside the other startup banners.
+    #[cfg(feature = "unsafe-shell-recovery")]
     if cfg.i_accept_shell_risk && (cfg.recovery_cmd.is_some() || cfg.recovery_cmd_file.is_some()) {
         varta_warn!(
-            "shell-mode recovery is active (--i-accept-shell-risk). /bin/sh -c \
+            "shell-mode recovery is active (--i-accept-shell-risk). The system shell \
              will be spawned with root-equivalent process authority on each unique \
              stall. NOT for production / safety-critical use — prefer --recovery-exec."
         );
@@ -472,18 +497,41 @@ fn run(cfg: Config) -> std::io::Result<()> {
         "inline".to_string()
     };
 
+    // High-visibility audit-trail when the operator has explicitly accepted
+    // recovery on an unauthenticated transport.  Config-level validation
+    // already rejects the combination without the flag, so reaching this
+    // branch means the choice was deliberate — log it once so the choice
+    // appears in any SIEM / syslog ingest alongside the other startup banners.
+    if cfg.i_accept_recovery_on_unauthenticated_transport && recovery_mode.is_some() {
+        varta_warn!(
+            "recovery-on-unauthenticated-transport is enabled \
+             (--i-accept-recovery-on-unauthenticated-transport). The runtime origin \
+             gate will still refuse to spawn recovery commands for UDP-origin stalls \
+             unless the operator additionally enables Recovery's \
+             allow_unauthenticated_source. NOT for production / safety-critical use."
+        );
+    }
+
     let mut recovery = recovery_mode.map(|mode| {
         let capture_cap = if cfg.recovery_capture_stdio {
             cfg.recovery_capture_bytes
         } else {
             0
         };
+        // Origin gate stays enabled by default even when the startup
+        // hard-error has been overridden — UDP-origin stalls are still
+        // refused at the runtime layer. This is intentional defense-in-depth:
+        // the startup flag enables the *combination* to start, but does
+        // not by itself authorize firing recovery against unauthenticated
+        // sources. Wiring the field to true is reserved for callers that
+        // make a separate, conscious choice.
         Recovery::with_timeout(mode, cfg.recovery_debounce, cfg.recovery_timeout)
             .with_recovery_env(cfg.recovery_env.clone())
             .with_shutdown_grace(cfg.shutdown_grace)
             .with_capture(capture_cap)
             .with_source(recovery_source.clone())
             .with_audit_sink(recovery_audit_sink)
+            .with_allow_unauthenticated_source(false)
     });
     let mut file_export: Option<FileExporter> = match cfg.file_export.as_ref() {
         Some(path) => Some(FileExporter::create(path, cfg.export_file_max_bytes)?),
@@ -527,6 +575,50 @@ fn run(cfg: Config) -> std::io::Result<()> {
         None => None,
     };
 
+    // --- sd_notify: signal READY=1 to the service manager. -----------------
+    let mut sd_notify = varta_watch::notify::SdNotify::from_env();
+    sd_notify.ready();
+
+    // --- Self-watchdog thread (optional) ------------------------------------
+    // The ONLY background thread in the binary.  It exists solely to detect
+    // a hung poll loop and call process::abort().  The beat path and observer
+    // loop remain single-threaded.  Enabled by --self-watchdog-secs.
+    if let Some(deadline) = cfg.self_watchdog {
+        let deadline_ns = deadline.as_nanos() as u64;
+        let secs = deadline.as_secs();
+        std::thread::Builder::new()
+            .name("varta-watchdog".into())
+            .spawn(move || loop {
+                std::thread::sleep(Duration::from_millis(500));
+                if SHUTDOWN.load(Ordering::Acquire) {
+                    return;
+                }
+                let last = LAST_TICK_NS.load(Ordering::Relaxed);
+                let now = observer_now_ns();
+                if watchdog_expired(now, last, deadline_ns) {
+                    eprintln!(
+                        "varta-watch poll loop wedged for >{secs}s; aborting"
+                    );
+                    std::process::abort();
+                }
+            })?;
+    }
+
+    // --- Hardware watchdog (optional) --------------------------------------
+    let mut hw_wdt = if let Some(ref path) = cfg.hw_watchdog {
+        match varta_watch::hw_watchdog::HwWatchdog::open(path) {
+            Ok(w) => Some(w),
+            Err(e) => {
+                return Err(io::Error::new(
+                    e.kind(),
+                    format!("--hw-watchdog {}: {e}", path.display()),
+                ));
+            }
+        }
+    } else {
+        None
+    };
+
     let started = Instant::now();
     let mut loop_count: u64 = 0;
     loop {
@@ -552,9 +644,9 @@ fn run(cfg: Config) -> std::io::Result<()> {
             if let Some(pe) = prom_export.as_mut() {
                 let _ = pe.record(&ev);
             }
-            if let Event::Stall { pid, .. } = &ev {
+            if let Event::Stall { pid, origin, .. } = &ev {
                 if let Some(rec) = recovery.as_mut() {
-                    let outcome = rec.on_stall(*pid);
+                    let outcome = rec.on_stall(*pid, *origin);
                     if let Some(pe) = prom_export.as_mut() {
                         pe.record_recovery_outcome(&outcome, None);
                     }
@@ -572,6 +664,15 @@ fn run(cfg: Config) -> std::io::Result<()> {
                                 *pid,
                                 e,
                                 "recovery for pid {pid} failed to spawn: {e}"
+                            );
+                        }
+                        RecoveryOutcome::RefusedUnauthenticatedSource { pid } => {
+                            varta_warn!(
+                                "recovery for pid {pid} REFUSED: stalled beat lifetime \
+                                 includes a non-kernel-attested transport (UDP). Pass \
+                                 --i-accept-recovery-on-unauthenticated-transport AND \
+                                 enable Recovery's allow_unauthenticated_source to \
+                                 override at your own risk."
                             );
                         }
                         RecoveryOutcome::Reaped { .. }
@@ -667,6 +768,13 @@ fn run(cfg: Config) -> std::io::Result<()> {
             }
         }
 
+        let origin_conflicts = observer.drain_origin_conflicts();
+        if origin_conflicts > 0 {
+            if let Some(pe) = prom_export.as_mut() {
+                pe.record_origin_conflicts(origin_conflicts);
+            }
+        }
+
         // Reap completed or timeout-exceeded children each tick.
         if let Some(rec) = recovery.as_mut() {
             for outcome in rec.try_reap() {
@@ -715,7 +823,7 @@ fn run(cfg: Config) -> std::io::Result<()> {
             std::thread::sleep(Duration::from_millis(10));
         }
 
-        // ----- 5. Heartbeat file update ------
+        // ----- 5. Heartbeat file, self-watchdog tick, and HW watchdog kick ------
         loop_count = loop_count.wrapping_add(1);
         if let Some(ref hb_path) = cfg.heartbeat_file {
             let ts = observer.now_ns();
@@ -724,7 +832,22 @@ fn run(cfg: Config) -> std::io::Result<()> {
                 varta_error!("heartbeat file write error: {e}");
             }
         }
+        // Update the self-watchdog liveness timestamp.  Uses wall-clock so the
+        // watchdog thread (which cannot access the observer) reads the same
+        // epoch.  Store after the poll work so a hung sd_notify/hw-watchdog
+        // kick would also be caught.
+        LAST_TICK_NS.store(observer_now_ns(), Ordering::Relaxed);
+        sd_notify.watchdog_tick();
+        if let Some(ref mut hw) = hw_wdt {
+            hw.kick();
+        }
     }
+
+    // Clean shutdown — disarm hardware watchdog and notify service manager.
+    if let Some(ref hw) = hw_wdt {
+        hw.arm_disarm_on_drop();
+    }
+    sd_notify.stopping();
 
     if let Some(fe) = file_export.as_mut() {
         let _ = fe.flush();
@@ -739,6 +862,28 @@ mod tests {
     use std::io::Read;
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
+
+    #[test]
+    fn watchdog_expired_returns_false_before_first_tick() {
+        // last == 0 means no tick yet — must never fire.
+        assert!(!watchdog_expired(u64::MAX, 0, 1));
+    }
+
+    #[test]
+    fn watchdog_expired_returns_false_within_deadline() {
+        let now = 1_000_000_000u64; // 1 s
+        let last = 999_000_000u64; // 1 ms ago
+        let deadline = 5_000_000_000u64; // 5 s
+        assert!(!watchdog_expired(now, last, deadline));
+    }
+
+    #[test]
+    fn watchdog_expired_returns_true_past_deadline() {
+        let now = 10_000_000_000u64; // 10 s
+        let last = 1_000_000u64; // very old
+        let deadline = 5_000_000_000u64; // 5 s
+        assert!(watchdog_expired(now, last, deadline));
+    }
 
     fn mk_tmpdir(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("varta_hb_{}_{}", tag, std::process::id()));

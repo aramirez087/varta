@@ -77,12 +77,7 @@ pub fn open(
     let cipher = ChaCha20Poly1305::new(chacha20poly1305::Key::from_slice(key));
     let mut pt = *ciphertext;
     cipher
-        .decrypt_in_place_detached(
-            Nonce::from_slice(nonce),
-            b"",
-            &mut pt,
-            Tag::from_slice(tag),
-        )
+        .decrypt_in_place_detached(Nonce::from_slice(nonce), b"", &mut pt, Tag::from_slice(tag))
         .map_err(|_| AuthError)?;
     Ok(pt)
 }

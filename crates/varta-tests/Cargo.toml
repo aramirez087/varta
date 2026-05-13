@@ -18,6 +18,7 @@ workspace = true
 # is unsafe and must be acknowledged at every layer.
 udp = ["varta-client/udp", "varta-watch/unsafe-plaintext-udp"]
 secure-udp = ["varta-client/secure-udp", "varta-watch/secure-udp"]
+shell-recovery = ["varta-watch/unsafe-shell-recovery"]
 
 [dev-dependencies]
 varta-vlp = { path = "../varta-vlp", features = ["crypto"] }
