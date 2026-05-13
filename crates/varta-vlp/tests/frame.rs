@@ -44,7 +44,11 @@ fn patch_with_valid_crc(mut buf: [u8; 32], offset: usize, value: u8) -> [u8; 32]
 }
 
 /// Same as `patch_with_valid_crc` for a multi-byte little-endian write.
-fn patch_range_with_valid_crc(mut buf: [u8; 32], range: core::ops::Range<usize>, src: &[u8]) -> [u8; 32] {
+fn patch_range_with_valid_crc(
+    mut buf: [u8; 32],
+    range: core::ops::Range<usize>,
+    src: &[u8],
+) -> [u8; 32] {
     buf[range].copy_from_slice(src);
     let crc = crc32c::compute(&buf[0..28]);
     buf[28..32].copy_from_slice(&crc.to_le_bytes());

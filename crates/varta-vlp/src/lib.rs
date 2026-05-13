@@ -222,8 +222,7 @@ impl Frame {
         // magic/version (so wrong-protocol bytes surface as BadMagic, not
         // BadCrc) and before any field-range check (so corruption cannot
         // produce a "well-formed" frame with the wrong meaning).
-        let stored_crc =
-            u32::from_le_bytes([bytes[28], bytes[29], bytes[30], bytes[31]]);
+        let stored_crc = u32::from_le_bytes([bytes[28], bytes[29], bytes[30], bytes[31]]);
         let computed_crc = crc32c::compute(&bytes[0..28]);
         if stored_crc != computed_crc {
             return Err(DecodeError::BadCrc {

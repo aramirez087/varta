@@ -1,9 +1,9 @@
-# VLP Frame — Wire Layout (v0.1.0)
+# VLP Frame — Wire Layout (v0.2)
 
 The Varta Lifeline Protocol carries a single message type: a 32-byte
 fixed-layout health frame. Every byte position is pinned at the protocol level
-so encode/decode is a handful of `from_le_bytes` / `to_le_bytes` calls and
-nothing else.
+so encode/decode is a handful of `from_le_bytes` / `to_le_bytes` calls and a
+single CRC-32C pass — nothing else.
 
 ## Byte map
 
@@ -11,15 +11,51 @@ nothing else.
 offset │ size │ field      │ notes
 ───────┼──────┼────────────┼──────────────────────────────────────────────
  0     │  2   │ magic      │ const [0x56, 0x41]  (ASCII "VA")
- 2     │  1   │ version    │ const 0x01
+ 2     │  1   │ version    │ const 0x02         (v0.1 → BadVersion)
  3     │  1   │ status     │ Status::{Ok=0, Degraded=1, Critical=2, Stall=3}
  4     │  4   │ pid        │ u32 little-endian — emitter's process id
  8     │  8   │ timestamp  │ u64 little-endian — emitter-local monotonic
 16     │  8   │ nonce      │ u64 little-endian — strictly increasing
-24     │  8   │ payload    │ u64 little-endian — opaque app context
+24     │  4   │ payload    │ u32 little-endian — opaque app context (v0.2)
+28     │  4   │ crc32c     │ u32 LE CRC-32C over bytes 0..28        (v0.2)
 ───────┴──────┴────────────┴──────────────────────────────────────────────
                                                               total 32 bytes
 ```
+
+## v0.2 wire integrity (CRC-32C)
+
+Bytes 28..32 carry a CRC-32C (Castagnoli, polynomial `0x1EDC6F41`,
+init `0xFFFFFFFF`, reflected, output-XOR `0xFFFFFFFF`) computed over
+bytes 0..28. The CRC catches:
+
+* Non-ECC RAM bit flips and cosmic-ray single-event upsets on the agent
+  or the observer host.
+* NIC firmware corruption between RX queue and userspace.
+* In-process memory corruption between `Frame::encode` and the
+  transport write (or between the transport read and `Frame::decode`),
+  including the gap between `crypto::seal` / `crypto::open` and the
+  frame-level codec on the secure-UDP transport. AEAD tag failures
+  surface separately as `crypto::AuthError`; the CRC is the
+  defence-in-depth catch for everything that AEAD does not (in-process
+  corruption on either side of the seal/open boundary).
+
+Decode order is fixed: `magic → version → CRC → status → pid → timestamp →
+nonce`. CRC verification sits between version and field-range checks so
+random bytes from a wrong-protocol sender still surface as `BadMagic` /
+`BadVersion` (preserving the "this isn't even VLP" diagnostic) while a
+single-bit-flipped status byte surfaces as `BadCrc`, never as a valid
+frame with the wrong meaning.
+
+Implementation: `crates/varta-vlp/src/crc32c.rs` carries a const-fn 256-entry
+lookup table; per-frame cost is ~28 cycles (~9 ns on Apple Silicon). Hardware
+CRC-32C is available on x86_64 (SSE 4.2) and ARMv8.1+ via `core::arch`
+intrinsics; a future `target_feature` cfg can drop the cost to ~1 cycle
+without changing the wire format.
+
+The payload field shrank from `u64` (v0.1) to `u32` (v0.2) to make room
+for the CRC trailer inside the 32-byte budget. Agents needing more than
+4 bytes of context should externalize the data and reference it from the
+payload (e.g. as a slot index into a shared ring buffer).
 
 The two compile-time assertions in `crates/varta-vlp/src/lib.rs` lock this in:
 
