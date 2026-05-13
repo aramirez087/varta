@@ -31,8 +31,65 @@
 //! restrictive file permissions for an additional trust check.
 
 use std::collections::HashMap;
-use std::process::{Child, Command};
+use std::io::Read;
+use std::os::unix::io::AsRawFd;
+use std::process::{Child, ChildStderr, ChildStdout, Command, Stdio};
 use std::time::{Duration, Instant};
+
+use crate::audit::{CompleteOutcome, CompleteRecord, RecoveryAuditLog, SpawnRecord};
+
+// fcntl(2) flags. Hand-rolled to avoid pulling `libc` into a production crate.
+#[cfg(target_os = "linux")]
+const O_NONBLOCK_FCNTL: i32 = 0x800;
+#[cfg(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    target_os = "dragonfly",
+))]
+const O_NONBLOCK_FCNTL: i32 = 0x0004;
+const F_GETFL: i32 = 3;
+const F_SETFL: i32 = 4;
+
+extern "C" {
+    fn fcntl(fd: i32, cmd: i32, ...) -> i32;
+}
+
+/// Best-effort set `O_NONBLOCK` on a raw fd. Failure is logged-only — the
+/// drain loop checks `WouldBlock` and falls back to a single bounded
+/// `read` if the flag could not be set, so a failing fcntl never blocks
+/// the observer.
+fn set_nonblocking_fd(fd: i32) -> bool {
+    // SAFETY: F_GETFL/F_SETFL are standard fcntl commands. The fd is owned
+    // by the ChildStdout/ChildStderr handle for the duration of this call.
+    let flags = unsafe { fcntl(fd, F_GETFL) };
+    if flags < 0 {
+        return false;
+    }
+    let rc = unsafe { fcntl(fd, F_SETFL, flags | O_NONBLOCK_FCNTL) };
+    rc >= 0
+}
+
+/// Take the piped stdout/stderr handles off `child` (when capture is
+/// enabled) and mark them non-blocking. Returns `(None, None)` when
+/// capture is disabled or the handles were never piped.
+fn take_capture_handles(
+    child: &mut Child,
+    capture_on: bool,
+) -> (Option<ChildStdout>, Option<ChildStderr>) {
+    if !capture_on {
+        return (None, None);
+    }
+    let out = child.stdout.take().inspect(|h| {
+        let _ = set_nonblocking_fd(h.as_raw_fd());
+    });
+    let err = child.stderr.take().inspect(|h| {
+        let _ = set_nonblocking_fd(h.as_raw_fd());
+    });
+    (out, err)
+}
 
 /// How the recovery command is executed when an agent stalls.
 ///
@@ -102,6 +159,23 @@ struct Outstanding {
     child: Child,
     spawned_at: Instant,
     killed: bool,
+    /// Wall-clock ms at spawn time; recorded into the audit log on
+    /// completion alongside the monotonic duration.
+    wallclock_at_spawn_ms: u64,
+    /// `Some` iff capture is enabled. Drains accumulate here non-blockingly
+    /// across `try_reap` calls; truncation is set when either stream's
+    /// captured bytes reach the per-child cap.
+    stdout_handle: Option<ChildStdout>,
+    /// See `stdout_handle`.
+    stderr_handle: Option<ChildStderr>,
+    /// Accumulated captured stdout bytes (length only — content is held
+    /// briefly in `_stdout_buf` and discarded after the cap is reached).
+    stdout_len: u32,
+    /// Accumulated captured stderr bytes.
+    stderr_len: u32,
+    /// True iff either pipe's reads hit the per-child cap and we
+    /// stopped reading.
+    truncated: bool,
 }
 
 /// Maximum number of pids tracked in `last_fired`. When the map is full and
@@ -127,6 +201,16 @@ pub struct Recovery {
     /// outlive the grace are abandoned to PID 1 (init) for reaping.  Tuned
     /// via `--shutdown-grace-ms` in the observer CLI.
     shutdown_grace: Duration,
+    /// Optional audit sink. Spawn and complete records are emitted here
+    /// when set; when `None`, audit is effectively disabled.
+    audit_sink: Option<RecoveryAuditLog>,
+    /// Per-child combined byte cap for stdout+stderr capture. `0` disables
+    /// capture entirely (default behavior). Set via
+    /// [`Recovery::with_capture`].
+    capture_cap: u32,
+    /// Source descriptor recorded into the spawn audit row: either
+    /// `"inline"` or the operator-supplied template-file path.
+    source: String,
 }
 
 impl Recovery {
@@ -171,7 +255,36 @@ impl Recovery {
             pending_outcomes: Vec::new(),
             recovery_env: Vec::new(),
             shutdown_grace: Duration::from_millis(crate::config::DEFAULT_SHUTDOWN_GRACE_MS),
+            audit_sink: None,
+            capture_cap: 0,
+            source: "inline".to_string(),
         }
+    }
+
+    /// Attach a recovery audit sink. Every spawn and completion will be
+    /// appended as a TSV record. Passing `None` (the default) disables
+    /// audit emission without altering the recovery behavior.
+    pub fn with_audit_sink(mut self, sink: Option<RecoveryAuditLog>) -> Self {
+        self.audit_sink = sink;
+        self
+    }
+
+    /// Enable bounded stdout/stderr capture for child processes. `cap` is
+    /// the combined per-child byte cap (stdout + stderr); a value of `0`
+    /// disables capture. Pipes are read non-blockingly each tick to
+    /// prevent the observer poll loop from stalling on a slow child.
+    pub fn with_capture(mut self, cap: u32) -> Self {
+        self.capture_cap = cap;
+        self
+    }
+
+    /// Set the audit-row `source` field. Use `"inline"` (default) for
+    /// `--recovery-cmd` / `--recovery-exec`, or the path string for the
+    /// `*-file` variants — provides operator visibility into which
+    /// template body was loaded into memory.
+    pub fn with_source(mut self, source: String) -> Self {
+        self.source = source;
+        self
     }
 
     /// Override the Drop-time shutdown grace.  See
@@ -209,19 +322,159 @@ impl Recovery {
     }
 
     fn reap_finished_child(&mut self, pid: u32) -> Option<RecoveryOutcome> {
+        // Drain piped stdio (if any) before checking exit; the child may
+        // have written its last bytes after our previous tick's drain.
+        self.drain_capture(pid);
+
         let entry = self.outstanding.get_mut(&pid)?;
         match entry.child.try_wait() {
             Ok(Some(status)) => {
                 let child_pid = entry.child.id();
-                self.outstanding.remove(&pid);
+                let killed = entry.killed;
+                let spawned_at = entry.spawned_at;
+                let wallclock_ms = entry.wallclock_at_spawn_ms;
+                let stdout_len = entry.stdout_len;
+                let stderr_len = entry.stderr_len;
+                let truncated = entry.truncated;
+                // Final drain pass after exit: the child may have flushed
+                // its tail buffer between our last drain and try_wait.
+                self.drain_capture(pid);
+                let outstanding_entry = self.outstanding.remove(&pid).unwrap();
+                self.emit_complete_audit(
+                    pid,
+                    child_pid,
+                    if killed {
+                        CompleteOutcome::Killed
+                    } else {
+                        CompleteOutcome::Reaped
+                    },
+                    Some(&status),
+                    spawned_at,
+                    wallclock_ms,
+                    outstanding_entry.stdout_len,
+                    outstanding_entry.stderr_len,
+                    outstanding_entry.truncated,
+                );
+                // suppress unused variable warning when capture is disabled
+                let _ = (stdout_len, stderr_len, truncated);
                 Some(RecoveryOutcome::Reaped { child_pid, status })
             }
             Ok(None) => None,
             Err(e) => {
-                self.outstanding.remove(&pid);
+                let child_pid = entry.child.id();
+                let spawned_at = entry.spawned_at;
+                let wallclock_ms = entry.wallclock_at_spawn_ms;
+                let entry = self.outstanding.remove(&pid).unwrap();
+                self.emit_complete_audit(
+                    pid,
+                    child_pid,
+                    CompleteOutcome::ReapFailed,
+                    None,
+                    spawned_at,
+                    wallclock_ms,
+                    entry.stdout_len,
+                    entry.stderr_len,
+                    entry.truncated,
+                );
                 Some(RecoveryOutcome::ReapFailed(e))
             }
         }
+    }
+
+    /// Non-blocking drain of captured stdout/stderr for one outstanding
+    /// child. Reads as many bytes as the kernel has buffered (up to the
+    /// remaining cap) without ever blocking. WouldBlock is treated as
+    /// "drain again next tick".
+    fn drain_capture(&mut self, pid: u32) {
+        let cap = self.capture_cap as usize;
+        if cap == 0 {
+            return;
+        }
+        let Some(entry) = self.outstanding.get_mut(&pid) else {
+            return;
+        };
+        if entry.truncated {
+            return;
+        }
+        let mut total = entry.stdout_len as usize + entry.stderr_len as usize;
+        // Drain stdout.
+        if let Some(handle) = entry.stdout_handle.as_mut() {
+            let mut buf = [0u8; 4096];
+            loop {
+                if total >= cap {
+                    entry.truncated = true;
+                    break;
+                }
+                let want = (cap - total).min(buf.len());
+                match handle.read(&mut buf[..want]) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        entry.stdout_len = entry.stdout_len.saturating_add(n as u32);
+                        total = total.saturating_add(n);
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                    Err(_) => break,
+                }
+            }
+        }
+        // Drain stderr.
+        if let Some(handle) = entry.stderr_handle.as_mut() {
+            let mut buf = [0u8; 4096];
+            loop {
+                if total >= cap {
+                    entry.truncated = true;
+                    break;
+                }
+                let want = (cap - total).min(buf.len());
+                match handle.read(&mut buf[..want]) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        entry.stderr_len = entry.stderr_len.saturating_add(n as u32);
+                        total = total.saturating_add(n);
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                    Err(_) => break,
+                }
+            }
+        }
+    }
+
+    /// Emit a recovery-complete audit record (if a sink is configured)
+    /// from already-extracted fields.
+    #[allow(clippy::too_many_arguments)]
+    fn emit_complete_audit(
+        &mut self,
+        agent_pid: u32,
+        child_pid: u32,
+        outcome: CompleteOutcome,
+        status: Option<&std::process::ExitStatus>,
+        spawned_at: Instant,
+        wallclock_at_spawn_ms: u64,
+        stdout_len: u32,
+        stderr_len: u32,
+        truncated: bool,
+    ) {
+        let Some(sink) = self.audit_sink.as_mut() else {
+            return;
+        };
+        use std::os::unix::process::ExitStatusExt;
+        let exit_code = status.and_then(|s| s.code());
+        let signal = status.and_then(|s| s.signal());
+        let duration_ns = spawned_at.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+        let _ = wallclock_at_spawn_ms; // reserved for future "spawn→complete" wallclock pair
+        sink.record_complete(&CompleteRecord {
+            wallclock_ms: RecoveryAuditLog::wallclock_ms_now(),
+            observer_ns: 0,
+            agent_pid,
+            child_pid,
+            outcome,
+            exit_code,
+            signal,
+            duration_ns,
+            stdout_len,
+            stderr_len,
+            truncated,
+        });
     }
 
     /// Spawn `/bin/sh -c <template> varta-recovery <pid>` (shell mode) or
@@ -263,25 +516,45 @@ impl Recovery {
             self.last_fired.insert(pid, now);
         }
 
+        let capture_on = self.capture_cap > 0;
+        let wallclock_ms = RecoveryAuditLog::wallclock_ms_now();
+
         match &self.mode {
             RecoveryMode::Shell(template) => {
+                let template_len = template.len() as u32;
                 let mut cmd = Command::new("/bin/sh");
                 self.apply_env(&mut cmd);
-                match cmd
-                    .arg("-c")
+                cmd.arg("-c")
                     .arg(template)
                     .arg("varta-recovery")
-                    .arg(pid.to_string())
-                    .spawn()
-                {
-                    Ok(child) => {
+                    .arg(pid.to_string());
+                if capture_on {
+                    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+                }
+                match cmd.spawn() {
+                    Ok(mut child) => {
                         let child_pid = child.id();
+                        let (out_handle, err_handle) = take_capture_handles(&mut child, capture_on);
+                        self.emit_spawn_audit(
+                            wallclock_ms,
+                            pid,
+                            child_pid,
+                            "shell",
+                            "/bin/sh",
+                            template_len,
+                        );
                         self.outstanding.insert(
                             pid,
                             Outstanding {
                                 child,
                                 spawned_at: now,
                                 killed: false,
+                                wallclock_at_spawn_ms: wallclock_ms,
+                                stdout_handle: out_handle,
+                                stderr_handle: err_handle,
+                                stdout_len: 0,
+                                stderr_len: 0,
+                                truncated: false,
                             },
                         );
                         RecoveryOutcome::Spawned { child_pid }
@@ -299,15 +572,38 @@ impl Recovery {
                 for arg in &substituted[1..] {
                     cmd.arg(arg);
                 }
+                if capture_on {
+                    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+                }
+                let template_len: u32 = substituted
+                    .iter()
+                    .map(|a| a.len() as u32 + 1)
+                    .sum::<u32>()
+                    .saturating_sub(1);
                 match cmd.spawn() {
-                    Ok(child) => {
+                    Ok(mut child) => {
                         let child_pid = child.id();
+                        let (out_handle, err_handle) = take_capture_handles(&mut child, capture_on);
+                        self.emit_spawn_audit(
+                            wallclock_ms,
+                            pid,
+                            child_pid,
+                            "exec",
+                            substituted[0].as_str(),
+                            template_len,
+                        );
                         self.outstanding.insert(
                             pid,
                             Outstanding {
                                 child,
                                 spawned_at: now,
                                 killed: false,
+                                wallclock_at_spawn_ms: wallclock_ms,
+                                stdout_handle: out_handle,
+                                stderr_handle: err_handle,
+                                stdout_len: 0,
+                                stderr_len: 0,
+                                truncated: false,
                             },
                         );
                         RecoveryOutcome::Spawned { child_pid }
@@ -316,6 +612,32 @@ impl Recovery {
                 }
             }
         }
+    }
+
+    /// Emit a recovery-spawn audit record if a sink is configured.
+    fn emit_spawn_audit(
+        &mut self,
+        wallclock_ms: u64,
+        agent_pid: u32,
+        child_pid: u32,
+        mode: &str,
+        program: &str,
+        template_len: u32,
+    ) {
+        let source = self.source.clone();
+        let Some(sink) = self.audit_sink.as_mut() else {
+            return;
+        };
+        sink.record_spawn(&SpawnRecord {
+            wallclock_ms,
+            observer_ns: 0,
+            agent_pid,
+            child_pid,
+            mode,
+            program,
+            source: &source,
+            template_len,
+        });
     }
 
     /// Apply environment isolation to a child [`Command`].
@@ -396,7 +718,18 @@ impl Recovery {
                         }
 
                         Err(e) => {
-                            self.outstanding.remove(&pid);
+                            let entry = self.outstanding.remove(&pid).unwrap();
+                            self.emit_complete_audit(
+                                pid,
+                                child_pid,
+                                CompleteOutcome::ReapFailed,
+                                None,
+                                entry.spawned_at,
+                                entry.wallclock_at_spawn_ms,
+                                entry.stdout_len,
+                                entry.stderr_len,
+                                entry.truncated,
+                            );
                             outcomes.push(RecoveryOutcome::ReapFailed(e));
                         }
                     }
@@ -858,5 +1191,201 @@ mod tests {
             }
             other => panic!("expected Spawned, got {other:?}"),
         }
+    }
+
+    // ----- M1: audit log + capture tests -----
+
+    fn audit_tmpdir(tag: &str) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "varta-rec-audit-{tag}-{}-{}",
+            std::process::id(),
+            nanos
+        ));
+        std::fs::create_dir(&dir).expect("create tempdir");
+        // Restore execute bit on the dir explicitly. A parallel
+        // `UnixDatagram::bind` in another test installs a 0o177 umask
+        // that masks out the `x` bit from new directories, which would
+        // make every subsequent open() inside this dir return EACCES.
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod tempdir");
+        dir
+    }
+
+    #[test]
+    fn audit_sink_records_spawn_and_complete_for_exec_mode() {
+        let dir = audit_tmpdir("audit-rt");
+        let path = dir.join("audit.log");
+        let sink = RecoveryAuditLog::create(&path, None).expect("create audit");
+
+        let mut rec = Recovery::with_mode(
+            RecoveryMode::Exec {
+                program: "true".to_string(),
+                args: vec![],
+            },
+            Duration::ZERO,
+        )
+        .with_audit_sink(Some(sink));
+
+        match rec.on_stall(123) {
+            RecoveryOutcome::Spawned { .. } => {}
+            other => panic!("expected Spawned, got {other:?}"),
+        }
+        // Spin try_reap until we observe Reaped, then drop to flush.
+        let deadline = Instant::now() + Duration::from_millis(500);
+        loop {
+            if Instant::now() >= deadline {
+                panic!("timed out waiting for Reaped");
+            }
+            let outcomes = rec.try_reap();
+            if outcomes
+                .iter()
+                .any(|o| matches!(o, RecoveryOutcome::Reaped { .. }))
+            {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        drop(rec);
+
+        let body = std::fs::read_to_string(&path).expect("read audit");
+        let lines: Vec<&str> = body.lines().collect();
+        assert!(lines[0].starts_with("# varta-watch recovery audit v1"));
+        assert!(
+            lines.iter().any(|l| l.contains("\tspawn\t123\t")),
+            "expected spawn line for pid 123: {body}"
+        );
+        assert!(
+            lines.iter().any(|l| l.contains("\tcomplete\t123\t")),
+            "expected complete line for pid 123: {body}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn capture_records_nonzero_length_for_chatty_child() {
+        let dir = audit_tmpdir("capture");
+        let path = dir.join("audit.log");
+        let sink = RecoveryAuditLog::create(&path, None).expect("create audit");
+
+        // Print exactly 64 bytes to stdout, then exit.
+        let mut rec = Recovery::with_mode(
+            RecoveryMode::Exec {
+                program: "sh".to_string(),
+                args: vec!["-c".to_string(), "printf '%64s' '' | tr ' ' X".to_string()],
+            },
+            Duration::ZERO,
+        )
+        .with_capture(4096)
+        .with_audit_sink(Some(sink));
+
+        match rec.on_stall(77) {
+            RecoveryOutcome::Spawned { .. } => {}
+            other => panic!("expected Spawned, got {other:?}"),
+        }
+        let deadline = Instant::now() + Duration::from_millis(500);
+        loop {
+            if Instant::now() >= deadline {
+                panic!("timed out waiting for Reaped");
+            }
+            let outcomes = rec.try_reap();
+            if outcomes
+                .iter()
+                .any(|o| matches!(o, RecoveryOutcome::Reaped { .. }))
+            {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        drop(rec);
+
+        let body = std::fs::read_to_string(&path).expect("read audit");
+        let complete = body
+            .lines()
+            .find(|l| l.contains("\tcomplete\t77\t"))
+            .expect("complete line");
+        // stdout_len appears in the 10th tab-separated column (index 9).
+        let cols: Vec<&str> = complete.split('\t').collect();
+        let stdout_len: u32 = cols[9].parse().expect("stdout_len");
+        assert!(
+            stdout_len >= 64,
+            "expected stdout_len ≥ 64, got {stdout_len}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn capture_truncates_at_per_child_cap() {
+        let dir = audit_tmpdir("truncate");
+        let path = dir.join("audit.log");
+        let sink = RecoveryAuditLog::create(&path, None).expect("create audit");
+
+        // Print ~10 KB to stdout; cap at 64 bytes.
+        let mut rec = Recovery::with_mode(
+            RecoveryMode::Exec {
+                program: "sh".to_string(),
+                args: vec![
+                    "-c".to_string(),
+                    "head -c 10000 /dev/zero | tr '\\0' X".to_string(),
+                ],
+            },
+            Duration::ZERO,
+        )
+        .with_capture(64)
+        .with_audit_sink(Some(sink));
+
+        match rec.on_stall(8) {
+            RecoveryOutcome::Spawned { .. } => {}
+            other => panic!("expected Spawned, got {other:?}"),
+        }
+        let deadline = Instant::now() + Duration::from_millis(2_000);
+        loop {
+            if Instant::now() >= deadline {
+                panic!("timed out waiting for Reaped");
+            }
+            let outcomes = rec.try_reap();
+            if outcomes
+                .iter()
+                .any(|o| matches!(o, RecoveryOutcome::Reaped { .. }))
+            {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        drop(rec);
+
+        let body = std::fs::read_to_string(&path).expect("read audit");
+        let complete = body
+            .lines()
+            .find(|l| l.contains("\tcomplete\t8\t"))
+            .expect("complete line");
+        let cols: Vec<&str> = complete.split('\t').collect();
+        let truncated = cols[11];
+        assert_eq!(
+            truncated, "true",
+            "expected truncated=true, got: {complete}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn audit_disabled_does_not_create_audit_file() {
+        // Sanity: audit is opt-in; without a sink we never touch any path.
+        let mut rec = Recovery::with_mode(
+            RecoveryMode::Exec {
+                program: "true".to_string(),
+                args: vec![],
+            },
+            Duration::ZERO,
+        );
+        match rec.on_stall(1) {
+            RecoveryOutcome::Spawned { .. } => {}
+            other => panic!("expected Spawned, got {other:?}"),
+        }
+        // No audit_sink configured → nothing to assert beyond "still works".
     }
 }

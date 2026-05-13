@@ -355,6 +355,15 @@ impl Observer {
         self.tracker.take_nonce_wraps()
     }
 
+    /// Drain and reset the count of bounded eviction-scan calls that ran
+    /// the full [`crate::tracker::EVICTION_SCAN_WINDOW`] without finding a
+    /// victim. Non-zero values prove the per-frame work cap engaged — i.e.
+    /// the tracker was full and an attacker would otherwise have forced
+    /// O(n) work per arriving frame.
+    pub fn drain_eviction_scan_truncated(&mut self) -> u64 {
+        self.tracker.take_eviction_scan_truncated()
+    }
+
     /// Drain and reset the rate-limited counter.
     pub fn drain_rate_limited(&mut self) -> u64 {
         let n = self.rate_limited_total;

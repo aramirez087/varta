@@ -59,7 +59,7 @@ fn main() -> ExitCode {
     }
 
     let mut failed = 0u32;
-    eprintln!("running 16 tests");
+    eprintln!("running 17 tests");
     failed += run_one(
         "client_to_observer_to_recovery_full_loop",
         client_to_observer_to_recovery_full_loop,
@@ -80,6 +80,10 @@ fn main() -> ExitCode {
     failed += run_one("recovery_exec_file_mode", recovery_exec_file_mode);
     failed += run_one("recovery_timeout_kill_after", recovery_timeout_kill_after);
     failed += run_one("recovery_env_isolation", recovery_env_isolation);
+    failed += run_one(
+        "recovery_audit_log_records_spawn_and_complete",
+        recovery_audit_log_records_spawn_and_complete,
+    );
     failed += run_one(
         "max_beat_rate_limits_and_reports_metric",
         max_beat_rate_limits_and_reports_metric,
@@ -121,7 +125,7 @@ fn main() -> ExitCode {
         );
     }
 
-    let total = 16u32
+    let total = 17u32
         + if cfg!(feature = "udp") { 1 } else { 0 }
         + if cfg!(feature = "secure-udp") { 1 } else { 0 };
     let passed = total - failed;
@@ -885,6 +889,114 @@ fn recovery_env_isolation() {
     assert!(
         wait_until(|| marker_inherited.exists(), Duration::from_secs(3)),
         "inherited-env marker did not appear (HOME should be present without --recovery-env)"
+    );
+}
+
+// ===== M1: recovery audit log E2E ===========================================
+
+/// Spawn `varta-watch` with `--recovery-audit-file`, drive a stall, assert
+/// the audit TSV contains both a spawn and a complete record for the
+/// agent's pid, and that the Prometheus surface exposes the new recovery
+/// outcome counters (every label value present, even at zero, from the
+/// first scrape).
+fn recovery_audit_log_records_spawn_and_complete() {
+    let tmp = TempDir::new("audit");
+    let socket = tmp.path().join("varta.sock");
+    let audit_path = tmp.path().join("recovery-audit.tsv");
+
+    let (mut child, prom_addr) = spawn_watch(&[
+        "--socket",
+        socket.to_str().unwrap(),
+        "--threshold-ms",
+        "200",
+        "--recovery-exec",
+        "/usr/bin/true",
+        "--recovery-debounce-ms",
+        "1000",
+        "--recovery-audit-file",
+        audit_path.to_str().unwrap(),
+        "--prom-addr",
+        "127.0.0.1:0",
+        "--shutdown-after-secs",
+        "10",
+    ]);
+    let _guard = ChildGuard(&mut child);
+
+    assert!(
+        wait_until(|| socket.exists(), Duration::from_secs(3)),
+        "varta-watch did not bind socket within 3s"
+    );
+
+    let agent_pid = std::process::id();
+    {
+        let mut agent = Varta::connect(&socket).expect("Varta::connect");
+        for _ in 0..10 {
+            let mut tries = 0u32;
+            loop {
+                match agent.beat(Status::Ok, 0) {
+                    BeatOutcome::Sent => break,
+                    BeatOutcome::Dropped => {
+                        tries += 1;
+                        if tries > 5_000 {
+                            panic!("kernel never accepted a beat within 5000 retries");
+                        }
+                        std::thread::sleep(Duration::from_micros(500));
+                    }
+                    BeatOutcome::Failed(e) => panic!("unexpected hard failure: {e}"),
+                }
+            }
+        }
+    }
+
+    // Stall + recovery must fire; audit log must record both spawn and
+    // complete for our pid. Poll the file for up to 5s — completion may
+    // happen one observer tick after spawn.
+    let spawn_needle = format!("\tspawn\t{agent_pid}\t");
+    let complete_needle = format!("\tcomplete\t{agent_pid}\t");
+    let mut last_body = String::new();
+    let satisfied = wait_until(
+        || {
+            match std::fs::read_to_string(&audit_path) {
+                Ok(body) => {
+                    let has_spawn = body.contains(&spawn_needle);
+                    let has_complete = body.contains(&complete_needle);
+                    last_body = body;
+                    has_spawn && has_complete
+                }
+                Err(_) => false,
+            }
+        },
+        Duration::from_secs(5),
+    );
+    assert!(
+        satisfied,
+        "audit log missing spawn+complete for pid {agent_pid}; got:\n{last_body}"
+    );
+    assert!(
+        last_body.starts_with("# varta-watch recovery audit v1\n"),
+        "audit log missing schema header; got:\n{last_body}"
+    );
+
+    // /metrics must expose every recovery outcome label (including zeroes)
+    // and at least one spawned + one reaped_zero counter increment.
+    let needles = [
+        "varta_recovery_outcomes_total{outcome=\"spawned\"}",
+        "varta_recovery_outcomes_total{outcome=\"debounced\"}",
+        "varta_recovery_outcomes_total{outcome=\"reaped_zero\"}",
+        "varta_recovery_outcomes_total{outcome=\"reaped_nonzero\"}",
+        "varta_recovery_outcomes_total{outcome=\"killed\"}",
+        "varta_recovery_outcomes_total{outcome=\"spawn_failed\"}",
+    ];
+    let metrics_ok = wait_until(
+        || match http_get(prom_addr, "/metrics") {
+            Ok((200, body)) => needles.iter().all(|n| body.contains(n)),
+            _ => false,
+        },
+        Duration::from_secs(3),
+    );
+    assert!(
+        metrics_ok,
+        "/metrics missing one of the varta_recovery_outcomes_total label values"
     );
 }
 

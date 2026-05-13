@@ -14,6 +14,7 @@
 //! [`Event`] values to exporters and the recovery command. The protocol root
 //! is [`varta_vlp`]; nothing else is on the dependency surface.
 
+pub mod audit;
 pub mod config;
 pub mod exporter;
 pub mod listener;

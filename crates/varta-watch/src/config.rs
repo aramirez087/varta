@@ -53,6 +53,17 @@ pub const DEFAULT_SHUTDOWN_GRACE_MS: u64 = 5_000;
 /// round under load, which would orphan every outstanding child to PID 1.
 pub const MIN_SHUTDOWN_GRACE_MS: u64 = 100;
 
+/// Default per-child cap for combined stdout+stderr capture when
+/// `--recovery-capture-stdio` is enabled.  4 KiB is enough to fit a typical
+/// systemctl/journalctl output snippet without risking pipe-buffer pressure
+/// on a chatty recovery command.
+pub const DEFAULT_RECOVERY_CAPTURE_BYTES: u32 = 4096;
+
+/// Maximum value accepted by `--recovery-capture-bytes`.  Values above this
+/// risk holding too much child output in observer memory and making the
+/// non-blocking pipe drain expensive per tick.
+pub const MAX_RECOVERY_CAPTURE_BYTES: u32 = 1024 * 1024;
+
 /// Parsed daemon configuration.
 #[derive(Clone, Debug)]
 pub struct Config {
@@ -167,6 +178,25 @@ pub struct Config {
     /// production deployments use `--recovery-exec` (no shell, no injection
     /// surface).  Set by `--i-accept-shell-risk`.
     pub i_accept_shell_risk: bool,
+    /// Optional path the recovery audit TSV is appended to. When set, every
+    /// recovery spawn and completion is recorded with wall-clock timestamp,
+    /// agent pid, child pid, mode, outcome, exit code, and duration. See
+    /// [`crate::audit::RecoveryAuditLog`] for the schema.
+    pub recovery_audit_file: Option<PathBuf>,
+    /// Optional byte cap for the recovery audit file. When exceeded, the
+    /// file rotates through up to 5 generations (PATH → PATH.1 → … →
+    /// PATH.5). Without a cap the file grows unbounded.
+    pub recovery_audit_max_bytes: Option<u64>,
+    /// Whether to capture child stdout/stderr non-blockingly for the audit
+    /// record. Default off — pipes are inherited from the observer. Opt-in
+    /// avoids deadlock risk for operators who alias chatty recovery
+    /// commands (e.g. `journalctl -xeu agent.service`).
+    pub recovery_capture_stdio: bool,
+    /// Total byte cap (stdout + stderr combined, per child) when
+    /// `recovery_capture_stdio` is enabled. Defaults to
+    /// [`DEFAULT_RECOVERY_CAPTURE_BYTES`]. Values larger than
+    /// [`MAX_RECOVERY_CAPTURE_BYTES`] are rejected at parse time.
+    pub recovery_capture_bytes: u32,
 }
 
 /// Failure modes for [`Config::from_args`].
@@ -227,6 +257,20 @@ pub enum ConfigError {
     /// has no anonymous access; the observer refuses to start rather than
     /// expose agent topology to anyone who can reach the bound port.
     PromAddrRequiresToken,
+    /// `--recovery-capture-bytes` was set above
+    /// [`MAX_RECOVERY_CAPTURE_BYTES`]. Capturing more output than that
+    /// risks holding too much child stdout/stderr in observer memory.
+    RecoveryCaptureBytesTooLarge {
+        /// The value that was provided.
+        value: u32,
+        /// The maximum allowed value.
+        max: u32,
+    },
+    /// `--recovery-capture-stdio` was passed without any recovery command
+    /// configured (`--recovery-cmd` / `--recovery-cmd-file` /
+    /// `--recovery-exec` / `--recovery-exec-file`). Capture is meaningless
+    /// without something to capture from.
+    RecoveryCaptureRequiresRecovery,
     /// `--shutdown-grace-ms` was below [`MIN_SHUTDOWN_GRACE_MS`].
     ShutdownGraceTooLow {
         /// The value provided on the CLI.
@@ -279,6 +323,14 @@ impl core::fmt::Display for ConfigError {
             ConfigError::ShutdownGraceTooLow { value, min } => write!(
                 f,
                 "--shutdown-grace-ms: {value} is below the minimum allowed value ({min} ms)"
+            ),
+            ConfigError::RecoveryCaptureBytesTooLarge { value, max } => write!(
+                f,
+                "--recovery-capture-bytes: {value} exceeds the maximum allowed value ({max} bytes)"
+            ),
+            ConfigError::RecoveryCaptureRequiresRecovery => f.write_str(
+                "--recovery-capture-stdio requires --recovery-cmd, --recovery-cmd-file, \
+                 --recovery-exec, or --recovery-exec-file",
             ),
         }
     }
@@ -431,6 +483,26 @@ OPTIONAL:
                                      root-equivalent process authority —
                                      prefer --recovery-exec for any
                                      production deployment.
+    --recovery-audit-file <PATH>   Append a tab-separated audit record for
+                                     every recovery spawn and completion.
+                                     Records carry wall-clock + observer
+                                     timestamps, agent pid, child pid,
+                                     mode, outcome, exit code, signal,
+                                     duration, and captured stdio
+                                     lengths. The file is created mode
+                                     0600.
+    --recovery-audit-max-bytes <N> Rotate the audit file after every write
+                                     that pushes it above N bytes. Up to
+                                     5 generations kept.
+    --recovery-capture-stdio       Capture child stdout/stderr non-
+                                     blockingly so its length and
+                                     truncation status appear in the audit
+                                     record. Off by default — opt in only
+                                     when you have a recovery command whose
+                                     output is bounded.
+    --recovery-capture-bytes <N>   Total combined byte cap (stdout +
+                                     stderr) per child when capture is
+                                     enabled. Default 4096; max 1048576.
 
     -h, --help                     Print this message and exit.
 ";
@@ -467,6 +539,10 @@ OPTIONAL:
         let mut prom_rate_limit_burst: Option<u32> = None;
         let mut i_accept_plaintext_udp = false;
         let mut i_accept_shell_risk = false;
+        let mut recovery_audit_file: Option<PathBuf> = None;
+        let mut recovery_audit_max_bytes: Option<u64> = None;
+        let mut recovery_capture_stdio = false;
+        let mut recovery_capture_bytes: Option<u32> = None;
 
         let mut iter = args.into_iter();
         while let Some(tok) = iter.next() {
@@ -685,6 +761,31 @@ OPTIONAL:
                 "--i-accept-shell-risk" => {
                     i_accept_shell_risk = true;
                 }
+                "--recovery-audit-file" => {
+                    let v = iter
+                        .next()
+                        .ok_or(ConfigError::MissingValue("--recovery-audit-file"))?;
+                    recovery_audit_file = Some(PathBuf::from(v));
+                }
+                "--recovery-audit-max-bytes" => {
+                    let v = iter
+                        .next()
+                        .ok_or(ConfigError::MissingValue("--recovery-audit-max-bytes"))?;
+                    recovery_audit_max_bytes = Some(parse_u64("--recovery-audit-max-bytes", &v)?);
+                }
+                "--recovery-capture-stdio" => {
+                    recovery_capture_stdio = true;
+                }
+                "--recovery-capture-bytes" => {
+                    let v = iter
+                        .next()
+                        .ok_or(ConfigError::MissingValue("--recovery-capture-bytes"))?;
+                    recovery_capture_bytes =
+                        Some(v.parse::<u32>().map_err(|_| ConfigError::BadInteger {
+                            flag: "--recovery-capture-bytes",
+                            raw: v,
+                        })?);
+                }
                 other => return Err(ConfigError::UnknownFlag(other.to_string())),
             }
         }
@@ -724,6 +825,27 @@ OPTIONAL:
         let recovery_debounce =
             Duration::from_millis(recovery_debounce_ms.unwrap_or(DEFAULT_RECOVERY_DEBOUNCE_MS));
 
+        let recovery_capture_bytes_resolved =
+            recovery_capture_bytes.unwrap_or(DEFAULT_RECOVERY_CAPTURE_BYTES);
+        if recovery_capture_bytes_resolved > MAX_RECOVERY_CAPTURE_BYTES {
+            return Err(ConfigError::RecoveryCaptureBytesTooLarge {
+                value: recovery_capture_bytes_resolved,
+                max: MAX_RECOVERY_CAPTURE_BYTES,
+            });
+        }
+
+        // Capture is meaningless without a recovery command. Reject the flag
+        // at parse time so a misconfiguration surfaces at startup rather than
+        // hiding silently in a runbook.
+        if recovery_capture_stdio
+            && recovery_cmd.is_none()
+            && recovery_exec_cmd.is_none()
+            && recovery_cmd_file.is_none()
+            && recovery_exec_file.is_none()
+        {
+            return Err(ConfigError::RecoveryCaptureRequiresRecovery);
+        }
+
         Ok(Config {
             socket,
             threshold: Duration::from_millis(threshold_ms),
@@ -756,6 +878,10 @@ OPTIONAL:
             prom_rate_limit_burst: prom_rate_limit_burst.unwrap_or(DEFAULT_PROM_RATE_LIMIT_BURST),
             i_accept_plaintext_udp,
             i_accept_shell_risk,
+            recovery_audit_file,
+            recovery_audit_max_bytes,
+            recovery_capture_stdio,
+            recovery_capture_bytes: recovery_capture_bytes_resolved,
         })
     }
 
@@ -1043,15 +1169,24 @@ fn parse_octal(raw: &str) -> Result<u32, ConfigError> {
 /// hardened requirements: regular file, owned by the observer's UID, mode
 /// `0o600` or stricter, no symlinks (`O_NOFOLLOW` open).
 ///
-/// Uses `symlink_metadata()` (which does **not** follow symlinks) so an
-/// attacker cannot replace the file with a symlink to e.g.
-/// `/etc/cron.d/evil` and have the metadata of the target satisfy the
-/// checks. Opening the file uses `O_NOFOLLOW` to close the TOCTOU window
-/// between check and read.
+/// The open-and-validate flow is collapsed into a single file descriptor to
+/// eliminate the TOCTOU window between metadata check and file read. The
+/// sequence is:
+///
+/// 1. `open(path, O_RDONLY | O_NOFOLLOW)` — atomically rejects a symlink at
+///    the leaf component. The kernel returns `ELOOP` if the path resolves
+///    to a symlink, so no separate `symlink_metadata` probe is needed.
+/// 2. `fstat(fd)` (via `File::metadata`) — operates on the open inode, not
+///    the path. An attacker who renames or replaces the file in the parent
+///    directory after the open has no effect: the fd still refers to the
+///    inode we just authenticated.
+/// 3. Mode / UID / file-type checks on the fstat result.
+/// 4. `read_to_string` from the same fd.
 ///
 /// Returns the raw file contents on success.
 pub(crate) fn validate_secret_file(path: &Path) -> std::io::Result<String> {
-    use std::os::unix::fs::MetadataExt;
+    use std::io::Read;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 
     // Platform-specific O_NOFOLLOW values (hard-coded for zero-dependency).
     #[cfg(any(
@@ -1078,14 +1213,39 @@ pub(crate) fn validate_secret_file(path: &Path) -> std::io::Result<String> {
     )))]
     compile_error!("O_NOFOLLOW value is unknown for this target — add it to the cfg gates above");
 
-    let meta = std::fs::symlink_metadata(path)?;
+    // ELOOP is raw 40 on Linux and 62 on the BSD family. On platforms outside
+    // both lists we fall through with the raw error message.
+    #[cfg(target_os = "linux")]
+    const ELOOP: i32 = 40;
+    #[cfg(any(
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_os = "dragonfly",
+    ))]
+    const ELOOP: i32 = 62;
 
-    if meta.file_type().is_symlink() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            format!("{}: must not be a symlink", path.display()),
-        ));
-    }
+    let mut file = match std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(O_NOFOLLOW)
+        .open(path)
+    {
+        Ok(f) => f,
+        Err(e) => {
+            if e.raw_os_error() == Some(ELOOP) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("{}: must not be a symlink", path.display()),
+                ));
+            }
+            return Err(e);
+        }
+    };
+
+    // fstat(fd) — operates on the open inode, immune to path-level races.
+    let meta = file.metadata()?;
 
     if !meta.is_file() {
         return Err(std::io::Error::new(
@@ -1118,7 +1278,9 @@ pub(crate) fn validate_secret_file(path: &Path) -> std::io::Result<String> {
         ));
     }
 
-    read_file_no_follow(path, O_NOFOLLOW)
+    let mut content = String::new();
+    file.read_to_string(&mut content)?;
+    Ok(content)
 }
 
 /// Recovery-command-file wrapper around [`validate_secret_file`] that also
@@ -1135,19 +1297,6 @@ fn validate_recovery_file(path: &Path) -> std::io::Result<String> {
 #[cfg(feature = "secure-udp")]
 pub(crate) fn read_secret_file(path: &Path) -> std::io::Result<String> {
     validate_secret_file(path)
-}
-
-/// Read a file's contents without following symlinks, using `O_NOFOLLOW`.
-fn read_file_no_follow(path: &Path, nofollow_flag: i32) -> std::io::Result<String> {
-    use std::io::Read;
-    use std::os::unix::fs::OpenOptionsExt;
-    let mut file = std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(nofollow_flag)
-        .open(path)?;
-    let mut content = String::new();
-    file.read_to_string(&mut content)?;
-    Ok(content)
 }
 
 /// Parse a recovery command line into (program, args).
@@ -1814,5 +1963,159 @@ mod tests {
         let cfg =
             Config::from_args(args(&["--socket", "/s", "--threshold-ms", "100"])).expect("parse");
         assert!(cfg.heartbeat_file.is_none());
+    }
+
+    // ----- validate_secret_file tests (M2: TOCTOU hardening) -----
+
+    /// Mint a unique tempdir under `$TMPDIR` for a single test. Tests cannot
+    /// rely on a shared dir because some of them deliberately set permissions
+    /// other tests would race on.
+    fn mk_tmpdir(tag: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let pid = std::process::id();
+        let dir = std::env::temp_dir().join(format!("varta-vsf-{tag}-{pid}-{nanos}"));
+        std::fs::create_dir(&dir).expect("create tempdir");
+        // A parallel `UnixDatagram::bind` in another test installs a
+        // 0o177 umask that strips the `x` bit from new directories,
+        // breaking subsequent open() inside this dir. Restore explicitly.
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod tempdir");
+        dir
+    }
+
+    fn write_mode(path: &Path, content: &[u8], mode: u32) {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(mode)
+            .open(path)
+            .expect("open mode");
+        f.write_all(content).expect("write");
+        // Reassert mode (umask may have masked it on create).
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).expect("set perms");
+    }
+
+    #[test]
+    fn validate_secret_file_reads_content_after_validation() {
+        let dir = mk_tmpdir("happy");
+        let p = dir.join("secret");
+        write_mode(&p, b"hello-world\n", 0o600);
+        let out = validate_secret_file(&p).expect("validate");
+        assert_eq!(out, "hello-world\n");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn validate_secret_file_rejects_symlink() {
+        let dir = mk_tmpdir("sym");
+        let target = dir.join("real");
+        write_mode(&target, b"x", 0o600);
+        let link = dir.join("link");
+        std::os::unix::fs::symlink(&target, &link).expect("symlink");
+        let err = validate_secret_file(&link).expect_err("should reject symlink");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(
+            err.to_string().contains("must not be a symlink"),
+            "unexpected error: {err}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn validate_secret_file_rejects_bad_mode() {
+        let dir = mk_tmpdir("mode");
+        let p = dir.join("perms");
+        write_mode(&p, b"x", 0o644);
+        let err = validate_secret_file(&p).expect_err("should reject 0644");
+        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(
+            err.to_string().contains("insecure permissions"),
+            "unexpected error: {err}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn validate_secret_file_rejects_non_regular_file() {
+        // A unix-domain socket bound at a path is a non-regular inode.
+        // O_NOFOLLOW lets it through (it's not a symlink) so the post-open
+        // file_type check is what defends us.
+        let dir = mk_tmpdir("sock");
+        let p = dir.join("sock");
+        let _listener = std::os::unix::net::UnixListener::bind(&p).expect("bind sock");
+        // Tighten mode so we exercise the regular-file check rather than
+        // the mode check.
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600));
+        let err = validate_secret_file(&p).expect_err("should reject socket");
+        // On platforms that block open(2) on a UDS path entirely we accept
+        // either InvalidInput (our check) or whatever errno the kernel
+        // returns from open(); the important property is "does not succeed".
+        assert_ne!(err.kind(), std::io::ErrorKind::Other);
+        let _ = std::fs::remove_file(&p);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// TOCTOU stress: race a writer that swaps the file between a
+    /// well-formed 0600 secret and a symlink to a sensitive path, while a
+    /// reader loops `validate_secret_file`. The reader must never return
+    /// content from the symlink target.
+    ///
+    /// The test is probabilistic (relies on scheduling); marked `#[ignore]`
+    /// so it does not flake the normal test run. Invoke via
+    /// `cargo test -p varta-watch validate_secret_file_toctou_stress -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "probabilistic stress test; run with --ignored"]
+    fn validate_secret_file_toctou_stress() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        let dir = mk_tmpdir("toctou");
+        let target = dir.join("file");
+        let attacker_target = dir.join("attacker-content");
+        write_mode(&target, b"GOOD\n", 0o600);
+        write_mode(&attacker_target, b"BAD-DO-NOT-READ\n", 0o600);
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_w = stop.clone();
+        let target_w = target.clone();
+        let atk = attacker_target.clone();
+        let writer = std::thread::spawn(move || {
+            while !stop_w.load(Ordering::Relaxed) {
+                // Try to swap GOOD ⇄ symlink-to-BAD as fast as we can.
+                let tmp = target_w.with_extension("swap");
+                let _ = std::fs::remove_file(&tmp);
+                if std::os::unix::fs::symlink(&atk, &tmp).is_ok() {
+                    let _ = std::fs::rename(&tmp, &target_w);
+                }
+                let _ = std::fs::remove_file(&target_w);
+                write_mode(&target_w, b"GOOD\n", 0o600);
+            }
+        });
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+        let mut iters = 0u64;
+        while std::time::Instant::now() < deadline {
+            // Any error is fine — race lost on the writer's swap window.
+            if let Ok(s) = validate_secret_file(&target) {
+                assert!(
+                    !s.contains("BAD"),
+                    "TOCTOU: validate_secret_file returned attacker content after {iters} iters"
+                );
+            }
+            iters += 1;
+        }
+        stop.store(true, Ordering::Relaxed);
+        writer.join().expect("writer thread");
+        eprintln!("toctou_stress: {iters} validate calls");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -433,6 +433,40 @@ struct PromIpState {
 /// the exposition output, so series remain stable across scrapes.
 const DROP_REASON_LABELS: [&str; 3] = ["drain", "rate_limit", "ip_table_full"];
 
+/// Outcome label values for `varta_recovery_outcomes_total`. Indexed by
+/// [`recovery_outcome_index`]; emitted unconditionally (every value, even
+/// at zero) so `absent()` alert rules stay green.
+const RECOVERY_OUTCOME_LABELS: [&str; 6] = [
+    "spawned",
+    "debounced",
+    "reaped_zero",
+    "reaped_nonzero",
+    "killed",
+    "spawn_failed",
+];
+
+/// Map a [`crate::recovery::RecoveryOutcome`] to a stable index for the
+/// `varta_recovery_outcomes_total` array.
+fn recovery_outcome_index(outcome: &crate::recovery::RecoveryOutcome) -> usize {
+    use crate::recovery::RecoveryOutcome;
+    match outcome {
+        RecoveryOutcome::Spawned { .. } => 0,
+        RecoveryOutcome::Debounced => 1,
+        RecoveryOutcome::Reaped { status, .. } => {
+            if status.success() {
+                2
+            } else {
+                3
+            }
+        }
+        RecoveryOutcome::Killed { .. } => 4,
+        RecoveryOutcome::SpawnFailed(_) => 5,
+        // ReapFailed is not user-facing here — treat as a reap-nonzero
+        // (it implies the child terminated abnormally from our POV).
+        RecoveryOutcome::ReapFailed(_) => 3,
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 enum DropReason {
     Drain,
@@ -489,6 +523,20 @@ pub struct PromExporter {
     sender_state_full_total: u64,
     rate_limited_total: u64,
     nonce_wrap_total: u64,
+    /// Count of bounded eviction-scan calls that ran the full
+    /// `EVICTION_SCAN_WINDOW` without finding a victim. Surfaced as
+    /// `varta_tracker_eviction_scan_truncated_total`; non-zero values prove
+    /// the per-frame work cap engaged under a unique-pid flood.
+    eviction_scan_truncated_total: u64,
+    /// Per-outcome recovery counters, indexed by [`recovery_outcome_index`].
+    /// Emitted in full at every scrape so dashboards/alerts stay green-on-green.
+    recovery_outcomes_total: [u64; RECOVERY_OUTCOME_LABELS.len()],
+    /// Sum of recovery child wall-clock durations in ns. Used together with
+    /// `recovery_duration_count_total` to compute an average runtime.
+    recovery_duration_ns_sum: u64,
+    /// Count of recovery completions that contributed to
+    /// `recovery_duration_ns_sum`. Mirrors a histogram `_count`.
+    recovery_duration_count_total: u64,
     /// Number of `/metrics` scrapes served from cache because
     /// [`PROM_MIN_SCRAPE_INTERVAL`] had not elapsed since the last fresh
     /// render.  Operators can alert on this to detect scrape pressure.
@@ -577,6 +625,10 @@ impl PromExporter {
             sender_state_full_total: 0,
             rate_limited_total: 0,
             nonce_wrap_total: 0,
+            eviction_scan_truncated_total: 0,
+            recovery_outcomes_total: [0; RECOVERY_OUTCOME_LABELS.len()],
+            recovery_duration_ns_sum: 0,
+            recovery_duration_count_total: 0,
             scrape_skipped_total: 0,
             scrape_budget_exhausted_total: 0,
             ip_state: HashMap::new(),
@@ -715,6 +767,32 @@ impl PromExporter {
     /// space and looped to 0).
     pub fn record_nonce_wraps(&mut self, count: u64) {
         self.nonce_wrap_total = self.nonce_wrap_total.saturating_add(count);
+    }
+
+    /// Record one or more bounded eviction-scan calls that exhausted the
+    /// `EVICTION_SCAN_WINDOW` without finding a victim. See
+    /// [`crate::tracker::Tracker::take_eviction_scan_truncated`].
+    pub fn record_eviction_scan_truncated(&mut self, count: u64) {
+        self.eviction_scan_truncated_total =
+            self.eviction_scan_truncated_total.saturating_add(count);
+    }
+
+    /// Record a recovery outcome and optional duration. Increments the
+    /// `varta_recovery_outcomes_total{outcome=…}` counter; when
+    /// `duration_ns` is provided (typically only for `Reaped` / `Killed`
+    /// outcomes), bumps the duration sum + count.
+    pub fn record_recovery_outcome(
+        &mut self,
+        outcome: &crate::recovery::RecoveryOutcome,
+        duration_ns: Option<u64>,
+    ) {
+        let idx = recovery_outcome_index(outcome);
+        self.recovery_outcomes_total[idx] = self.recovery_outcomes_total[idx].saturating_add(1);
+        if let Some(d) = duration_ns {
+            self.recovery_duration_ns_sum = self.recovery_duration_ns_sum.saturating_add(d);
+            self.recovery_duration_count_total =
+                self.recovery_duration_count_total.saturating_add(1);
+        }
     }
 
     /// Record one or more scrapes served from cache (scrape arrived before
@@ -1004,6 +1082,52 @@ impl PromExporter {
             self.body_buf,
             "varta_tracker_capacity_exceeded_total {}",
             self.capacity_exceeded_total
+        );
+        // Emitted unconditionally (even at zero) so `absent()` alert rules
+        // stay green-on-green — see the contract on
+        // `varta_decode_errors_total`. Non-zero values prove the bounded
+        // eviction-scan window cap engaged under a unique-pid flood.
+        self.body_buf.push_str("# HELP varta_tracker_eviction_scan_truncated_total Total bounded eviction scans that exhausted the window without finding a victim.\n");
+        self.body_buf
+            .push_str("# TYPE varta_tracker_eviction_scan_truncated_total counter\n");
+        let _ = writeln!(
+            self.body_buf,
+            "varta_tracker_eviction_scan_truncated_total {}",
+            self.eviction_scan_truncated_total
+        );
+        // Recovery outcome counters — emit every label value at zero from the
+        // first scrape so `absent()` rules stay green even before the first
+        // recovery fires.
+        self.body_buf
+            .push_str("# HELP varta_recovery_outcomes_total Total recovery outcomes by kind.\n");
+        self.body_buf
+            .push_str("# TYPE varta_recovery_outcomes_total counter\n");
+        for (idx, outcome) in RECOVERY_OUTCOME_LABELS.iter().enumerate() {
+            let _ = writeln!(
+                self.body_buf,
+                "varta_recovery_outcomes_total{{outcome=\"{outcome}\"}} {}",
+                self.recovery_outcomes_total[idx]
+            );
+        }
+        self.body_buf.push_str(
+            "# HELP varta_recovery_duration_ns_sum Sum of recovery child wall-clock durations in ns.\n",
+        );
+        self.body_buf
+            .push_str("# TYPE varta_recovery_duration_ns_sum counter\n");
+        let _ = writeln!(
+            self.body_buf,
+            "varta_recovery_duration_ns_sum {}",
+            self.recovery_duration_ns_sum
+        );
+        self.body_buf.push_str(
+            "# HELP varta_recovery_duration_count_total Number of recovery completions contributing to varta_recovery_duration_ns_sum.\n",
+        );
+        self.body_buf
+            .push_str("# TYPE varta_recovery_duration_count_total counter\n");
+        let _ = writeln!(
+            self.body_buf,
+            "varta_recovery_duration_count_total {}",
+            self.recovery_duration_count_total
         );
         self.body_buf.push_str(
             "# HELP varta_frame_decrypt_failures_total Total AEAD decryption/tag-verification failures.\n",

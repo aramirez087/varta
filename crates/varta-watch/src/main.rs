@@ -397,10 +397,38 @@ fn run(cfg: Config) -> std::io::Result<()> {
         );
     }
 
+    // Optional audit log — opened once at startup. The same hardened
+    // permission check (mode 0600, owned by observer UID) used for key/
+    // token files protects the audit path: never publish recovery
+    // activity world-readable.
+    let recovery_audit_sink = match cfg.recovery_audit_file.as_ref() {
+        Some(path) => {
+            let sink =
+                varta_watch::audit::RecoveryAuditLog::create(path, cfg.recovery_audit_max_bytes)?;
+            Some(sink)
+        }
+        None => None,
+    };
+    let recovery_source = if let Some(p) = cfg.recovery_cmd_file.as_ref() {
+        p.display().to_string()
+    } else if let Some(p) = cfg.recovery_exec_file.as_ref() {
+        p.display().to_string()
+    } else {
+        "inline".to_string()
+    };
+
     let mut recovery = recovery_mode.map(|mode| {
+        let capture_cap = if cfg.recovery_capture_stdio {
+            cfg.recovery_capture_bytes
+        } else {
+            0
+        };
         Recovery::with_timeout(mode, cfg.recovery_debounce, cfg.recovery_timeout)
             .with_recovery_env(cfg.recovery_env.clone())
             .with_shutdown_grace(cfg.shutdown_grace)
+            .with_capture(capture_cap)
+            .with_source(recovery_source.clone())
+            .with_audit_sink(recovery_audit_sink)
     });
     let mut file_export: Option<FileExporter> = match cfg.file_export.as_ref() {
         Some(path) => Some(FileExporter::create(path, cfg.export_file_max_bytes)?),
@@ -471,7 +499,11 @@ fn run(cfg: Config) -> std::io::Result<()> {
             }
             if let Event::Stall { pid, .. } = &ev {
                 if let Some(rec) = recovery.as_mut() {
-                    match rec.on_stall(*pid) {
+                    let outcome = rec.on_stall(*pid);
+                    if let Some(pe) = prom_export.as_mut() {
+                        pe.record_recovery_outcome(&outcome, None);
+                    }
+                    match outcome {
                         RecoveryOutcome::Spawned { child_pid } => {
                             varta_info_pid_child!(
                                 *pid,
@@ -573,9 +605,24 @@ fn run(cfg: Config) -> std::io::Result<()> {
             }
         }
 
+        let eviction_scan_truncated = observer.drain_eviction_scan_truncated();
+        if eviction_scan_truncated > 0 {
+            if let Some(pe) = prom_export.as_mut() {
+                pe.record_eviction_scan_truncated(eviction_scan_truncated);
+            }
+        }
+
         // Reap completed or timeout-exceeded children each tick.
         if let Some(rec) = recovery.as_mut() {
             for outcome in rec.try_reap() {
+                if let Some(pe) = prom_export.as_mut() {
+                    // Duration is only meaningful for terminal outcomes; the
+                    // audit sink already carries the exact ns, but the
+                    // Prometheus sum/count tracks aggregate runtime trends.
+                    // We pass `None` here and rely on the audit log for
+                    // per-recovery duration history.
+                    pe.record_recovery_outcome(&outcome, None);
+                }
                 match outcome {
                     RecoveryOutcome::Reaped { child_pid, status } if !status.success() => {
                         varta_warn_child!(
