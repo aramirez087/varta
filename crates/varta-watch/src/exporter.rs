@@ -384,13 +384,14 @@ fn status_label(s: Status) -> &'static str {
 /// Prometheus `kind` label values for `varta_decode_errors_total`. Indexed
 /// by [`decode_kind_index`]; the array doubles as the canonical ordering
 /// for the exposition output, so series remain stable across scrapes.
-const DECODE_KIND_LABELS: [&str; 6] = [
+const DECODE_KIND_LABELS: [&str; 7] = [
     "bad_magic",
     "bad_version",
     "bad_status",
     "bad_pid",
     "bad_timestamp",
     "bad_nonce",
+    "stall_on_wire",
 ];
 
 fn decode_kind_index(err: &DecodeError) -> usize {
@@ -401,6 +402,7 @@ fn decode_kind_index(err: &DecodeError) -> usize {
         DecodeError::BadPid(_) => 3,
         DecodeError::BadTimestamp(_) => 4,
         DecodeError::BadNonce { .. } => 5,
+        DecodeError::StallOnWire => 6,
     }
 }
 
@@ -628,6 +630,14 @@ pub struct PromExporter {
     decrypt_failures_total: u64,
     truncated_total: u64,
     sender_state_full_total: u64,
+    /// Total AEAD decryption attempts across the loaded key set. The
+    /// secure-UDP listener trials *every* loaded key (and the master-key
+    /// derivation, if configured) on every frame, regardless of which key
+    /// succeeds. This removes the linear-in-key-index timing signal that
+    /// let a remote attacker fingerprint the primary rotation slot by
+    /// measuring RTT. In steady state this equals
+    /// `frames_received * (keys.len() + master_key_configured as u64)`.
+    secure_aead_attempts_total: u64,
     rate_limited_total: u64,
     nonce_wrap_total: u64,
     /// Count of bounded eviction-scan calls that ran the full
@@ -807,6 +817,7 @@ impl PromExporter {
             decrypt_failures_total: 0,
             truncated_total: 0,
             sender_state_full_total: 0,
+            secure_aead_attempts_total: 0,
             rate_limited_total: 0,
             nonce_wrap_total: 0,
             eviction_scan_truncated_total: 0,
@@ -958,6 +969,15 @@ impl PromExporter {
     /// forcing eviction of the oldest entry.
     pub fn record_sender_state_full(&mut self, count: u64) {
         self.sender_state_full_total = self.sender_state_full_total.saturating_add(count);
+    }
+
+    /// Record AEAD decryption attempts since the last drain. The secure-UDP
+    /// listener trials every loaded key on every frame, so this counter
+    /// grows by `frames_received * (keys.len() + master_key_configured as u64)`
+    /// in steady state — the operational signal that the constant-trial-count
+    /// timing-leak fix is active.
+    pub fn record_secure_aead_attempts(&mut self, count: u64) {
+        self.secure_aead_attempts_total = self.secure_aead_attempts_total.saturating_add(count);
     }
 
     /// Record one or more beats dropped by per-pid rate limiting.
@@ -1605,6 +1625,16 @@ impl PromExporter {
             self.body_buf,
             "varta_sender_state_full_total {}",
             self.sender_state_full_total
+        );
+        self.body_buf.push_str(
+            "# HELP varta_secure_aead_attempts_total Total ChaCha20-Poly1305 decryption attempts across the loaded key set. The listener trials every loaded key (and the master-key derivation, if configured) on every frame, removing the linear-in-key-index timing side-channel. In steady state this equals frames_received * (keys.len() + master_key_configured as u64).\n",
+        );
+        self.body_buf
+            .push_str("# TYPE varta_secure_aead_attempts_total counter\n");
+        let _ = writeln!(
+            self.body_buf,
+            "varta_secure_aead_attempts_total {}",
+            self.secure_aead_attempts_total
         );
         self.body_buf.push_str(
             "# HELP varta_rate_limited_total Total beats dropped by per-pid rate limiting.\n",

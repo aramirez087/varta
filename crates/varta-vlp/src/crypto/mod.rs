@@ -8,10 +8,16 @@
 //!
 //! # Wire format
 //!
-//! Each secure frame is 60 bytes:
+//! Shared-key frames are 60 bytes:
 //!
 //! ```text
 //! [iv_random: 8] [iv_counter: 4] [ciphertext: 32] [tag: 16]
+//! ```
+//!
+//! Master-key frames are 64 bytes (agent PID bound as AAD):
+//!
+//! ```text
+//! [agent_pid: 4] [iv_random: 8] [iv_counter: 4] [ciphertext: 32] [tag: 16]
 //! ```
 //!
 //! The 12-byte nonce for the AEAD construction is `iv_random || iv_counter`.
@@ -32,10 +38,16 @@ pub const NONCE_BYTES: usize = 12;
 /// Length of the Poly1305 authentication tag (128 bits).
 pub const TAG_BYTES: usize = 16;
 
-/// Total length of a secure frame on the wire.
+/// Total length of a shared-key secure frame on the wire.
 ///
 /// 8 (iv_random) + 4 (iv_counter) + 32 (ciphertext) + 16 (tag) = 60.
 pub const SECURE_FRAME_BYTES: usize = 60;
+
+/// Total length of a master-key secure frame on the wire.
+///
+/// 4 (agent_pid) + 8 (iv_random) + 4 (iv_counter) + 32 (ciphertext) + 16 (tag) = 64.
+/// The `agent_pid` field is bound as AAD into the Poly1305 tag.
+pub const SECURE_FRAME_MASTER_BYTES: usize = 64;
 
 /// Error returned when a hex-encoded key fails to parse.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

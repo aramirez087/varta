@@ -24,8 +24,8 @@ use varta_vlp::crypto::{open, seal};
 // Helper: roundtrip a single (key, nonce, plaintext) tuple and assert success.
 // ---------------------------------------------------------------------------
 fn assert_roundtrip(key: &[u8; 32], nonce: &[u8; 12], plaintext: &[u8; 32]) {
-    let (ciphertext, tag) = seal(key, nonce, plaintext);
-    let decrypted = open(key, nonce, &ciphertext, &tag)
+    let (ciphertext, tag) = seal(key, nonce, b"", plaintext);
+    let decrypted = open(key, nonce, b"", &ciphertext, &tag)
         .unwrap_or_else(|_| panic!("roundtrip failed for a valid seal"));
     assert_eq!(
         &decrypted, plaintext,
@@ -61,8 +61,8 @@ proptest! {
         if k1 == k2 {
             return Ok(());
         }
-        let (ciphertext, tag) = seal(&k1, &nonce, &plaintext);
-        let result = open(&k2, &nonce, &ciphertext, &tag);
+        let (ciphertext, tag) = seal(&k1, &nonce, b"", &plaintext);
+        let result = open(&k2, &nonce, b"", &ciphertext, &tag);
         prop_assert!(result.is_err(), "wrong key must be detected");
     }
 
@@ -76,9 +76,9 @@ proptest! {
         flip_byte in 0usize..32,
         flip_bit in 0u8..8,
     ) {
-        let (mut ciphertext, tag) = seal(&key, &nonce, &plaintext);
+        let (mut ciphertext, tag) = seal(&key, &nonce, b"", &plaintext);
         ciphertext[flip_byte] ^= 1u8 << flip_bit;
-        let result = open(&key, &nonce, &ciphertext, &tag);
+        let result = open(&key, &nonce, b"", &ciphertext, &tag);
         prop_assert!(result.is_err(), "tampered ciphertext must be detected");
     }
 
@@ -93,9 +93,9 @@ proptest! {
         flip_byte in 0usize..16,
         flip_bit in 0u8..8,
     ) {
-        let (ciphertext, mut tag) = seal(&key, &nonce, &plaintext);
+        let (ciphertext, mut tag) = seal(&key, &nonce, b"", &plaintext);
         tag[flip_byte] ^= 1u8 << flip_bit;
-        let result = open(&key, &nonce, &ciphertext, &tag);
+        let result = open(&key, &nonce, b"", &ciphertext, &tag);
         prop_assert!(result.is_err(), "tampered tag must be detected");
     }
 
@@ -109,8 +109,8 @@ proptest! {
         nonce in uniform::<_, 12>(any::<u8>()),
         plaintext in uniform::<_, 32>(any::<u8>()),
     ) {
-        let (ct1, tag1) = seal(&key, &nonce, &plaintext);
-        let (ct2, tag2) = seal(&key, &nonce, &plaintext);
+        let (ct1, tag1) = seal(&key, &nonce, b"", &plaintext);
+        let (ct2, tag2) = seal(&key, &nonce, b"", &plaintext);
         prop_assert_eq!(ct1, ct2, "encryption must be deterministic");
         prop_assert_eq!(tag1, tag2, "tag must be deterministic");
     }
@@ -126,8 +126,8 @@ proptest! {
         if n1 == n2 {
             return Ok(());
         }
-        let (ciphertext, tag) = seal(&key, &n1, &plaintext);
-        let result = open(&key, &n2, &ciphertext, &tag);
+        let (ciphertext, tag) = seal(&key, &n1, b"", &plaintext);
+        let result = open(&key, &n2, b"", &ciphertext, &tag);
         prop_assert!(result.is_err(), "wrong nonce must be detected");
     }
 }

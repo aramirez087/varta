@@ -194,15 +194,14 @@ impl PidIndex {
                 EMPTY => {
                     let target = first_tombstone.unwrap_or(i);
                     if let Some(slot) = self.table.get_mut(target) {
-                        let was_tombstone = slot.slot_idx == TOMBSTONE;
                         *slot = PidEntry {
                             pid,
                             slot_idx: slot_idx as u32,
                         };
-                        if !was_tombstone {
-                            // Filling a true EMPTY slot — bookkeeping only;
-                            // tombstone reuse does not change `occupied`.
-                        }
+                        // Both paths (filling a true EMPTY slot and reusing a
+                        // tombstone) produce a new live entry. `remove()` already
+                        // decremented `occupied` when the tombstone was created,
+                        // so re-incrementing here restores the correct live count.
                         self.occupied = self.occupied.saturating_add(1);
                         return Ok(());
                     }
@@ -1538,5 +1537,76 @@ mod tests {
         );
         assert_eq!(r, Update::Refreshed);
         assert_eq!(t.take_namespace_conflicts(), 0);
+    }
+
+    // ---- C1 regression: PidIndex::insert occupancy bookkeeping ----------
+
+    /// `occupied` tracks live entries.  Under a cyclic insert/remove cycle the
+    /// counter must stay exactly equal to the number of live pids — neither
+    /// drifting up (double-counting) nor drifting down (under-counting).
+    #[test]
+    fn pid_index_occupied_tracks_live_entries_under_churn() {
+        // Table sized for 32 entries (64 slots, load ≤ 0.5).
+        // We use a *cyclic* pid space (0..48) so tombstones from removed pids
+        // fall in the same hash chains as later inserts, ensuring reuse.
+        const CAP: usize = 32;
+        const PID_RANGE: u32 = 48; // > CAP but < table_size; guarantees reuse
+        let mut idx = PidIndex::new(CAP);
+
+        let mut expected_live: u32 = 0;
+        let mut live_set = std::collections::HashSet::new();
+
+        for i in 0u32..2_000 {
+            let pid = i % PID_RANGE;
+            if live_set.contains(&pid) {
+                // Already live — remove then re-insert to exercise the tombstone path.
+                idx.remove(pid);
+                live_set.remove(&pid);
+                expected_live -= 1;
+                idx.insert(pid, pid as usize).expect("re-insert");
+                live_set.insert(pid);
+                expected_live += 1;
+            } else if expected_live < CAP as u32 {
+                idx.insert(pid, pid as usize).expect("fresh insert");
+                live_set.insert(pid);
+                expected_live += 1;
+            } else {
+                // At capacity: remove the first entry and insert the new one.
+                let victim = *live_set.iter().next().unwrap();
+                idx.remove(victim);
+                live_set.remove(&victim);
+                expected_live -= 1;
+                idx.insert(pid, pid as usize).expect("insert after evict");
+                live_set.insert(pid);
+                expected_live += 1;
+            }
+            assert_eq!(
+                idx.occupied, expected_live as usize,
+                "i={i} pid={pid}: occupied={} expected={expected_live}",
+                idx.occupied
+            );
+        }
+    }
+
+    /// Re-inserting a previously-removed pid via its tombstone slot must
+    /// restore the live count.  `remove()` decremented `occupied`; the
+    /// re-insert must re-increment it so the counter stays accurate.
+    #[test]
+    fn pid_index_occupied_restored_on_tombstone_reuse() {
+        let mut idx = PidIndex::new(16);
+
+        idx.insert(42, 0).expect("first insert");
+        assert_eq!(idx.occupied, 1);
+
+        idx.remove(42);
+        assert_eq!(idx.occupied, 0);
+
+        // Re-insert via the tombstone slot: live count must go back to 1.
+        idx.insert(42, 5).expect("reinsert via tombstone");
+        assert_eq!(
+            idx.occupied, 1,
+            "reinsert via tombstone did not restore occupied to 1 (was {})",
+            idx.occupied
+        );
     }
 }

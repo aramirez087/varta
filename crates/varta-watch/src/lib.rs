@@ -31,7 +31,7 @@ pub mod secure_listener;
 
 pub use config::{Config, ConfigError};
 pub use exporter::{Exporter, FileExporter, PromExporter};
-pub use listener::{BeatListener, UdsListener};
+pub use listener::{BeatListener, TransportTrust, UdsListener};
 pub use observer::{Event, Observer};
 pub use peer_cred::BeatOrigin;
 pub use recovery::{Recovery, RecoveryOutcome};

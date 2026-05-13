@@ -259,17 +259,6 @@ pub struct Recovery {
     /// Source descriptor recorded into the spawn audit row: either
     /// `"inline"` or the operator-supplied template-file path.
     source: String,
-    /// If `true`, [`on_stall`] will spawn the recovery command even when the
-    /// stalled slot's pinned origin is [`BeatOrigin::NetworkUnverified`].
-    /// Controlled by `--i-accept-recovery-on-unauthenticated-transport`.
-    ///
-    /// Default `false`: refuse recovery for any non-kernel-attested origin
-    /// and emit a structured audit entry instead. This is the safety-critical
-    /// default — see `docs/architecture/peer-authentication.md` for the
-    /// trust model.
-    ///
-    /// [`on_stall`]: Recovery::on_stall
-    allow_unauthenticated_source: bool,
     /// Per-pid count of refused recoveries since the last call to
     /// [`Recovery::take_refused_unauthenticated_source`]. Surfaced as
     /// `varta_recovery_refused_total{reason="unauthenticated_transport"}`.
@@ -335,7 +324,6 @@ impl Recovery {
             audit_sink: None,
             capture_cap: 0,
             source: "inline".to_string(),
-            allow_unauthenticated_source: false,
             refused_unauthenticated_source: 0,
             allow_cross_namespace: false,
             refused_cross_namespace: 0,
@@ -360,23 +348,12 @@ impl Recovery {
         n
     }
 
-    /// Enable spawning the recovery command even when the stalled slot's
-    /// pinned transport origin is [`BeatOrigin::NetworkUnverified`] (any UDP
-    /// variant). Default `false` — recovery refuses non-kernel-attested
-    /// sources, treats them as audit-only stalls.
-    ///
-    /// Wired from `--i-accept-recovery-on-unauthenticated-transport`. The
-    /// flag is intentionally verbose: an operator who types it is making an
-    /// explicit statement that this build is not for safety-critical use.
-    pub fn with_allow_unauthenticated_source(mut self, allow: bool) -> Self {
-        self.allow_unauthenticated_source = allow;
-        self
-    }
-
     /// Take and reset the count of recovery refusals that fired because the
-    /// stalled slot's origin was [`BeatOrigin::NetworkUnverified`] and the
-    /// operator did not pass
-    /// `--i-accept-recovery-on-unauthenticated-transport`.
+    /// stalled slot's origin was [`BeatOrigin::NetworkUnverified`].
+    ///
+    /// With C3, this counter only increments for `NetworkUnverified` origins.
+    /// `OperatorAttestedTransport` beats are allowed to fire recovery and do
+    /// not increment this counter.
     pub fn take_refused_unauthenticated_source(&mut self) -> u64 {
         let n = self.refused_unauthenticated_source;
         self.refused_unauthenticated_source = 0;
@@ -447,24 +424,33 @@ impl Recovery {
     }
 
     fn reap_finished_child(&mut self, pid: u32) -> Option<RecoveryOutcome> {
+        // Acquire the entry once via the Entry API. `OccupiedEntry::remove`
+        // returns the owned value with no second map lookup, so the
+        // formerly-unreachable `remove(&pid).unwrap()` paths cannot be
+        // constructed at all — the unreachable branch is gone, not just
+        // better-annotated. Mirrors the DO-178C "no unproven panics" stance
+        // already enforced in tracker.rs (cerebrum 2026-05-13).
+        use std::collections::hash_map::Entry;
+        let cap = self.capture_cap;
+        let mut occupied = match self.outstanding.entry(pid) {
+            Entry::Occupied(o) => o,
+            Entry::Vacant(_) => return None,
+        };
+
         // Drain piped stdio (if any) before checking exit; the child may
         // have written its last bytes after our previous tick's drain.
-        self.drain_capture(pid);
+        Self::drain_outstanding_capture(occupied.get_mut(), cap);
 
-        let entry = self.outstanding.get_mut(&pid)?;
-        match entry.child.try_wait() {
+        match occupied.get_mut().child.try_wait() {
             Ok(Some(status)) => {
-                let child_pid = entry.child.id();
-                let killed = entry.killed;
-                let spawned_at = entry.spawned_at;
-                let wallclock_ms = entry.wallclock_at_spawn_ms;
-                let stdout_len = entry.stdout_len;
-                let stderr_len = entry.stderr_len;
-                let truncated = entry.truncated;
+                let child_pid = occupied.get().child.id();
+                let killed = occupied.get().killed;
+                let spawned_at = occupied.get().spawned_at;
+                let wallclock_ms = occupied.get().wallclock_at_spawn_ms;
                 // Final drain pass after exit: the child may have flushed
                 // its tail buffer between our last drain and try_wait.
-                self.drain_capture(pid);
-                let outstanding_entry = self.outstanding.remove(&pid).unwrap();
+                Self::drain_outstanding_capture(occupied.get_mut(), cap);
+                let entry = occupied.remove();
                 self.emit_complete_audit(
                     pid,
                     child_pid,
@@ -476,20 +462,18 @@ impl Recovery {
                     Some(&status),
                     spawned_at,
                     wallclock_ms,
-                    outstanding_entry.stdout_len,
-                    outstanding_entry.stderr_len,
-                    outstanding_entry.truncated,
+                    entry.stdout_len,
+                    entry.stderr_len,
+                    entry.truncated,
                 );
-                // suppress unused variable warning when capture is disabled
-                let _ = (stdout_len, stderr_len, truncated);
                 Some(RecoveryOutcome::Reaped { child_pid, status })
             }
             Ok(None) => None,
             Err(e) => {
-                let child_pid = entry.child.id();
-                let spawned_at = entry.spawned_at;
-                let wallclock_ms = entry.wallclock_at_spawn_ms;
-                let entry = self.outstanding.remove(&pid).unwrap();
+                let child_pid = occupied.get().child.id();
+                let spawned_at = occupied.get().spawned_at;
+                let wallclock_ms = occupied.get().wallclock_at_spawn_ms;
+                let entry = occupied.remove();
                 self.emit_complete_audit(
                     pid,
                     child_pid,
@@ -510,14 +494,15 @@ impl Recovery {
     /// child. Reads as many bytes as the kernel has buffered (up to the
     /// remaining cap) without ever blocking. WouldBlock is treated as
     /// "drain again next tick".
-    fn drain_capture(&mut self, pid: u32) {
-        let cap = self.capture_cap as usize;
+    ///
+    /// Takes the entry by `&mut Outstanding` rather than by `pid`+`&mut self`
+    /// so it can be called while an `OccupiedEntry` is held in
+    /// [`Self::reap_finished_child`] without re-borrowing the map.
+    fn drain_outstanding_capture(entry: &mut Outstanding, cap_cfg: u32) {
+        let cap = cap_cfg as usize;
         if cap == 0 {
             return;
         }
-        let Some(entry) = self.outstanding.get_mut(&pid) else {
-            return;
-        };
         if entry.truncated {
             return;
         }
@@ -650,11 +635,12 @@ impl Recovery {
             return RecoveryOutcome::RefusedCrossNamespace { pid };
         }
 
-        // Structural origin gate. Default-safe: refuse recovery when the
-        // stalled pid's beat lifetime included a non-kernel-attested
-        // transport. The operator can opt out (e.g. for development /
-        // testing) via `--i-accept-recovery-on-unauthenticated-transport`.
-        if origin == BeatOrigin::NetworkUnverified && !self.allow_unauthenticated_source {
+        // Structural origin gate. Refuse recovery when the stalled pid's
+        // beat lifetime was on a transport the operator did not declare
+        // recovery-eligible at bind time. `NetworkUnverified` is always
+        // refused; `OperatorAttestedTransport` and `KernelAttested` flow
+        // through. Trust is per-listener, not daemon-wide.
+        if origin == BeatOrigin::NetworkUnverified {
             self.refused_unauthenticated_source =
                 self.refused_unauthenticated_source.saturating_add(1);
             if let Some(sink) = self.audit_sink.as_mut() {
@@ -873,54 +859,68 @@ impl Recovery {
                 continue;
             }
 
-            let entry = match self.outstanding.get_mut(&pid) {
-                Some(e) => e,
-                None => continue,
+            // Acquire the entry once via the Entry API. `OccupiedEntry::remove`
+            // returns owned ownership in the `kill()` error arm without a
+            // second map lookup, so the formerly-unreachable
+            // `remove(&pid).unwrap()` cannot be constructed.
+            use std::collections::hash_map::Entry;
+            let mut occupied = match self.outstanding.entry(pid) {
+                Entry::Occupied(o) => o,
+                Entry::Vacant(_) => continue,
             };
 
             // Still running — check timeout.
-            if let Some(to) = self.timeout {
-                if entry.spawned_at.elapsed() >= to {
-                    if entry.killed {
-                        continue;
-                    }
+            let Some(to) = self.timeout else { continue };
+            if occupied.get().spawned_at.elapsed() < to {
+                // No timeout exceeded — leave in place.
+                continue;
+            }
+            if occupied.get().killed {
+                continue;
+            }
 
-                    let child_pid = entry.child.id();
-                    match entry.child.kill() {
-                        Ok(()) => {
-                            // Do not wait here; the observer poll loop must remain
-                            // non-blocking. A later try_wait call will reap the child.
-                            entry.killed = true;
-                            outcomes.push(RecoveryOutcome::Killed { child_pid });
-                        }
+            let child_pid = occupied.get().child.id();
+            // Defer the post-borrow retry so the `OccupiedEntry` lifetime
+            // ends naturally before we re-enter `&mut self` methods.
+            let mut needs_reap_retry = false;
+            match occupied.get_mut().child.kill() {
+                Ok(()) => {
+                    // Do not wait here; the observer poll loop must remain
+                    // non-blocking. A later try_wait call will reap the child.
+                    occupied.get_mut().killed = true;
+                    outcomes.push(RecoveryOutcome::Killed { child_pid });
+                }
 
-                        Err(e) if e.kind() == std::io::ErrorKind::InvalidInput => {
-                            // Child already exited between our try_wait and kill.
-                            // Retry try_wait once to reap.
-                            if let Some(outcome) = self.reap_finished_child(pid) {
-                                outcomes.push(outcome);
-                            }
-                        }
+                Err(e) if e.kind() == std::io::ErrorKind::InvalidInput => {
+                    // Child already exited between our try_wait and kill.
+                    // Retry try_wait once to reap, but only after this
+                    // borrow on `self.outstanding` ends.
+                    needs_reap_retry = true;
+                }
 
-                        Err(e) => {
-                            let entry = self.outstanding.remove(&pid).unwrap();
-                            self.emit_complete_audit(
-                                pid,
-                                child_pid,
-                                CompleteOutcome::ReapFailed,
-                                None,
-                                entry.spawned_at,
-                                entry.wallclock_at_spawn_ms,
-                                entry.stdout_len,
-                                entry.stderr_len,
-                                entry.truncated,
-                            );
-                            outcomes.push(RecoveryOutcome::ReapFailed(e));
-                        }
-                    }
+                Err(e) => {
+                    let entry = occupied.remove();
+                    self.emit_complete_audit(
+                        pid,
+                        child_pid,
+                        CompleteOutcome::ReapFailed,
+                        None,
+                        entry.spawned_at,
+                        entry.wallclock_at_spawn_ms,
+                        entry.stdout_len,
+                        entry.stderr_len,
+                        entry.truncated,
+                    );
+                    outcomes.push(RecoveryOutcome::ReapFailed(e));
                 }
             }
-            // No timeout or not yet exceeded — leave in place.
+            // `occupied` borrow on `self.outstanding` ends here. Safe to
+            // re-enter `&mut self` methods for the deferred retry.
+            if needs_reap_retry {
+                if let Some(outcome) = self.reap_finished_child(pid) {
+                    outcomes.push(outcome);
+                }
+            }
         }
 
         outcomes
@@ -1598,10 +1598,10 @@ mod tests {
     }
 
     /// H2 default-safe gate: a `NetworkUnverified` stall must NOT spawn the
-    /// recovery command. The counter increments and the outcome is the new
+    /// recovery command. The counter increments and the outcome is the
     /// `RefusedUnauthenticatedSource` variant.
     #[test]
-    fn refuses_recovery_on_unauthenticated_origin_by_default() {
+    fn refuses_recovery_on_unauthenticated_origin_always() {
         let mut rec = Recovery::with_mode(
             RecoveryMode::Exec {
                 program: "true".to_string(),
@@ -1619,23 +1619,24 @@ mod tests {
         assert_eq!(rec.take_refused_unauthenticated_source(), 0);
     }
 
-    /// `--i-accept-recovery-on-unauthenticated-transport` flips the gate
-    /// off — `NetworkUnverified` stalls spawn like UDS ones.
+    /// `OperatorAttestedTransport` beats fire recovery just like UDS ones.
+    /// The per-listener trust promotion is what enables this path — no
+    /// daemon-wide flag required.
     #[test]
-    fn accept_flag_allows_unauthenticated_recovery() {
+    fn operator_attested_transport_fires_recovery() {
         let mut rec = Recovery::with_mode(
             RecoveryMode::Exec {
                 program: "true".to_string(),
                 args: vec![],
             },
             Duration::ZERO,
-        )
-        .with_allow_unauthenticated_source(true);
+        );
 
-        match rec.on_stall(42, BeatOrigin::NetworkUnverified, false) {
+        match rec.on_stall(42, BeatOrigin::OperatorAttestedTransport, false) {
             RecoveryOutcome::Spawned { .. } => {}
             other => panic!("expected Spawned, got {other:?}"),
         }
+        // NetworkUnverified counter must not have been bumped.
         assert_eq!(rec.take_refused_unauthenticated_source(), 0);
     }
 
@@ -1722,7 +1723,7 @@ mod tests {
             other => panic!("expected RefusedCrossNamespace, got {other:?}"),
         }
         assert_eq!(rec.take_refused_cross_namespace(), 1);
-        // The unauth counter must NOT have been bumped — first match wins.
+        // The unauth counter must NOT have been bumped — cross-namespace is checked first.
         assert_eq!(rec.take_refused_unauthenticated_source(), 0);
     }
 }

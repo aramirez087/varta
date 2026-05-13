@@ -68,11 +68,16 @@ fn decode_rejects_bad_status() {
 
 #[test]
 fn every_status_variant_round_trips() {
+    // Agent-emitted statuses must round-trip through the wire decode
+    // chokepoint cleanly. `Status::Stall` is excluded by design — see
+    // `decode_rejects_stall_on_wire`. The byte mapping for `Stall` is still
+    // covered here because `Status::try_from_u8` accepts it (in-memory
+    // construction is intentionally permissive; observer code synthesises
+    // `Stall` events via the tracker without round-tripping a `Frame`).
     for (byte, expected) in [
         (0u8, Status::Ok),
         (1u8, Status::Degraded),
         (2u8, Status::Critical),
-        (3u8, Status::Stall),
     ] {
         assert_eq!(
             Status::try_from_u8(byte).expect("known byte must decode"),
@@ -87,6 +92,36 @@ fn every_status_variant_round_trips() {
         let decoded = Frame::decode(&buf).expect("variant frame must decode");
         assert_eq!(decoded.status, expected);
     }
+
+    // `Status::Stall` parses from the byte but is rejected at wire decode.
+    assert_eq!(
+        Status::try_from_u8(3).expect("Stall byte must parse"),
+        Status::Stall,
+    );
+}
+
+#[test]
+fn decode_rejects_stall_on_wire() {
+    // Status::Stall is observer-synthesised when a pid goes silent; agents
+    // emit only Ok/Degraded/Critical. A spoofed Stall frame would inject
+    // false liveness telemetry from any pid, so decode rejects it at the
+    // single chokepoint.
+    let frame = Frame::new(Status::Stall, 12_345, 1_000, 7, 0);
+    let mut buf = [0u8; 32];
+    frame.encode(&mut buf);
+    assert_eq!(Frame::decode(&buf), Err(DecodeError::StallOnWire));
+}
+
+#[test]
+fn decode_stall_precedence_fires_before_bad_pid() {
+    // The Stall-on-wire check sits between the status parse and the pid
+    // range check, so a hostile frame combining `Status::Stall` with a
+    // reserved pid must surface as `StallOnWire`, not `BadPid`. Locking
+    // this in prevents accidental reordering during future refactors.
+    let frame = Frame::new(Status::Stall, 1, 1_000, 7, 0);
+    let mut buf = [0u8; 32];
+    frame.encode(&mut buf);
+    assert_eq!(Frame::decode(&buf), Err(DecodeError::StallOnWire));
 }
 
 #[test]
@@ -168,6 +203,7 @@ fn decode_error_implements_display_and_error() {
     let bad_magic = format!("{}", DecodeError::BadMagic);
     let bad_version = format!("{}", DecodeError::BadVersion);
     let bad_status = format!("{}", DecodeError::BadStatus(0x42));
+    let stall_on_wire = format!("{}", DecodeError::StallOnWire);
     let bad_pid = format!("{}", DecodeError::BadPid(1));
     let bad_timestamp = format!("{}", DecodeError::BadTimestamp(u64::MAX));
     let bad_nonce = format!(
@@ -180,6 +216,7 @@ fn decode_error_implements_display_and_error() {
     assert!(!bad_magic.is_empty());
     assert!(!bad_version.is_empty());
     assert!(bad_status.contains("0x42") || bad_status.contains("66"));
+    assert!(stall_on_wire.contains("Stall"));
     assert!(bad_pid.contains('1'));
     assert!(bad_timestamp.contains("ffff") || bad_timestamp.contains("FFFF"));
     assert!(bad_nonce.contains("Ok"));

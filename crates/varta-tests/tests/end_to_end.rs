@@ -2160,16 +2160,23 @@ fn serve_pending_seconds_separates_scrape_from_beat_path() {
     );
 }
 
-/// `hostile_frame_rejected_at_decode_with_label_emit` (M1 contract).
+/// `hostile_frame_rejected_at_decode_with_label_emit` (M1 contract + H1).
 ///
-/// Spawns the observer, hand-crafts a frame with the reserved `pid = 1`
-/// (init/systemd), and sends it over UDS. Asserts that:
-///   * `varta_decode_errors_total{kind="bad_pid"}` ticks up;
-///   * every new label (`bad_pid`, `bad_timestamp`, `bad_nonce`) is
-///     present in the exposition output even when only `bad_pid` fires
-///     — the stable-label-set contract (cerebrum 2026-05-11);
-///   * no per-pid beat counter is published for `pid=1` (the frame must
-///     never reach the tracker).
+/// Spawns the observer and sends two hand-crafted frames:
+///   1. `Status::Stall` paired with the reserved `pid = 1` — exercises the
+///      H1 precedence (StallOnWire check fires before BadPid).
+///   2. `Status::Stall` paired with a legitimate pid `12345` — exercises
+///      the H1 path independently of any other validation rule, locking
+///      in that StallOnWire is the canonical rejection label for any
+///      observer-only status appearing on the wire.
+///
+/// Asserts:
+///   * `varta_decode_errors_total{kind="stall_on_wire"}` ticks up by >= 2;
+///   * every kind label (including the new `stall_on_wire`) is present in
+///     the exposition output even when only one has fired — the
+///     stable-label-set contract (cerebrum 2026-05-11);
+///   * no per-pid beat counter is published for either pid (the frames
+///     must never reach the tracker).
 fn hostile_frame_rejected_at_decode_with_label_emit() {
     use std::os::unix::net::UnixDatagram;
     use varta_vlp::{Frame, Status};
@@ -2201,29 +2208,34 @@ fn hostile_frame_rejected_at_decode_with_label_emit() {
         "/metrics not reachable within 3s"
     );
 
-    // Hand-craft a frame whose only protocol violation is the reserved
-    // pid=1. Status::Stall is the most dangerous combination — pre-2026-05
-    // it would have been accepted and could have triggered "init has
-    // stalled" recovery on systems where recovery is configured.
-    let hostile = Frame::new(Status::Stall, 1, 1_000, 7, 0);
-    let mut buf = [0u8; 32];
-    hostile.encode(&mut buf);
-
+    // Two hostile frames:
+    //   1. Status::Stall + reserved pid=1 — pre-H1 would have decoded
+    //      cleanly and could have triggered "init has stalled" recovery.
+    //      Post-H1, decode rejects on StallOnWire before reaching the pid
+    //      range check.
+    //   2. Status::Stall + legitimate pid=12345 — locks in StallOnWire as
+    //      the canonical rejection label independent of any other rule.
     let client = UnixDatagram::unbound().expect("unbound");
     client.connect(&socket).expect("connect");
-    client.send(&buf).expect("send hostile frame");
+
+    for hostile_pid in [1u32, 12_345] {
+        let hostile = Frame::new(Status::Stall, hostile_pid, 1_000, 7, 0);
+        let mut buf = [0u8; 32];
+        hostile.encode(&mut buf);
+        client.send(&buf).expect("send hostile frame");
+    }
 
     // The observer's poll loop reads, decodes, and either records or
     // rejects on its next tick (~100ms). Poll the counter until it
-    // increments.
-    let bad_pid_count = wait_until_with_timeout(
+    // increments by 2.
+    let stall_count = wait_until_with_timeout(
         || {
             let (code, body) = http_get(prom_addr, "/metrics").ok()?;
             if code != 200 {
                 return None;
             }
-            let v = parse_metric_value(&body, "varta_decode_errors_total{kind=\"bad_pid\"}")?;
-            if v >= 1 {
+            let v = parse_metric_value(&body, "varta_decode_errors_total{kind=\"stall_on_wire\"}")?;
+            if v >= 2 {
                 Some((v, body))
             } else {
                 None
@@ -2231,16 +2243,26 @@ fn hostile_frame_rejected_at_decode_with_label_emit() {
         },
         Duration::from_secs(5),
     )
-    .expect("bad_pid counter never observed within 5s");
+    .expect("stall_on_wire counter did not reach 2 within 5s");
 
-    let (count, body) = bad_pid_count;
+    let (count, body) = stall_count;
     assert!(
-        count >= 1,
-        "bad_pid decode-error counter must increment for pid=1"
+        count >= 2,
+        "stall_on_wire decode-error counter must increment for both hostile frames"
     );
 
-    // Stable-label-set contract: all six kinds must be emitted, including
-    // the three new ones, even when only one has fired.
+    // The reserved-pid path must NOT fire — StallOnWire takes precedence
+    // by decode order, even when pid=1 would also be rejected.
+    let bad_pid =
+        parse_metric_value(&body, "varta_decode_errors_total{kind=\"bad_pid\"}").unwrap_or(0);
+    assert_eq!(
+        bad_pid, 0,
+        "bad_pid must not fire for Status::Stall + pid=1 — \
+         StallOnWire takes precedence; body:\n{body}"
+    );
+
+    // Stable-label-set contract: every kind must be emitted, including the
+    // new `stall_on_wire`, even when only one fires.
     for kind in [
         "bad_magic",
         "bad_version",
@@ -2248,6 +2270,7 @@ fn hostile_frame_rejected_at_decode_with_label_emit() {
         "bad_pid",
         "bad_timestamp",
         "bad_nonce",
+        "stall_on_wire",
     ] {
         let needle = format!("varta_decode_errors_total{{kind=\"{kind}\"}} ");
         assert!(
@@ -2257,10 +2280,14 @@ fn hostile_frame_rejected_at_decode_with_label_emit() {
     }
 
     // Tracker invariant: a rejected frame must NEVER surface as a
-    // per-pid beat. Confirm the spoofed pid=1 has no beats_total series.
+    // per-pid beat. Confirm neither hostile pid has a beats_total series.
     assert!(
         !body.contains("varta_beats_total{pid=\"1\"}"),
         "rejected frame leaked to tracker for pid=1; body:\n{body}"
+    );
+    assert!(
+        !body.contains("varta_beats_total{pid=\"12345\"}"),
+        "rejected frame leaked to tracker for pid=12345; body:\n{body}"
     );
 
     eprintln!("hostile_frame_rejected_at_decode_with_label_emit: ok");

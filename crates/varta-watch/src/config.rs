@@ -216,19 +216,36 @@ pub struct Config {
     /// production deployments use `--recovery-exec` (no shell, no injection
     /// surface).  Set by `--i-accept-shell-risk`.
     pub i_accept_shell_risk: bool,
-    /// Operator opt-in required to combine a UDP listener with a recovery
-    /// command.  UDP transports (plain and secure) lack kernel attestation
-    /// of the sending process, so a `frame.pid` field on the wire is not
-    /// tied back to a verified sender — any holder of a shared PSK (or a
-    /// per-agent key derived from a leaked master key) can forge a beat
-    /// claiming any pid, then stop sending to trigger a recovery command
-    /// targeting an arbitrary process.  Without this flag, startup refuses
-    /// to proceed when both `--udp-port` and a recovery template are set.
-    /// Even with this flag, the runtime origin gate (Recovery's
-    /// `allow_unauthenticated_source`) still refuses UDP-origin stalls
-    /// unless the operator additionally accepts that runtime risk.
-    /// Set by `--i-accept-recovery-on-unauthenticated-transport`.
-    pub i_accept_recovery_on_unauthenticated_transport: bool,
+    /// Operator opt-in to combine the **secure-UDP** listener with a recovery
+    /// command.  Secure UDP authenticates wire bytes but cannot attest the
+    /// sending process — a holder of a shared PSK or a derived per-agent key
+    /// can forge a beat for any pid.  Without this flag, startup refuses to
+    /// proceed when both `--udp-port` (with key files) and a recovery template
+    /// are set.  With this flag the runtime origin gate stamps beats from this
+    /// listener [`BeatOrigin::OperatorAttestedTransport`] so recovery fires.
+    /// Set by `--secure-udp-i-accept-recovery-on-unauthenticated-transport`.
+    pub i_accept_recovery_on_secure_udp: bool,
+    /// Operator opt-in to combine the **plaintext-UDP** listener with a
+    /// recovery command.  Plaintext UDP has no authentication whatsoever —
+    /// any host that can reach the observer port can forge any frame.  Without
+    /// this flag, startup refuses to proceed when both `--udp-port` (without
+    /// key files) and a recovery template are set.  With this flag the runtime
+    /// origin gate stamps beats from this listener
+    /// [`BeatOrigin::OperatorAttestedTransport`] so recovery fires.
+    /// Set by `--plaintext-udp-i-accept-recovery-on-unauthenticated-transport`.
+    pub i_accept_recovery_on_plaintext_udp: bool,
+    /// Operator opt-in to bind the **secure-UDP** listener to a non-loopback
+    /// address (H4).  The per-sender replay protection retains state for up
+    /// to 1024 source addresses plus a 1-deep eviction shadow — an attacker
+    /// who can spoof ≥1025 UDP source addresses (trivial on a routed network)
+    /// can rotate the shadow and replay a captured frame against a target
+    /// sender.  Loopback is safe (only same-host processes can forge loopback
+    /// source addresses, which requires `CAP_NET_RAW`); any reachable network
+    /// must be explicitly acknowledged.  Without this flag, startup refuses
+    /// to proceed when `--udp-bind-addr` resolves to a non-loopback address
+    /// and secure-UDP keys are configured.  Set by
+    /// `--i-accept-secure-udp-non-loopback`.
+    pub i_accept_secure_udp_non_loopback: bool,
     /// Permit beats — and, by extension, recovery commands — for agents
     /// whose kernel-attested PID namespace differs from the observer's.
     /// Use only when agents intentionally share the host namespace
@@ -373,13 +390,27 @@ pub enum ConfigError {
     ShellRecoveryNotCompiledIn,
     /// A recovery command (`--recovery-cmd` / `--recovery-cmd-file` /
     /// `--recovery-exec` / `--recovery-exec-file`) was configured at the
-    /// same time as a UDP listener (`--udp-port`), without the operator's
-    /// explicit acknowledgement.  UDP transports cannot attest the sending
-    /// process — an attacker holding the AEAD key (or a derived per-agent
-    /// key) can forge a beat claiming any pid, then stop sending to
+    /// same time as a UDP listener (`--udp-port`), without the matching
+    /// per-listener operator acknowledgement.  UDP transports cannot attest
+    /// the sending process — an attacker holding the AEAD key (or a derived
+    /// per-agent key) can forge a beat claiming any pid, then stop sending to
     /// trigger the recovery command against the chosen pid.  Pass
-    /// `--i-accept-recovery-on-unauthenticated-transport` to proceed.
+    /// `--secure-udp-i-accept-recovery-on-unauthenticated-transport` (for
+    /// secure UDP) or
+    /// `--plaintext-udp-i-accept-recovery-on-unauthenticated-transport` (for
+    /// plaintext UDP) to proceed.
     RecoveryRequiresAuthenticatedTransport {
+        /// The `IP:PORT` of the UDP listener that would have been bound.
+        udp_addr: String,
+    },
+    /// A secure-UDP listener was configured with a non-loopback
+    /// `--udp-bind-addr`, but `--i-accept-secure-udp-non-loopback` was not
+    /// passed (H4).  The 1-deep replay shadow after capacity-forced eviction
+    /// is acceptable for closed local networks (loopback) but inadequate for
+    /// any reachable network — any spoofable-source attacker with ≥1025
+    /// distinct UDP source addresses can rotate the shadow and replay one
+    /// captured frame per target.
+    SecureUdpRequiresLoopbackBind {
         /// The `IP:PORT` of the UDP listener that would have been bound.
         udp_addr: String,
     },
@@ -478,9 +509,20 @@ impl core::fmt::Display for ConfigError {
                  UDP transports cannot attest the sending process — a holder of the AEAD key \
                  (or a per-agent key derived from a leaked master key) can forge a beat \
                  claiming any pid, then stop sending to trigger recovery against the chosen pid. \
-                 Either remove the recovery command, switch to a UDS-only deployment, or \
-                 pass --i-accept-recovery-on-unauthenticated-transport to explicitly accept \
-                 this risk."
+                 Either remove the recovery command, switch to a UDS-only deployment, or pass \
+                 --secure-udp-i-accept-recovery-on-unauthenticated-transport (for secure UDP) \
+                 or --plaintext-udp-i-accept-recovery-on-unauthenticated-transport (for plaintext \
+                 UDP) to explicitly accept this risk on a per-listener basis."
+            ),
+            ConfigError::SecureUdpRequiresLoopbackBind { udp_addr } => write!(
+                f,
+                "secure-UDP listener configured with non-loopback --udp-bind-addr ({udp_addr}). \
+                 The per-sender replay-state map holds up to 1024 senders plus a 1-deep \
+                 eviction shadow; an attacker who can spoof ≥1025 UDP source addresses can \
+                 rotate the shadow and replay a captured frame against a target sender. \
+                 Either bind to a loopback address (default 127.0.0.1) or pass \
+                 --i-accept-secure-udp-non-loopback to explicitly accept this risk. \
+                 See docs/architecture/vlp-transports.md for the threat-boundary derivation."
             ),
             ConfigError::IterationBudgetOutOfRange { value, min, max } => write!(
                 f,
@@ -602,8 +644,13 @@ OPTIONAL:
                                      network-based agents (requires --features
                                      udp at build time). Combine with UDS or
                                      use alone.
-    --udp-bind-addr <IP>           IP address to bind the UDP listener on
-                                     (default 0.0.0.0). Requires --udp-port.
+    --udp-bind-addr <IP>           IP address to bind the UDP listener on.
+                                     Defaults to 127.0.0.1 (loopback) when
+                                     secure-UDP keys are configured, and
+                                     0.0.0.0 when only plaintext UDP is in
+                                     play.  A non-loopback secure-UDP bind
+                                     requires --i-accept-secure-udp-non-loopback.
+                                     Requires --udp-port.
     --key-file <PATH>              Path to a file containing a 64-hex-char
                                      key for secure UDP (requires --features
                                      secure-udp at build time).
@@ -621,11 +668,17 @@ OPTIONAL:
                                      this file on every poll iteration.
                                      External watchdogs can monitor the file
                                      mtime to detect observer stalls.
-    --self-watchdog-secs <SECS>    Spawn a background thread that calls
+    --self-watchdog-secs <SECS>    Spawn a background thread that (a) calls
                                      process::abort() if the poll loop has
-                                     not ticked for longer than SECS seconds.
-                                     Catches hung poll loops. Triggers
-                                     systemd Restart=on-abort. Minimum 1.
+                                     not ticked for longer than SECS seconds
+                                     and (b) emits systemd WATCHDOG=1 from
+                                     its own cadence.  Catches hung poll
+                                     loops AND silent watchdog-thread
+                                     deaths (H5 — see
+                                     docs/architecture/observer-liveness.md).
+                                     Auto-enabled with a 4 s deadline when
+                                     $WATCHDOG_USEC is set by the service
+                                     manager.  Minimum 1.
     --hw-watchdog <PATH>           Open a hardware watchdog device (e.g.
                                      /dev/watchdog) and kick it once per
                                      poll iteration. On clean shutdown the
@@ -653,6 +706,23 @@ OPTIONAL:
                                      for production / safety-critical use;
                                      any device with network reach to the
                                      bound port can inject heartbeats.
+    --i-accept-secure-udp-non-loopback
+                                   UNSAFE: explicitly accept the security
+                                     risk of binding a secure-UDP listener
+                                     to a non-loopback address.  The
+                                     per-sender replay-state map carries a
+                                     1-deep eviction shadow; an attacker
+                                     with ≥1025 spoofable UDP source
+                                     addresses can rotate the shadow and
+                                     replay one captured frame per target
+                                     sender.  Required whenever
+                                     --udp-bind-addr is set to any address
+                                     other than 127.0.0.0/8 or ::1 while
+                                     secure-UDP keys are configured.
+                                     Restrict the listener's reach with
+                                     firewall rules or a private VLAN
+                                     before enabling.  See
+                                     docs/architecture/vlp-transports.md.
     --i-accept-shell-risk          UNSAFE: explicitly accept the security
                                      risk of shell-mode recovery
                                      (--recovery-cmd / --recovery-cmd-file).
@@ -664,23 +734,30 @@ OPTIONAL:
                                      — prefer --recovery-exec for any
                                      production deployment. Build must also
                                      include --features unsafe-shell-recovery.
-    --i-accept-recovery-on-unauthenticated-transport
-                                   UNSAFE: explicitly accept the security
-                                     risk of running a recovery command
-                                     while a UDP listener is bound.  UDP
-                                     transports (plain or secure) have no
-                                     kernel attestation of the sending
-                                     process — a holder of the AEAD key
-                                     (or a per-agent key derived from a
-                                     leaked master key) can forge a beat
-                                     claiming any pid, then stop sending
-                                     to trigger recovery against that pid.
-                                     Without this flag, --udp-port plus
-                                     any recovery-command flag is rejected
-                                     at startup.  The runtime origin gate
-                                     still refuses UDP-origin recoveries
-                                     by default; see
-                                     docs/architecture/peer-authentication.md.
+    --secure-udp-i-accept-recovery-on-unauthenticated-transport
+                                   UNSAFE: accept the security risk of
+                                     running a recovery command while the
+                                     secure-UDP listener is bound.  Secure
+                                     UDP authenticates wire bytes but cannot
+                                     attest the sending process — a holder
+                                     of the AEAD key can forge a beat for
+                                     any pid.  Without this flag, combining
+                                     --udp-port (with key files) and a
+                                     recovery command is rejected at startup.
+                                     This flag stamps beats from the secure-
+                                     UDP listener as operator-attested so
+                                     the runtime recovery gate fires.
+    --plaintext-udp-i-accept-recovery-on-unauthenticated-transport
+                                   UNSAFE: accept the security risk of
+                                     running a recovery command while the
+                                     plaintext-UDP listener is bound.
+                                     Plaintext UDP has no authentication —
+                                     any host can forge any frame.  Without
+                                     this flag, combining --udp-port (without
+                                     key files) and a recovery command is
+                                     rejected at startup.  This flag stamps
+                                     beats from the plaintext-UDP listener
+                                     as operator-attested so recovery fires.
     --allow-cross-namespace-agents UNSAFE: permit beats and recovery for
                                      agents whose kernel-attested PID
                                      namespace differs from the observer's.
@@ -779,7 +856,9 @@ OPTIONAL:
         let mut prom_rate_limit_burst: Option<u32> = None;
         let mut i_accept_plaintext_udp = false;
         let mut i_accept_shell_risk = false;
-        let mut i_accept_recovery_on_unauthenticated_transport = false;
+        let mut i_accept_recovery_on_secure_udp = false;
+        let mut i_accept_recovery_on_plaintext_udp = false;
+        let mut i_accept_secure_udp_non_loopback = false;
         let mut allow_cross_namespace_agents = false;
         let mut strict_namespace_check = false;
         let mut recovery_audit_file: Option<PathBuf> = None;
@@ -1045,8 +1124,14 @@ OPTIONAL:
                 "--i-accept-shell-risk" => {
                     i_accept_shell_risk = true;
                 }
-                "--i-accept-recovery-on-unauthenticated-transport" => {
-                    i_accept_recovery_on_unauthenticated_transport = true;
+                "--secure-udp-i-accept-recovery-on-unauthenticated-transport" => {
+                    i_accept_recovery_on_secure_udp = true;
+                }
+                "--plaintext-udp-i-accept-recovery-on-unauthenticated-transport" => {
+                    i_accept_recovery_on_plaintext_udp = true;
+                }
+                "--i-accept-secure-udp-non-loopback" => {
+                    i_accept_secure_udp_non_loopback = true;
                 }
                 "--allow-cross-namespace-agents" => {
                     allow_cross_namespace_agents = true;
@@ -1153,25 +1238,37 @@ OPTIONAL:
 
         // H2 mitigation — recovery commands are operator-controlled actions
         // (`kill -9 {pid}`, `systemctl restart agent@{pid}.service`).  UDP
-        // transports (plain *and* secure) cannot attest the sending process;
-        // any holder of the AEAD key (or a per-agent key derived from a
-        // leaked master key) can forge a beat claiming any pid, then stop
-        // sending to trigger the recovery command against that pid.  Refuse
-        // to start when both are configured unless the operator passes
-        // `--i-accept-recovery-on-unauthenticated-transport`.  Per
-        // docs/architecture/peer-authentication.md, even with the flag the
-        // runtime gate in Recovery still refuses UDP-origin stalls unless
-        // wired to explicitly allow them.
+        // transports cannot attest the sending process; a holder of the AEAD
+        // key can forge a beat for any pid, then stop sending to trigger the
+        // recovery command against that pid.  Refuse to start when both a UDP
+        // listener and a recovery command are configured unless the operator
+        // passes the matching per-listener flag.
+        //
+        // Trust is per-listener: --secure-udp-i-accept-recovery-on-
+        // unauthenticated-transport covers the secure-UDP listener only;
+        // --plaintext-udp-i-accept-recovery-on-unauthenticated-transport
+        // covers the plaintext-UDP listener only. They are independent.
         let any_recovery_configured = recovery_cmd.is_some()
             || recovery_exec_cmd.is_some()
             || recovery_cmd_file.is_some()
             || recovery_exec_file.is_some();
-        if any_recovery_configured && !i_accept_recovery_on_unauthenticated_transport {
+        if any_recovery_configured {
             if let Some(port) = udp_port {
                 let bind_ip =
                     udp_bind_addr.unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
                 let udp_addr = format!("{bind_ip}:{port}");
-                return Err(ConfigError::RecoveryRequiresAuthenticatedTransport { udp_addr });
+                // Is a secure-UDP listener being configured (any key file)?
+                let secure_udp =
+                    secure_key_file.is_some() || accepted_key_file.is_some() || master_key_file.is_some();
+                // Is a plaintext-UDP listener being configured (no keys, explicit opt-in)?
+                let plaintext_udp = i_accept_plaintext_udp && !secure_udp;
+
+                if secure_udp && !i_accept_recovery_on_secure_udp {
+                    return Err(ConfigError::RecoveryRequiresAuthenticatedTransport { udp_addr });
+                }
+                if plaintext_udp && !i_accept_recovery_on_plaintext_udp {
+                    return Err(ConfigError::RecoveryRequiresAuthenticatedTransport { udp_addr });
+                }
             }
         }
 
@@ -1262,7 +1359,8 @@ OPTIONAL:
             prom_rate_limit_burst: prom_rate_limit_burst.unwrap_or(DEFAULT_PROM_RATE_LIMIT_BURST),
             i_accept_plaintext_udp,
             i_accept_shell_risk,
-            i_accept_recovery_on_unauthenticated_transport,
+            i_accept_recovery_on_secure_udp,
+            i_accept_recovery_on_plaintext_udp,
             allow_cross_namespace_agents,
             strict_namespace_check,
             recovery_audit_file,
@@ -2310,23 +2408,39 @@ mod tests {
     }
 
     #[test]
-    fn parses_i_accept_recovery_on_unauthenticated_transport_flag() {
+    fn parses_secure_udp_i_accept_recovery_flag() {
         let cfg = Config::from_args(args(&[
             "--socket",
             "/s",
             "--threshold-ms",
             "100",
-            "--i-accept-recovery-on-unauthenticated-transport",
+            "--secure-udp-i-accept-recovery-on-unauthenticated-transport",
         ]))
         .expect("parse");
-        assert!(cfg.i_accept_recovery_on_unauthenticated_transport);
+        assert!(cfg.i_accept_recovery_on_secure_udp);
+        assert!(!cfg.i_accept_recovery_on_plaintext_udp);
     }
 
     #[test]
-    fn i_accept_recovery_on_unauthenticated_transport_defaults_to_false() {
+    fn parses_plaintext_udp_i_accept_recovery_flag() {
+        let cfg = Config::from_args(args(&[
+            "--socket",
+            "/s",
+            "--threshold-ms",
+            "100",
+            "--plaintext-udp-i-accept-recovery-on-unauthenticated-transport",
+        ]))
+        .expect("parse");
+        assert!(!cfg.i_accept_recovery_on_secure_udp);
+        assert!(cfg.i_accept_recovery_on_plaintext_udp);
+    }
+
+    #[test]
+    fn recovery_accept_flags_default_to_false() {
         let cfg =
             Config::from_args(args(&["--socket", "/s", "--threshold-ms", "100"])).expect("parse");
-        assert!(!cfg.i_accept_recovery_on_unauthenticated_transport);
+        assert!(!cfg.i_accept_recovery_on_secure_udp);
+        assert!(!cfg.i_accept_recovery_on_plaintext_udp);
     }
 
     #[test]
@@ -2366,11 +2480,8 @@ mod tests {
     }
 
     #[test]
-    fn recovery_plus_udp_port_without_accept_flag_is_rejected() {
-        // H2 mitigation: combining a recovery command with a UDP listener
-        // is structurally unsafe (UDP cannot attest the sending process).
-        // Without --i-accept-recovery-on-unauthenticated-transport, startup
-        // must hard-error.
+    fn recovery_plus_plaintext_udp_without_accept_flag_is_rejected() {
+        // H2 mitigation: plaintext UDP + recovery without per-listener flag must fail.
         let err = Config::from_args(args(&[
             "--socket",
             "/s",
@@ -2378,6 +2489,7 @@ mod tests {
             "100",
             "--udp-port",
             "9000",
+            "--i-accept-plaintext-udp",
             "--recovery-exec",
             "/bin/true",
         ]))
@@ -2390,11 +2502,38 @@ mod tests {
         }
         assert!(err
             .to_string()
-            .contains("--i-accept-recovery-on-unauthenticated-transport"));
+            .contains("--plaintext-udp-i-accept-recovery-on-unauthenticated-transport"));
     }
 
     #[test]
-    fn recovery_plus_udp_port_with_accept_flag_succeeds() {
+    fn recovery_plus_secure_udp_without_accept_flag_is_rejected() {
+        // H2 mitigation: secure UDP + recovery without per-listener flag must fail.
+        let err = Config::from_args(args(&[
+            "--socket",
+            "/s",
+            "--threshold-ms",
+            "100",
+            "--udp-port",
+            "9000",
+            "--key-file",
+            "/nonexistent-key",
+            "--recovery-exec",
+            "/bin/true",
+        ]))
+        .expect_err("must reject");
+        match err {
+            ConfigError::RecoveryRequiresAuthenticatedTransport { ref udp_addr } => {
+                assert!(udp_addr.contains(":9000"), "udp_addr = {udp_addr}");
+            }
+            other => panic!("expected RecoveryRequiresAuthenticatedTransport, got {other:?}"),
+        }
+        assert!(err
+            .to_string()
+            .contains("--secure-udp-i-accept-recovery-on-unauthenticated-transport"));
+    }
+
+    #[test]
+    fn recovery_plus_plaintext_udp_with_accept_flag_succeeds() {
         let cfg = Config::from_args(args(&[
             "--socket",
             "/s",
@@ -2402,12 +2541,35 @@ mod tests {
             "100",
             "--udp-port",
             "9000",
+            "--i-accept-plaintext-udp",
             "--recovery-exec",
             "/bin/true",
-            "--i-accept-recovery-on-unauthenticated-transport",
+            "--plaintext-udp-i-accept-recovery-on-unauthenticated-transport",
         ]))
         .expect("parse");
-        assert!(cfg.i_accept_recovery_on_unauthenticated_transport);
+        assert!(cfg.i_accept_recovery_on_plaintext_udp);
+        assert!(!cfg.i_accept_recovery_on_secure_udp);
+        assert_eq!(cfg.udp_port, Some(9000));
+    }
+
+    #[test]
+    fn recovery_plus_secure_udp_with_accept_flag_succeeds() {
+        let cfg = Config::from_args(args(&[
+            "--socket",
+            "/s",
+            "--threshold-ms",
+            "100",
+            "--udp-port",
+            "9000",
+            "--key-file",
+            "/nonexistent-key",
+            "--recovery-exec",
+            "/bin/true",
+            "--secure-udp-i-accept-recovery-on-unauthenticated-transport",
+        ]))
+        .expect("parse");
+        assert!(cfg.i_accept_recovery_on_secure_udp);
+        assert!(!cfg.i_accept_recovery_on_plaintext_udp);
         assert_eq!(cfg.udp_port, Some(9000));
     }
 
@@ -2422,7 +2584,8 @@ mod tests {
             "/bin/true",
         ]))
         .expect("parse");
-        assert!(!cfg.i_accept_recovery_on_unauthenticated_transport);
+        assert!(!cfg.i_accept_recovery_on_secure_udp);
+        assert!(!cfg.i_accept_recovery_on_plaintext_udp);
         assert!(cfg.udp_port.is_none());
     }
 

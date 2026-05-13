@@ -196,9 +196,17 @@ pub enum BeatOrigin {
     /// attests the sender's PID and UID per-datagram; the observer has
     /// already verified `frame.pid == peer_pid`.
     KernelAttested,
-    /// Beat arrived on a UDP listener (plain or secure). The wire bytes may
-    /// be cryptographically authenticated (secure-udp), but the underlying
-    /// transport has no notion of "sending process" — the `frame.pid` field
+    /// Beat arrived on a UDP listener that the operator explicitly declared
+    /// recovery-eligible at bind time (via
+    /// `--secure-udp-i-accept-recovery-on-unauthenticated-transport` or
+    /// `--plaintext-udp-i-accept-recovery-on-unauthenticated-transport`).
+    ///
+    /// The kernel cannot attest the sender, but the operator has accepted the
+    /// risk *for this specific listener*. Recovery commands are allowed to
+    /// fire for stalls on this transport, just as they would on UDS.
+    OperatorAttestedTransport,
+    /// Beat arrived on a UDP listener (plain or secure) with no operator
+    /// trust declaration. Recovery commands must NOT fire — the `frame.pid`
     /// is purely operator-controlled and cannot be tied back to a kernel
     /// attestation. Any holder of a shared PSK, or a leaked master key, can
     /// forge a beat for any pid.

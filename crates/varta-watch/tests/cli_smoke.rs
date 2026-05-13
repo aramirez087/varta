@@ -609,8 +609,8 @@ fn cli_recovery_plus_udp_port_without_accept_flag_is_rejected() {
     // Cross-flag invariant from docs/architecture/peer-authentication.md:
     // UDP transports cannot attest the sending process; combining a recovery
     // command with --udp-port is structurally unsafe and must hard-error at
-    // startup unless --i-accept-recovery-on-unauthenticated-transport is
-    // passed. This is the structural-enforcement layer behind the H2 fix.
+    // startup unless the matching per-listener flag is passed.
+    // This is the structural-enforcement layer behind the H2 fix.
     let socket = unique_uds_path("h2-no-accept");
     let out = Command::new(env!("CARGO_BIN_EXE_varta-watch"))
         .args([
@@ -620,6 +620,7 @@ fn cli_recovery_plus_udp_port_without_accept_flag_is_rejected() {
             "100",
             "--udp-port",
             "9001",
+            "--i-accept-plaintext-udp",
             "--recovery-exec",
             "/bin/true",
         ])
@@ -633,7 +634,7 @@ fn cli_recovery_plus_udp_port_without_accept_flag_is_rejected() {
     );
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("--i-accept-recovery-on-unauthenticated-transport"),
+        stderr.contains("--plaintext-udp-i-accept-recovery-on-unauthenticated-transport"),
         "error must name the opt-in flag; got: {stderr}"
     );
 }
@@ -653,8 +654,12 @@ fn cli_recovery_plus_udp_port_with_accept_flag_parses() {
     assert!(out.status.success(), "--help should exit 0");
     let s = String::from_utf8(out.stdout).expect("--help stdout utf8");
     assert!(
-        s.contains("--i-accept-recovery-on-unauthenticated-transport"),
-        "--help must list the new opt-in flag; full output:\n{s}"
+        s.contains("--secure-udp-i-accept-recovery-on-unauthenticated-transport"),
+        "--help must list the secure-udp opt-in flag; full output:\n{s}"
+    );
+    assert!(
+        s.contains("--plaintext-udp-i-accept-recovery-on-unauthenticated-transport"),
+        "--help must list the plaintext-udp opt-in flag; full output:\n{s}"
     );
 }
 

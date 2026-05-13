@@ -31,6 +31,27 @@ impl Drop for UmaskGuard {
 
 use crate::peer_cred::{self, RecvResult};
 
+/// Per-listener operator trust declaration for recovery eligibility.
+///
+/// Passed to a listener's builder method to promote UDP-origin beats from
+/// [`BeatOrigin::NetworkUnverified`] to [`BeatOrigin::OperatorAttestedTransport`].
+/// Recovery commands will then fire for stalls on that listener, as they
+/// would for kernel-attested UDS beats.
+///
+/// This is a structural enforcement of per-listener trust — there is no
+/// daemon-wide way to grant recovery trust to a UDP listener.
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Default)]
+pub enum TransportTrust {
+    /// No operator declaration — beats from this listener are stamped
+    /// [`BeatOrigin::NetworkUnverified`]. Recovery is refused for stalls.
+    #[default]
+    Untrusted,
+    /// Operator has explicitly accepted the security risk for this listener.
+    /// Beats are stamped [`BeatOrigin::OperatorAttestedTransport`] so the
+    /// runtime recovery gate allows them to fire.
+    Operator,
+}
+
 /// Abstraction over a source that can receive 32-byte VLP frames.
 ///
 /// Implementations must be `Send + 'static` so [`Observer`] can be moved.
@@ -62,6 +83,16 @@ pub trait BeatListener: Send + 'static {
     /// oldest entry. Only listeners that maintain per-sender state will
     /// override this.
     fn drain_sender_state_full(&mut self) -> u64 {
+        0
+    }
+
+    /// Drain and reset the AEAD-decryption-attempt counter.
+    ///
+    /// Counted by listeners that trial every loaded key on every frame
+    /// without early-exit on success — the constant-trial-count poll that
+    /// closes the key-rotation timing side-channel. Only the secure-UDP
+    /// listener overrides this.
+    fn drain_aead_attempts(&mut self) -> u64 {
         0
     }
 }
@@ -315,6 +346,7 @@ mod udp_impl {
     pub struct UdpListener {
         sock: UdpSocket,
         truncated_count: u64,
+        recovery_trust: super::TransportTrust,
     }
 
     impl UdpListener {
@@ -330,13 +362,28 @@ mod udp_impl {
             Ok(UdpListener {
                 sock,
                 truncated_count: 0,
+                recovery_trust: super::TransportTrust::Untrusted,
             })
+        }
+
+        /// Declare this listener recovery-eligible.
+        ///
+        /// When `trust` is [`TransportTrust::Operator`], beats received on
+        /// this listener are stamped [`BeatOrigin::OperatorAttestedTransport`]
+        /// so the runtime recovery gate allows them to fire.
+        pub fn with_recovery_trust(mut self, trust: super::TransportTrust) -> Self {
+            self.recovery_trust = trust;
+            self
         }
     }
 
     impl BeatListener for UdpListener {
         fn recv(&mut self) -> RecvResult {
             let mut buf = [0u8; 32];
+            let origin = match self.recovery_trust {
+                super::TransportTrust::Operator => BeatOrigin::OperatorAttestedTransport,
+                super::TransportTrust::Untrusted => BeatOrigin::NetworkUnverified,
+            };
             loop {
                 match self.sock.recv(&mut buf) {
                     Ok(32) => {
@@ -345,7 +392,7 @@ mod udp_impl {
                             peer_uid: 0,
                             // UDP carries no kernel-attested namespace identity.
                             peer_pid_ns_inode: None,
-                            origin: BeatOrigin::NetworkUnverified,
+                            origin,
                             data: buf,
                         };
                     }

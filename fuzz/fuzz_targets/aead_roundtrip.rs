@@ -23,10 +23,13 @@ fuzz_target!(|data: &[u8]| {
             return;
         };
 
-        // Roundtrip: encrypt then decrypt with same key/nonce
-        let (ciphertext, tag) = varta_vlp::crypto::seal(&key, &nonce, &plaintext);
+        // Extract optional AAD from fuzz data (4 bytes after plaintext)
+        let aad: &[u8] = if data.len() >= 80 { &data[76..80] } else { b"" };
 
-        match varta_vlp::crypto::open(&key, &nonce, &ciphertext, &tag) {
+        // Roundtrip: encrypt then decrypt with same key/nonce/aad
+        let (ciphertext, tag) = varta_vlp::crypto::seal(&key, &nonce, aad, &plaintext);
+
+        match varta_vlp::crypto::open(&key, &nonce, aad, &ciphertext, &tag) {
             Ok(decrypted) => {
                 assert_eq!(decrypted, plaintext, "roundtrip mismatch");
             }
@@ -39,14 +42,14 @@ fuzz_target!(|data: &[u8]| {
         if ciphertext != [0u8; 32] {
             let mut tampered = ciphertext;
             tampered[0] ^= 0x01;
-            let result = varta_vlp::crypto::open(&key, &nonce, &tampered, &tag);
+            let result = varta_vlp::crypto::open(&key, &nonce, aad, &tampered, &tag);
             assert!(result.is_err(), "tampered ciphertext must not pass AEAD");
         }
 
         // Wrong key must fail
         let mut wrong_key = key;
         wrong_key[0] ^= 0x01;
-        let result = varta_vlp::crypto::open(&wrong_key, &nonce, &ciphertext, &tag);
+        let result = varta_vlp::crypto::open(&wrong_key, &nonce, aad, &ciphertext, &tag);
         assert!(result.is_err(), "wrong key must not pass AEAD");
     }
 });

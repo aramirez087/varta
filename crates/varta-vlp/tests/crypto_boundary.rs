@@ -29,7 +29,7 @@ fn seal_does_not_panic_on_boundary_keys_and_nonces() {
     for k in &keys {
         for n in &nonces {
             for p in &plaintexts {
-                let (_ct, _tag) = seal(k, n, p);
+                let (_ct, _tag) = seal(k, n, b"", p);
             }
         }
     }
@@ -43,8 +43,8 @@ fn seal_open_round_trip_at_boundaries() {
         ([0x5Au8; 32], [0xA5u8; 12], [0x42u8; 32]),
     ];
     for (k, n, p) in cases {
-        let (ct, tag) = seal(k, n, p);
-        let pt = open(k, n, &ct, &tag).expect("authentic ciphertext should decrypt");
+        let (ct, tag) = seal(k, n, b"", p);
+        let pt = open(k, n, b"", &ct, &tag).expect("authentic ciphertext should decrypt");
         assert_eq!(&pt, p);
     }
 }
@@ -54,10 +54,33 @@ fn open_rejects_tampered_tag_without_panic() {
     let k = [0x42u8; 32];
     let n = [0x11u8; 12];
     let p = [0x77u8; 32];
-    let (ct, mut tag) = seal(&k, &n, &p);
+    let (ct, mut tag) = seal(&k, &n, b"", &p);
     tag[0] ^= 0x01;
-    let err = open(&k, &n, &ct, &tag).expect_err("tampered tag must fail to verify");
+    let err = open(&k, &n, b"", &ct, &tag).expect_err("tampered tag must fail to verify");
     assert_eq!(err, AuthError);
+}
+
+#[test]
+fn aad_binding_rejects_wrong_aad_at_open() {
+    let k = [0xABu8; 32];
+    let n = [0xCDu8; 12];
+    let p = [0xEFu8; 32];
+    let aad: &[u8] = &[0x01, 0x00, 0x00, 0x00]; // agent_pid = 1 LE
+
+    let (ct, tag) = seal(&k, &n, aad, &p);
+
+    // Correct AAD must decrypt.
+    open(&k, &n, aad, &ct, &tag).expect("correct AAD must verify");
+
+    // Any mutation of the on-wire AAD must fail.
+    for i in 0..aad.len() {
+        let mut bad = aad.to_vec();
+        bad[i] ^= 0xFF;
+        assert!(open(&k, &n, &bad, &ct, &tag).is_err(), "mutated AAD byte {i} must fail");
+    }
+
+    // Missing AAD must fail.
+    assert!(open(&k, &n, b"", &ct, &tag).is_err(), "empty AAD must fail for non-empty sealed");
 }
 
 #[test]

@@ -172,6 +172,11 @@ impl Frame {
     /// [`DecodeError`] on the first failed check.
     ///
     /// Field-range rules enforced after the byte-level fields are read:
+    /// * `status == Status::Stall` is rejected — `Stall` is observer-synthesized
+    ///   by `varta-watch` when a pid goes silent past its threshold; no
+    ///   legitimate agent emits it on the wire. Accepting a spoofed `Stall`
+    ///   frame would let a hostile sender pollute observer telemetry from
+    ///   any pid.
     /// * `pid ∈ {0, 1}` is rejected — pid 0 is the kernel/scheduler and
     ///   pid 1 is init/systemd; no legitimate agent runs at either, and
     ///   accepting them lets a hostile sender spoof "init has stalled" to
@@ -193,6 +198,9 @@ impl Frame {
             return Err(DecodeError::BadVersion);
         }
         let status = Status::try_from_u8(bytes[3])?;
+        if status == Status::Stall {
+            return Err(DecodeError::StallOnWire);
+        }
 
         // Each integer field is decoded via explicit array indexing — the
         // compiler statically proves every index is in-bounds against the
@@ -247,6 +255,12 @@ pub enum DecodeError {
     /// Status byte did not match any known [`Status`] variant. The inner
     /// value is the offending byte, surfaced for observer-side diagnostics.
     BadStatus(u8),
+    /// Observer-only status `Status::Stall` observed on the wire. `Stall`
+    /// is synthesized by `varta-watch` when a pid goes silent past its
+    /// threshold; agents emit only `Ok`, `Degraded`, or `Critical`. A
+    /// spoofed `Stall` frame would inject false liveness telemetry from
+    /// any pid, so the decoder rejects it at the single chokepoint.
+    StallOnWire,
     /// Reserved pid: `0` (kernel/scheduler) or `1` (init/systemd). No
     /// legitimate agent runs at either pid; rejecting closes the "spoof
     /// init has stalled" recovery-trigger attack on UDP listeners.
@@ -274,6 +288,9 @@ impl core::fmt::Display for DecodeError {
             DecodeError::BadVersion => f.write_str("varta-vlp: bad version byte"),
             DecodeError::BadStatus(byte) => {
                 write!(f, "varta-vlp: bad status byte {byte:#04x}")
+            }
+            DecodeError::StallOnWire => {
+                f.write_str("varta-vlp: Status::Stall is observer-only and forbidden on the wire")
             }
             DecodeError::BadPid(pid) => {
                 write!(f, "varta-vlp: reserved pid {pid}")

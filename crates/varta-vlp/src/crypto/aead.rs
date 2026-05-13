@@ -35,17 +35,19 @@ pub struct AuthError;
 /// * `key` — 256-bit (32-byte) pre-shared symmetric key.
 /// * `nonce` — 96-bit (12-byte) message nonce. **Must never be reused**
 ///   with the same key. The caller is responsible for nonce uniqueness.
+/// * `aad` — Additional Authenticated Data bound into the tag but not
+///   encrypted. Pass `b""` when no plaintext wire fields need binding.
 /// * `plaintext` — 32-byte VLP frame to encrypt.
 ///
 /// # Returns
 ///
 /// `(ciphertext, tag)` where `ciphertext` is 32 bytes and `tag` is 16 bytes.
 /// The transport layer joins these with the caller-provided nonce prefix
-/// for a total of 60 bytes.
-pub fn seal(key: &[u8; 32], nonce: &[u8; 12], plaintext: &[u8; 32]) -> ([u8; 32], [u8; 16]) {
+/// for a total of 60 bytes (shared-key) or 64 bytes (master-key).
+pub fn seal(key: &[u8; 32], nonce: &[u8; 12], aad: &[u8], plaintext: &[u8; 32]) -> ([u8; 32], [u8; 16]) {
     let cipher = ChaCha20Poly1305::new(chacha20poly1305::Key::from_slice(key));
     let mut ct = *plaintext;
-    let tag = match cipher.encrypt_in_place_detached(Nonce::from_slice(nonce), b"", &mut ct) {
+    let tag = match cipher.encrypt_in_place_detached(Nonce::from_slice(nonce), aad, &mut ct) {
         Ok(t) => t,
         // `chacha20poly1305::aead::Error` is returned only when the plaintext
         // length plus AAD length would exceed ChaCha20-Poly1305's 2^32-block
@@ -65,6 +67,8 @@ pub fn seal(key: &[u8; 32], nonce: &[u8; 12], plaintext: &[u8; 32]) -> ([u8; 32]
 /// * `key` — 256-bit (32-byte) pre-shared symmetric key.
 /// * `nonce` — 96-bit (12-byte) message nonce (must match the nonce used
 ///   during encryption).
+/// * `aad` — Additional Authenticated Data (must match what was passed to
+///   [`seal`]). Pass `b""` when no AAD was used.
 /// * `ciphertext` — 32-byte encrypted payload.
 /// * `tag` — 16-byte Poly1305 authentication tag.
 ///
@@ -72,17 +76,18 @@ pub fn seal(key: &[u8; 32], nonce: &[u8; 12], plaintext: &[u8; 32]) -> ([u8; 32]
 ///
 /// `Ok(plaintext)` on successful authentication and decryption, or
 /// `Err(AuthError)` if the tag does not verify (indicating tampering,
-/// wrong key, or corrupted data). Tag comparison is constant-time.
+/// wrong key, wrong AAD, or corrupted data). Tag comparison is constant-time.
 pub fn open(
     key: &[u8; 32],
     nonce: &[u8; 12],
+    aad: &[u8],
     ciphertext: &[u8; 32],
     tag: &[u8; 16],
 ) -> Result<[u8; 32], AuthError> {
     let cipher = ChaCha20Poly1305::new(chacha20poly1305::Key::from_slice(key));
     let mut pt = *ciphertext;
     cipher
-        .decrypt_in_place_detached(Nonce::from_slice(nonce), b"", &mut pt, Tag::from_slice(tag))
+        .decrypt_in_place_detached(Nonce::from_slice(nonce), aad, &mut pt, Tag::from_slice(tag))
         .map_err(|_| AuthError)?;
     Ok(pt)
 }
@@ -107,10 +112,10 @@ mod tests {
         ];
         let plaintext = [0xdeu8; 32];
 
-        let (ct, tag) = seal(&key, &nonce, &plaintext);
+        let (ct, tag) = seal(&key, &nonce, b"", &plaintext);
 
         // Verify via open — round-trip proves seal produces a valid AEAD frame.
-        let decrypted = open(&key, &nonce, &ct, &tag).expect("round-trip must succeed");
+        let decrypted = open(&key, &nonce, b"", &ct, &tag).expect("round-trip must succeed");
         assert_eq!(decrypted, plaintext);
     }
 
@@ -132,8 +137,8 @@ mod tests {
             0x63, 0x6c, 0x61, 0x73,
         ];
 
-        let (ciphertext, tag) = seal(&key, &nonce, &plaintext);
-        let decrypted = open(&key, &nonce, &ciphertext, &tag)
+        let (ciphertext, tag) = seal(&key, &nonce, b"", &plaintext);
+        let decrypted = open(&key, &nonce, b"", &ciphertext, &tag)
             .expect("roundtrip with RFC params should succeed");
         assert_eq!(decrypted, plaintext);
     }
@@ -167,7 +172,7 @@ mod tests {
             0xef, 0x33,
         ];
 
-        let (ciphertext, tag) = seal(&key, &nonce, &plaintext);
+        let (ciphertext, tag) = seal(&key, &nonce, b"", &plaintext);
 
         assert_eq!(ciphertext, expected_ciphertext);
         assert_eq!(tag, expected_tag);
@@ -179,10 +184,10 @@ mod tests {
         let nonce = [0x42u8; 12];
         let plaintext = [0xdeu8; 32];
 
-        let (ciphertext, tag) = seal(&key, &nonce, &plaintext);
+        let (ciphertext, tag) = seal(&key, &nonce, b"", &plaintext);
         assert_ne!(ciphertext, plaintext, "encryption should change data");
 
-        let decrypted = open(&key, &nonce, &ciphertext, &tag)
+        let decrypted = open(&key, &nonce, b"", &ciphertext, &tag)
             .expect("decryption should succeed with correct key and nonce");
         assert_eq!(
             decrypted, plaintext,
@@ -197,9 +202,9 @@ mod tests {
         let nonce = [0x01u8; 12];
         let plaintext = [0xdeu8; 32];
 
-        let (ciphertext, tag) = seal(&key_a, &nonce, &plaintext);
+        let (ciphertext, tag) = seal(&key_a, &nonce, b"", &plaintext);
 
-        let result = open(&key_b, &nonce, &ciphertext, &tag);
+        let result = open(&key_b, &nonce, b"", &ciphertext, &tag);
         assert!(result.is_err(), "decryption with wrong key must fail");
     }
 
@@ -210,9 +215,9 @@ mod tests {
         let nonce_b = [0x02u8; 12];
         let plaintext = [0xdeu8; 32];
 
-        let (ciphertext, tag) = seal(&key, &nonce_a, &plaintext);
+        let (ciphertext, tag) = seal(&key, &nonce_a, b"", &plaintext);
 
-        let result = open(&key, &nonce_b, &ciphertext, &tag);
+        let result = open(&key, &nonce_b, b"", &ciphertext, &tag);
         assert!(result.is_err(), "decryption with wrong nonce must fail");
     }
 
@@ -222,10 +227,10 @@ mod tests {
         let nonce = [0x42u8; 12];
         let plaintext = [0xdeu8; 32];
 
-        let (mut ciphertext, tag) = seal(&key, &nonce, &plaintext);
+        let (mut ciphertext, tag) = seal(&key, &nonce, b"", &plaintext);
         ciphertext[15] ^= 0x01;
 
-        let result = open(&key, &nonce, &ciphertext, &tag);
+        let result = open(&key, &nonce, b"", &ciphertext, &tag);
         assert!(
             result.is_err(),
             "decryption with tampered ciphertext must fail"
@@ -238,10 +243,10 @@ mod tests {
         let nonce = [0x42u8; 12];
         let plaintext = [0xdeu8; 32];
 
-        let (ciphertext, mut tag) = seal(&key, &nonce, &plaintext);
+        let (ciphertext, mut tag) = seal(&key, &nonce, b"", &plaintext);
         tag[0] ^= 0x01;
 
-        let result = open(&key, &nonce, &ciphertext, &tag);
+        let result = open(&key, &nonce, b"", &ciphertext, &tag);
         assert!(result.is_err(), "decryption with tampered tag must fail");
     }
 
@@ -251,10 +256,51 @@ mod tests {
         let nonce = [0x42u8; 12];
         let plaintext = [0xdeu8; 32];
 
-        let (ct1, tag1) = seal(&key, &nonce, &plaintext);
-        let (ct2, tag2) = seal(&key, &nonce, &plaintext);
+        let (ct1, tag1) = seal(&key, &nonce, b"", &plaintext);
+        let (ct2, tag2) = seal(&key, &nonce, b"", &plaintext);
 
         assert_eq!(ct1, ct2, "same input must produce same ciphertext");
         assert_eq!(tag1, tag2, "same input must produce same tag");
+    }
+
+    // AAD binding: a frame sealed with non-empty AAD must fail to open with
+    // wrong or missing AAD. Regression catch for the master-key wire format.
+    #[test]
+    fn aead_aad_binding_roundtrip() {
+        let key = [0x11u8; 32];
+        let nonce = [0x22u8; 12];
+        let plaintext = [0x33u8; 32];
+        let aad: &[u8] = &[0x01, 0x02, 0x03, 0x04]; // simulates agent_pid LE
+
+        let (ct, tag) = seal(&key, &nonce, aad, &plaintext);
+
+        // Correct AAD must succeed.
+        let decrypted = open(&key, &nonce, aad, &ct, &tag).expect("correct AAD must verify");
+        assert_eq!(decrypted, plaintext);
+
+        // Wrong AAD must fail.
+        let wrong_aad: &[u8] = &[0xFF, 0xFF, 0xFF, 0xFF];
+        assert!(open(&key, &nonce, wrong_aad, &ct, &tag).is_err(), "wrong AAD must fail");
+
+        // Missing AAD (b"") must fail.
+        assert!(open(&key, &nonce, b"", &ct, &tag).is_err(), "missing AAD must fail");
+    }
+
+    #[test]
+    fn aead_tampered_aad_fails() {
+        let key = [0x55u8; 32];
+        let nonce = [0x66u8; 12];
+        let plaintext = [0x77u8; 32];
+        let aad = [0x01u8, 0x00, 0x00, 0x00]; // agent_pid = 1 LE
+
+        let (ct, tag) = seal(&key, &nonce, &aad, &plaintext);
+
+        // Tamper one byte of the AAD (simulates on-wire agent_pid mutation).
+        let mut tampered_aad = aad;
+        tampered_aad[0] ^= 0x01;
+        assert!(
+            open(&key, &nonce, &tampered_aad, &ct, &tag).is_err(),
+            "tampered AAD must fail AEAD verification"
+        );
     }
 }

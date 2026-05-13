@@ -20,13 +20,16 @@ use std::io;
 use std::net::{SocketAddr, UdpSocket};
 use std::time::{Duration, Instant};
 
-use varta_vlp::crypto::{self, Key, NONCE_BYTES, TAG_BYTES};
+use varta_vlp::crypto::{self, Key, NONCE_BYTES, SECURE_FRAME_MASTER_BYTES, TAG_BYTES};
 
-use crate::listener::BeatListener;
+use crate::listener::{BeatListener, TransportTrust};
 use crate::peer_cred::{BeatOrigin, RecvResult};
 
-/// Total wire size of a secure VLP frame.
+/// Wire size of a shared-key VLP frame.
 const SECURE_FRAME_LEN: usize = crypto::SECURE_FRAME_BYTES;
+
+/// Wire size of a master-key VLP frame.
+const SECURE_FRAME_MASTER_LEN: usize = SECURE_FRAME_MASTER_BYTES;
 
 /// Maximum number of unique senders tracked simultaneously. Prevents
 /// unbounded memory growth from short-lived agents (cron jobs, CI runners).
@@ -89,7 +92,16 @@ pub struct SecureUdpListener {
     decrypt_failures: u64,
     truncated_count: u64,
     sender_state_full: u64,
+    /// Total AEAD decryption attempts since the last drain. The receive path
+    /// trials *every* loaded key on every frame (no early-exit on success),
+    /// so an attacker measuring RTT can no longer count attempts to learn
+    /// which rotation slot is primary. In steady state this equals
+    /// `frames_received * (keys.len() + master_key_configured as u64)`. The
+    /// counter is the operational signal that the constant-trial-count
+    /// timing-leak fix is active.
+    aead_attempts: u64,
     last_evicted: Option<(SocketAddr, SenderState)>,
+    recovery_trust: TransportTrust,
 }
 
 impl SecureUdpListener {
@@ -121,7 +133,9 @@ impl SecureUdpListener {
             decrypt_failures: 0,
             truncated_count: 0,
             sender_state_full: 0,
+            aead_attempts: 0,
             last_evicted: None,
+            recovery_trust: TransportTrust::Untrusted,
         })
     }
 
@@ -150,8 +164,21 @@ impl SecureUdpListener {
             decrypt_failures: 0,
             truncated_count: 0,
             sender_state_full: 0,
+            aead_attempts: 0,
             last_evicted: None,
+            recovery_trust: TransportTrust::Untrusted,
         })
+    }
+
+    /// Declare this listener recovery-eligible.
+    ///
+    /// When `trust` is [`TransportTrust::Operator`], authenticated beats
+    /// received on this listener are stamped
+    /// [`BeatOrigin::OperatorAttestedTransport`] so the runtime recovery gate
+    /// allows them to fire.
+    pub fn with_recovery_trust(mut self, trust: TransportTrust) -> Self {
+        self.recovery_trust = trust;
+        self
     }
 
     /// Remove senders that haven't been seen in [`EVICTION_TTL`].
@@ -208,31 +235,33 @@ impl SecureUdpListener {
         state.last_seen = Instant::now();
     }
 
-    /// Derive a per-agent key from the master key using the PID embedded in
-    /// `iv_random[0..4]` and attempt AEAD decryption.
+    /// Derive a per-agent key from the master key using the plaintext
+    /// `agent_pid` field from the 64-byte master-key wire frame and attempt
+    /// AEAD decryption with `aad` (= the on-wire `agent_pid` bytes).
     ///
     /// Returns `None` if no master key is configured, or if the derived key
-    /// fails to decrypt the frame.
+    /// fails to decrypt the frame. The `agent_pid` binding in the AAD means
+    /// any tampering of the on-wire PID prefix causes authentication failure
+    /// before this function is even reached.
     fn try_master_key_decrypt(
         &self,
-        iv_random: &[u8; 8],
+        agent_pid: u32,
+        aad: &[u8],
         nonce: &[u8; 12],
         ciphertext: &[u8; 32],
         tag: &[u8; 16],
     ) -> Option<[u8; 32]> {
         let master = self.master_key.as_ref()?;
-        let claimed_pid =
-            u32::from_le_bytes([iv_random[0], iv_random[1], iv_random[2], iv_random[3]]);
 
         use varta_vlp::crypto::kdf;
-        let agent_key = kdf::derive_agent_key(master, claimed_pid);
-        let plaintext = crypto::open(agent_key.as_bytes(), nonce, ciphertext, tag).ok()?;
+        let agent_key = kdf::derive_agent_key(master, agent_pid);
+        let plaintext = crypto::open(agent_key.as_bytes(), nonce, aad, ciphertext, tag).ok()?;
 
-        // Verify that the decrypted frame's PID matches the PID from
-        // iv_random to prevent PID spoofing at the transport layer.
+        // Defense-in-depth: verify the decrypted frame's inner PID matches
+        // the on-wire agent_pid even though the AAD binding already covers this.
         let frame_pid =
             u32::from_le_bytes([plaintext[4], plaintext[5], plaintext[6], plaintext[7]]);
-        if frame_pid != claimed_pid {
+        if frame_pid != agent_pid {
             return None;
         }
 
@@ -336,11 +365,18 @@ impl SecureUdpListener {
     fn sender_state_len(&self) -> usize {
         self.sender_state.len()
     }
+
+    #[cfg(test)]
+    fn test_local_addr(&self) -> SocketAddr {
+        self.sock.local_addr().expect("listener has local addr")
+    }
 }
 
 impl BeatListener for SecureUdpListener {
     fn recv(&mut self) -> RecvResult {
-        let mut buf = [0u8; SECURE_FRAME_LEN];
+        // Sized for the larger master-key frame; a 60-byte shared-key datagram
+        // fills only the first 60 bytes and nread discriminates the path.
+        let mut buf = [0u8; SECURE_FRAME_MASTER_LEN];
         loop {
             // Periodic eviction sweep for stale senders
             let now = Instant::now();
@@ -360,28 +396,85 @@ impl BeatListener for SecureUdpListener {
                 },
             };
 
-            if nread != SECURE_FRAME_LEN {
-                self.truncated_count = self.truncated_count.wrapping_add(1);
-                continue;
-            }
+            let (iv_random, iv_counter, ciphertext, tag, decrypted) = match nread {
+                SECURE_FRAME_LEN => {
+                    // Shared-key wire format (60 bytes):
+                    // [iv_random: 8] [iv_counter: 4] [ciphertext: 32] [tag: 16]
+                    let iv_random: [u8; 8] = buf[..8].try_into().unwrap();
+                    let iv_counter = u32::from_le_bytes(buf[8..12].try_into().unwrap());
 
-            // Parse wire format: iv_random(8) || iv_counter(4) || ciphertext(32) || tag(16)
-            let iv_random: [u8; 8] = buf[..8].try_into().unwrap();
-            let iv_counter = u32::from_le_bytes(buf[8..12].try_into().unwrap());
+                    let mut nonce = [0u8; NONCE_BYTES];
+                    nonce[..8].copy_from_slice(&iv_random);
+                    nonce[8..12].copy_from_slice(&iv_counter.to_le_bytes());
 
-            // Build 12-byte nonce
-            let mut nonce = [0u8; NONCE_BYTES];
-            nonce[..8].copy_from_slice(&iv_random);
-            nonce[8..12].copy_from_slice(&iv_counter.to_le_bytes());
+                    let ciphertext: [u8; 32] = buf[12..44].try_into().unwrap();
+                    let tag: [u8; TAG_BYTES] = buf[44..60].try_into().unwrap();
 
-            let ciphertext: [u8; 32] = buf[12..44].try_into().unwrap();
-            let tag: [u8; TAG_BYTES] = buf[44..60].try_into().unwrap();
+                    // Constant-trial-count poll: every loaded key is tried on
+                    // every frame, regardless of whether one already succeeded.
+                    // This removes the linear-in-key-index timing signal that
+                    // let a remote attacker fingerprint which rotation slot is
+                    // primary by measuring RTT. The post-loop `if .is_none()`
+                    // gate keeps the first successful plaintext.
+                    let mut decrypted: Option<[u8; 32]> = None;
+                    for key in self.keys.iter() {
+                        self.aead_attempts = self.aead_attempts.saturating_add(1);
+                        let result =
+                            crypto::open(key.as_bytes(), &nonce, b"", &ciphertext, &tag).ok();
+                        if decrypted.is_none() {
+                            decrypted = result;
+                        }
+                    }
 
-            let decrypted = self
-                .keys
-                .iter()
-                .find_map(|key| crypto::open(key.as_bytes(), &nonce, &ciphertext, &tag).ok())
-                .or_else(|| self.try_master_key_decrypt(&iv_random, &nonce, &ciphertext, &tag));
+                    (iv_random, iv_counter, ciphertext, tag, decrypted)
+                }
+                SECURE_FRAME_MASTER_LEN => {
+                    // Master-key wire format (64 bytes):
+                    // [agent_pid: 4] [iv_random: 8] [iv_counter: 4] [ciphertext: 32] [tag: 16]
+                    let agent_pid = u32::from_le_bytes(buf[0..4].try_into().unwrap());
+                    let iv_random: [u8; 8] = buf[4..12].try_into().unwrap();
+                    let iv_counter = u32::from_le_bytes(buf[12..16].try_into().unwrap());
+
+                    let mut nonce = [0u8; NONCE_BYTES];
+                    nonce[..8].copy_from_slice(&iv_random);
+                    nonce[8..12].copy_from_slice(&iv_counter.to_le_bytes());
+
+                    let ciphertext: [u8; 32] = buf[16..48].try_into().unwrap();
+                    let tag: [u8; TAG_BYTES] = buf[48..64].try_into().unwrap();
+
+                    // aad = on-wire agent_pid bytes; bound into the Poly1305 tag.
+                    let aad = &buf[0..4];
+
+                    // Constant-trial-count poll across shared keys *and* the
+                    // master-key derivation. Both are always evaluated, so an
+                    // attacker cannot fingerprint "shared key sufficed" vs
+                    // "needed master derivation" from RTT.
+                    let mut decrypted: Option<[u8; 32]> = None;
+                    for key in self.keys.iter() {
+                        self.aead_attempts = self.aead_attempts.saturating_add(1);
+                        let result =
+                            crypto::open(key.as_bytes(), &nonce, b"", &ciphertext, &tag).ok();
+                        if decrypted.is_none() {
+                            decrypted = result;
+                        }
+                    }
+                    let master_attempt =
+                        self.try_master_key_decrypt(agent_pid, aad, &nonce, &ciphertext, &tag);
+                    if decrypted.is_none() {
+                        decrypted = master_attempt;
+                    }
+
+                    (iv_random, iv_counter, ciphertext, tag, decrypted)
+                }
+                _ => {
+                    self.truncated_count = self.truncated_count.wrapping_add(1);
+                    continue;
+                }
+            };
+
+            // Suppress unused-variable warnings on tag/ciphertext when no
+            // caller inspects them after decryption.
+            let _ = (ciphertext, tag);
 
             let Some(plaintext) = decrypted else {
                 self.decrypt_failures = self.decrypt_failures.wrapping_add(1);
@@ -409,13 +502,17 @@ impl BeatListener for SecureUdpListener {
                 continue;
             }
 
+            let origin = match self.recovery_trust {
+                TransportTrust::Operator => BeatOrigin::OperatorAttestedTransport,
+                TransportTrust::Untrusted => BeatOrigin::NetworkUnverified,
+            };
             return RecvResult::Authenticated {
                 peer_pid: 0,
                 peer_uid: 0,
                 // Secure UDP authenticates wire bytes cryptographically but
                 // carries no kernel-attested namespace identity.
                 peer_pid_ns_inode: None,
-                origin: BeatOrigin::NetworkUnverified,
+                origin,
                 data: plaintext,
             };
         }
@@ -436,6 +533,12 @@ impl BeatListener for SecureUdpListener {
     fn drain_sender_state_full(&mut self) -> u64 {
         let n = self.sender_state_full;
         self.sender_state_full = 0;
+        n
+    }
+
+    fn drain_aead_attempts(&mut self) -> u64 {
+        let n = self.aead_attempts;
+        self.aead_attempts = 0;
         n
     }
 }
@@ -626,5 +729,140 @@ mod tests {
         // Force-evict should remove one entry.
         listener.force_evict_oldest_sender();
         assert_eq!(listener.sender_state_len(), MAX_SENDER_STATES - 1);
+    }
+
+    // ----- H3: constant-trial-count AEAD poll -----
+
+    /// Build a 60-byte shared-key wire frame using the given key, iv_random,
+    /// iv_counter, and plaintext. Mirrors the layout enforced by
+    /// `SecureUdpListener::recv` so the listener's parser will accept it.
+    fn build_shared_frame(
+        key: &Key,
+        iv_random: [u8; 8],
+        iv_counter: u32,
+        plaintext: &[u8; 32],
+    ) -> [u8; 60] {
+        let mut nonce = [0u8; NONCE_BYTES];
+        nonce[..8].copy_from_slice(&iv_random);
+        nonce[8..12].copy_from_slice(&iv_counter.to_le_bytes());
+        let (ciphertext, tag) = crypto::seal(key.as_bytes(), &nonce, b"", plaintext);
+
+        let mut wire = [0u8; 60];
+        wire[0..8].copy_from_slice(&iv_random);
+        wire[8..12].copy_from_slice(&iv_counter.to_le_bytes());
+        wire[12..44].copy_from_slice(&ciphertext);
+        wire[44..60].copy_from_slice(&tag);
+        wire
+    }
+
+    /// Spin until the listener returns something other than `WouldBlock`.
+    /// UDP delivery on localhost is fast but not synchronous; busy-poll a
+    /// few times before giving up.
+    fn recv_one(listener: &mut SecureUdpListener) -> RecvResult {
+        use std::time::Instant;
+        let deadline = Instant::now() + Duration::from_millis(500);
+        loop {
+            match listener.recv() {
+                RecvResult::WouldBlock => {
+                    if Instant::now() >= deadline {
+                        return RecvResult::WouldBlock;
+                    }
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                other => return other,
+            }
+        }
+    }
+
+    fn bind_with_keys(keys: Vec<Key>) -> SecureUdpListener {
+        SecureUdpListener::bind("127.0.0.1:0".parse().unwrap(), keys).expect("bind")
+    }
+
+    fn send_wire(target: SocketAddr, wire: &[u8]) {
+        let sender = UdpSocket::bind("127.0.0.1:0").expect("sender bind");
+        sender.send_to(wire, target).expect("send_to");
+    }
+
+    /// Frame encrypted by the *last* rotation key must still decrypt, AND
+    /// `drain_aead_attempts` must equal `keys.len()` — proving the poll did
+    /// not early-exit on success.
+    #[test]
+    fn aead_attempts_equals_keys_len_when_last_key_matches() {
+        let key0 = Key::from_bytes([0x11u8; 32]);
+        let key1 = Key::from_bytes([0x22u8; 32]);
+        let key2 = Key::from_bytes([0x33u8; 32]);
+        let mut listener = bind_with_keys(vec![key0.clone(), key1.clone(), key2.clone()]);
+        let target = listener.test_local_addr();
+
+        let plaintext = [0x55u8; 32];
+        let wire = build_shared_frame(&key2, test_iv(), 1, &plaintext);
+        send_wire(target, &wire);
+
+        let result = recv_one(&mut listener);
+        match result {
+            RecvResult::Authenticated { data, .. } => {
+                assert_eq!(data, plaintext, "decrypted plaintext must match");
+            }
+            _ => panic!("expected Authenticated, got non-Authenticated RecvResult"),
+        }
+        assert_eq!(
+            listener.drain_aead_attempts(),
+            3,
+            "every loaded key must be trialled even when the last one matches"
+        );
+    }
+
+    /// Frame encrypted by the *first* rotation key must produce the same
+    /// attempt count as a last-key match — no early-exit timing signal.
+    #[test]
+    fn aead_attempts_equals_keys_len_when_first_key_matches() {
+        let key0 = Key::from_bytes([0x44u8; 32]);
+        let key1 = Key::from_bytes([0x55u8; 32]);
+        let key2 = Key::from_bytes([0x66u8; 32]);
+        let mut listener = bind_with_keys(vec![key0.clone(), key1.clone(), key2.clone()]);
+        let target = listener.test_local_addr();
+
+        let plaintext = [0xAAu8; 32];
+        let wire = build_shared_frame(&key0, test_iv(), 1, &plaintext);
+        send_wire(target, &wire);
+
+        let result = recv_one(&mut listener);
+        match result {
+            RecvResult::Authenticated { data, .. } => {
+                assert_eq!(data, plaintext, "decrypted plaintext must match");
+            }
+            _ => panic!("expected Authenticated, got non-Authenticated RecvResult"),
+        }
+        assert_eq!(
+            listener.drain_aead_attempts(),
+            3,
+            "every loaded key must be trialled even when the first one matches"
+        );
+    }
+
+    /// Frame that decrypts under no key must still pay the full attempt
+    /// budget — failure path is constant-trial-count too.
+    #[test]
+    fn aead_attempts_equals_keys_len_on_decrypt_failure() {
+        let key0 = Key::from_bytes([0x77u8; 32]);
+        let key1 = Key::from_bytes([0x88u8; 32]);
+        let key2 = Key::from_bytes([0x99u8; 32]);
+        let mut listener = bind_with_keys(vec![key0, key1, key2]);
+        let target = listener.test_local_addr();
+
+        // Encrypt with an unrelated key the listener does not hold.
+        let stranger = Key::from_bytes([0xFFu8; 32]);
+        let plaintext = [0xBBu8; 32];
+        let wire = build_shared_frame(&stranger, test_iv(), 1, &plaintext);
+        send_wire(target, &wire);
+
+        // recv() consumes datagrams in a loop; the unauthenticated frame
+        // increments decrypt_failures and continues, returning WouldBlock.
+        let _ = recv_one(&mut listener);
+        assert_eq!(
+            listener.drain_aead_attempts(),
+            3,
+            "decrypt-failure path must still pay the full attempt budget"
+        );
     }
 }

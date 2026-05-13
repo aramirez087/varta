@@ -592,6 +592,18 @@ impl Observer {
             .map(|l| l.drain_sender_state_full())
             .sum()
     }
+
+    /// Drain and reset the AEAD-decryption-attempt counter across all
+    /// listeners. In steady state this equals
+    /// `frames_received * (keys.len() + master_key_configured as u64)` for
+    /// the secure-UDP listener — every loaded key is tried per frame to
+    /// remove the key-rotation timing side-channel.
+    pub fn drain_aead_attempts(&mut self) -> u64 {
+        self.listeners
+            .iter_mut()
+            .map(|l| l.drain_aead_attempts())
+            .sum()
+    }
 }
 
 #[cfg(test)]

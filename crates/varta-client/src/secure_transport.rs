@@ -29,12 +29,15 @@
 use std::io;
 use std::net::{SocketAddr, UdpSocket};
 
-use varta_vlp::crypto::{self, Key, NONCE_BYTES};
+use varta_vlp::crypto::{self, Key, NONCE_BYTES, SECURE_FRAME_MASTER_BYTES};
 
 use crate::transport::{bind_ephemeral, BeatTransport};
 
-/// Total length of an encrypted frame on the wire.
+/// Wire length for a shared-key frame.
 const SECURE_FRAME_LEN: usize = crypto::SECURE_FRAME_BYTES;
+
+/// Wire length for a master-key frame.
+const SECURE_FRAME_MASTER_LEN: usize = SECURE_FRAME_MASTER_BYTES;
 
 /// UDP transport with ChaCha20-Poly1305 AEAD encryption and authentication.
 ///
@@ -68,6 +71,7 @@ pub struct SecureUdpTransport {
     key: Key,
     iv_counter: u32,
     iv_random: [u8; 8],
+    is_master_mode: bool,
 }
 
 impl SecureUdpTransport {
@@ -93,6 +97,7 @@ impl SecureUdpTransport {
             key,
             iv_counter: 0,
             iv_random,
+            is_master_mode: false,
         })
     }
 
@@ -101,11 +106,22 @@ impl SecureUdpTransport {
     ///
     /// The agent key is derived from the master key and the calling
     /// process's PID using [`varta_vlp::crypto::kdf::derive_agent_key`].
-    /// The PID is also embedded in `iv_random[0..4]` so the observer can
-    /// derive the same agent key before decrypting the frame.
+    /// On each beat the PID is sent as a 4-byte plaintext prefix (AAD)
+    /// so the observer can derive the same agent key before decrypting.
     ///
-    /// `iv_random[4..8]` is filled with 4 random bytes from `/dev/urandom`
-    /// to ensure nonce uniqueness across connections.
+    /// The 8-byte `iv_random` is filled entirely from OS entropy — the PID
+    /// is no longer embedded in it. This gives a 64-bit random birthday
+    /// bound (~2^32 reconnects before collision probability reaches 50%),
+    /// versus the old 32-bit bound of ~2^16 reconnects.
+    ///
+    /// # Wire format (master-key mode, 64 bytes)
+    ///
+    /// ```text
+    /// [agent_pid: 4] [iv_random: 8] [iv_counter: 4] [ciphertext: 32] [tag: 16]
+    /// ```
+    ///
+    /// `agent_pid` is bound as Additional Authenticated Data (AAD) into the
+    /// Poly1305 tag; tampering the on-wire PID causes authentication failure.
     ///
     /// # Security
     ///
@@ -121,12 +137,9 @@ impl SecureUdpTransport {
         sock.connect(addr)?;
         sock.set_nonblocking(true)?;
 
-        // Encode PID in iv_random[0..4] so the observer can derive the
-        // agent key before decryption. Fill iv_random[4..8] with random
-        // bytes for nonce uniqueness across reconnects.
-        let mut iv_random = [0u8; 8];
-        iv_random[..4].copy_from_slice(&peer_pid.to_le_bytes());
-        iv_random[4..].copy_from_slice(&read_iv_random_prefix_4()?);
+        // Full 8 bytes of OS entropy — no PID embedded in iv_random.
+        // The PID is sent as a plaintext AAD field in the 64-byte wire frame.
+        let iv_random = read_iv_random()?;
 
         Ok(SecureUdpTransport {
             sock,
@@ -134,6 +147,7 @@ impl SecureUdpTransport {
             key: agent_key,
             iv_counter: 0,
             iv_random,
+            is_master_mode: true,
         })
     }
 }
@@ -159,16 +173,38 @@ impl BeatTransport for SecureUdpTransport {
         nonce[..8].copy_from_slice(&self.iv_random);
         nonce[8..12].copy_from_slice(&self.iv_counter.to_le_bytes());
 
-        let (ciphertext, tag) = crypto::seal(self.key.as_bytes(), &nonce, buf);
+        if self.is_master_mode {
+            // Master-key wire format (64 bytes):
+            // [agent_pid: 4] [iv_random: 8] [iv_counter: 4] [ciphertext: 32] [tag: 16]
+            //
+            // agent_pid is read fresh each beat (never cached — see cerebrum
+            // 2026-05-11) and bound as AAD so tampering the PID prefix fails
+            // authentication.
+            let agent_pid = std::process::id();
+            let agent_pid_bytes = agent_pid.to_le_bytes();
+            let (ciphertext, tag) = crypto::seal(self.key.as_bytes(), &nonce, &agent_pid_bytes, buf);
 
-        // Assemble wire frame: iv_random(8) || iv_counter(4) || ciphertext(32) || tag(16)
-        let mut frame = [0u8; SECURE_FRAME_LEN];
-        frame[..8].copy_from_slice(&self.iv_random);
-        frame[8..12].copy_from_slice(&self.iv_counter.to_le_bytes());
-        frame[12..44].copy_from_slice(&ciphertext);
-        frame[44..60].copy_from_slice(&tag);
+            let mut frame = [0u8; SECURE_FRAME_MASTER_LEN];
+            frame[0..4].copy_from_slice(&agent_pid_bytes);
+            frame[4..12].copy_from_slice(&self.iv_random);
+            frame[12..16].copy_from_slice(&self.iv_counter.to_le_bytes());
+            frame[16..48].copy_from_slice(&ciphertext);
+            frame[48..64].copy_from_slice(&tag);
 
-        self.sock.send(&frame)
+            self.sock.send(&frame)
+        } else {
+            // Shared-key wire format (60 bytes):
+            // [iv_random: 8] [iv_counter: 4] [ciphertext: 32] [tag: 16]
+            let (ciphertext, tag) = crypto::seal(self.key.as_bytes(), &nonce, b"", buf);
+
+            let mut frame = [0u8; SECURE_FRAME_LEN];
+            frame[..8].copy_from_slice(&self.iv_random);
+            frame[8..12].copy_from_slice(&self.iv_counter.to_le_bytes());
+            frame[12..44].copy_from_slice(&ciphertext);
+            frame[44..60].copy_from_slice(&tag);
+
+            self.sock.send(&frame)
+        }
     }
 
     fn reconnect(&mut self) -> io::Result<()> {
@@ -279,22 +315,6 @@ fn os_random(_buf: &mut [u8]) -> io::Result<()> {
 /// then falls back to `/dev/urandom`.
 pub(crate) fn read_iv_random() -> io::Result<[u8; 8]> {
     let mut buf = [0u8; 8];
-    if os_random(&mut buf).is_ok() {
-        return Ok(buf);
-    }
-    std::fs::File::open("/dev/urandom").and_then(|mut f| {
-        use std::io::Read;
-        f.read_exact(&mut buf)
-    })?;
-    Ok(buf)
-}
-
-/// Read 4 cryptographically-random bytes for the master-key IV prefix.
-///
-/// Used alongside the 4-byte PID prefix in master-key mode. Tries
-/// `getrandom(2)` / `getentropy(3)` first, then falls back to `/dev/urandom`.
-fn read_iv_random_prefix_4() -> io::Result<[u8; 4]> {
-    let mut buf = [0u8; 4];
     if os_random(&mut buf).is_ok() {
         return Ok(buf);
     }

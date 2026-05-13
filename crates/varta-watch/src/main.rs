@@ -380,6 +380,12 @@ fn run(cfg: Config) -> std::io::Result<()> {
                         std::io::Error::new(e.kind(), format!("secure UDP bind {}: {e}", addr))
                     })?
                 };
+                let trust = if cfg.i_accept_recovery_on_secure_udp {
+                    varta_watch::TransportTrust::Operator
+                } else {
+                    varta_watch::TransportTrust::Untrusted
+                };
+                let secure = secure.with_recovery_trust(trust);
                 observer.add_listener(Box::new(secure));
                 secure_bound = true;
             }
@@ -406,9 +412,16 @@ fn run(cfg: Config) -> std::io::Result<()> {
 
             #[cfg(feature = "unsafe-plaintext-udp")]
             {
-                let udp = varta_watch::UdpListener::bind(addr).map_err(|e| {
-                    std::io::Error::new(e.kind(), format!("UDP bind {}: {e}", addr))
-                })?;
+                let trust = if cfg.i_accept_recovery_on_plaintext_udp {
+                    varta_watch::TransportTrust::Operator
+                } else {
+                    varta_watch::TransportTrust::Untrusted
+                };
+                let udp = varta_watch::UdpListener::bind(addr)
+                    .map_err(|e| {
+                        std::io::Error::new(e.kind(), format!("UDP bind {}: {e}", addr))
+                    })?
+                    .with_recovery_trust(trust);
                 observer.add_listener(Box::new(udp));
                 varta_warn!(
                     "UDP on {addr} is running WITHOUT authentication \
@@ -499,19 +512,24 @@ fn run(cfg: Config) -> std::io::Result<()> {
         "inline".to_string()
     };
 
-    // High-visibility audit-trail when the operator has explicitly accepted
-    // recovery on an unauthenticated transport.  Config-level validation
-    // already rejects the combination without the flag, so reaching this
-    // branch means the choice was deliberate — log it once so the choice
-    // appears in any SIEM / syslog ingest alongside the other startup banners.
-    if cfg.i_accept_recovery_on_unauthenticated_transport && recovery_mode.is_some() {
-        varta_warn!(
-            "recovery-on-unauthenticated-transport is enabled \
-             (--i-accept-recovery-on-unauthenticated-transport). The runtime origin \
-             gate will still refuse to spawn recovery commands for UDP-origin stalls \
-             unless the operator additionally enables Recovery's \
-             allow_unauthenticated_source. NOT for production / safety-critical use."
-        );
+    // High-visibility audit-trail when the operator has accepted recovery on
+    // a UDP listener. Config-level validation already rejects the combination
+    // without the per-listener flag, so reaching this branch is deliberate.
+    if recovery_mode.is_some() {
+        if cfg.i_accept_recovery_on_secure_udp {
+            varta_warn!(
+                "recovery on secure-UDP listener is enabled \
+                 (--secure-udp-i-accept-recovery-on-unauthenticated-transport). \
+                 NOT for safety-critical use."
+            );
+        }
+        if cfg.i_accept_recovery_on_plaintext_udp {
+            varta_warn!(
+                "recovery on plaintext-UDP listener is enabled \
+                 (--plaintext-udp-i-accept-recovery-on-unauthenticated-transport). \
+                 NOT for safety-critical use."
+            );
+        }
     }
 
     let mut recovery = recovery_mode.map(|mode| {
@@ -520,20 +538,15 @@ fn run(cfg: Config) -> std::io::Result<()> {
         } else {
             0
         };
-        // Origin gate stays enabled by default even when the startup
-        // hard-error has been overridden — UDP-origin stalls are still
-        // refused at the runtime layer. This is intentional defense-in-depth:
-        // the startup flag enables the *combination* to start, but does
-        // not by itself authorize firing recovery against unauthenticated
-        // sources. Wiring the field to true is reserved for callers that
-        // make a separate, conscious choice.
+        // `NetworkUnverified` beats are always refused by the runtime gate.
+        // `OperatorAttestedTransport` beats (stamped by per-listener trust)
+        // fire just like `KernelAttested` ones — trust is structural.
         Recovery::with_timeout(mode, cfg.recovery_debounce, cfg.recovery_timeout)
             .with_recovery_env(cfg.recovery_env.clone())
             .with_shutdown_grace(cfg.shutdown_grace)
             .with_capture(capture_cap)
             .with_source(recovery_source.clone())
             .with_audit_sink(recovery_audit_sink)
-            .with_allow_unauthenticated_source(false)
             .with_allow_cross_namespace(cfg.allow_cross_namespace_agents)
     });
     let mut file_export: Option<FileExporter> = match cfg.file_export.as_ref() {
@@ -586,16 +599,52 @@ fn run(cfg: Config) -> std::io::Result<()> {
     sd_notify.ready();
 
     // --- Self-watchdog thread (optional) ------------------------------------
-    // The ONLY background thread in the binary.  It exists solely to detect
-    // a hung poll loop and call process::abort().  The beat path and observer
-    // loop remain single-threaded.  Enabled by --self-watchdog-secs.
-    if let Some(deadline) = cfg.self_watchdog {
+    // The ONLY background thread in the binary.  It exists to (a) detect a
+    // hung poll loop and `process::abort()`, AND (b) emit systemd
+    // `WATCHDOG=1\n` notifications on its own cadence.  The latter is the H5
+    // closure: with emission moved off the main loop, a silently-dead
+    // watchdog thread stops WATCHDOG=1 and systemd's `WatchdogSec=` fires,
+    // even when the main loop is still ticking.  The beat path and observer
+    // loop remain single-threaded; the watchdog reads two atomics and writes
+    // to its own dup-ed socket fd only.
+    //
+    // Enabled when EITHER `--self-watchdog-secs` is passed OR systemd
+    // provided `$WATCHDOG_USEC`.  The latter is the "auto-enable" path: an
+    // operator running under a `Type=notify` unit with `WatchdogSec=`
+    // automatically gets in-process abort + watchdog emission without
+    // touching the command line.
+    //
+    // `AUTO_DEADLINE_SECS` is the conservative default deadline applied in
+    // the auto-enable case (operator passed no explicit `--self-watchdog-secs`).
+    // 4 s mirrors the documented L1 example in
+    // `docs/architecture/observer-liveness.md`.  Operators with tighter
+    // `WatchdogSec=` should pass `--self-watchdog-secs` to override.
+    const AUTO_DEADLINE_SECS: u64 = 4;
+    let wdt_notifier = sd_notify.take_watchdog_notifier();
+    let wdt_deadline: Option<Duration> = match (cfg.self_watchdog, wdt_notifier.is_some()) {
+        (Some(d), _) => Some(d),
+        (None, true) => Some(Duration::from_secs(AUTO_DEADLINE_SECS)),
+        (None, false) => None,
+    };
+
+    if let Some(deadline) = wdt_deadline {
         let deadline_ns = deadline.as_nanos() as u64;
         let secs = deadline.as_secs();
+        // Sleep period for the watchdog thread.  Bounded above by 500 ms
+        // (the historical cadence) and below by half_interval/2 when systemd
+        // is supervising — a tight WatchdogSec (e.g. 500 ms) demands faster
+        // ticks than a fixed 500 ms could deliver.
+        let tick_sleep = match wdt_notifier.as_ref() {
+            Some(n) => (n.half_interval() / 2)
+                .min(Duration::from_millis(500))
+                .max(Duration::from_millis(50)),
+            None => Duration::from_millis(500),
+        };
+        let mut wdt_notifier = wdt_notifier;
         std::thread::Builder::new()
             .name("varta-watchdog".into())
             .spawn(move || loop {
-                std::thread::sleep(Duration::from_millis(500));
+                std::thread::sleep(tick_sleep);
                 if SHUTDOWN.load(Ordering::Acquire) {
                     return;
                 }
@@ -605,7 +654,23 @@ fn run(cfg: Config) -> std::io::Result<()> {
                     eprintln!("varta-watch poll loop wedged for >{secs}s; aborting");
                     std::process::abort();
                 }
+                // Main loop is still ticking — emit WATCHDOG=1 to keep
+                // systemd informed of *our* liveness (not just the main
+                // thread's).  No-op when WATCHDOG_USEC is unset.
+                if let Some(n) = wdt_notifier.as_mut() {
+                    n.tick();
+                }
             })?;
+    } else if sd_notify.watchdog_half_interval().is_some() {
+        // Defensive: should be unreachable because `take_watchdog_notifier`
+        // returns Some when the interval is set AND the socket is open.
+        // Keep the branch so a future regression that mismatches the two
+        // conditions surfaces a startup warning rather than a silent
+        // watchdog drop.
+        varta_warn!(
+            "$WATCHDOG_USEC is set but no self-watchdog could be started \
+             (notify socket open failed). systemd watchdog integration is disabled."
+        );
     }
 
     // --- Hardware watchdog (optional) --------------------------------------
@@ -805,6 +870,13 @@ fn run(cfg: Config) -> std::io::Result<()> {
             }
         }
 
+        let aead_attempts = observer.drain_aead_attempts();
+        if aead_attempts > 0 {
+            if let Some(pe) = prom_export.as_mut() {
+                pe.record_secure_aead_attempts(aead_attempts);
+            }
+        }
+
         let rate_limited = observer.drain_rate_limited();
         if rate_limited > 0 {
             if let Some(pe) = prom_export.as_mut() {
@@ -926,10 +998,16 @@ fn run(cfg: Config) -> std::io::Result<()> {
         }
         // Update the self-watchdog liveness timestamp.  Uses wall-clock so the
         // watchdog thread (which cannot access the observer) reads the same
-        // epoch.  Store after the poll work so a hung sd_notify/hw-watchdog
-        // kick would also be caught.
+        // epoch.  Store after the poll work so a hung hw-watchdog kick would
+        // also be caught.
+        //
+        // H5: systemd `WATCHDOG=1` notifications are emitted from the
+        // self-watchdog thread, NOT here.  This is the load-bearing closure
+        // — if the watchdog thread dies but the main loop survives, the
+        // emission stream stops and `WatchdogSec=` fires.  Calling
+        // `sd_notify.watchdog_tick()` on the main thread would re-open that
+        // gap, so it is deliberately omitted.
         LAST_TICK_NS.store(observer_now_ns(), Ordering::Relaxed);
-        sd_notify.watchdog_tick();
         if let Some(ref mut hw) = hw_wdt {
             hw.kick();
         }
