@@ -336,3 +336,17 @@ jobs:
             cat /tmp/feature-combo.log
             exit 1
           fi
+
+  book:
+    name: build-book
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: install mdbook
+        run: |
+          tag=$(curl -s https://api.github.com/repos/rust-lang/mdBook/releases/latest | grep -oP '"tag_name": "\K[^"]+')
+          curl -L "https://github.com/rust-lang/mdBook/releases/download/${tag}/mdbook-${tag}-x86_64-unknown-linux-gnu.tar.gz" | tar xz
+          mv mdbook /usr/local/bin/
+
+      - name: build book
+        run: mdbook build

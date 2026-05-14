@@ -1,0 +1,21 @@
+[book]
+authors = ["Alexander Ramirez"]
+language = "en"
+multilingual = false
+src = "src"
+title = "The Varta Book"
+
+[output.html]
+git-repository-url = "https://github.com/aramirez087/Varta"
+edit-url-template = "https://github.com/aramirez087/Varta/edit/main/book/{path}"
+preferred-dark-theme = "navy"
+
+[output.html.search]
+limit-results = 30
+use-boolean-and = true
+boost-title = 2.0
+boost-hierarchy = 1.2
+boost-paragraph = 1.0
+expand = true
+heading-split-level = 3
+copy-js = true
