@@ -1,7 +1,8 @@
 #![deny(missing_docs, unsafe_op_in_unsafe_fn, rust_2018_idioms)]
 #![forbid(clippy::dbg_macro, clippy::print_stdout)]
-// SAFETY: unsafe_code is legitimately required for sigaction(2) FFI in
-// install_signal_handlers().  The workspace-level deny forces explicit opt-in.
+// SAFETY: unsafe_code is required for the signal_install::install() call in
+// run() and for the inline test that calls it. The workspace-level deny
+// forces explicit opt-in.
 #![allow(unsafe_code)]
 
 //! Varta observer binary entry point.
@@ -23,18 +24,18 @@ use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::time::{Duration, Instant};
 
+#[cfg(feature = "prometheus-exporter")]
+use varta_watch::exporter::IterStage;
 use varta_watch::log_ratelimit::LogKind;
 #[cfg(feature = "prometheus-exporter")]
 use varta_watch::PromExporter;
-#[cfg(feature = "prometheus-exporter")]
-use varta_watch::exporter::IterStage;
 use varta_watch::{
     varta_error, varta_error_err, varta_error_pid, varta_error_rl, varta_info_pid_child,
     varta_warn, varta_warn_child, varta_warn_rl, Config, ConfigError, Event, Exporter,
     FileExporter, Observer, Recovery, RecoveryOutcome,
 };
 
-/// Shutdown latch flipped by [`install_signal_handlers`] on SIGINT/SIGTERM
+/// Shutdown latch flipped by [`handle_shutdown`] on SIGINT/SIGTERM
 /// and by the `--shutdown-after-secs` deadline path. The poll loop exits
 /// when this becomes `true`.
 ///
@@ -90,12 +91,12 @@ static CURRENT_STAGE: AtomicU8 = AtomicU8::new(u8::MAX);
 /// Indexed by [`IterStage as usize`] — must stay in sync with the enum.
 #[cfg(feature = "prometheus-exporter")]
 const STAGE_ABORT_NS: [u64; 6] = [
-    2_000 * 1_000_000,   // DrainPending: 2 s (5× 20 ms soft budget)
-    2_000 * 1_000_000,   // Poll:         2 s (≈18× read_timeout default)
-      500 * 1_000_000,   // Maintenance:  500 ms (50× 10 ms)
-    1_000 * 1_000_000,   // RecoveryReap: 1 s (50× 20 ms)
-    2_000 * 1_000_000,   // ServePending: 2 s (10× 200 ms structural cap)
-    1_000 * 1_000_000,   // Housekeeping: 1 s (100× 10 ms)
+    2_000 * 1_000_000, // DrainPending: 2 s (5× 20 ms soft budget)
+    2_000 * 1_000_000, // Poll:         2 s (≈18× read_timeout default)
+    500 * 1_000_000,   // Maintenance:  500 ms (50× 10 ms)
+    1_000 * 1_000_000, // RecoveryReap: 1 s (50× 20 ms)
+    2_000 * 1_000_000, // ServePending: 2 s (10× 200 ms structural cap)
+    1_000 * 1_000_000, // Housekeeping: 1 s (100× 10 ms)
 ];
 
 /// Kernel clock source for `observer_now_ns()`.  Set exactly once in
@@ -106,479 +107,17 @@ const STAGE_ABORT_NS: [u64; 6] = [
 /// Encoding: `ClockSource::as_u8()` / `ClockSource::from_u8()`.
 static CLOCK_SOURCE: AtomicU8 = AtomicU8::new(0);
 
-// --------------------------------------------------------------------------
-// Linux signal-handler installation: kernel ABI, not libc wrapper.
-// --------------------------------------------------------------------------
-//
-// Background. Earlier revisions of this file called `sigaction(3)` (the
-// libc wrapper) and passed a glibc-shaped `struct sigaction`. That worked
-// only because glibc and musl both *unconditionally* substitute their own
-// signal restorer before calling the kernel:
-//
-//   // glibc sysdeps/unix/sysv/linux/x86_64/sigaction.c
-//   kact.sa_flags    = act->sa_flags | SA_RESTORER;
-//   kact.sa_restorer = &restore_rt;   // OUR sa_restorer IS IGNORED
-//
-//   // musl src/signal/sigaction.c
-//   ksa.flags    = sa->sa_flags | SA_RESTORER;
-//   ksa.restorer = (sa->sa_flags & SA_SIGINFO) ? __restore_rt : __restore;
-//
-// In other words: passing a non-null `sa_restorer` to libc's wrapper is
-// theatre. Our pointer is stripped on the way to the kernel and libc's
-// restorer is installed in its place.
-//
-// To actually own the kernel ABI we now invoke `rt_sigaction(2)` directly
-// via `core::arch::asm!` with the kernel's struct layout. macOS and
-// FreeBSD keep the libc-wrapper path (neither has the same restorer
-// issue), so the change is fully Linux-scoped.
-//
-// Refuse to compile on Linux architectures we have not pinned the syscall
-// ABI for.
-#[cfg(all(
-    target_os = "linux",
-    not(any(target_arch = "x86_64", target_arch = "aarch64"))
-))]
-compile_error!(
-    "varta-watch on Linux currently supports x86_64 and aarch64 only — \
-     add a `KernelSigAction` and `rt_sigaction_raw` arm for this \
-     architecture (matching the `<asm-generic/signal.h>` layout and the \
-     `__NR_rt_sigaction` syscall number) before enabling it."
-);
+// Signal-handler installation is delegated to the `signal_install` module
+// (see `crates/varta-watch/src/signal_install/`). The handler below sets the
+// `SHUTDOWN` latch; `run()` passes it to `signal_install::install`.
+// Architecture support is gated in `signal_install/linux/mod.rs`.
 
-// Kernel-ABI signal-return trampoline for Linux/x86_64.
-//
-// On x86_64 the kernel's `__setup_rt_frame` (arch/x86/kernel/signal_64.c)
-// requires `SA_RESTORER` set and `sa_restorer` pointing at a userspace
-// `rt_sigreturn(2)` trampoline — otherwise it returns `-EFAULT` and the
-// process gets `SIGSEGV` on signal-handler return. glibc and musl ship
-// `__restore_rt`; we ship our own equivalent here so that we own the kernel
-// ABI end-to-end and are not implicitly dependent on libc.
-//
-// Two-instruction trampoline. Stack is already pointing at the rt_sigframe
-// the kernel set up before jumping to the handler; `rt_sigreturn` reads it.
-//
-// `.cfi_signal_frame` tells gdb / perf / Rust unwinders that this is a
-// signal trampoline so backtraces step past the interrupted context
-// correctly. `.hidden` keeps the symbol private to this binary.
-//
-// References:
-//   * arch/x86/kernel/signal_64.c::__setup_rt_frame
-//   * arch/x86/entry/syscalls/syscall_64.tbl  (__NR_rt_sigreturn = 15)
-//   * glibc sysdeps/unix/sysv/linux/x86_64/sigaction.c::restore_rt
-//   * musl src/signal/x86_64/restore.s
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-core::arch::global_asm!(
-    ".section .text.varta_signal_restorer,\"ax\",@progbits",
-    ".globl varta_signal_restorer",
-    ".hidden varta_signal_restorer",
-    ".type varta_signal_restorer, @function",
-    ".p2align 4",
-    "varta_signal_restorer:",
-    ".cfi_startproc",
-    ".cfi_signal_frame",
-    "    mov $15, %rax", // __NR_rt_sigreturn
-    "    syscall",
-    "    ud2", // never reached: rt_sigreturn does not return
-    ".cfi_endproc",
-    ".size varta_signal_restorer, .-varta_signal_restorer",
-    options(att_syntax),
-);
-
-// Note: aarch64 has no userspace restorer at all. The kernel sets x30 (LR)
-// to a vDSO sigreturn trampoline (`__kernel_rt_sigreturn`) before jumping
-// to the handler; `<asm-generic/signal.h>` does not include the
-// `sa_restorer` field on aarch64 because `__ARCH_HAS_SA_RESTORER` is
-// undefined for arm64 (see arch/arm64/include/uapi/asm/signal.h). So no
-// trampoline is needed or possible on aarch64 — the kernel owns the path.
-
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-extern "C" {
-    /// Kernel-ABI signal-return trampoline defined by the `global_asm!`
-    /// block above. Never invoked from Rust — only by the kernel as the
-    /// `sa_restorer` callee when a signal handler returns. Issues
-    /// `__NR_rt_sigreturn` and does not return to userspace.
-    // SAFETY: only ever taken as a function-pointer value
-    // (`varta_signal_restorer as *const ()`) and handed to `rt_sigaction(2)`.
-    fn varta_signal_restorer();
-}
-
-// Kernel ABI for `struct sigaction` on Linux/x86_64 — **different** from
-// glibc's userspace layout. See `<asm-generic/signal.h>` and
-// `<arch/x86/include/uapi/asm/signal.h>` (the latter defines
-// `__ARCH_HAS_SA_RESTORER`, which inserts the restorer field).
-//
-//   field        offset  type           note
-//   sa_handler        0  void (*)(int)
-//   sa_flags          8  unsigned long
-//   sa_restorer      16  void (*)(void) present iff __ARCH_HAS_SA_RESTORER
-//   sa_mask          24  sigset_t       1×unsigned long on 64-bit Linux
-//   total size       32
-//
-// Compile-time size + offset assertions follow `KernelSigAction` below.
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-#[repr(C)]
-struct KernelSigAction {
-    sa_handler: *const (),
-    sa_flags: u64,
-    sa_restorer: *const (),
-    sa_mask: u64,
-}
-
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-const _: () = assert!(core::mem::size_of::<KernelSigAction>() == 32);
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-const _: () = assert!(core::mem::offset_of!(KernelSigAction, sa_handler) == 0);
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-const _: () = assert!(core::mem::offset_of!(KernelSigAction, sa_flags) == 8);
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-const _: () = assert!(core::mem::offset_of!(KernelSigAction, sa_restorer) == 16);
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-const _: () = assert!(core::mem::offset_of!(KernelSigAction, sa_mask) == 24);
-
-// Kernel ABI for Linux/aarch64. No `sa_restorer` (see comment above).
-//
-//   field        offset  type           note
-//   sa_handler        0  void (*)(int)
-//   sa_flags          8  unsigned long
-//   sa_mask          16  sigset_t       1×unsigned long
-//   total size       24
-#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
-#[repr(C)]
-struct KernelSigAction {
-    sa_handler: *const (),
-    sa_flags: u64,
-    sa_mask: u64,
-}
-
-#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
-const _: () = assert!(core::mem::size_of::<KernelSigAction>() == 24);
-#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
-const _: () = assert!(core::mem::offset_of!(KernelSigAction, sa_handler) == 0);
-#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
-const _: () = assert!(core::mem::offset_of!(KernelSigAction, sa_flags) == 8);
-#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
-const _: () = assert!(core::mem::offset_of!(KernelSigAction, sa_mask) == 16);
-
-/// Direct `rt_sigaction(2)` syscall — bypasses any libc wrapper.
+/// Shutdown handler — flips [`SHUTDOWN`] on SIGINT / SIGTERM delivery.
 ///
-/// Linux syscall ABI on x86_64: number in `rax`; args in `rdi, rsi, rdx,
-/// r10`; result in `rax` (negative `-errno` on failure, `0` on success).
-/// `syscall` clobbers `rcx` (saved RIP) and `r11` (saved RFLAGS); flags
-/// are *not* preserved.
-///
-/// The 4th argument is `sigsetsize` — the number of bytes of `sa_mask`
-/// the kernel should consult. On 64-bit Linux `sigset_t` is one
-/// `unsigned long` (8 bytes); passing the wrong size yields `-EINVAL`.
-///
-/// SAFETY: caller is responsible for the validity of `act` / `oact`
-/// pointers and for ensuring no concurrent thread is racing on the same
-/// signal disposition.
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-#[inline]
-unsafe fn rt_sigaction_raw(
-    sig: i32,
-    act: *const KernelSigAction,
-    oact: *mut KernelSigAction,
-) -> i64 {
-    const SYS_RT_SIGACTION: i64 = 13;
-    const SIGSETSIZE: i64 = core::mem::size_of::<u64>() as i64; // 8 bytes
-    let ret: i64;
-    // SAFETY: see function-level safety comment. The asm performs a
-    // syscall with the documented Linux x86_64 calling convention.
-    unsafe {
-        core::arch::asm!(
-            "syscall",
-            inlateout("rax") SYS_RT_SIGACTION => ret,
-            in("rdi") sig as i64,
-            in("rsi") act,
-            in("rdx") oact,
-            in("r10") SIGSETSIZE,
-            lateout("rcx") _,   // clobbered: saved RIP
-            lateout("r11") _,   // clobbered: saved RFLAGS
-            options(nostack),
-        );
-    }
-    ret
-}
-
-/// Direct `rt_sigaction(2)` syscall on Linux/aarch64.
-///
-/// Linux syscall ABI on aarch64: number in `x8`; args in `x0..x5`;
-/// result in `x0`. The kernel preserves `x1..x18` across the syscall.
-///
-/// SAFETY: identical contract to the x86_64 variant.
-#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
-#[inline]
-unsafe fn rt_sigaction_raw(
-    sig: i32,
-    act: *const KernelSigAction,
-    oact: *mut KernelSigAction,
-) -> i64 {
-    const SYS_RT_SIGACTION: i64 = 134;
-    const SIGSETSIZE: i64 = core::mem::size_of::<u64>() as i64; // 8 bytes
-    let ret: i64;
-    // SAFETY: see function-level safety comment.
-    unsafe {
-        core::arch::asm!(
-            "svc #0",
-            in("x8") SYS_RT_SIGACTION,
-            inlateout("x0") sig as i64 => ret,
-            in("x1") act,
-            in("x2") oact,
-            in("x3") SIGSETSIZE,
-            options(nostack),
-        );
-    }
-    ret
-}
-
-/// Install SIGINT / SIGTERM handlers on Linux by invoking the
-/// `rt_sigaction(2)` syscall **directly** — bypassing the libc wrapper.
-///
-/// The libc wrapper (glibc, musl, ...) unconditionally replaces the
-/// caller's `sa_restorer` with its own. To genuinely own the kernel ABI
-/// — and to make this code work even with no libc, a minimal libc, or
-/// a `LD_PRELOAD` shim — we issue the syscall ourselves through
-/// `rt_sigaction_raw`. On x86_64 the kernel needs `SA_RESTORER` set and
-/// `sa_restorer` pointing at our `varta_signal_restorer` trampoline; on
-/// aarch64 signal-return is handled by the vDSO and the kernel struct
-/// has no `sa_restorer` field at all.
-///
-/// The debug-build readback round-trips the same kernel ABI and asserts
-/// that the kernel preserved exactly what we sent — including (on
-/// x86_64) our trampoline pointer, which is the proof that no libc
-/// override is in the path.
-#[cfg(target_os = "linux")]
-unsafe fn install_signal_handlers() -> io::Result<()> {
-    const SIGINT: i32 = 2;
-    const SIGTERM: i32 = 15;
-
-    /// `SA_RESTART`: restart interrupted syscalls (no `EINTR`).
-    /// Verified against `<asm-generic/signal-defs.h>`.
-    const SA_RESTART: u64 = 0x1000_0000;
-    /// `SA_RESTORER`: kernel uses `sa_restorer` as the signal-return
-    /// trampoline. x86_64 requires this; on aarch64 the bit is defined
-    /// (for AArch32 compat) but the kernel struct has no restorer
-    /// field, so we do not set it.
-    #[cfg(target_arch = "x86_64")]
-    const SA_RESTORER: u64 = 0x0400_0000;
-
-    extern "C" fn handle(_sig: i32) {
-        SHUTDOWN.store(true, Ordering::Release);
-    }
-
-    // SAFETY: MaybeUninit::zeroed() gives us a zeroed stack slot; no
-    // `KernelSigAction` value is constructed until `assume_init()`. We
-    // fill fields through a raw pointer first. sa_mask = 0 leaves no
-    // additional signals blocked during the handler. The handler is
-    // async-signal-safe (single atomic store).
-    let mut act = std::mem::MaybeUninit::<KernelSigAction>::zeroed();
-    // SAFETY: writes through `as_mut_ptr()` are valid for the zeroed slot.
-    unsafe {
-        (*act.as_mut_ptr()).sa_handler = handle as *const ();
-        #[cfg(target_arch = "x86_64")]
-        {
-            (*act.as_mut_ptr()).sa_flags = SA_RESTART | SA_RESTORER;
-            (*act.as_mut_ptr()).sa_restorer = varta_signal_restorer as *const ();
-        }
-        #[cfg(target_arch = "aarch64")]
-        {
-            (*act.as_mut_ptr()).sa_flags = SA_RESTART;
-        }
-    }
-    // SAFETY: every field has been written; `KernelSigAction` is `#[repr(C)]`
-    // with POD fields, so the struct is now fully initialised.
-    let act = unsafe { act.assume_init() };
-
-    let install = |sig: i32| -> io::Result<()> {
-        // SAFETY: `act` lives on the stack for the duration of the call;
-        // passing a null `oact` is permitted.
-        let rc = unsafe { rt_sigaction_raw(sig, &act, std::ptr::null_mut()) };
-        if rc < 0 {
-            // Linux returns -errno on syscall failure; values are in
-            // [-4095, -1]. Convert back to a positive errno for io::Error.
-            return Err(io::Error::from_raw_os_error(-rc as i32));
-        }
-
-        // Production-grade readback. Runs in every build (debug + release)
-        // and refuses to start the binary if the kernel did not store
-        // exactly what we sent. This is the runtime check that the
-        // trampoline ABI is still valid on the kernel we're running on:
-        // if a future kernel silently changes `rt_sigreturn` / `SA_RESTORER`
-        // semantics in a way that would SIGSEGV us on first signal
-        // delivery, that change is overwhelmingly likely to also cause one
-        // of the field comparisons below to disagree, so we surface a
-        // typed `io::Error` at startup instead of crashing at SIGTERM.
-        // Cost: one extra syscall per signal install (two total at startup).
-        let mut old = std::mem::MaybeUninit::<KernelSigAction>::zeroed();
-        // SAFETY: `oact` is a writable, correctly-sized stack slot.
-        let rc2 = unsafe { rt_sigaction_raw(sig, std::ptr::null(), old.as_mut_ptr()) };
-        if rc2 < 0 {
-            return Err(io::Error::from_raw_os_error(-rc2 as i32));
-        }
-        // SAFETY: a successful readback fully initialises the slot.
-        let old = unsafe { old.assume_init() };
-        if old.sa_handler != handle as *const () {
-            return Err(io::Error::other(
-                "rt_sigaction readback: kernel reports a different sa_handler than we installed",
-            ));
-        }
-        if old.sa_flags & SA_RESTART == 0 {
-            return Err(io::Error::other(
-                "rt_sigaction readback: kernel did not preserve SA_RESTART",
-            ));
-        }
-        #[cfg(target_arch = "x86_64")]
-        {
-            if old.sa_flags & SA_RESTORER == 0 {
-                return Err(io::Error::other(
-                    "rt_sigaction readback: SA_RESTORER not set in installed action \
-                     (libc wrapper hijacked the syscall?)",
-                ));
-            }
-            if old.sa_restorer != varta_signal_restorer as *const () {
-                return Err(io::Error::other(
-                    "rt_sigaction readback: kernel did not install our trampoline \
-                     (libc override, or kernel rt_sigreturn ABI changed?)",
-                ));
-            }
-        }
-        Ok(())
-    };
-    install(SIGINT)?;
-    install(SIGTERM)?;
-    Ok(())
-}
-
-/// Install SIGINT / SIGTERM handlers on macOS / FreeBSD by calling
-/// libc's `sigaction(3)` wrapper. Neither platform has the `sa_restorer`
-/// substitution issue that motivates the direct-syscall path on Linux,
-/// so the libc wrapper is correct and idiomatic here.
-#[cfg(any(target_os = "macos", target_os = "freebsd"))]
-unsafe fn install_signal_handlers() -> io::Result<()> {
-    const SIGINT: i32 = 2;
-    const SIGTERM: i32 = 15;
-
-    #[cfg(target_os = "macos")]
-    const SA_RESTART: i32 = 0x0002;
-    #[cfg(target_os = "freebsd")]
-    const SA_RESTART: i32 = 0x0040;
-
-    extern "C" fn handle(_sig: i32) {
-        SHUTDOWN.store(true, Ordering::Release);
-    }
-
-    // Per-platform sigaction struct: ABI-pinned with compile-time size /
-    // offset assertions below.
-    #[cfg(target_os = "macos")]
-    #[repr(C)]
-    struct SigAction {
-        sa_handler: *const (),
-        /// sigset_t on macOS / XNU is `__uint32_t` (4 bytes), not 32 bytes.
-        /// Defined in `<sys/_types/_sigset_t.h>`; verified against xnu
-        /// sources (xnu-8792.81.2, xnu-11215.1.10).
-        sa_mask: u32,
-        sa_flags: i32,
-    }
-
-    #[cfg(target_os = "freebsd")]
-    #[repr(C)]
-    struct SigAction {
-        sa_handler: *const (),
-        sa_flags: i32,
-        /// sigset_t on FreeBSD is `__uint32_t[4]` (16 bytes). Verified
-        /// against `<sys/_sigset.h>` (FreeBSD 14.2).
-        sa_mask: [u8; 16],
-    }
-
-    #[cfg(target_os = "macos")]
-    const _: () = assert!(core::mem::size_of::<SigAction>() == 16);
-    #[cfg(target_os = "freebsd")]
-    const _: () = assert!(core::mem::size_of::<SigAction>() == 32);
-
-    #[cfg(target_os = "macos")]
-    const _: () = assert!(core::mem::offset_of!(SigAction, sa_handler) == 0);
-    #[cfg(target_os = "macos")]
-    const _: () = assert!(core::mem::offset_of!(SigAction, sa_mask) == 8);
-    #[cfg(target_os = "macos")]
-    const _: () = assert!(core::mem::offset_of!(SigAction, sa_flags) == 12);
-
-    #[cfg(target_os = "freebsd")]
-    const _: () = assert!(core::mem::offset_of!(SigAction, sa_handler) == 0);
-    #[cfg(target_os = "freebsd")]
-    const _: () = assert!(core::mem::offset_of!(SigAction, sa_flags) == 8);
-    #[cfg(target_os = "freebsd")]
-    const _: () = assert!(core::mem::offset_of!(SigAction, sa_mask) == 12);
-
-    extern "C" {
-        fn sigaction(signum: i32, act: *const SigAction, oldact: *mut SigAction) -> i32;
-    }
-
-    // SAFETY: see Linux equivalent; the same MaybeUninit pattern applies.
-    let mut act = std::mem::MaybeUninit::<SigAction>::zeroed();
-    unsafe {
-        (*act.as_mut_ptr()).sa_handler = handle as *const ();
-        (*act.as_mut_ptr()).sa_flags = SA_RESTART;
-    }
-    let act = unsafe { act.assume_init() };
-
-    let install = |sig: i32| -> io::Result<()> {
-        // SAFETY: `act` is initialised; null `oldact` is permitted.
-        let rc = unsafe { sigaction(sig, &act, std::ptr::null_mut()) };
-        if rc == -1 {
-            return Err(io::Error::last_os_error());
-        }
-        Ok(())
-    };
-    install(SIGINT)?;
-    install(SIGTERM)?;
-    Ok(())
-}
-
-#[cfg(all(
-    unix,
-    not(any(target_os = "linux", target_os = "macos", target_os = "freebsd",)),
-))]
-unsafe fn install_signal_handlers() -> io::Result<()> {
-    const SIGINT: i32 = 2;
-    const SIGTERM: i32 = 15;
-
-    extern "C" {
-        // Declared as *const () so we can compare against SIG_ERR = -1isize
-        // as a raw pointer value without a function-pointer-to-integer cast.
-        fn signal(signum: i32, handler: *const ()) -> *const ();
-    }
-
-    extern "C" fn handle(_sig: i32) {
-        SHUTDOWN.store(true, Ordering::Release);
-    }
-
-    // SIG_ERR is defined as `(void(*)(int))-1` in C99 §7.14.1.1 and POSIX.
-    // The all-ones pointer value is portable across the exotic-Unix set this
-    // branch covers.
-    let sig_err: *const () = (-1isize) as usize as *const ();
-
-    // SAFETY: signal(2) fallback for exotic Unix targets whose sigaction(2)
-    // struct layout is unknown (NetBSD, OpenBSD, illumos, etc.). On SysV
-    // systems signal(2) may reset the handler to SIG_DFL after delivery,
-    // but the shutdown latch stays set after the first signal — a repeated
-    // signal becomes a SIG_DFL termination, which is acceptable during
-    // shutdown.
-    let prev = unsafe { signal(SIGINT, handle as *const ()) };
-    if prev == sig_err {
-        return Err(io::Error::last_os_error());
-    }
-    let prev = unsafe { signal(SIGTERM, handle as *const ()) };
-    if prev == sig_err {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(())
-}
-
-#[cfg(not(unix))]
-unsafe fn install_signal_handlers() -> io::Result<()> {
-    // No-op on non-Unix; --shutdown-after-secs remains the only exit path.
-    Ok(())
+/// Async-signal-safe: a single `Release` store to an `AtomicBool` compiles
+/// to one aligned atomic instruction on all Tier-1 targets.
+extern "C" fn handle_shutdown(_sig: i32) {
+    SHUTDOWN.store(true, Ordering::Release);
 }
 
 /// Write `contents` to `path` atomically via a same-directory tempfile + rename.
@@ -681,12 +220,15 @@ fn main() -> ExitCode {
 }
 
 fn run(cfg: Config) -> std::io::Result<()> {
-    // SAFETY: `install_signal_handlers` is safe to call here because this is
-    // the sole entry point of a single-threaded binary with no other libraries
-    // that install their own SIGINT/SIGTERM handlers.
+    // SAFETY: sole entry point of a single-threaded binary with no competing
+    // SIGINT/SIGTERM installers; called before any thread is spawned.
     unsafe {
-        install_signal_handlers()?;
+        varta_watch::signal_install::install(cfg.signal_handler_mode, handle_shutdown)?;
     }
+    // On Class-A builds (no prometheus-exporter) the mode is logged so the
+    // startup audit can confirm the certified path is active.
+    #[cfg(not(feature = "prometheus-exporter"))]
+    varta_watch::varta_info!("signal_handler_mode={}", cfg.signal_handler_mode.as_str());
 
     // Publish the configured kernel clock source to `CLOCK_SOURCE` BEFORE
     // any thread is spawned. The self-watchdog thread reads this atomic on
@@ -1121,6 +663,7 @@ fn run(cfg: Config) -> std::io::Result<()> {
             .with_iteration_budget(cfg.iteration_budget)
             .with_scrape_budget(cfg.scrape_budget);
             pe.set_tracker_config(cfg.tracker_capacity, cfg.eviction_scan_window);
+            pe.set_signal_handler_mode(cfg.signal_handler_mode.as_str());
             if let Ok(bound_addr) = pe.local_addr() {
                 let line = format!("{bound_addr}\n");
                 let _ = std::io::stdout().lock().write_all(line.as_bytes());
@@ -1297,7 +840,8 @@ fn run(cfg: Config) -> std::io::Result<()> {
         #[cfg(feature = "prometheus-exporter")]
         {
             CURRENT_STAGE.store(IterStage::DrainPending as u8, Ordering::Relaxed);
-            LAST_STAGE_ENTRY_NS.get(IterStage::DrainPending as usize)
+            LAST_STAGE_ENTRY_NS
+                .get(IterStage::DrainPending as usize)
                 .map(|a| a.store(observer_now_ns(), Ordering::Relaxed));
         }
 
@@ -1445,7 +989,8 @@ fn run(cfg: Config) -> std::io::Result<()> {
             pe.record_stage_duration(IterStage::DrainPending, stage_start.elapsed());
             stage_start = Instant::now();
             CURRENT_STAGE.store(IterStage::Poll as u8, Ordering::Relaxed);
-            LAST_STAGE_ENTRY_NS.get(IterStage::Poll as usize)
+            LAST_STAGE_ENTRY_NS
+                .get(IterStage::Poll as usize)
                 .map(|a| a.store(observer_now_ns(), Ordering::Relaxed));
         }
 
@@ -1498,7 +1043,8 @@ fn run(cfg: Config) -> std::io::Result<()> {
             pe.record_stage_duration(IterStage::Poll, stage_start.elapsed());
             stage_start = Instant::now();
             CURRENT_STAGE.store(IterStage::Maintenance as u8, Ordering::Relaxed);
-            LAST_STAGE_ENTRY_NS.get(IterStage::Maintenance as usize)
+            LAST_STAGE_ENTRY_NS
+                .get(IterStage::Maintenance as usize)
                 .map(|a| a.store(observer_now_ns(), Ordering::Relaxed));
         }
 
@@ -1716,7 +1262,8 @@ fn run(cfg: Config) -> std::io::Result<()> {
             pe.record_stage_duration(IterStage::Maintenance, stage_start.elapsed());
             stage_start = Instant::now();
             CURRENT_STAGE.store(IterStage::RecoveryReap as u8, Ordering::Relaxed);
-            LAST_STAGE_ENTRY_NS.get(IterStage::RecoveryReap as usize)
+            LAST_STAGE_ENTRY_NS
+                .get(IterStage::RecoveryReap as usize)
                 .map(|a| a.store(observer_now_ns(), Ordering::Relaxed));
         }
 
@@ -1771,7 +1318,8 @@ fn run(cfg: Config) -> std::io::Result<()> {
             // Record recovery_reap stage before entering serve_pending.
             pe.record_stage_duration(IterStage::RecoveryReap, stage_start.elapsed());
             CURRENT_STAGE.store(IterStage::ServePending as u8, Ordering::Relaxed);
-            LAST_STAGE_ENTRY_NS.get(IterStage::ServePending as usize)
+            LAST_STAGE_ENTRY_NS
+                .get(IterStage::ServePending as usize)
                 .map(|a| a.store(observer_now_ns(), Ordering::Relaxed));
 
             // Bracket serve_pending so its wall time is observable
@@ -1791,7 +1339,8 @@ fn run(cfg: Config) -> std::io::Result<()> {
             pe.record_stage_duration(IterStage::ServePending, serve_elapsed);
             stage_start = Instant::now(); // housekeeping starts after serve_pending
             CURRENT_STAGE.store(IterStage::Housekeeping as u8, Ordering::Relaxed);
-            LAST_STAGE_ENTRY_NS.get(IterStage::Housekeeping as usize)
+            LAST_STAGE_ENTRY_NS
+                .get(IterStage::Housekeeping as usize)
                 .map(|a| a.store(observer_now_ns(), Ordering::Relaxed));
         }
 
@@ -1877,6 +1426,7 @@ mod tests {
     use std::io::Read;
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
+    use varta_watch::signal_install::SignalHandlerMode;
 
     /// Serializes tests that install global signal handlers or read/write
     /// the `SHUTDOWN` static. Cargo runs tests in parallel by default; two
@@ -1983,30 +1533,24 @@ mod tests {
     #[test]
     fn signal_handler_returns_ok_under_normal_conditions() {
         let _guard = SIGNAL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        // Verifies the new error-propagation path doesn't misclassify success.
+        // Verifies the error-propagation path doesn't misclassify success.
         // SAFETY: single-threaded test process; no other signal handlers active.
-        let result = unsafe { install_signal_handlers() };
-        assert!(
-            result.is_ok(),
-            "install_signal_handlers failed: {:?}",
-            result
-        );
+        let result = unsafe {
+            varta_watch::signal_install::install(SignalHandlerMode::Direct, handle_shutdown)
+        };
+        assert!(result.is_ok(), "signal install failed: {:?}", result);
     }
 
     #[cfg(unix)]
     #[test]
     fn signal_handler_real_sigint_flips_shutdown() {
-        // Hold the global lock so we don't race the other SHUTDOWN-touching
-        // test that runs in this same binary.
         let _guard = SIGNAL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
-        // Reset SHUTDOWN to a known state before the exercise.
         SHUTDOWN.store(false, Ordering::Release);
 
-        // SAFETY: `install_signal_handlers` registers our async-signal-safe
-        // handler. The handler does nothing but `SHUTDOWN.store(true)` —
-        // safe to deliver from any thread.
-        unsafe { install_signal_handlers() }.expect("install signal handlers");
+        // SAFETY: single-threaded test process; handler does one atomic store.
+        unsafe { varta_watch::signal_install::install(SignalHandlerMode::Direct, handle_shutdown) }
+            .expect("install signal handlers");
 
         // Confirm the handler hasn't already fired from some stray signal.
         assert!(

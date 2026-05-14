@@ -18,6 +18,7 @@
 - [Safety Profiles](architecture/safety-profiles.md)
 - [Supply-Chain Posture](architecture/supply-chain.md)
 - [Bounded Collections](architecture/bounded-collections.md)
+- [Signal-Handler Installation](architecture/signal-install.md)
 
 ---
 

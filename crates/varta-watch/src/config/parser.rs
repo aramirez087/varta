@@ -99,6 +99,7 @@ impl Config {
         let mut scrape_budget_ms: Option<u64> = None;
         #[cfg(feature = "test-hooks")]
         let mut inject_wedge_ms: Option<u64> = None;
+        let mut signal_handler_mode: Option<crate::signal_install::SignalHandlerMode> = None;
 
         let mut iter = args.into_iter();
         while let Some(tok) = iter.next() {
@@ -263,6 +264,18 @@ impl Config {
                                     raw: v,
                                 })?,
                         );
+                }
+                "--signal-handler-mode" => {
+                    let v = iter
+                        .next()
+                        .ok_or(ConfigError::MissingValue("--signal-handler-mode"))?;
+                    signal_handler_mode = Some(
+                        v.parse::<crate::signal_install::SignalHandlerMode>()
+                            .map_err(|_| ConfigError::BadValue {
+                                flag: "--signal-handler-mode",
+                                raw: v,
+                            })?,
+                    );
                 }
                 "--shutdown-after-secs" => {
                     let v = iter
@@ -686,6 +699,8 @@ impl Config {
             #[cfg(feature = "test-hooks")]
             inject_wedge_ms,
             clock_source: clock_source.unwrap_or(ClockSource::Monotonic),
+            signal_handler_mode: signal_handler_mode
+                .unwrap_or(crate::signal_install::SignalHandlerMode::Direct),
         })
     }
 }

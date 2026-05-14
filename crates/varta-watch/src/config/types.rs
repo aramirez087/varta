@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use crate::clock::ClockSource;
+use crate::signal_install::SignalHandlerMode;
 use crate::tracker::EvictionPolicy;
 
 /// Default per-pid debounce window applied when `--recovery-cmd` is set
@@ -319,6 +320,18 @@ pub struct Config {
     /// See `book/src/architecture/safety-profiles.md` for the deployment
     /// matrix. Set by `--clock-source <monotonic|boottime>`.
     pub clock_source: ClockSource,
+    /// Signal-handler installation path on Linux.
+    ///
+    /// - `Direct` (default): direct `rt_sigaction(2)` syscall — owns the
+    ///   kernel ABI end-to-end, including the x86_64 signal-return trampoline.
+    ///   A readback + live SIGUSR1 smoke test run at startup.
+    /// - `Libc`: libc `sigaction(3)` wrapper — libc's `__restore_rt` is used.
+    ///   Opt-in for kernels not yet certified against the direct path.
+    ///
+    /// On macOS, FreeBSD, and other Unix, the mode is noted in startup
+    /// logs but has no operational effect (libc / POSIX is the only option).
+    /// Set by `--signal-handler-mode <direct|libc>`.
+    pub signal_handler_mode: SignalHandlerMode,
 }
 
 /// Failure modes for [`Config::from_args`].

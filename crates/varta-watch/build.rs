@@ -397,7 +397,18 @@ fn render_constructor(parsed: &ParsedConfig, test_hooks_active: bool) -> String 
             None => s.push_str("        inject_wedge_ms: None,\n"),
         }
     }
+    let signal_handler_mode = match parsed
+        .singletons
+        .get("signal_handler_mode")
+        .map(String::as_str)
+    {
+        Some("libc") => "crate::signal_install::SignalHandlerMode::Libc",
+        _ => "crate::signal_install::SignalHandlerMode::Direct",
+    };
     s.push_str(&format!("        clock_source: {clock_source},\n"));
+    s.push_str(&format!(
+        "        signal_handler_mode: {signal_handler_mode},\n"
+    ));
     s.push_str("    }\n");
     s.push_str("}\n");
     s

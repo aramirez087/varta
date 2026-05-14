@@ -586,9 +586,9 @@ pub enum IterStage {
     /// Drain queued stall events from the observer stall queue.
     DrainPending = 0,
     /// One non-blocking I/O poll for new beats, decode, and authentication.
-    Poll         = 1,
+    Poll = 1,
     /// Maintenance: eviction drains, capacity counters, and audit-error drain.
-    Maintenance  = 2,
+    Maintenance = 2,
     /// Recovery reap: non-blocking `waitpid(2)` and optional kill for timed-out children.
     RecoveryReap = 3,
     /// Prometheus `/metrics` serving: `serve_pending` accept + response loop.
@@ -1009,6 +1009,11 @@ pub struct PromExporter {
     /// `varta_watch_last_poll_loop_timestamp_seconds` so operators can
     /// detect observer stalls.
     last_loop_system: SystemTime,
+    /// Active signal-handler installation mode (`"direct"` or `"libc"`). Set
+    /// once at startup via [`PromExporter::set_signal_handler_mode`]; emitted
+    /// as `varta_signal_handler_install_total{mode="..."}` so dashboards can
+    /// assert the certified path is active.
+    signal_handler_mode: &'static str,
 }
 
 #[cfg(feature = "prometheus-exporter")]
@@ -1110,6 +1115,7 @@ impl PromExporter {
             connections_dropped_total: [0; DROP_REASON_LABELS.len()],
             started_at: now,
             last_loop_system: SystemTime::now(),
+            signal_handler_mode: "direct",
         })
     }
 
@@ -1257,6 +1263,14 @@ impl PromExporter {
     pub fn record_eviction_scan_truncated(&mut self, count: u64) {
         self.eviction_scan_truncated_total =
             self.eviction_scan_truncated_total.saturating_add(count);
+    }
+
+    /// Set the active signal-handler mode label. Call once at daemon startup,
+    /// immediately after [`crate::signal_install::install`] succeeds. The value
+    /// is emitted as `varta_signal_handler_install_total{mode="..."}` so
+    /// dashboards can assert the certified `direct` path is active.
+    pub fn set_signal_handler_mode(&mut self, mode: &'static str) {
+        self.signal_handler_mode = mode;
     }
 
     /// Set the tracker capacity and eviction-scan-window config values emitted
@@ -1409,9 +1423,8 @@ impl PromExporter {
     /// were truncated because outstanding children exceeded the per-tick cap.
     /// See [`crate::recovery::Recovery::take_reap_truncated`].
     pub fn record_recovery_reap_truncated(&mut self, count: u64) {
-        self.recovery_reap_truncated_total = self
-            .recovery_reap_truncated_total
-            .saturating_add(count);
+        self.recovery_reap_truncated_total =
+            self.recovery_reap_truncated_total.saturating_add(count);
     }
 
     /// Record audit lines dropped because the ring was at capacity when they
@@ -1424,9 +1437,8 @@ impl PromExporter {
     /// the audit ring. See
     /// [`crate::recovery::Recovery::take_audit_flush_budget_exceeded`].
     pub fn record_audit_flush_budget_exceeded(&mut self, count: u64) {
-        self.audit_flush_budget_exceeded_total = self
-            .audit_flush_budget_exceeded_total
-            .saturating_add(count);
+        self.audit_flush_budget_exceeded_total =
+            self.audit_flush_budget_exceeded_total.saturating_add(count);
     }
 
     /// Record one or more scrapes served from cache (scrape arrived before
@@ -2355,6 +2367,16 @@ impl PromExporter {
             self.nonce_wrap_total
         );
         // --- Observer self-health metrics ---------------------------------
+        self.body_buf.push_str(
+            "# HELP varta_signal_handler_install_total Signal-handler installation events since startup, labelled by mode (direct or libc). Always 1 in steady state; 0 means install was skipped or the label was never set.\n",
+        );
+        self.body_buf
+            .push_str("# TYPE varta_signal_handler_install_total counter\n");
+        let _ = writeln!(
+            self.body_buf,
+            "varta_signal_handler_install_total{{mode=\"{}\"}} 1",
+            self.signal_handler_mode,
+        );
         self.body_buf
             .push_str("# HELP varta_watch_uptime_seconds Observer process uptime in seconds.\n");
         self.body_buf
@@ -3141,9 +3163,8 @@ mod tests {
                 body.contains(&inf_key),
                 "stage={stage_label} +Inf bucket missing or non-zero at first scrape; body:\n{body}"
             );
-            let count_key = format!(
-                "varta_observer_stage_seconds_count{{stage=\"{stage_label}\"}} 0"
-            );
+            let count_key =
+                format!("varta_observer_stage_seconds_count{{stage=\"{stage_label}\"}} 0");
             assert!(
                 body.contains(&count_key),
                 "stage={stage_label} _count missing at first scrape; body:\n{body}"
@@ -3163,9 +3184,7 @@ mod tests {
         let body = &prom.body_buf;
         // le="0.005" bucket for Poll must be cumulative 1.
         assert!(
-            body.contains(
-                "varta_observer_stage_seconds_bucket{stage=\"poll\",le=\"0.005\"} 1"
-            ),
+            body.contains("varta_observer_stage_seconds_bucket{stage=\"poll\",le=\"0.005\"} 1"),
             "Poll 2 ms must land in le=0.005; body:\n{body}"
         );
         // count must be 1.
@@ -3175,9 +3194,7 @@ mod tests {
         );
         // Other stages must still have count 0.
         assert!(
-            body.contains(
-                "varta_observer_stage_seconds_count{stage=\"drain_pending\"} 0"
-            ),
+            body.contains("varta_observer_stage_seconds_count{stage=\"drain_pending\"} 0"),
             "drain_pending count must remain 0; body:\n{body}"
         );
     }

@@ -52,6 +52,8 @@ pub enum FlagKind {
     ClockSource,
     /// `strict` | `balanced`.
     EvictionPolicy,
+    /// `direct` | `libc`.
+    SignalHandlerMode,
     /// Repeatable string; values accumulate into a `Vec<String>`.
     List,
 }
@@ -404,6 +406,15 @@ pub const FLAGS: &[FlagSpec] = &[
         cli: "--strict-namespace-check",
         key: "strict_namespace_check",
         kind: FlagKind::Bool,
+        feature: "",
+    },
+    // -------------------------------------------------------------------------
+    // Signal handling
+    // -------------------------------------------------------------------------
+    FlagSpec {
+        cli: "--signal-handler-mode",
+        key: "signal_handler_mode",
+        kind: FlagKind::SignalHandlerMode,
         feature: "",
     },
     // -------------------------------------------------------------------------

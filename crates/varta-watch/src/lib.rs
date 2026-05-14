@@ -41,6 +41,7 @@ pub mod notify;
 pub mod observer;
 pub mod peer_cred;
 pub mod pid_max;
+pub mod signal_install;
 // When `fuzzing` is on, bounded-collection modules are exposed as
 // public so the `fuzz/` crate can drive them directly through
 // `varta_watch::__fuzz_internals::*`. The names stay namespaced under
@@ -69,6 +70,19 @@ pub mod __fuzz_internals {
     pub use crate::ip_state_table;
     pub use crate::outstanding_table;
     pub use crate::probe_table;
+}
+
+/// Test-only: expose the Linux kernel-ABI signal structs and syscall wrapper
+/// so integration tests can consume the *real* definitions instead of
+/// maintaining parallel duplicates. Gated to `test-hooks` (which CI always
+/// enables for the integration-test binary) or `test` cfg.
+///
+/// Mirrors the `__fuzz_internals` pattern used for bounded-collection modules.
+#[cfg(any(test, feature = "test-hooks"))]
+#[doc(hidden)]
+pub mod __test_signal_abi {
+    #[cfg(target_os = "linux")]
+    pub use crate::signal_install::linux::test_abi::*;
 }
 pub mod tracker;
 

@@ -19,6 +19,7 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::time::Duration;
 
+use varta_watch::signal_install::SignalHandlerMode;
 use varta_watch::Config;
 
 /// `Config::compile_time()` produces a value that matches the fixture
@@ -39,6 +40,11 @@ fn compile_time_config_matches_fixture() {
     assert!(cfg.recovery_cmd.is_none());
     assert!(cfg.recovery_exec_cmd.is_none());
     assert!(cfg.prom_addr.is_none());
+    assert_eq!(
+        cfg.signal_handler_mode,
+        SignalHandlerMode::Direct,
+        "fixture sets signal_handler_mode=direct; Class-A binary must default to Direct"
+    );
 }
 
 /// `Config::HELP` under `compile-time-config` is the neutral one-liner —
@@ -60,6 +66,29 @@ fn help_is_neutral_one_liner() {
     assert!(
         help.contains("compile-time"),
         "Class-A HELP should point at the compile-time-config posture, got: {help:?}"
+    );
+}
+
+/// The binary refuses `--signal-handler-mode=libc` — that flag does not exist
+/// in the Class-A argv surface. The binary must exit non-zero and must not
+/// echo the flag name (strings audit requirement).
+#[test]
+fn binary_rejects_signal_handler_mode_flag() {
+    let bin = env!("CARGO_BIN_EXE_varta-watch");
+    let out = Command::new(bin)
+        .args(["--signal-handler-mode", "libc"])
+        .output()
+        .expect("spawn varta-watch --signal-handler-mode libc");
+    assert!(
+        !out.status.success(),
+        "Class-A binary must reject --signal-handler-mode; status: {:?}",
+        out.status,
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !stderr.contains("--signal-handler-mode") && !stdout.contains("--signal-handler-mode"),
+        "Class-A binary echoed the rejected flag name; stderr={stderr:?} stdout={stdout:?}"
     );
 }
 

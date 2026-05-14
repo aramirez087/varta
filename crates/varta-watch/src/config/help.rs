@@ -131,6 +131,21 @@ OPTIONAL:
                                                      macOS equivalent of
                                                      boottime)
                                      See book/src/architecture/safety-profiles.md.
+    --signal-handler-mode <MODE>   Signal-handler installation path on Linux:
+                                       direct  (default) — direct rt_sigaction(2)
+                                                syscall; owns the kernel ABI
+                                                end-to-end including the x86_64
+                                                trampoline. Startup readback +
+                                                live SIGUSR1 smoke test verify
+                                                correctness before the first
+                                                real SIGTERM.
+                                       libc    — libc sigaction(3) fallback;
+                                                sa_restorer is libc's __restore_rt.
+                                                Use when running on a kernel not
+                                                yet certified for the direct path.
+                                     Ignored on macOS/FreeBSD (libc is the only
+                                     option). See
+                                     book/src/architecture/signal-install.md.
     --shutdown-after-secs <SECS>   Exit cleanly after the given uptime
                                      (used by integration tests).
     --udp-port <PORT>              Bind a UDP listener on this port for

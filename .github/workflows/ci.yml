@@ -259,18 +259,28 @@ jobs:
         env: { MIRIFLAGS: "-Zmiri-strict-provenance" }
 
   cross-compile-checks:
-    name: cross-compile-checks (illumos + OpenBSD)
-    # Verify that varta-watch compiles cleanly on the two Tier-2/Tier-3 targets
-    # that gained support in this branch: illumos (per-datagram SO_RECVUCRED
-    # attestation) and OpenBSD (SocketModeOnly fallback).  These are type-check
-    # only — no linking, no test execution — because we have no runners for
-    # those platforms.
+    name: cross-compile-checks (illumos + OpenBSD + riscv64)
+    # Verify that varta-watch compiles cleanly on Tier-2/Tier-3 targets:
+    # illumos (per-datagram SO_RECVUCRED attestation), OpenBSD (SocketModeOnly
+    # fallback), and riscv64 (new signal-install architecture support).
+    # Type-check only — no linking, no test execution — because we have no
+    # runners for those platforms.
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
       - name: rust toolchain (stable)
         uses: dtolnay/rust-toolchain@stable
+
+      - name: install cross-compile targets
+        run: rustup target add x86_64-unknown-illumos riscv64gc-unknown-linux-gnu
+
+      - name: cargo check — riscv64gc-unknown-linux-gnu
+        # Verifies the riscv64 KernelSigAction layout, ecall syscall wrapper,
+        # and compile_error! allowlist (no sa_restorer on riscv64 — vDSO handles
+        # signal-return, same as aarch64).  Compile-time regression coverage
+        # until a native riscv64 GHA runner is available.
+        run: cargo check --locked -p varta-watch --target riscv64gc-unknown-linux-gnu
 
       - name: install illumos target
         run: rustup target add x86_64-unknown-illumos
