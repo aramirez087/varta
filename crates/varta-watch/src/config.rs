@@ -10,8 +10,15 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::clock::ClockSource;
+use crate::tracker::EvictionPolicy;
+// Tracker capacity / eviction-window constants are only referenced from
+// the argv parser (`Config::from_args`) and its bounds checks.  When
+// `--features compile-time-config` is active those callers are excluded
+// from compilation; re-importing the constants would surface as
+// unused-imports under `-D warnings`.
+#[cfg(not(feature = "compile-time-config"))]
 use crate::tracker::{
-    EvictionPolicy, DEFAULT_CAPACITY, DEFAULT_EVICTION_SCAN_WINDOW, MAX_EVICTION_SCAN_WINDOW,
+    DEFAULT_CAPACITY, DEFAULT_EVICTION_SCAN_WINDOW, MAX_EVICTION_SCAN_WINDOW,
     MIN_EVICTION_SCAN_WINDOW,
 };
 
@@ -472,8 +479,41 @@ pub enum ConfigError {
         /// `std::env::consts::OS` for the build target.
         platform: &'static str,
     },
+    /// The binary was built with `--features compile-time-config` but the
+    /// operator supplied one or more argv tokens.  Class-A safety-critical
+    /// builds intentionally accept zero argv; the configuration is baked
+    /// into the binary by `build.rs` at compile time.
+    CompileTimeArgvForbidden,
+    /// `Config::compile_time()` produced a value that fails cross-field
+    /// validation at startup (e.g. recovery requires kernel-attested
+    /// transport but the compile-time blob enabled both UDP and recovery
+    /// without the acknowledgement flag).  Carries the same diagnostic
+    /// text the corresponding `from_args` error would produce.
+    CompileTimeConfigInvalid {
+        /// Static description of which invariant was violated.
+        reason: &'static str,
+    },
 }
 
+// The `ConfigError` Display impl has two cfg-gated personalities:
+//
+// 1. Default (SRE) builds: rich messages that name the flag the operator
+//    must supply or correct.  These strings carry literal flag names like
+//    `--socket` and `--prom-addr` and are linked unconditionally.
+//
+// 2. Class-A (`compile-time-config`) builds: terse, neutral phrasings that
+//    never mention argv flag names.  Most variants are dead code anyway —
+//    they are produced only by `Config::from_args`, which is excluded from
+//    compilation when the feature is on — but the Display impl must still
+//    cover every variant, and any literal flag string in the impl ends up
+//    in the binary (cerebrum 2026-05-12: `pub const &str` is always linked
+//    regardless of `#[cfg]` on the code paths that consume it).
+//
+// The Class-A wording uses `config key` instead of `--flag-name` and refers
+// the operator to `docs/architecture/compile-time-config.md` for any
+// remediation.  The two impls are mutually exclusive at the `#[cfg]` layer.
+
+#[cfg(not(feature = "compile-time-config"))]
 impl core::fmt::Display for ConfigError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
@@ -571,6 +611,72 @@ impl core::fmt::Display for ConfigError {
                  CLOCK_BOOTTIME; macOS / BSD have no equivalent kernel clock. \
                  Use `--clock-source monotonic` (the default) or switch to a Linux host."
             ),
+            ConfigError::CompileTimeArgvForbidden => f.write_str(
+                "this binary was configured at compile time \
+                 (--features compile-time-config); refusing to accept argv. \
+                 See docs/architecture/compile-time-config.md for the \
+                 supported configuration mechanism.",
+            ),
+            ConfigError::CompileTimeConfigInvalid { reason } => write!(
+                f,
+                "compile-time config violates a cross-field invariant: {reason}"
+            ),
+        }
+    }
+}
+
+#[cfg(feature = "compile-time-config")]
+impl core::fmt::Display for ConfigError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        // Generic remediation pointer for every flag-relevant variant.
+        // Argv-only variants are unreachable in Class-A builds (their
+        // producer, `Config::from_args`, is excluded from compilation),
+        // but the Display impl must still cover them.  Neutral wording
+        // keeps argv flag names out of the binary's `strings` output.
+        const REF: &str = "see docs/architecture/compile-time-config.md";
+        match self {
+            ConfigError::MissingValue(_)
+            | ConfigError::MissingRequired(_)
+            | ConfigError::UnknownFlag(_)
+            | ConfigError::BadInteger { .. }
+            | ConfigError::BadSocketMode(_)
+            | ConfigError::BadAddr(_)
+            | ConfigError::BadValue { .. }
+            | ConfigError::HelpRequested
+            | ConfigError::MutuallyExclusive { .. }
+            | ConfigError::RemovedFlag { .. }
+            | ConfigError::PromAddrRequiresToken
+            | ConfigError::ShutdownGraceTooLow { .. }
+            | ConfigError::RecoveryCaptureBytesTooLarge { .. }
+            | ConfigError::RecoveryCaptureRequiresRecovery
+            | ConfigError::RecoveryRequiresAuthenticatedTransport { .. }
+            | ConfigError::SecureUdpRequiresLoopbackBind { .. }
+            | ConfigError::IterationBudgetOutOfRange { .. }
+            | ConfigError::ScrapeBudgetOutOfRange { .. }
+            | ConfigError::EvictionScanWindowOutOfRange { .. } => {
+                write!(f, "configuration error (argv path unreachable; {REF})")
+            }
+            ConfigError::ThresholdTooLow { value, min } => {
+                write!(f, "threshold below minimum: {value} ms < {min} ms ({REF})")
+            }
+            ConfigError::ShellRecoveryNotCompiledIn => write!(
+                f,
+                "shell-mode recovery is not compiled into this build; \
+                 use the exec-mode recovery key instead ({REF})"
+            ),
+            ConfigError::ClockSourceUnsupported { platform, .. } => write!(
+                f,
+                "configured clock source is not supported on `{platform}`; \
+                 only the monotonic source is available off Linux ({REF})"
+            ),
+            ConfigError::CompileTimeArgvForbidden => f.write_str(
+                "this binary was configured at compile time; \
+                 refusing to accept command-line arguments",
+            ),
+            ConfigError::CompileTimeConfigInvalid { reason } => write!(
+                f,
+                "compile-time config violates a cross-field invariant: {reason}"
+            ),
         }
     }
 }
@@ -578,8 +684,19 @@ impl core::fmt::Display for ConfigError {
 impl std::error::Error for ConfigError {}
 
 impl Config {
+    /// Class-A (compile-time-config) builds replace the long help body with
+    /// a neutral one-liner so the binary's `strings` output never carries
+    /// flag literals.  The static `pub const` is always linked into the
+    /// binary — even when the corresponding code path is `#[cfg]`-gated —
+    /// so the only way to keep flag names out of the binary is to keep
+    /// them out of the constant body itself.
+    #[cfg(feature = "compile-time-config")]
+    pub const HELP: &'static str = "varta-watch (compile-time configured; no argv accepted; see \
+         docs/architecture/compile-time-config.md)\n";
+
     /// Verbatim `--help` text. The acceptance test asserts that every
     /// documented long-flag substring appears in this body.
+    #[cfg(not(feature = "compile-time-config"))]
     pub const HELP: &'static str = "\
 varta-watch — observe Varta Lifeline Protocol agents over configurable transports.
 
@@ -870,6 +987,10 @@ OPTIONAL:
 ";
 
     /// Parse a token stream (typically `std::env::args().skip(1)`).
+    ///
+    /// Excluded from compilation when `--features compile-time-config` is
+    /// active — the Class-A binary intentionally has no argv parser linked.
+    #[cfg(not(feature = "compile-time-config"))]
     pub fn from_args(args: impl IntoIterator<Item = String>) -> Result<Config, ConfigError> {
         let mut socket: Option<PathBuf> = None;
         let mut threshold_ms: Option<u64> = None;
@@ -881,7 +1002,14 @@ OPTIONAL:
         let mut recovery_env: Vec<String> = Vec::new();
         let mut file_export: Option<PathBuf> = None;
         let mut export_file_max_bytes: Option<u64> = None;
+        // `prom_*` locals are mutated only by `--prom-*` arms gated under
+        // `feature = "prometheus-exporter"`.  Without the feature the
+        // arms vanish and the `mut` becomes redundant; allow the lint so
+        // the parser body keeps the same shape across feature
+        // permutations.
+        #[allow(unused_mut)]
         let mut prom_addr: Option<SocketAddr> = None;
+        #[allow(unused_mut)]
         let mut prom_token_file: Option<PathBuf> = None;
         let mut shutdown_after_secs: Option<u64> = None;
         let mut recovery_timeout_ms: Option<u64> = None;
@@ -901,7 +1029,9 @@ OPTIONAL:
         let mut heartbeat_file: Option<PathBuf> = None;
         let mut self_watchdog: Option<Duration> = None;
         let mut hw_watchdog: Option<PathBuf> = None;
+        #[allow(unused_mut)]
         let mut prom_rate_limit_per_sec: Option<u32> = None;
+        #[allow(unused_mut)]
         let mut prom_rate_limit_burst: Option<u32> = None;
         let mut i_accept_plaintext_udp = false;
         let mut i_accept_shell_risk = false;
@@ -988,6 +1118,7 @@ OPTIONAL:
                         .ok_or(ConfigError::MissingValue("--export-file-max-bytes"))?;
                     export_file_max_bytes = Some(parse_u64("--export-file-max-bytes", &v)?);
                 }
+                #[cfg(feature = "prometheus-exporter")]
                 "--prom-addr" => {
                     let v = iter
                         .next()
@@ -997,6 +1128,7 @@ OPTIONAL:
                             .map_err(|_| ConfigError::BadAddr(v))?,
                     );
                 }
+                #[cfg(feature = "prometheus-exporter")]
                 "--prom-token-file" => {
                     let v = iter
                         .next()
@@ -1161,6 +1293,7 @@ OPTIONAL:
                     })?;
                     inject_wedge_ms = Some(ms);
                 }
+                #[cfg(feature = "prometheus-exporter")]
                 "--prom-rate-limit-per-sec" => {
                     let v = iter
                         .next()
@@ -1171,6 +1304,7 @@ OPTIONAL:
                             raw: v,
                         })?);
                 }
+                #[cfg(feature = "prometheus-exporter")]
                 "--prom-rate-limit-burst" => {
                     let v = iter
                         .next()
@@ -1526,6 +1660,7 @@ OPTIONAL:
         // cfg(not) branch below fires first.
         #[cfg(feature = "unsafe-shell-recovery")]
         if shell_any && !self.i_accept_shell_risk {
+            #[cfg(not(feature = "compile-time-config"))]
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 "shell-mode recovery (--recovery-cmd / --recovery-cmd-file) runs \
@@ -1533,39 +1668,69 @@ OPTIONAL:
                  use --recovery-exec (no shell, no injection surface). To proceed \
                  with shell mode anyway, pass --i-accept-shell-risk.",
             ));
-        }
-
-        // Shell and exec are mutually exclusive
-        if shell_any && exec_any {
-            let shell_flag = if has_cmd {
-                "--recovery-cmd"
-            } else {
-                "--recovery-cmd-file"
-            };
-            let exec_flag = if has_exec {
-                "--recovery-exec"
-            } else {
-                "--recovery-exec-file"
-            };
+            #[cfg(feature = "compile-time-config")]
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
-                format!("{shell_flag} and {exec_flag} are mutually exclusive"),
+                "shell-mode recovery requires the shell-risk acknowledgement to \
+                 be set in the compile-time configuration",
             ));
         }
 
-        // --recovery-cmd and --recovery-cmd-file are mutually exclusive
+        // Shell and exec are mutually exclusive.  Class-A builds receive a
+        // neutral message that does not embed argv flag names — those would
+        // be linked into the binary's `strings` output even when this code
+        // path is dead (`pub const &str` is always linked; the same rule
+        // applies to format-string literals).  SRE builds keep the verbose
+        // remediation that points at the specific flag pair the operator
+        // wrote.
+        if shell_any && exec_any {
+            #[cfg(not(feature = "compile-time-config"))]
+            {
+                let shell_flag = if has_cmd {
+                    "--recovery-cmd"
+                } else {
+                    "--recovery-cmd-file"
+                };
+                let exec_flag = if has_exec {
+                    "--recovery-exec"
+                } else {
+                    "--recovery-exec-file"
+                };
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("{shell_flag} and {exec_flag} are mutually exclusive"),
+                ));
+            }
+            #[cfg(feature = "compile-time-config")]
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "shell-mode and exec-mode recovery are mutually exclusive",
+            ));
+        }
+
         if has_cmd && has_cmd_file {
+            #[cfg(not(feature = "compile-time-config"))]
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 "--recovery-cmd and --recovery-cmd-file are mutually exclusive",
             ));
+            #[cfg(feature = "compile-time-config")]
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "inline shell-recovery template and shell-recovery file are mutually exclusive",
+            ));
         }
 
-        // --recovery-exec and --recovery-exec-file are mutually exclusive
         if has_exec && has_exec_file {
+            #[cfg(not(feature = "compile-time-config"))]
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 "--recovery-exec and --recovery-exec-file are mutually exclusive",
+            ));
+            #[cfg(feature = "compile-time-config")]
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "inline exec-recovery command and exec-recovery file are mutually exclusive",
             ));
         }
 
@@ -1594,9 +1759,15 @@ OPTIONAL:
         if let Some(ref cmd) = self.recovery_exec_cmd {
             let mut parts: Vec<&str> = cmd.split_whitespace().collect();
             if parts.is_empty() {
+                #[cfg(not(feature = "compile-time-config"))]
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
                     "--recovery-exec: command must not be empty",
+                ));
+                #[cfg(feature = "compile-time-config")]
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "exec-recovery command must not be empty",
                 ));
             }
             let program = parts.remove(0).to_string();
@@ -1758,6 +1929,7 @@ OPTIONAL:
     }
 }
 
+#[cfg(not(feature = "compile-time-config"))]
 fn parse_u64(flag: &'static str, raw: &str) -> Result<u64, ConfigError> {
     raw.parse::<u64>().map_err(|_| ConfigError::BadInteger {
         flag,
@@ -1765,6 +1937,7 @@ fn parse_u64(flag: &'static str, raw: &str) -> Result<u64, ConfigError> {
     })
 }
 
+#[cfg(not(feature = "compile-time-config"))]
 fn parse_u16(flag: &'static str, raw: &str) -> Result<u16, ConfigError> {
     raw.parse::<u16>().map_err(|_| ConfigError::BadInteger {
         flag,
@@ -1772,6 +1945,7 @@ fn parse_u16(flag: &'static str, raw: &str) -> Result<u16, ConfigError> {
     })
 }
 
+#[cfg(not(feature = "compile-time-config"))]
 fn parse_octal(raw: &str) -> Result<u32, ConfigError> {
     // Accept the three forms a user might naturally type: bare octal (`600`),
     // leading-zero octal (`0600`), or Rust-literal octal (`0o600` / `0O600`).
@@ -1936,7 +2110,56 @@ pub fn parse_exec_cmd(cmd: &str) -> std::io::Result<(String, Vec<String>)> {
     Ok((program, args))
 }
 
-#[cfg(test)]
+// --- compile-time-config integration ----------------------------------------
+//
+// When `--features compile-time-config` is active, the runtime binary skips
+// argv parsing entirely and uses a `Config` constant produced by `build.rs`
+// from the operator's static configuration file ($VARTA_CONFIG_FILE).  The
+// generated file lives in $OUT_DIR and is `include!`-ed here so the build
+// graph remains feature-gated cleanly: there is no parser anywhere in the
+// Class-A binary, only a literal constructor.
+
+#[cfg(feature = "compile-time-config")]
+mod compile_time_blob {
+    include!(concat!(env!("OUT_DIR"), "/compile_time_config.rs"));
+}
+
+#[cfg(feature = "compile-time-config")]
+impl Config {
+    /// Return the compile-time-baked `Config` after running the same
+    /// cross-field validation that [`Config::from_args`] applies in
+    /// default builds.  Always called exactly once, at startup, from
+    /// `main.rs`.
+    pub fn compile_time() -> Result<Config, ConfigError> {
+        let cfg = compile_time_blob::build_compile_time_config();
+        cfg.validate_runtime()
+    }
+}
+
+#[cfg(feature = "compile-time-config")]
+impl Config {
+    /// Runtime cross-field validator for Class-A builds.  Default builds
+    /// run the same checks inline in `Config::from_args`; the method
+    /// exists only to share the platform-dependent rules with
+    /// `Config::compile_time()`, which has no argv path of its own.
+    ///
+    /// Returning `Ok(self)` lets the caller chain `?` against the
+    /// validation step without an extra `let` binding.
+    pub(crate) fn validate_runtime(self) -> Result<Config, ConfigError> {
+        // H7 — `boottime` requires Linux's CLOCK_BOOTTIME; non-Linux
+        // targets have no equivalent clock and must fail loudly rather
+        // than silently picking a clock that pauses on suspend.
+        if self.clock_source.clk_id().is_none() {
+            return Err(ConfigError::ClockSourceUnsupported {
+                source: self.clock_source,
+                platform: std::env::consts::OS,
+            });
+        }
+        Ok(self)
+    }
+}
+
+#[cfg(all(test, not(feature = "compile-time-config")))]
 mod tests {
     use super::*;
 
@@ -1956,6 +2179,7 @@ mod tests {
         assert!(cfg.prom_addr.is_none());
     }
 
+    #[cfg(feature = "prometheus-exporter")]
     #[test]
     fn parses_full_flag_surface() {
         // --prom-addr now requires --prom-token-file; the file does not
@@ -2168,6 +2392,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "prometheus-exporter")]
     #[test]
     fn prom_addr_without_token_file_is_rejected() {
         match Config::from_args(args(&[
@@ -2183,6 +2408,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "prometheus-exporter")]
     #[test]
     fn prom_token_file_without_prom_addr_is_rejected() {
         match Config::from_args(args(&[
@@ -2875,6 +3101,7 @@ mod tests {
         assert!(cfg.udp_bind_addr.is_none());
     }
 
+    #[cfg(feature = "prometheus-exporter")]
     #[test]
     fn parses_prom_rate_limit_flags() {
         let cfg = Config::from_args(args(&[

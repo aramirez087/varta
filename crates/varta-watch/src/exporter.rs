@@ -10,15 +10,25 @@
 //!   poll-driven by [`PromExporter::serve_pending`]; no background thread
 //!   and no shared state.
 
-use std::collections::HashMap;
-use std::fmt::Write as _;
 use std::fs::{File, OpenOptions};
-use std::io::{self, BufWriter, ErrorKind, Read, Write};
-use std::net::{IpAddr, Shutdown, SocketAddr, TcpListener, TcpStream};
+use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
-use varta_vlp::{DecodeError, Status};
+#[cfg(feature = "prometheus-exporter")]
+use std::collections::HashMap;
+#[cfg(feature = "prometheus-exporter")]
+use std::fmt::Write as _;
+#[cfg(feature = "prometheus-exporter")]
+use std::io::{ErrorKind, Read};
+#[cfg(feature = "prometheus-exporter")]
+use std::net::{IpAddr, Shutdown, SocketAddr, TcpListener, TcpStream};
+#[cfg(feature = "prometheus-exporter")]
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
+
+#[cfg(feature = "prometheus-exporter")]
+use varta_vlp::DecodeError;
+use varta_vlp::Status;
 
 use crate::observer::Event;
 
@@ -384,6 +394,7 @@ fn status_label(s: Status) -> &'static str {
 /// Prometheus `kind` label values for `varta_decode_errors_total`. Indexed
 /// by [`decode_kind_index`]; the array doubles as the canonical ordering
 /// for the exposition output, so series remain stable across scrapes.
+#[cfg(feature = "prometheus-exporter")]
 const DECODE_KIND_LABELS: [&str; 8] = [
     "bad_magic",
     "bad_version",
@@ -395,6 +406,7 @@ const DECODE_KIND_LABELS: [&str; 8] = [
     "bad_crc",
 ];
 
+#[cfg(feature = "prometheus-exporter")]
 fn decode_kind_index(err: &DecodeError) -> usize {
     match err {
         DecodeError::BadMagic => 0,
@@ -408,6 +420,7 @@ fn decode_kind_index(err: &DecodeError) -> usize {
     }
 }
 
+#[cfg(feature = "prometheus-exporter")]
 #[derive(Clone, Copy, Debug)]
 struct GaugeRow {
     beats_total: u64,
@@ -415,6 +428,7 @@ struct GaugeRow {
     last_status: Option<u8>,
 }
 
+#[cfg(feature = "prometheus-exporter")]
 impl GaugeRow {
     const fn new() -> Self {
         GaugeRow {
@@ -427,20 +441,24 @@ impl GaugeRow {
 
 /// Per-connection read timeout on the [`PromExporter`]'s accepted streams.
 /// Capped so a slow or hostile client cannot stall the observer's poll loop.
+#[cfg(feature = "prometheus-exporter")]
 const PROM_READ_DEADLINE: Duration = Duration::from_millis(10);
 /// Per-connection write timeout for the metrics response body.
+#[cfg(feature = "prometheus-exporter")]
 const PROM_WRITE_TIMEOUT: Duration = Duration::from_millis(50);
 /// Maximum connections accepted per [`PromExporter::serve_pending`] call.
 /// Caps the amount of work done before returning control to the observer
 /// loop so that stall detection, I/O polling, and reaping are not starved
 /// under a storm of slow scrapers. The 100 ms serve deadline still applies
 /// as an additional guard.
+#[cfg(feature = "prometheus-exporter")]
 const PROM_MAX_CONNECTIONS_PER_SERVE: usize = 8;
 /// After the serve budget is exhausted, the exporter enters drain mode:
 /// remaining connections are accepted and immediately closed (without
 /// serving) to prevent the kernel's accept queue from building up under a
 /// connection flood. A hostile client opening thousands of connections
 /// would otherwise fill the backlog and starve legitimate scrapers.
+#[cfg(feature = "prometheus-exporter")]
 const PROM_MAX_DRAIN_PER_SERVE: usize = 50;
 
 // --- iteration budget histogram (H5) -----------------------------------
@@ -457,6 +475,7 @@ const PROM_MAX_DRAIN_PER_SERVE: usize = 50;
 /// cutoff is aligned to the default `--iteration-budget-ms` so
 /// `le="0.25"` directly answers "what fraction of iterations were over
 /// budget?".
+#[cfg(feature = "prometheus-exporter")]
 const ITERATION_BUCKET_BOUNDS_S: [f64; 8] =
     [0.001, 0.005, 0.010, 0.050, 0.100, 0.250, 0.500, 1.000];
 
@@ -478,11 +497,13 @@ pub const DEFAULT_ITERATION_BUDGET: Duration = Duration::from_millis(250);
 pub const DEFAULT_SCRAPE_BUDGET: Duration = Duration::from_millis(250);
 /// Cap on how many bytes [`PromExporter::serve_pending`] reads from a
 /// single request before responding (we discard the request line/headers).
+#[cfg(feature = "prometheus-exporter")]
 const PROM_REQUEST_CAP: usize = 4096;
 /// Minimum interval between accepted scrapes. A scraper hitting faster than
 /// once per second cannot starve stall detection in the single-threaded
 /// poll loop. Prometheus default scrape intervals are 15–60 s, so this only
 /// gates pathological or misconfigured scrapers.
+#[cfg(feature = "prometheus-exporter")]
 const PROM_MIN_SCRAPE_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Maximum number of unique source IPs tracked in the per-IP token bucket.
@@ -490,17 +511,21 @@ const PROM_MIN_SCRAPE_INTERVAL: Duration = Duration::from_secs(1);
 /// each sending one connection).  When the table is full, stale entries are
 /// evicted first; if every entry is still fresh, the oldest is force-evicted
 /// and counted as `varta_prom_connections_dropped_total{reason="ip_table_full"}`.
+#[cfg(feature = "prometheus-exporter")]
 const MAX_PROM_IP_STATES: usize = 1024;
 
 /// How long a source IP's bucket state is retained after its last seen
 /// connection. Entries older than this are eligible for stale-eviction.
+#[cfg(feature = "prometheus-exporter")]
 const PROM_IP_STATE_TTL: Duration = Duration::from_secs(60);
 
 /// How often the stale-IP sweep runs (only triggered when the IP table
 /// reaches capacity).
+#[cfg(feature = "prometheus-exporter")]
 const PROM_IP_STATE_SWEEP_INTERVAL: Duration = Duration::from_secs(10);
 
 /// Per-source-IP token bucket state for the Prometheus `/metrics` endpoint.
+#[cfg(feature = "prometheus-exporter")]
 #[derive(Clone, Copy, Debug)]
 struct PromIpState {
     /// Tokens available (fractional, scaled by 1000 to avoid floats).
@@ -515,11 +540,13 @@ struct PromIpState {
 /// Reasons a `/metrics` connection can be dropped before serving.  Indexed by
 /// [`drop_reason_index`]; the array doubles as the canonical ordering for
 /// the exposition output, so series remain stable across scrapes.
+#[cfg(feature = "prometheus-exporter")]
 const DROP_REASON_LABELS: [&str; 3] = ["drain", "rate_limit", "ip_table_full"];
 
 /// Outcome label values for `varta_recovery_outcomes_total`. Indexed by
 /// [`recovery_outcome_index`]; emitted unconditionally (every value, even
 /// at zero) so `absent()` alert rules stay green.
+#[cfg(feature = "prometheus-exporter")]
 const RECOVERY_OUTCOME_LABELS: [&str; 8] = [
     "spawned",
     "debounced",
@@ -534,11 +561,13 @@ const RECOVERY_OUTCOME_LABELS: [&str; 8] = [
 /// Reason label values for `varta_recovery_refused_total`. Indexed by
 /// [`refused_reason_index`]; emitted unconditionally so `absent()` rules
 /// stay green.
+#[cfg(feature = "prometheus-exporter")]
 const RECOVERY_REFUSED_REASON_LABELS: [&str; 2] =
     ["unauthenticated_transport", "cross_namespace_agent"];
 
 /// Map a [`crate::recovery::RecoveryOutcome`] to a stable index for the
 /// `varta_recovery_outcomes_total` array.
+#[cfg(feature = "prometheus-exporter")]
 fn recovery_outcome_index(outcome: &crate::recovery::RecoveryOutcome) -> usize {
     use crate::recovery::RecoveryOutcome;
     match outcome {
@@ -565,12 +594,14 @@ fn recovery_outcome_index(outcome: &crate::recovery::RecoveryOutcome) -> usize {
 /// only one reason is defined; the helper is kept to mirror the
 /// decode_kind_index / drop_reason_index pattern so adding new reasons is
 /// a localized change.
+#[cfg(feature = "prometheus-exporter")]
 #[derive(Clone, Copy, Debug)]
 enum RefusedReason {
     UnauthenticatedTransport,
     CrossNamespaceAgent,
 }
 
+#[cfg(feature = "prometheus-exporter")]
 fn refused_reason_index(r: RefusedReason) -> usize {
     match r {
         RefusedReason::UnauthenticatedTransport => 0,
@@ -578,6 +609,7 @@ fn refused_reason_index(r: RefusedReason) -> usize {
     }
 }
 
+#[cfg(feature = "prometheus-exporter")]
 #[derive(Clone, Copy, Debug)]
 enum DropReason {
     Drain,
@@ -585,6 +617,7 @@ enum DropReason {
     IpTableFull,
 }
 
+#[cfg(feature = "prometheus-exporter")]
 fn drop_reason_index(r: DropReason) -> usize {
     match r {
         DropReason::Drain => 0,
@@ -599,6 +632,7 @@ fn drop_reason_index(r: DropReason) -> usize {
 /// [`PromExporter::serve_pending`] once per outer tick and the listener
 /// is non-blocking, so there is no background thread. Each accepted
 /// connection receives a fresh metrics body with `Connection: close`.
+#[cfg(feature = "prometheus-exporter")]
 pub struct PromExporter {
     listener: TcpListener,
     rows: HashMap<u32, GaugeRow>,
@@ -767,6 +801,7 @@ pub struct PromExporter {
     last_loop_system: SystemTime,
 }
 
+#[cfg(feature = "prometheus-exporter")]
 impl PromExporter {
     /// Bind a non-blocking TCP listener on `addr` with default per-IP rate
     /// limits.  Equivalent to
@@ -1838,6 +1873,7 @@ impl PromExporter {
     }
 }
 
+#[cfg(feature = "prometheus-exporter")]
 impl Exporter for PromExporter {
     fn record(&mut self, ev: &Event) -> io::Result<()> {
         match ev {
@@ -1897,6 +1933,7 @@ impl Exporter for PromExporter {
 /// Write the HTTP 200 response line and headers (including Content-Length)
 /// into `stream` using a stack buffer so no heap allocation occurs on the
 /// `/metrics` scrape path.
+#[cfg(feature = "prometheus-exporter")]
 fn write_headers_with_len(
     stream: &mut TcpStream,
     body_len: usize,
@@ -1918,6 +1955,7 @@ fn write_headers_with_len(
 /// `usize` on 64-bit can require up to 20 decimal digits.  The caller must
 /// ensure `buf` is large enough; the debug assertion catches undersized
 /// buffers at test time and has zero overhead in release builds.
+#[cfg(feature = "prometheus-exporter")]
 fn write_usize(buf: &mut [u8], mut n: usize) -> usize {
     debug_assert!(
         buf.len() >= 20,
@@ -1943,6 +1981,7 @@ fn write_usize(buf: &mut [u8], mut n: usize) -> usize {
 /// invocation.  At ~100 µs per yield (macOS) and 10 yields this bounds
 /// scheduler concessions to ~1 ms, well within the 50 ms
 /// [`PROM_WRITE_TIMEOUT`].
+#[cfg(feature = "prometheus-exporter")]
 const MAX_WRITE_YIELDS: usize = 10;
 
 /// Non-blocking `write_all` with a wall-clock deadline. Returns `Ok(())`
@@ -1956,6 +1995,7 @@ const MAX_WRITE_YIELDS: usize = 10;
 ///
 /// `yield_now()` can be surprisingly long on macOS (~100 µs).  With the
 /// 50 ms [`PROM_WRITE_TIMEOUT`] a 10-yield budget is safe.
+#[cfg(feature = "prometheus-exporter")]
 fn write_all_nonblocking(stream: &mut TcpStream, buf: &[u8], deadline: Instant) -> io::Result<()> {
     let mut written = 0;
     let mut yields = 0;
@@ -1985,6 +2025,7 @@ fn write_all_nonblocking(stream: &mut TcpStream, buf: &[u8], deadline: Instant) 
 /// the header is present, well-formed, and carries exactly 64 hex
 /// characters of token material; returns `None` otherwise.  The header
 /// field name is matched case-insensitively per RFC 7230 §3.2.
+#[cfg(feature = "prometheus-exporter")]
 fn parse_authorization_bearer(buf: &[u8]) -> Option<[u8; 32]> {
     // Skip the request line. find_crlf returns the index of '\r'; bump
     // past the '\n' that follows.
@@ -2035,6 +2076,7 @@ fn parse_authorization_bearer(buf: &[u8]) -> Option<[u8; 32]> {
 }
 
 /// Position of the first `\r\n` byte pair in `buf`.
+#[cfg(feature = "prometheus-exporter")]
 fn find_crlf(buf: &[u8]) -> Option<usize> {
     buf.windows(2).position(|w| w == b"\r\n")
 }
@@ -2046,6 +2088,7 @@ fn find_crlf(buf: &[u8]) -> Option<usize> {
 /// unread data in the receive buffer triggers an RST rather than a TCP FIN.
 /// This non-blocking drain empties the receive buffer, letting
 /// `shutdown(SHUT_WR)` complete cleanly on all platforms.
+#[cfg(feature = "prometheus-exporter")]
 fn drain_read_to_would_block(stream: &mut TcpStream) {
     let mut buf = [0u8; 128];
     loop {
@@ -2058,7 +2101,7 @@ fn drain_read_to_would_block(stream: &mut TcpStream) {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "prometheus-exporter"))]
 mod tests {
     use super::*;
 

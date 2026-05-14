@@ -8,6 +8,12 @@
 //!
 //! Without `test-hooks` this file compiles to an empty crate — no test
 //! functions are defined outside the cfg gate.
+//!
+//! Also excluded from the Class-A `compile-time-config` profile: the
+//! harness drives the binary with `--inject-wedge-ms`, which is rejected
+//! by a Class-A binary that accepts no argv tokens.
+
+#![cfg(not(feature = "compile-time-config"))]
 
 #[cfg(feature = "test-hooks")]
 mod tests {

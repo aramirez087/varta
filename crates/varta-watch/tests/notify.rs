@@ -4,6 +4,12 @@
 //! `$NOTIFY_SOCKET` set to the listener path (or abstract name on Linux),
 //! and asserts the message sequence: `READY=1\n` first, at least one
 //! `WATCHDOG=1\n`, then `STOPPING=1\n` last.
+//!
+//! The harness drives the binary via argv flags (`--socket`,
+//! `--threshold-ms`, …) — incompatible with the Class-A
+//! `compile-time-config` profile, which rejects all argv input.
+
+#![cfg(not(feature = "compile-time-config"))]
 
 use std::os::unix::net::UnixDatagram;
 use std::path::PathBuf;

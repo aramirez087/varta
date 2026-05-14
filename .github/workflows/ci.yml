@@ -24,8 +24,23 @@ jobs:
       - name: cargo fmt --check
         run: cargo fmt --all -- --check
 
-      - name: clippy (all-features)
-        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      # `--all-features` cannot be used directly: `prometheus-exporter`
+      # and `compile-time-config` are mutually exclusive (compile_error!
+      # in `crates/varta-watch/src/lib.rs`).  Two explicit lanes cover
+      # the SRE and Class-A profiles.
+      - name: clippy (SRE — argv parser + HTTP exporter)
+        run: |
+          cargo clippy --workspace --all-targets \
+            --features 'varta-watch/secure-udp varta-watch/unsafe-plaintext-udp varta-watch/unsafe-shell-recovery varta-watch/json-log varta-watch/audit-chain varta-watch/test-hooks varta-watch/prometheus-exporter varta-vlp/crypto varta-vlp/std varta-client/panic-handler varta-client/udp varta-client/secure-udp varta-client/test-hooks varta-tests/udp varta-tests/secure-udp varta-tests/shell-recovery varta-tests/test-hooks varta-tests/prometheus-exporter' \
+            -- -D warnings
+
+      - name: clippy (Class-A — compile-time config, no HTTP, no argv)
+        env:
+          VARTA_CONFIG_FILE: ${{ github.workspace }}/crates/varta-watch/tests/fixtures/safety_critical.varta.conf
+        run: |
+          cargo clippy -p varta-watch --all-targets \
+            --no-default-features --features secure-udp,compile-time-config \
+            -- -D warnings
 
       - name: clippy (no-default-features)
         run: cargo clippy --workspace --all-targets --no-default-features -- -D warnings
@@ -54,19 +69,29 @@ jobs:
           cargo build -p varta-vlp --no-default-features --target thumbv7m-none-eabi
           cargo build -p varta-vlp --no-default-features --features crypto --target thumbv7m-none-eabi
 
-      - name: tests (all-features, -D warnings)
-        run: cargo test --workspace --all-features
+      # `--all-features` is forbidden by the `prometheus-exporter` +
+      # `compile-time-config` compile_error guard.  Run SRE-profile tests
+      # with the full SRE feature set; Class-A coverage runs in a
+      # dedicated safety-profiles step below.
+      - name: tests (SRE profile, -D warnings)
         env:
           RUSTFLAGS: -D warnings
+        run: |
+          cargo test --workspace \
+            --features 'varta-watch/secure-udp varta-watch/unsafe-plaintext-udp varta-watch/unsafe-shell-recovery varta-watch/json-log varta-watch/audit-chain varta-watch/test-hooks varta-watch/prometheus-exporter varta-vlp/crypto varta-vlp/std varta-client/panic-handler varta-client/udp varta-client/secure-udp varta-client/test-hooks varta-tests/udp varta-tests/secure-udp varta-tests/shell-recovery varta-tests/test-hooks varta-tests/prometheus-exporter'
 
-      - name: doc-tests (all-features)
-        run: cargo test --doc --workspace --all-features
+      - name: doc-tests (SRE profile)
+        run: |
+          cargo test --doc --workspace \
+            --features 'varta-watch/secure-udp varta-watch/unsafe-plaintext-udp varta-watch/unsafe-shell-recovery varta-watch/json-log varta-watch/audit-chain varta-watch/test-hooks varta-watch/prometheus-exporter varta-vlp/crypto varta-vlp/std varta-client/panic-handler varta-client/udp varta-client/secure-udp varta-client/test-hooks varta-tests/udp varta-tests/secure-udp varta-tests/shell-recovery varta-tests/test-hooks varta-tests/prometheus-exporter'
 
       - name: release build
         run: cargo build --workspace --release
 
-      - name: examples build (all-features)
-        run: cargo build --workspace --examples --all-features
+      - name: examples build (SRE profile)
+        run: |
+          cargo build --workspace --examples \
+            --features 'varta-watch/secure-udp varta-watch/unsafe-plaintext-udp varta-watch/unsafe-shell-recovery varta-watch/json-log varta-watch/audit-chain varta-watch/test-hooks varta-watch/prometheus-exporter varta-vlp/crypto varta-vlp/std varta-client/panic-handler varta-client/udp varta-client/secure-udp varta-client/test-hooks varta-tests/udp varta-tests/secure-udp varta-tests/shell-recovery varta-tests/test-hooks varta-tests/prometheus-exporter'
 
       - name: zero-dep audit (varta-vlp)
         run: |
@@ -240,3 +265,74 @@ jobs:
 
       - name: observer-liveness integration tests (L1 self-watchdog, L2 sd_notify, L3 hw_watchdog)
         run: cargo test -p varta-watch --features test-hooks --test notify --test cli_smoke --test self_watchdog
+
+      # --- SRE profile (M3 — Prometheus HTTP exporter compiled in) ----------
+      - name: SRE profile — build
+        run: cargo build -p varta-watch --release --features prometheus-exporter
+
+      - name: SRE profile — tests
+        run: cargo test -p varta-watch --features prometheus-exporter
+
+      # --- Class-A profile (M3 + M4 — no HTTP, no argv parser) --------------
+      # Build with the canonical safety-critical recipe.  The CI fixture
+      # (tests/fixtures/safety_critical.varta.conf) is the same one the
+      # smoke test consumes locally.
+      - name: Class-A profile — build
+        env:
+          VARTA_CONFIG_FILE: ${{ github.workspace }}/crates/varta-watch/tests/fixtures/safety_critical.varta.conf
+        run: |
+          cargo build -p varta-watch --release \
+            --no-default-features --features secure-udp,compile-time-config
+
+      - name: Class-A profile — strings audit
+        run: |
+          B=target/release/varta-watch
+          FORBIDDEN=(
+            "GET /metrics" "HTTP/1.0" "HTTP/1.1" "WWW-Authenticate"
+            "Bearer realm" "/bin/sh"
+            "--socket" "--threshold-ms" "--prom-addr" "--prom-token-file"
+            "--recovery-cmd" "--recovery-exec" "--help" "--secure-key-file"
+            "--master-key-file" "--key-file" "--clock-source" "--i-accept"
+            "--allow-cross-namespace" "--udp-port"
+            "--features audit-chain" "--features secure-udp"
+            "--features unsafe-plaintext-udp" "--features unsafe-shell-recovery"
+          )
+          fail=0
+          for needle in "${FORBIDDEN[@]}"; do
+            if strings "$B" | grep -qF -- "$needle"; then
+              echo "FAIL: Class-A binary contains forbidden literal: $needle"
+              fail=1
+            fi
+          done
+          if [ "$fail" -eq 0 ]; then
+            echo "OK: Class-A strings audit clean"
+          else
+            exit 1
+          fi
+
+      - name: Class-A profile — smoke
+        env:
+          VARTA_CONFIG_FILE: ${{ github.workspace }}/crates/varta-watch/tests/fixtures/safety_critical.varta.conf
+        run: |
+          cargo test -p varta-watch --release \
+            --no-default-features --features secure-udp,compile-time-config \
+            --test compile_time_config_smoke --test strings_audit
+
+      # --- Compile-error guard ---------------------------------------------
+      # The combination `prometheus-exporter` + `compile-time-config` is
+      # explicitly forbidden in lib.rs.  CI confirms the diagnostic fires.
+      - name: Mutually-exclusive features fail to compile
+        env:
+          VARTA_CONFIG_FILE: ${{ github.workspace }}/crates/varta-watch/tests/fixtures/safety_critical.varta.conf
+        run: |
+          if cargo build -p varta-watch --release \
+            --no-default-features --features prometheus-exporter,compile-time-config 2>&1 \
+            | tee /tmp/feature-combo.log \
+            | grep -qF "cannot be combined with"
+          then
+            echo "OK: prometheus-exporter + compile-time-config rejected by compile_error!"
+          else
+            echo "FAIL: combination should have triggered compile_error!"
+            cat /tmp/feature-combo.log
+            exit 1
+          fi

@@ -3,6 +3,11 @@
 //! Each test name here is verbatim from `docs/acceptance/varta-v0-1-0.md`.
 //! The CI gate (Session 08) greps these names — do not rename without
 //! updating the contract.
+//!
+//! Requires `--features prometheus-exporter` — exercises the HTTP /metrics
+//! surface that the Class-A safety-critical profile intentionally excludes.
+
+#![cfg(feature = "prometheus-exporter")]
 
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};

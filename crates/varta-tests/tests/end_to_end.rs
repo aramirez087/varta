@@ -4,6 +4,12 @@
 //! (with the `panic-handler` feature), and asserts on the live `/metrics`
 //! endpoint exposed by [`varta_watch::PromExporter`].
 //!
+//! SRE-profile contract harness: `varta-tests`'s dependency on
+//! `varta-watch` always pulls `--features prometheus-exporter`, so the
+//! /metrics surface is guaranteed available.  Class-A safety-critical
+//! coverage (no argv, no HTTP) lives in
+//! `crates/varta-watch/tests/compile_time_config_smoke.rs` instead.
+//!
 //! This target uses `harness = false` so the binary can intercept the
 //! `VARTA_E2E_PANIC_CHILD` env-var dispatch *before* the test runner
 //! starts. The contract for `panic_handler_critical_beat_visible_in_metrics`

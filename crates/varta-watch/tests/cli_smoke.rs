@@ -4,6 +4,12 @@
 //! The CI gate (Session 08) greps these names — do not rename without
 //! updating the contract.
 //!
+//! Excluded when `--features compile-time-config` is active — the Class-A
+//! binary accepts no argv tokens, so the entire test surface here is
+//! inapplicable to that profile.
+
+#![cfg(not(feature = "compile-time-config"))]
+//!
 //! Session 01 of the recovery-async-spawn epic appends two red-phase
 //! tests below for the new `--recovery-timeout-ms` flag. Session 03
 //! turns them green.

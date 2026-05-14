@@ -8,6 +8,19 @@ alone is sufficient; both must be active.
 This document defines what "production-safe" means for Varta and how to verify
 a binary before deploying it to a safety-critical environment.
 
+## Profile matrix
+
+| Profile | Features | argv | /metrics | Recovery |
+|---|---|---|---|---|
+| SRE / cloud | `prometheus-exporter` (+ optional `unsafe-*`) | full GNU-style parser | HTTP `/metrics` + Bearer-token | shell or exec |
+| Class-A safety-critical | `secure-udp,compile-time-config` | none (build-time fixed) | absent | exec only (or `unsafe-shell-recovery` + signed acknowledgement) |
+
+The two profiles are mutually exclusive: `prometheus-exporter` cannot
+combine with `compile-time-config` (a `compile_error!` in
+`crates/varta-watch/src/lib.rs` rejects the combination at build time).
+This is the structural guarantee Class-A builds rest on — the Class-A
+binary cannot ship with an HTTP server linked in.
+
 ---
 
 ## Production-safe build
@@ -74,6 +87,63 @@ unsafe-shell-recovery = []
 
 Even with this feature, shell-mode recovery **will not activate** unless
 `--i-accept-shell-risk` is also passed at runtime.
+
+---
+
+## Class-A safety-critical features
+
+### `prometheus-exporter` (opt-in HTTP exposition)
+
+The Prometheus `/metrics` endpoint, the bearer-token loader, the per-IP
+rate-limit table, and every `--prom-*` argv flag live behind this
+feature.  When absent the binary contains zero HTTP / TCP-accept code
+and the only exporter linked is `FileExporter` (one-way append-only
+TSV sink — no listener, no network surface).
+
+```toml
+[features]
+prometheus-exporter = []
+```
+
+Verification recipe (default build, feature off):
+
+```sh
+cargo build -p varta-watch --release
+B=target/release/varta-watch
+strings "$B" | grep -E -- "(GET /metrics|HTTP/1\.|WWW-Authenticate|Bearer realm)" \
+  && echo "FAIL" || echo "OK"
+```
+
+### `compile-time-config` (no argv parser, no runtime config)
+
+Replaces the runtime argv parser with a build-script-generated constant
+populated from `$VARTA_CONFIG_FILE` (a `KEY = VALUE` text file).  When
+the feature is on:
+
+- `Config::from_args` is excluded from compilation; the 292-arm match
+  block carrying every `--flag-name` literal is not linked.
+- `Config::HELP` is a neutral one-liner that contains no flag names.
+- The binary refuses any argv tokens with `CompileTimeArgvForbidden`.
+
+Cannot be combined with `prometheus-exporter` — the combination is
+rejected at compile time by a `compile_error!` in `lib.rs`.
+
+```sh
+export VARTA_CONFIG_FILE=/etc/varta/varta.conf
+cargo build -p varta-watch --release \
+  --no-default-features --features secure-udp,compile-time-config
+```
+
+Verification recipe:
+
+```sh
+B=target/release/varta-watch
+FORBIDDEN="GET /metrics|HTTP/1\.|WWW-Authenticate|--socket|--prom-addr|--help|--i-accept|/bin/sh"
+strings "$B" | grep -E -- "$FORBIDDEN" && echo "FAIL" || echo "OK"
+```
+
+See [compile-time-config.md](compile-time-config.md) for the canonical
+KEY=VALUE grammar and key catalogue.
 
 ---
 

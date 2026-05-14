@@ -23,10 +23,12 @@ use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::time::{Duration, Instant};
 
+#[cfg(feature = "prometheus-exporter")]
+use varta_watch::PromExporter;
 use varta_watch::{
     varta_error, varta_error_err, varta_error_pid, varta_info_pid_child, varta_warn,
-    varta_warn_child, Config, ConfigError, Event, Exporter, FileExporter, Observer, PromExporter,
-    Recovery, RecoveryOutcome,
+    varta_warn_child, Config, ConfigError, Event, Exporter, FileExporter, Observer, Recovery,
+    RecoveryOutcome,
 };
 
 /// Shutdown latch flipped by [`install_signal_handlers`] on SIGINT/SIGTERM
@@ -293,8 +295,25 @@ fn write_heartbeat_atomic(path: &Path, contents: &[u8]) -> io::Result<()> {
 }
 
 fn main() -> ExitCode {
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    match Config::from_args(args) {
+    // Branch the configuration source on the `compile-time-config` feature.
+    // Default builds parse argv (SRE profile); Class-A builds reject any argv
+    // and read the baked-in constant produced by build.rs from
+    // $VARTA_CONFIG_FILE at compile time.
+    #[cfg(not(feature = "compile-time-config"))]
+    let cfg_result: Result<Config, ConfigError> = {
+        let args: Vec<String> = std::env::args().skip(1).collect();
+        Config::from_args(args)
+    };
+    #[cfg(feature = "compile-time-config")]
+    let cfg_result: Result<Config, ConfigError> = {
+        if std::env::args().skip(1).next().is_some() {
+            Err(ConfigError::CompileTimeArgvForbidden)
+        } else {
+            Config::compile_time()
+        }
+    };
+
+    match cfg_result {
         Ok(cfg) => match run(cfg) {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => {
@@ -396,6 +415,7 @@ fn run(cfg: Config) -> std::io::Result<()> {
         // loopback warning above.  Skipped for the default (loopback) and
         // for plaintext UDP (warned elsewhere).
         if secure_keys_configured && !bind_addr.is_loopback() {
+            #[cfg(not(feature = "compile-time-config"))]
             varta_warn!(
                 "secure-UDP is bound to non-loopback {addr} \
                  (--i-accept-secure-udp-non-loopback). The 1-deep replay shadow \
@@ -403,6 +423,12 @@ fn run(cfg: Config) -> std::io::Result<()> {
                  network; restrict reach via firewall / private VLAN. See \
                  docs/architecture/vlp-transports.md for the threat-boundary \
                  derivation."
+            );
+            #[cfg(feature = "compile-time-config")]
+            varta_warn!(
+                "secure-UDP is bound to non-loopback {addr}. The 1-deep replay \
+                 shadow after capacity-forced eviction is inadequate for any \
+                 reachable network; restrict reach via firewall / private VLAN."
             );
         }
 
@@ -457,6 +483,7 @@ fn run(cfg: Config) -> std::io::Result<()> {
             // explicitly opted in at runtime, and the plaintext path was
             // compiled in.
             if !cfg.i_accept_plaintext_udp {
+                #[cfg(not(feature = "compile-time-config"))]
                 varta_error!(
                     "--udp-port {addr} cannot bind: no AEAD keys are configured \
                      and --i-accept-plaintext-udp was not passed. Provide \
@@ -464,9 +491,14 @@ fn run(cfg: Config) -> std::io::Result<()> {
                      or pass --i-accept-plaintext-udp to explicitly accept the \
                      security risk of an unauthenticated UDP listener (test/dev only)."
                 );
+                #[cfg(feature = "compile-time-config")]
+                varta_error!(
+                    "UDP listener at {addr} cannot bind: no AEAD keys are configured \
+                     and plaintext-UDP acknowledgement is not set."
+                );
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
-                    "plaintext UDP requires --i-accept-plaintext-udp (and no keys are configured)",
+                    "plaintext UDP requires the plaintext-UDP acknowledgement (and no keys are configured)",
                 ));
             }
 
@@ -481,6 +513,7 @@ fn run(cfg: Config) -> std::io::Result<()> {
                     .map_err(|e| std::io::Error::new(e.kind(), format!("UDP bind {}: {e}", addr)))?
                     .with_recovery_trust(trust);
                 observer.add_listener(Box::new(udp));
+                #[cfg(not(feature = "compile-time-config"))]
                 varta_warn!(
                     "UDP on {addr} is running WITHOUT authentication \
                      (--i-accept-plaintext-udp). Any device with network reach to \
@@ -488,15 +521,27 @@ fn run(cfg: Config) -> std::io::Result<()> {
                      trigger false recovery commands. NOT for production / \
                      safety-critical use."
                 );
+                #[cfg(feature = "compile-time-config")]
+                varta_warn!(
+                    "UDP on {addr} is running WITHOUT authentication. \
+                     Any device with network reach to this port can inject \
+                     heartbeats. NOT for production / safety-critical use."
+                );
             }
 
             #[cfg(not(feature = "unsafe-plaintext-udp"))]
             {
+                #[cfg(not(feature = "compile-time-config"))]
                 varta_error!(
                     "--udp-port {addr} cannot bind: this build does not include \
                      --features unsafe-plaintext-udp, and no AEAD keys are \
                      configured. Rebuild with --features secure-udp and provide \
                      --key-file / --master-key-file."
+                );
+                #[cfg(feature = "compile-time-config")]
+                varta_error!(
+                    "UDP listener at {addr} cannot bind: plaintext UDP is not \
+                     compiled in and no AEAD keys are configured."
                 );
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
@@ -508,11 +553,14 @@ fn run(cfg: Config) -> std::io::Result<()> {
 
     #[cfg(not(feature = "udp-core"))]
     if cfg.udp_port.is_some() {
+        #[cfg(not(feature = "compile-time-config"))]
         varta_error!(
             "--udp-port requires UDP support (rebuild with --features secure-udp \
              for authenticated transport, or --features unsafe-plaintext-udp for \
              a development/testing plaintext listener)"
         );
+        #[cfg(feature = "compile-time-config")]
+        varta_error!("UDP port configured but UDP support is not compiled in");
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             "UDP support not compiled in",
@@ -524,9 +572,15 @@ fn run(cfg: Config) -> std::io::Result<()> {
         || cfg.accepted_key_file.is_some()
         || cfg.master_key_file.is_some()
     {
+        #[cfg(not(feature = "compile-time-config"))]
         varta_error!(
             "--key-file / --accepted-key-file / --master-key-file require secure \
              UDP support (rebuild with --features secure-udp)"
+        );
+        #[cfg(feature = "compile-time-config")]
+        varta_error!(
+            "secure-UDP key files are configured but the secure-UDP transport \
+             is not compiled into this build"
         );
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -566,18 +620,30 @@ fn run(cfg: Config) -> std::io::Result<()> {
             // time. Each is a structural risk an auditor should know about
             // before the daemon emits its first recovery record.
             if warnings.chain_disabled {
+                #[cfg(not(feature = "compile-time-config"))]
                 varta_warn!(
                     "recovery audit chain is DISABLED (build is missing the `audit-chain` \
                      feature). v2 records will carry a literal `-` in the chain column and \
                      this build is NOT IEC 62304 Class C-conforming. Rebuild with \
                      --features audit-chain for tamper-evident audit records."
                 );
+                #[cfg(feature = "compile-time-config")]
+                varta_warn!(
+                    "recovery audit chain is DISABLED; records will carry `-` in the \
+                     chain column and this build is NOT IEC 62304 Class C-conforming."
+                );
             }
             if warnings.sync_relaxed {
+                #[cfg(not(feature = "compile-time-config"))]
                 varta_warn!(
                     "recovery audit fdatasync cadence is relaxed (--recovery-audit-sync-every \
                      > 1). A power cut can lose up to N-1 records. The Class C-conforming \
                      value is 1 (every record)."
+                );
+                #[cfg(feature = "compile-time-config")]
+                varta_warn!(
+                    "recovery audit fdatasync cadence is relaxed (> 1). A power cut can \
+                     lose up to N-1 records. The Class C-conforming value is 1."
                 );
             }
             if warnings.legacy_v1 {
@@ -615,16 +681,28 @@ fn run(cfg: Config) -> std::io::Result<()> {
     // without the per-listener flag, so reaching this branch is deliberate.
     if recovery_mode.is_some() {
         if cfg.i_accept_recovery_on_secure_udp {
+            #[cfg(not(feature = "compile-time-config"))]
             varta_warn!(
                 "recovery on secure-UDP listener is enabled \
                  (--secure-udp-i-accept-recovery-on-unauthenticated-transport). \
                  NOT for safety-critical use."
             );
+            #[cfg(feature = "compile-time-config")]
+            varta_warn!(
+                "recovery on secure-UDP listener is enabled. \
+                 NOT for safety-critical use."
+            );
         }
         if cfg.i_accept_recovery_on_plaintext_udp {
+            #[cfg(not(feature = "compile-time-config"))]
             varta_warn!(
                 "recovery on plaintext-UDP listener is enabled \
                  (--plaintext-udp-i-accept-recovery-on-unauthenticated-transport). \
+                 NOT for safety-critical use."
+            );
+            #[cfg(feature = "compile-time-config")]
+            varta_warn!(
+                "recovery on plaintext-UDP listener is enabled. \
                  NOT for safety-critical use."
             );
         }
@@ -651,6 +729,7 @@ fn run(cfg: Config) -> std::io::Result<()> {
         Some(path) => Some(FileExporter::create(path, cfg.export_file_max_bytes)?),
         None => None,
     };
+    #[cfg(feature = "prometheus-exporter")]
     let mut prom_export: Option<PromExporter> = match cfg.prom_addr {
         Some(addr) => {
             if !addr.ip().is_loopback() {
@@ -776,10 +855,11 @@ fn run(cfg: Config) -> std::io::Result<()> {
         match varta_watch::hw_watchdog::HwWatchdog::open(path) {
             Ok(w) => Some(w),
             Err(e) => {
-                return Err(io::Error::new(
-                    e.kind(),
-                    format!("--hw-watchdog {}: {e}", path.display()),
-                ));
+                #[cfg(not(feature = "compile-time-config"))]
+                let msg = format!("--hw-watchdog {}: {e}", path.display());
+                #[cfg(feature = "compile-time-config")]
+                let msg = format!("hw_watchdog {}: {e}", path.display());
+                return Err(io::Error::new(e.kind(), msg));
             }
         }
     } else {
@@ -808,6 +888,7 @@ fn run(cfg: Config) -> std::io::Result<()> {
         // including them would pollute the histogram. The heartbeat write,
         // sd_notify, and HW watchdog kick ARE included because a slow disk
         // or wedged sd_notify socket would be a real budget event.
+        #[cfg(feature = "prometheus-exporter")]
         let iter_start = Instant::now();
 
         // ------ 1. Drain queued stall events before I/O or maintenance ------
@@ -820,6 +901,7 @@ fn run(cfg: Config) -> std::io::Result<()> {
                     varta_error!("file export error: {e}");
                 }
             }
+            #[cfg(feature = "prometheus-exporter")]
             if let Some(pe) = prom_export.as_mut() {
                 let _ = pe.record(&ev);
             }
@@ -841,6 +923,7 @@ fn run(cfg: Config) -> std::io::Result<()> {
                         (Some(a), Some(b)) if a != b
                     );
                     let outcome = rec.on_stall(*pid, *origin, cross_namespace_agent);
+                    #[cfg(feature = "prometheus-exporter")]
                     if let Some(pe) = prom_export.as_mut() {
                         pe.record_recovery_outcome(&outcome, None);
                     }
@@ -861,6 +944,10 @@ fn run(cfg: Config) -> std::io::Result<()> {
                             );
                         }
                         RecoveryOutcome::RefusedUnauthenticatedSource { pid } => {
+                            // Class-A builds (`compile-time-config`) must
+                            // not carry argv flag names in static strings;
+                            // SRE builds emit a remediation pointer.
+                            #[cfg(not(feature = "compile-time-config"))]
                             varta_warn!(
                                 "recovery for pid {pid} REFUSED: stalled beat lifetime \
                                  includes a non-kernel-attested transport (UDP). Pass \
@@ -868,8 +955,14 @@ fn run(cfg: Config) -> std::io::Result<()> {
                                  enable Recovery's allow_unauthenticated_source to \
                                  override at your own risk."
                             );
+                            #[cfg(feature = "compile-time-config")]
+                            varta_warn!(
+                                "recovery for pid {pid} REFUSED: stalled beat lifetime \
+                                 includes a non-kernel-attested transport (UDP)."
+                            );
                         }
                         RecoveryOutcome::RefusedCrossNamespace { pid } => {
+                            #[cfg(not(feature = "compile-time-config"))]
                             varta_warn!(
                                 "recovery for pid {pid} REFUSED: agent's PID namespace \
                                  differs from observer's. kill(2) against this pid \
@@ -877,6 +970,11 @@ fn run(cfg: Config) -> std::io::Result<()> {
                                  process. Pass --allow-cross-namespace-agents only when \
                                  agents are run with --pid=host or an out-of-band PID \
                                  translator is in place."
+                            );
+                            #[cfg(feature = "compile-time-config")]
+                            varta_warn!(
+                                "recovery for pid {pid} REFUSED: agent's PID namespace \
+                                 differs from observer's."
                             );
                         }
                         RecoveryOutcome::Reaped { .. }
@@ -898,6 +996,7 @@ fn run(cfg: Config) -> std::io::Result<()> {
                     varta_error!("file export error: {e}");
                 }
             }
+            #[cfg(feature = "prometheus-exporter")]
             if let Some(pe) = prom_export.as_mut() {
                 let _ = pe.record(&ev);
             }
@@ -907,14 +1006,21 @@ fn run(cfg: Config) -> std::io::Result<()> {
             // mode escalates to daemon exit so the operator notices.
             if cfg.strict_namespace_check && !cfg.allow_cross_namespace_agents {
                 if let Event::NamespaceConflict { claimed_pid, .. } = &ev {
+                    #[cfg(not(feature = "compile-time-config"))]
                     varta_error!(
                         "FATAL --strict-namespace-check: cross-namespace agent \
                          detected for claimed pid {claimed_pid}; refusing to \
                          continue. Re-run with --allow-cross-namespace-agents \
                          only if PID translation is correctly configured."
                     );
+                    #[cfg(feature = "compile-time-config")]
+                    varta_error!(
+                        "FATAL strict namespace check: cross-namespace agent \
+                         detected for claimed pid {claimed_pid}; refusing to \
+                         continue."
+                    );
                     return Err(io::Error::other(
-                        "cross-namespace agent detected under --strict-namespace-check",
+                        "cross-namespace agent detected under strict namespace check",
                     ));
                 }
             }
@@ -926,6 +1032,7 @@ fn run(cfg: Config) -> std::io::Result<()> {
         // ------ 3. Maintenance (evictions, capacity, reaping, /metrics) ------
         let evicted = observer.drain_evictions();
         if evicted > 0 {
+            #[cfg(feature = "prometheus-exporter")]
             if let Some(pe) = prom_export.as_mut() {
                 pe.record_eviction(evicted);
             }
@@ -935,6 +1042,7 @@ fn run(cfg: Config) -> std::io::Result<()> {
             if let Some(fe) = file_export.as_mut() {
                 fe.record_eviction_pid(evicted_pid, observer.now_ns());
             }
+            #[cfg(feature = "prometheus-exporter")]
             if let Some(pe) = prom_export.as_mut() {
                 pe.record_evicted_pid(evicted_pid);
             }
@@ -942,6 +1050,7 @@ fn run(cfg: Config) -> std::io::Result<()> {
 
         let capacity_exceeded = observer.drain_capacity_exceeded();
         if capacity_exceeded > 0 {
+            #[cfg(feature = "prometheus-exporter")]
             if let Some(pe) = prom_export.as_mut() {
                 pe.record_capacity_exceeded(capacity_exceeded);
             }
@@ -949,6 +1058,7 @@ fn run(cfg: Config) -> std::io::Result<()> {
 
         let decrypt_failures = observer.drain_decrypt_failures();
         if decrypt_failures > 0 {
+            #[cfg(feature = "prometheus-exporter")]
             if let Some(pe) = prom_export.as_mut() {
                 pe.record_decrypt_failures(decrypt_failures);
             }
@@ -956,6 +1066,7 @@ fn run(cfg: Config) -> std::io::Result<()> {
 
         let truncated = observer.drain_truncated();
         if truncated > 0 {
+            #[cfg(feature = "prometheus-exporter")]
             if let Some(pe) = prom_export.as_mut() {
                 pe.record_truncated(truncated);
             }
@@ -963,6 +1074,7 @@ fn run(cfg: Config) -> std::io::Result<()> {
 
         let sender_state_full = observer.drain_sender_state_full();
         if sender_state_full > 0 {
+            #[cfg(feature = "prometheus-exporter")]
             if let Some(pe) = prom_export.as_mut() {
                 pe.record_sender_state_full(sender_state_full);
             }
@@ -970,6 +1082,7 @@ fn run(cfg: Config) -> std::io::Result<()> {
 
         let aead_attempts = observer.drain_aead_attempts();
         if aead_attempts > 0 {
+            #[cfg(feature = "prometheus-exporter")]
             if let Some(pe) = prom_export.as_mut() {
                 pe.record_secure_aead_attempts(aead_attempts);
             }
@@ -977,6 +1090,7 @@ fn run(cfg: Config) -> std::io::Result<()> {
 
         let rate_limited = observer.drain_rate_limited();
         if rate_limited > 0 {
+            #[cfg(feature = "prometheus-exporter")]
             if let Some(pe) = prom_export.as_mut() {
                 pe.record_rate_limited(rate_limited);
             }
@@ -984,6 +1098,7 @@ fn run(cfg: Config) -> std::io::Result<()> {
 
         let nonce_wraps = observer.drain_nonce_wraps();
         if nonce_wraps > 0 {
+            #[cfg(feature = "prometheus-exporter")]
             if let Some(pe) = prom_export.as_mut() {
                 pe.record_nonce_wraps(nonce_wraps);
             }
@@ -991,6 +1106,7 @@ fn run(cfg: Config) -> std::io::Result<()> {
 
         let eviction_scan_truncated = observer.drain_eviction_scan_truncated();
         if eviction_scan_truncated > 0 {
+            #[cfg(feature = "prometheus-exporter")]
             if let Some(pe) = prom_export.as_mut() {
                 pe.record_eviction_scan_truncated(eviction_scan_truncated);
             }
@@ -998,6 +1114,7 @@ fn run(cfg: Config) -> std::io::Result<()> {
 
         let origin_conflicts = observer.drain_origin_conflicts();
         if origin_conflicts > 0 {
+            #[cfg(feature = "prometheus-exporter")]
             if let Some(pe) = prom_export.as_mut() {
                 pe.record_origin_conflicts(origin_conflicts);
             }
@@ -1007,6 +1124,7 @@ fn run(cfg: Config) -> std::io::Result<()> {
         // other platforms or when --allow-cross-namespace-agents is set).
         let frame_ns_mismatches = observer.drain_cross_namespace_drops();
         if frame_ns_mismatches > 0 {
+            #[cfg(feature = "prometheus-exporter")]
             if let Some(pe) = prom_export.as_mut() {
                 pe.record_frame_namespace_mismatches(frame_ns_mismatches);
             }
@@ -1015,6 +1133,7 @@ fn run(cfg: Config) -> std::io::Result<()> {
         // Tracker namespace conflicts (rebind with a different inode).
         let tracker_ns_conflicts = observer.drain_namespace_conflicts();
         if tracker_ns_conflicts > 0 {
+            #[cfg(feature = "prometheus-exporter")]
             if let Some(pe) = prom_export.as_mut() {
                 pe.record_tracker_namespace_conflicts(tracker_ns_conflicts);
             }
@@ -1022,6 +1141,7 @@ fn run(cfg: Config) -> std::io::Result<()> {
 
         let tracker_invariants = observer.drain_invariant_violations();
         if tracker_invariants > 0 {
+            #[cfg(feature = "prometheus-exporter")]
             if let Some(pe) = prom_export.as_mut() {
                 pe.record_tracker_invariant_violations(tracker_invariants);
             }
@@ -1029,6 +1149,7 @@ fn run(cfg: Config) -> std::io::Result<()> {
 
         let probe_exhausted = observer.drain_pid_index_probe_exhausted();
         if probe_exhausted > 0 {
+            #[cfg(feature = "prometheus-exporter")]
             if let Some(pe) = prom_export.as_mut() {
                 pe.record_tracker_pid_index_probe_exhausted(probe_exhausted);
             }
@@ -1048,6 +1169,7 @@ fn run(cfg: Config) -> std::io::Result<()> {
         // Reap completed or timeout-exceeded children each tick.
         if let Some(rec) = recovery.as_mut() {
             for outcome in rec.try_reap() {
+                #[cfg(feature = "prometheus-exporter")]
                 if let Some(pe) = prom_export.as_mut() {
                     // Duration is only meaningful for terminal outcomes; the
                     // audit sink already carries the exact ns, but the
@@ -1077,6 +1199,7 @@ fn run(cfg: Config) -> std::io::Result<()> {
             }
         }
 
+        #[cfg(feature = "prometheus-exporter")]
         if let Some(pe) = prom_export.as_mut() {
             // Bracket serve_pending so its wall time is observable
             // independently of beat-path latency.  See
@@ -1127,6 +1250,7 @@ fn run(cfg: Config) -> std::io::Result<()> {
         // the watchdog kicks).  Excludes the idle sleep below and the
         // test-hooks wedge — those are throttling / fault injection, not
         // real work.  See `docs/architecture/observer-liveness.md`.
+        #[cfg(feature = "prometheus-exporter")]
         if let Some(pe) = prom_export.as_mut() {
             pe.record_iteration_duration(iter_start.elapsed());
         }

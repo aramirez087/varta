@@ -22,11 +22,20 @@ shell-recovery = ["varta-watch/unsafe-shell-recovery"]
 # Forward test-hooks to varta-client (H6 counter-wrap fast-forward) and to
 # varta-watch (existing self-watchdog wedge).
 test-hooks = ["varta-client/test-hooks", "varta-watch/test-hooks"]
+# Forward the Prometheus HTTP exporter feature so end_to_end tests that
+# scrape /metrics can opt in.  Default `cargo test -p varta-tests` runs
+# the SRE-profile lane (this feature off) — most contract tests are
+# transport-level and do not need /metrics.
+prometheus-exporter = ["varta-watch/prometheus-exporter"]
 
 [dev-dependencies]
 varta-vlp = { path = "../varta-vlp", features = ["crypto"] }
 varta-client = { path = "../varta-client", features = ["panic-handler"] }
-varta-watch = { path = "../varta-watch" }
+# `varta-tests` is an SRE-profile contract harness: it drives the binary
+# via argv and asserts on the live `/metrics` endpoint, so it always
+# requires `prometheus-exporter`.  Class-A safety-critical coverage
+# (no argv, no HTTP) lives in `varta-watch/tests/compile_time_config_smoke.rs`.
+varta-watch = { path = "../varta-watch", features = ["prometheus-exporter"] }
 proptest = "1"
 
 [[test]]
