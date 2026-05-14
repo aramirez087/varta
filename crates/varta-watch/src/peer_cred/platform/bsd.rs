@@ -109,24 +109,54 @@ extern "C" {
 pub(crate) const ANCILLARY_BUFFER_SIZE: usize = 256;
 
 const _: () = assert!(
-    ANCILLARY_BUFFER_SIZE >= super::super::cmsg::cmsg_hdr_size() + core::mem::size_of::<Cmsgcred>()
+    ANCILLARY_BUFFER_SIZE
+        >= super::super::cmsg::cmsg_align(core::mem::size_of::<Cmsghdr>())
+            + core::mem::size_of::<Cmsgcred>()
 );
 
+/// Zero-sized marker type that selects the BSD-family cmsg-walking parameters.
+pub(crate) struct BsdCmsg;
+
+// SAFETY: All required layouts are verified at compile time elsewhere in
+// this file:
+// - `Cmsghdr`: cmsg_len@0 (u32), cmsg_level@4 (i32), cmsg_type@8 (i32),
+//   total size 12.
+// - `Cmsgcred`: cmcred_pid@0 (i32), cmcred_uid@4 (u32), cmcred_euid@8 (u32),
+//   cmcred_gid@12, cmcred_ngroups@16, cmcred_groups@20 — total size 84.
+// - `Msghdr`: msg_control@32 (*c_void), msg_controllen@40 (u32), total
+//   size 48.
+// `SOL_SOCKET` and `SCM_CREDS` are the kernel-defined `(level, type)` pair
+// for `LOCAL_CREDS` credential ancillary data on the BSD family.
+unsafe impl super::super::cmsg::CmsgPlatform for BsdCmsg {
+    type Hdr = Cmsghdr;
+    type Cred = Cmsgcred;
+    type Msghdr = Msghdr;
+    const TARGET_LEVEL: i32 = SOL_SOCKET;
+    const TARGET_TYPE: i32 = SCM_CREDS;
+
+    fn cmsg_len(hdr: &Cmsghdr) -> usize {
+        hdr.cmsg_len as usize
+    }
+    fn cmsg_level(hdr: &Cmsghdr) -> i32 {
+        hdr.cmsg_level
+    }
+    fn cmsg_type(hdr: &Cmsghdr) -> i32 {
+        hdr.cmsg_type
+    }
+    fn msg_control(mhdr: &Msghdr) -> *const u8 {
+        mhdr.msg_control as *const u8
+    }
+    fn msg_controllen(mhdr: &Msghdr) -> usize {
+        mhdr.msg_controllen as usize
+    }
+    fn extract_pid_uid(cred: &Cmsgcred) -> (u32, u32) {
+        (cred.cmcred_pid as u32, cred.cmcred_euid)
+    }
+}
+
 /// Extract peer PID and effective UID after a successful `recvmsg` on BSD.
-///
-/// Iterates ancillary data looking for an `SCM_CREDS` message containing
-/// a `struct cmsgcred`.  Returns `(cmcred_pid, cmcred_euid)`.
-pub(crate) fn peer_pid_after_recv(
-    _fd: i32,
-    mhdr: &Msghdr,
-    anc_base: *const u8,
-) -> Option<(u32, u32)> {
-    debug_assert_eq!(
-        mhdr.msg_control as *const u8, anc_base,
-        "msg_control and ancillary buffer base must be the same address"
-    );
-    let hdr = unsafe { super::super::cmsg::cmsg_firsthdr(mhdr) };
-    unsafe { super::super::cmsg::find_credential_pid(hdr, mhdr, anc_base) }
+pub(crate) fn peer_pid_after_recv(_fd: i32, mhdr: &Msghdr) -> Option<(u32, u32)> {
+    super::super::cmsg::find_credential::<BsdCmsg>(mhdr)
 }
 
 // --- compile-time layout guards -------------------------------------------

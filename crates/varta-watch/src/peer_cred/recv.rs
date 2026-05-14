@@ -163,7 +163,7 @@ pub(crate) fn recv_authenticated(fd: i32) -> RecvResult {
         return RecvResult::ShortRead;
     }
 
-    let (peer_pid, peer_uid) = match plat::peer_pid_after_recv(fd, &mhdr, anc.0.as_ptr()) {
+    let (peer_pid, peer_uid) = match plat::peer_pid_after_recv(fd, &mhdr) {
         Some((pid, uid)) => (pid, uid),
         None => {
             return RecvResult::IoError(io::Error::new(

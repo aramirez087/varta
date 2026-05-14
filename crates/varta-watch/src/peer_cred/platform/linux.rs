@@ -89,22 +89,54 @@ pub(crate) const ANCILLARY_BUFFER_SIZE: usize = 256;
 // Compile-time guard: the ancillary buffer must fit at least one
 // SCM_CREDENTIALS message (aligned cmsghdr + struct ucred).
 const _: () = assert!(
-    ANCILLARY_BUFFER_SIZE >= super::super::cmsg::cmsg_hdr_size() + core::mem::size_of::<Ucred>()
+    ANCILLARY_BUFFER_SIZE
+        >= super::super::cmsg::cmsg_align(core::mem::size_of::<Cmsghdr>())
+            + core::mem::size_of::<Ucred>()
 );
+
+/// Zero-sized marker type that selects the Linux cmsg-walking parameters.
+pub(crate) struct LinuxCmsg;
+
+// SAFETY: All required layouts are verified at compile time elsewhere in
+// this file:
+// - `Cmsghdr`: cmsg_len@0 (usize), cmsg_level@8 (i32), cmsg_type@12 (i32),
+//   total size 16.
+// - `Ucred`: pid@0 (i32), uid@4 (u32), gid@8 (u32), total size 12.
+// - `Msghdr`: msg_control@32 (*c_void), msg_controllen@40 (usize), total
+//   size 56.
+// `SOL_SOCKET` and `SCM_CREDENTIALS` are the kernel-defined `(level, type)`
+// pair for `SO_PASSCRED` credential ancillary data on Linux.
+unsafe impl super::super::cmsg::CmsgPlatform for LinuxCmsg {
+    type Hdr = Cmsghdr;
+    type Cred = Ucred;
+    type Msghdr = Msghdr;
+    const TARGET_LEVEL: i32 = SOL_SOCKET;
+    const TARGET_TYPE: i32 = SCM_CREDENTIALS;
+
+    fn cmsg_len(hdr: &Cmsghdr) -> usize {
+        hdr.cmsg_len
+    }
+    fn cmsg_level(hdr: &Cmsghdr) -> i32 {
+        hdr.cmsg_level
+    }
+    fn cmsg_type(hdr: &Cmsghdr) -> i32 {
+        hdr.cmsg_type
+    }
+    fn msg_control(mhdr: &Msghdr) -> *const u8 {
+        mhdr.msg_control as *const u8
+    }
+    fn msg_controllen(mhdr: &Msghdr) -> usize {
+        mhdr.msg_controllen
+    }
+    fn extract_pid_uid(cred: &Ucred) -> (u32, u32) {
+        (cred.pid as u32, cred.uid)
+    }
+}
 
 /// Extract peer PID and UID after a successful `recvmsg` — on Linux this is
 /// done via ancillary-data parsing.
-pub(crate) fn peer_pid_after_recv(
-    _fd: i32,
-    mhdr: &Msghdr,
-    anc_base: *const u8,
-) -> Option<(u32, u32)> {
-    debug_assert_eq!(
-        mhdr.msg_control as *const u8, anc_base,
-        "msg_control and ancillary buffer base must be the same address"
-    );
-    let hdr = unsafe { super::super::cmsg::cmsg_firsthdr(mhdr) };
-    unsafe { super::super::cmsg::find_credential_pid(hdr, mhdr, anc_base) }
+pub(crate) fn peer_pid_after_recv(_fd: i32, mhdr: &Msghdr) -> Option<(u32, u32)> {
+    super::super::cmsg::find_credential::<LinuxCmsg>(mhdr)
 }
 
 // Compile-time invariant: glibc/Linux msghdr is 56 bytes on every 64-bit

@@ -94,11 +94,7 @@ pub(crate) const ANCILLARY_BUFFER_SIZE: usize = 16;
 /// credentials), falls back to `LOCAL_PEERPID` and `LOCAL_PEERCRED`
 /// individually. Only returns the sentinel (0, 0) when all three
 /// mechanisms fail.
-pub(crate) fn peer_pid_after_recv(
-    fd: i32,
-    _mhdr: &Msghdr,
-    _anc_base: *const u8,
-) -> Option<(u32, u32)> {
+pub(crate) fn peer_pid_after_recv(fd: i32, _mhdr: &Msghdr) -> Option<(u32, u32)> {
     let mut token = AuditToken { val: [0u32; 8] };
     let mut optlen: u32 = mem::size_of::<AuditToken>() as u32;
     let ret = unsafe {
