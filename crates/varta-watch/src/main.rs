@@ -45,6 +45,11 @@ use varta_watch::{
 /// the minimum guarantee, but lock-free atomics are explicitly supported in
 /// signal handlers by Linux `signal-safety(7)` and Apple `sigaction(2)`.
 /// `SA_RESTART` is set so the observer's `recvmsg(2)` never returns `EINTR`.
+/// On Linux the handler is installed via a direct `rt_sigaction(2)` syscall
+/// (not the libc wrapper, which would strip our `sa_restorer`); on x86_64
+/// the kernel returns through our own [`varta_signal_restorer`] trampoline.
+/// On aarch64 the kernel-side `<asm-generic/signal.h>` struct has no
+/// `sa_restorer` field, and signal-return goes through the vDSO.
 static SHUTDOWN: AtomicBool = AtomicBool::new(false);
 
 /// Nanosecond timestamp of the most recent poll loop iteration, written by
@@ -61,18 +66,349 @@ static LAST_TICK_NS: AtomicU64 = AtomicU64::new(0);
 /// Encoding: `ClockSource::as_u8()` / `ClockSource::from_u8()`.
 static CLOCK_SOURCE: AtomicU8 = AtomicU8::new(0);
 
-#[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd",))]
+// --------------------------------------------------------------------------
+// Linux signal-handler installation: kernel ABI, not libc wrapper.
+// --------------------------------------------------------------------------
+//
+// Background. Earlier revisions of this file called `sigaction(3)` (the
+// libc wrapper) and passed a glibc-shaped `struct sigaction`. That worked
+// only because glibc and musl both *unconditionally* substitute their own
+// signal restorer before calling the kernel:
+//
+//   // glibc sysdeps/unix/sysv/linux/x86_64/sigaction.c
+//   kact.sa_flags    = act->sa_flags | SA_RESTORER;
+//   kact.sa_restorer = &restore_rt;   // OUR sa_restorer IS IGNORED
+//
+//   // musl src/signal/sigaction.c
+//   ksa.flags    = sa->sa_flags | SA_RESTORER;
+//   ksa.restorer = (sa->sa_flags & SA_SIGINFO) ? __restore_rt : __restore;
+//
+// In other words: passing a non-null `sa_restorer` to libc's wrapper is
+// theatre. Our pointer is stripped on the way to the kernel and libc's
+// restorer is installed in its place.
+//
+// To actually own the kernel ABI we now invoke `rt_sigaction(2)` directly
+// via `core::arch::asm!` with the kernel's struct layout. macOS and
+// FreeBSD keep the libc-wrapper path (neither has the same restorer
+// issue), so the change is fully Linux-scoped.
+//
+// Refuse to compile on Linux architectures we have not pinned the syscall
+// ABI for.
+#[cfg(all(
+    target_os = "linux",
+    not(any(target_arch = "x86_64", target_arch = "aarch64"))
+))]
+compile_error!(
+    "varta-watch on Linux currently supports x86_64 and aarch64 only — \
+     add a `KernelSigAction` and `rt_sigaction_raw` arm for this \
+     architecture (matching the `<asm-generic/signal.h>` layout and the \
+     `__NR_rt_sigaction` syscall number) before enabling it."
+);
+
+// Kernel-ABI signal-return trampoline for Linux/x86_64.
+//
+// On x86_64 the kernel's `__setup_rt_frame` (arch/x86/kernel/signal_64.c)
+// requires `SA_RESTORER` set and `sa_restorer` pointing at a userspace
+// `rt_sigreturn(2)` trampoline — otherwise it returns `-EFAULT` and the
+// process gets `SIGSEGV` on signal-handler return. glibc and musl ship
+// `__restore_rt`; we ship our own equivalent here so that we own the kernel
+// ABI end-to-end and are not implicitly dependent on libc.
+//
+// Two-instruction trampoline. Stack is already pointing at the rt_sigframe
+// the kernel set up before jumping to the handler; `rt_sigreturn` reads it.
+//
+// `.cfi_signal_frame` tells gdb / perf / Rust unwinders that this is a
+// signal trampoline so backtraces step past the interrupted context
+// correctly. `.hidden` keeps the symbol private to this binary.
+//
+// References:
+//   * arch/x86/kernel/signal_64.c::__setup_rt_frame
+//   * arch/x86/entry/syscalls/syscall_64.tbl  (__NR_rt_sigreturn = 15)
+//   * glibc sysdeps/unix/sysv/linux/x86_64/sigaction.c::restore_rt
+//   * musl src/signal/x86_64/restore.s
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+core::arch::global_asm!(
+    ".section .text.varta_signal_restorer,\"ax\",@progbits",
+    ".globl varta_signal_restorer",
+    ".hidden varta_signal_restorer",
+    ".type varta_signal_restorer, @function",
+    ".p2align 4",
+    "varta_signal_restorer:",
+    ".cfi_startproc",
+    ".cfi_signal_frame",
+    "    mov $15, %rax", // __NR_rt_sigreturn
+    "    syscall",
+    "    ud2", // never reached: rt_sigreturn does not return
+    ".cfi_endproc",
+    ".size varta_signal_restorer, .-varta_signal_restorer",
+    options(att_syntax),
+);
+
+// Note: aarch64 has no userspace restorer at all. The kernel sets x30 (LR)
+// to a vDSO sigreturn trampoline (`__kernel_rt_sigreturn`) before jumping
+// to the handler; `<asm-generic/signal.h>` does not include the
+// `sa_restorer` field on aarch64 because `__ARCH_HAS_SA_RESTORER` is
+// undefined for arm64 (see arch/arm64/include/uapi/asm/signal.h). So no
+// trampoline is needed or possible on aarch64 — the kernel owns the path.
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+extern "C" {
+    /// Kernel-ABI signal-return trampoline defined by the `global_asm!`
+    /// block above. Never invoked from Rust — only by the kernel as the
+    /// `sa_restorer` callee when a signal handler returns. Issues
+    /// `__NR_rt_sigreturn` and does not return to userspace.
+    // SAFETY: only ever taken as a function-pointer value
+    // (`varta_signal_restorer as *const ()`) and handed to `rt_sigaction(2)`.
+    fn varta_signal_restorer();
+}
+
+// Kernel ABI for `struct sigaction` on Linux/x86_64 — **different** from
+// glibc's userspace layout. See `<asm-generic/signal.h>` and
+// `<arch/x86/include/uapi/asm/signal.h>` (the latter defines
+// `__ARCH_HAS_SA_RESTORER`, which inserts the restorer field).
+//
+//   field        offset  type           note
+//   sa_handler        0  void (*)(int)
+//   sa_flags          8  unsigned long
+//   sa_restorer      16  void (*)(void) present iff __ARCH_HAS_SA_RESTORER
+//   sa_mask          24  sigset_t       1×unsigned long on 64-bit Linux
+//   total size       32
+//
+// Compile-time size + offset assertions follow `KernelSigAction` below.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[repr(C)]
+struct KernelSigAction {
+    sa_handler: *const (),
+    sa_flags: u64,
+    sa_restorer: *const (),
+    sa_mask: u64,
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+const _: () = assert!(core::mem::size_of::<KernelSigAction>() == 32);
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+const _: () = assert!(core::mem::offset_of!(KernelSigAction, sa_handler) == 0);
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+const _: () = assert!(core::mem::offset_of!(KernelSigAction, sa_flags) == 8);
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+const _: () = assert!(core::mem::offset_of!(KernelSigAction, sa_restorer) == 16);
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+const _: () = assert!(core::mem::offset_of!(KernelSigAction, sa_mask) == 24);
+
+// Kernel ABI for Linux/aarch64. No `sa_restorer` (see comment above).
+//
+//   field        offset  type           note
+//   sa_handler        0  void (*)(int)
+//   sa_flags          8  unsigned long
+//   sa_mask          16  sigset_t       1×unsigned long
+//   total size       24
+#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+#[repr(C)]
+struct KernelSigAction {
+    sa_handler: *const (),
+    sa_flags: u64,
+    sa_mask: u64,
+}
+
+#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+const _: () = assert!(core::mem::size_of::<KernelSigAction>() == 24);
+#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+const _: () = assert!(core::mem::offset_of!(KernelSigAction, sa_handler) == 0);
+#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+const _: () = assert!(core::mem::offset_of!(KernelSigAction, sa_flags) == 8);
+#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+const _: () = assert!(core::mem::offset_of!(KernelSigAction, sa_mask) == 16);
+
+/// Direct `rt_sigaction(2)` syscall — bypasses any libc wrapper.
+///
+/// Linux syscall ABI on x86_64: number in `rax`; args in `rdi, rsi, rdx,
+/// r10`; result in `rax` (negative `-errno` on failure, `0` on success).
+/// `syscall` clobbers `rcx` (saved RIP) and `r11` (saved RFLAGS); flags
+/// are *not* preserved.
+///
+/// The 4th argument is `sigsetsize` — the number of bytes of `sa_mask`
+/// the kernel should consult. On 64-bit Linux `sigset_t` is one
+/// `unsigned long` (8 bytes); passing the wrong size yields `-EINVAL`.
+///
+/// SAFETY: caller is responsible for the validity of `act` / `oact`
+/// pointers and for ensuring no concurrent thread is racing on the same
+/// signal disposition.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[inline]
+unsafe fn rt_sigaction_raw(
+    sig: i32,
+    act: *const KernelSigAction,
+    oact: *mut KernelSigAction,
+) -> i64 {
+    const SYS_RT_SIGACTION: i64 = 13;
+    const SIGSETSIZE: i64 = core::mem::size_of::<u64>() as i64; // 8 bytes
+    let ret: i64;
+    // SAFETY: see function-level safety comment. The asm performs a
+    // syscall with the documented Linux x86_64 calling convention.
+    unsafe {
+        core::arch::asm!(
+            "syscall",
+            inlateout("rax") SYS_RT_SIGACTION => ret,
+            in("rdi") sig as i64,
+            in("rsi") act,
+            in("rdx") oact,
+            in("r10") SIGSETSIZE,
+            lateout("rcx") _,   // clobbered: saved RIP
+            lateout("r11") _,   // clobbered: saved RFLAGS
+            options(nostack),
+        );
+    }
+    ret
+}
+
+/// Direct `rt_sigaction(2)` syscall on Linux/aarch64.
+///
+/// Linux syscall ABI on aarch64: number in `x8`; args in `x0..x5`;
+/// result in `x0`. The kernel preserves `x1..x18` across the syscall.
+///
+/// SAFETY: identical contract to the x86_64 variant.
+#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+#[inline]
+unsafe fn rt_sigaction_raw(
+    sig: i32,
+    act: *const KernelSigAction,
+    oact: *mut KernelSigAction,
+) -> i64 {
+    const SYS_RT_SIGACTION: i64 = 134;
+    const SIGSETSIZE: i64 = core::mem::size_of::<u64>() as i64; // 8 bytes
+    let ret: i64;
+    // SAFETY: see function-level safety comment.
+    unsafe {
+        core::arch::asm!(
+            "svc #0",
+            in("x8") SYS_RT_SIGACTION,
+            inlateout("x0") sig as i64 => ret,
+            in("x1") act,
+            in("x2") oact,
+            in("x3") SIGSETSIZE,
+            options(nostack),
+        );
+    }
+    ret
+}
+
+/// Install SIGINT / SIGTERM handlers on Linux by invoking the
+/// `rt_sigaction(2)` syscall **directly** — bypassing the libc wrapper.
+///
+/// The libc wrapper (glibc, musl, ...) unconditionally replaces the
+/// caller's `sa_restorer` with its own. To genuinely own the kernel ABI
+/// — and to make this code work even with no libc, a minimal libc, or
+/// a `LD_PRELOAD` shim — we issue the syscall ourselves through
+/// `rt_sigaction_raw`. On x86_64 the kernel needs `SA_RESTORER` set and
+/// `sa_restorer` pointing at our `varta_signal_restorer` trampoline; on
+/// aarch64 signal-return is handled by the vDSO and the kernel struct
+/// has no `sa_restorer` field at all.
+///
+/// The debug-build readback round-trips the same kernel ABI and asserts
+/// that the kernel preserved exactly what we sent — including (on
+/// x86_64) our trampoline pointer, which is the proof that no libc
+/// override is in the path.
+#[cfg(target_os = "linux")]
 unsafe fn install_signal_handlers() -> io::Result<()> {
     const SIGINT: i32 = 2;
     const SIGTERM: i32 = 15;
 
-    /// `SA_RESTART`: automatically restart interrupted syscalls (e.g.
-    /// `recvmsg(2)`) instead of returning `EINTR`.  Eliminates the need
-    /// for explicit `EINTR` handling in the I/O path.  Values are
-    /// platform-defined; verified against `<bits/signum-generic.h>`
-    /// (Linux), `<sys/signal.h>` (macOS), and `<sys/signal.h>` (FreeBSD).
-    #[cfg(target_os = "linux")]
-    const SA_RESTART: i32 = 0x1000_0000;
+    /// `SA_RESTART`: restart interrupted syscalls (no `EINTR`).
+    /// Verified against `<asm-generic/signal-defs.h>`.
+    const SA_RESTART: u64 = 0x1000_0000;
+    /// `SA_RESTORER`: kernel uses `sa_restorer` as the signal-return
+    /// trampoline. x86_64 requires this; on aarch64 the bit is defined
+    /// (for AArch32 compat) but the kernel struct has no restorer
+    /// field, so we do not set it.
+    #[cfg(target_arch = "x86_64")]
+    const SA_RESTORER: u64 = 0x0400_0000;
+
+    extern "C" fn handle(_sig: i32) {
+        SHUTDOWN.store(true, Ordering::Release);
+    }
+
+    // SAFETY: MaybeUninit::zeroed() gives us a zeroed stack slot; no
+    // `KernelSigAction` value is constructed until `assume_init()`. We
+    // fill fields through a raw pointer first. sa_mask = 0 leaves no
+    // additional signals blocked during the handler. The handler is
+    // async-signal-safe (single atomic store).
+    let mut act = std::mem::MaybeUninit::<KernelSigAction>::zeroed();
+    // SAFETY: writes through `as_mut_ptr()` are valid for the zeroed slot.
+    unsafe {
+        (*act.as_mut_ptr()).sa_handler = handle as *const ();
+        #[cfg(target_arch = "x86_64")]
+        {
+            (*act.as_mut_ptr()).sa_flags = SA_RESTART | SA_RESTORER;
+            (*act.as_mut_ptr()).sa_restorer = varta_signal_restorer as *const ();
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            (*act.as_mut_ptr()).sa_flags = SA_RESTART;
+        }
+    }
+    // SAFETY: every field has been written; `KernelSigAction` is `#[repr(C)]`
+    // with POD fields, so the struct is now fully initialised.
+    let act = unsafe { act.assume_init() };
+
+    let install = |sig: i32| -> io::Result<()> {
+        // SAFETY: `act` lives on the stack for the duration of the call;
+        // passing a null `oact` is permitted.
+        let rc = unsafe { rt_sigaction_raw(sig, &act, std::ptr::null_mut()) };
+        if rc < 0 {
+            // Linux returns -errno on syscall failure; values are in
+            // [-4095, -1]. Convert back to a positive errno for io::Error.
+            return Err(io::Error::from_raw_os_error(-rc as i32));
+        }
+
+        // Defensive readback (debug builds only). Prove the kernel
+        // stored exactly what we sent — proves the syscall path bypasses
+        // libc and (on x86_64) our trampoline is the installed restorer.
+        // Zero release-build cost.
+        #[cfg(debug_assertions)]
+        {
+            let mut old = std::mem::MaybeUninit::<KernelSigAction>::zeroed();
+            // SAFETY: `oact` is a writable, correctly-sized stack slot.
+            let rc2 = unsafe { rt_sigaction_raw(sig, std::ptr::null(), old.as_mut_ptr()) };
+            debug_assert!(rc2 >= 0, "rt_sigaction readback failed: {rc2}");
+            // SAFETY: a successful readback fully initialises the slot.
+            let old = unsafe { old.assume_init() };
+            debug_assert_eq!(
+                old.sa_handler, handle as *const (),
+                "kernel reports a different sa_handler than we installed",
+            );
+            debug_assert!(
+                old.sa_flags & SA_RESTART != 0,
+                "kernel did not preserve SA_RESTART",
+            );
+            #[cfg(target_arch = "x86_64")]
+            {
+                debug_assert!(
+                    old.sa_flags & SA_RESTORER != 0,
+                    "SA_RESTORER not set in installed action — \
+                     libc wrapper hijacked the syscall?",
+                );
+                debug_assert_eq!(
+                    old.sa_restorer, varta_signal_restorer as *const (),
+                    "kernel did not install our trampoline (libc override?)",
+                );
+            }
+        }
+        Ok(())
+    };
+    install(SIGINT)?;
+    install(SIGTERM)?;
+    Ok(())
+}
+
+/// Install SIGINT / SIGTERM handlers on macOS / FreeBSD by calling
+/// libc's `sigaction(3)` wrapper. Neither platform has the `sa_restorer`
+/// substitution issue that motivates the direct-syscall path on Linux,
+/// so the libc wrapper is correct and idiomatic here.
+#[cfg(any(target_os = "macos", target_os = "freebsd"))]
+unsafe fn install_signal_handlers() -> io::Result<()> {
+    const SIGINT: i32 = 2;
+    const SIGTERM: i32 = 15;
+
     #[cfg(target_os = "macos")]
     const SA_RESTART: i32 = 0x0002;
     #[cfg(target_os = "freebsd")]
@@ -82,29 +418,15 @@ unsafe fn install_signal_handlers() -> io::Result<()> {
         SHUTDOWN.store(true, Ordering::Release);
     }
 
-    // Platform-specific sigaction struct: layout differs between Linux,
-    // macOS, and FreeBSD (sigset_t size, field ordering, presence of
-    // sa_restorer).  Each layout is matched against the platform C ABI
-    // and guarded by compile-time size / offset assertions.
-    #[cfg(target_os = "linux")]
-    #[repr(C)]
-    struct SigAction {
-        sa_handler: *const (),
-        sa_mask: [u8; 128],
-        sa_flags: i32,
-        _pad: i32,
-        sa_restorer: *const (),
-    }
-
+    // Per-platform sigaction struct: ABI-pinned with compile-time size /
+    // offset assertions below.
     #[cfg(target_os = "macos")]
     #[repr(C)]
     struct SigAction {
         sa_handler: *const (),
         /// sigset_t on macOS / XNU is `__uint32_t` (4 bytes), not 32 bytes.
         /// Defined in `<sys/_types/_sigset_t.h>`; verified against xnu
-        /// sources (xnu-8792.81.2, xnu-11215.1.10).  Passing a 32-byte mask
-        /// here would write past the kernel-expected field and corrupt the
-        /// caller's stack frame on ARM64 / Apple Silicon.
+        /// sources (xnu-8792.81.2, xnu-11215.1.10).
         sa_mask: u32,
         sa_flags: i32,
     }
@@ -114,33 +436,15 @@ unsafe fn install_signal_handlers() -> io::Result<()> {
     struct SigAction {
         sa_handler: *const (),
         sa_flags: i32,
-        /// sigset_t on FreeBSD is `__uint32_t[4]` (16 bytes).  Verified
+        /// sigset_t on FreeBSD is `__uint32_t[4]` (16 bytes). Verified
         /// against `<sys/_sigset.h>` (FreeBSD 14.2).
         sa_mask: [u8; 16],
     }
 
-    // Compile-time size and offset assertions — guard against ABI drift
-    // across kernel / libc versions.  These `const _` assertions are
-    // evaluated at compile time (not runtime), so a mismatch becomes a
-    // hard "evaluation of constant value failed" error during `cargo build`,
-    // preventing stack corruption at signal-install time.  Every platform
-    // field's size and offset is pinned against the known-good C ABI values
-    // documented in the per-platform struct comments above.
-    #[cfg(target_os = "linux")]
-    const _: () = assert!(core::mem::size_of::<SigAction>() == 152);
     #[cfg(target_os = "macos")]
     const _: () = assert!(core::mem::size_of::<SigAction>() == 16);
     #[cfg(target_os = "freebsd")]
     const _: () = assert!(core::mem::size_of::<SigAction>() == 32);
-
-    #[cfg(target_os = "linux")]
-    const _: () = assert!(core::mem::offset_of!(SigAction, sa_handler) == 0);
-    #[cfg(target_os = "linux")]
-    const _: () = assert!(core::mem::offset_of!(SigAction, sa_mask) == 8);
-    #[cfg(target_os = "linux")]
-    const _: () = assert!(core::mem::offset_of!(SigAction, sa_flags) == 136);
-    #[cfg(target_os = "linux")]
-    const _: () = assert!(core::mem::offset_of!(SigAction, sa_restorer) == 144);
 
     #[cfg(target_os = "macos")]
     const _: () = assert!(core::mem::offset_of!(SigAction, sa_handler) == 0);
@@ -160,13 +464,7 @@ unsafe fn install_signal_handlers() -> io::Result<()> {
         fn sigaction(signum: i32, act: *const SigAction, oldact: *mut SigAction) -> i32;
     }
 
-    // SAFETY: MaybeUninit::zeroed() allocates zeroed stack memory without
-    // constructing a SigAction value, so there is no UB regardless of the
-    // fields' validity requirements.  We write sa_handler through the raw
-    // pointer before passing the struct to sigaction(2).  sa_mask of all
-    // zeros and sa_flags of 0 are correct defaults (no blocked signals,
-    // SA_RESETHAND not set).  The handler is async-signal-safe: it writes
-    // to a lock-free AtomicBool only.
+    // SAFETY: see Linux equivalent; the same MaybeUninit pattern applies.
     let mut act = std::mem::MaybeUninit::<SigAction>::zeroed();
     unsafe {
         (*act.as_mut_ptr()).sa_handler = handle as *const ();
@@ -175,14 +473,12 @@ unsafe fn install_signal_handlers() -> io::Result<()> {
     let act = unsafe { act.assume_init() };
 
     let install = |sig: i32| -> io::Result<()> {
-        // SAFETY: `act` is a fully-initialised SigAction on the stack;
-        // passing null for oldact is permitted by POSIX.
+        // SAFETY: `act` is initialised; null `oldact` is permitted.
         let rc = unsafe { sigaction(sig, &act, std::ptr::null_mut()) };
         if rc == -1 {
-            Err(io::Error::last_os_error())
-        } else {
-            Ok(())
+            return Err(io::Error::last_os_error());
         }
+        Ok(())
     };
     install(SIGINT)?;
     install(SIGTERM)?;
