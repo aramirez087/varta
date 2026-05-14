@@ -102,11 +102,13 @@ fn take_capture_handles(
     if !capture_on {
         return (None, None);
     }
-    let out = child.stdout.take().inspect(|h| {
+    let out = child.stdout.take().map(|h| {
         let _ = set_nonblocking_fd(h.as_raw_fd());
+        h
     });
-    let err = child.stderr.take().inspect(|h| {
+    let err = child.stderr.take().map(|h| {
         let _ = set_nonblocking_fd(h.as_raw_fd());
+        h
     });
     (out, err)
 }

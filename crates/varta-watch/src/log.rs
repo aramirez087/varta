@@ -126,6 +126,13 @@ pub struct StackFmt<const N: usize> {
     len: usize,
 }
 
+impl<const N: usize> Default for StackFmt<N> {
+    #[inline]
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl<const N: usize> StackFmt<N> {
     /// Create an empty buffer.
     #[inline]

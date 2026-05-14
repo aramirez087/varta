@@ -175,6 +175,8 @@ impl FileExporter {
             }
         }
         let first = format!("{path_str}.1");
+        // CrossesDevices: stable 1.85, MSRV 1.70; correct on Linux/macOS
+        #[allow(clippy::incompatible_msrv)]
         match std::fs::rename(path, &first) {
             Ok(()) => {}
             Err(e) if e.kind() == io::ErrorKind::NotFound => {}

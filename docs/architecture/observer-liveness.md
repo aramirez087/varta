@@ -396,6 +396,77 @@ iteration_max ≤ read_timeout × N_listeners + eviction_scan_window × slot_rea
 
 ---
 
+## Tick-latency budget and hardware-watchdog margin
+
+### Bench-derived p99 cap
+
+Under the **canonical stress profile** — 4096-slot tracker, `balanced`
+eviction policy, 30 agents × 100 Hz (≈ 3 000 beats/s) over UDS — the
+`varta_observer_iteration_seconds` p99 is ≤ **5 ms**.
+
+Run the bench to reproduce the measurement on your hardware:
+
+```bash
+cargo build --workspace --release --features prometheus-exporter
+cargo run -p varta-bench --release -- tick-distribution
+```
+
+The bench asserts `p99 ≤ 5 ms` and exits non-zero if the cap is breached,
+printing the full bucket distribution and observed percentiles for triage.
+It also reports `varta_tracker_eviction_scan_truncated_total` and
+`varta_observer_iteration_budget_exceeded_total` so you can confirm the
+eviction-scan cap engages under the test load without blowing the latency
+budget.
+
+### Soft iteration budget
+
+`--iteration-budget-ms` (default **250 ms**) is the soft per-iteration
+ceiling.  Overruns increment `varta_observer_iteration_budget_exceeded_total`
+but do not abort the loop.  The default 250 ms gives **50× headroom** over the
+5 ms p99 cap; overruns therefore indicate genuine scrape-storm pressure, not
+normal active-load variance.  See the "Latency budget" section for the full
+derivation.
+
+### Hardware-watchdog timeout floor
+
+Operators deploying `--hw-watchdog /dev/watchdog` **must** configure the
+kernel watchdog device with a timeout of **≥ 30 s**.  The derivation:
+
+| Margin factor             | Value       | Note                                            |
+|---|---|---|
+| p99 iteration time        | ≤ 5 ms      | Bench-certified under canonical load            |
+| Iteration budget (soft)   | 250 ms      | Default; raise for higher `--read-timeout-ms`   |
+| Self-watchdog deadline    | 4 s         | Default auto-set from `$WATCHDOG_USEC`          |
+| Recommended device timeout| **≥ 30 s**  | ≥ 6000× p99 cap, ≥ 7× self-watchdog deadline   |
+
+The observer kicks the hardware watchdog at the end of every poll iteration
+(after heartbeat-file write and `sd_notify`).  A single missed kick cannot
+trip the device; a **sustained stall of ≥ device-timeout** will.  The 30 s
+floor provides ample budget for:
+
+- Audit-log filesystem stalls (`varta_log_suppressed_total{kind="audit_io"}`
+  will show rate limiting if these recur)
+- Prometheus scrape contention (`serve_pending_seconds` quantiles)
+- The H5 self-watchdog's 4 s deadline with ≥ 7× margin
+
+### Round-robin fairness bound
+
+`Observer::poll()` rotates the `next_listener_start` cursor on every
+non-`WouldBlock` receive.  Per-listener worst-case admission delay is therefore
+bounded by **N_listeners × per-listener-recv-cost**.  Under the canonical bench
+profile (single UDS listener) this is simply the UDS recv latency; with
+N additional UDP listeners add N × ~10 µs per iteration.
+
+### Eviction scan under stress
+
+The bench will record non-zero `varta_tracker_eviction_scan_truncated_total`
+when the tracker fills and the 256-slot eviction window exhausts without
+finding a stalled slot.  This is expected and by design — the cap proves the
+per-frame cost stays bounded even under a unique-pid flood.  The p99 assertion
+holds even when the truncation counter is non-zero.
+
+---
+
 ## Cross-references
 
 - [Safety profiles](safety-profiles.md) — compile-time vs. runtime feature

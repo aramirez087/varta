@@ -1020,7 +1020,8 @@ fn run(cfg: Config) -> std::io::Result<()> {
                          detected for claimed pid {claimed_pid}; refusing to \
                          continue."
                     );
-                    return Err(io::Error::other(
+                    return Err(io::Error::new(
+                        io::ErrorKind::Other,
                         "cross-namespace agent detected under strict namespace check",
                     ));
                 }
