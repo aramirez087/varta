@@ -161,6 +161,14 @@ pub struct Observer {
     /// PID namespace inode differs from the observer's. Linux-only signal;
     /// 0 on other platforms.
     cross_namespace_drops: u64,
+    /// Maximum PID accepted on the wire — cached from
+    /// `/proc/sys/kernel/pid_max` on Linux at observer startup. On non-Linux
+    /// targets and when `/proc` is unreadable, this is `u32::MAX` (gate
+    /// effectively disabled). See [`crate::pid_max::read_pid_max`].
+    pid_max: u32,
+    /// Count of beats dropped at ingress because `frame.pid > pid_max`.
+    /// Surfaced as `varta_frame_rejected_pid_above_max_total`.
+    pid_above_max_drops: u64,
 }
 
 impl Observer {
@@ -215,6 +223,8 @@ impl Observer {
             last_now_ns: 0,
             allow_cross_namespace: false,
             cross_namespace_drops: 0,
+            pid_max: crate::pid_max::read_pid_max(),
+            pid_above_max_drops: 0,
         })
     }
 
@@ -322,6 +332,18 @@ impl Observer {
                     }
                     match Frame::decode(&data) {
                         Ok(frame) => {
+                            // Observer-side PID range gate. VLP rejects 0/1
+                            // as wire-format `BadPid`; here we additionally
+                            // reject any pid above the kernel's configured
+                            // `pid_max` (Linux) — no live process can hold
+                            // that id, so the frame is either corrupted or
+                            // forged. Non-Linux: `pid_max == u32::MAX`,
+                            // gate is a no-op.
+                            if frame.pid > self.pid_max {
+                                self.pid_above_max_drops =
+                                    self.pid_above_max_drops.saturating_add(1);
+                                continue;
+                            }
                             // Per-datagram PID verification — works on Linux
                             // (SCM_CREDENTIALS via SO_PASSCRED) and macOS
                             // (LOCAL_PEERTOKEN via getsockopt). For transports
@@ -557,6 +579,24 @@ impl Observer {
         let n = self.cross_namespace_drops;
         self.cross_namespace_drops = 0;
         n
+    }
+
+    /// Drain and reset the count of beats dropped at ingress because
+    /// `frame.pid` exceeded the kernel's configured `pid_max`. Surfaced as
+    /// `varta_frame_rejected_pid_above_max_total` in the Prometheus
+    /// exporter. Linux-only signal; 0 on platforms where the gate defaults
+    /// to `u32::MAX`.
+    pub fn drain_pid_above_max_drops(&mut self) -> u64 {
+        let n = self.pid_above_max_drops;
+        self.pid_above_max_drops = 0;
+        n
+    }
+
+    /// Observer's cached `pid_max`. Linux-only meaningful value; otherwise
+    /// `u32::MAX`. Exposed for tests and for the Prometheus exporter's
+    /// gauge.
+    pub fn pid_max(&self) -> u32 {
+        self.pid_max
     }
 
     /// Drain and reset the per-tracker namespace-conflict counter — beats

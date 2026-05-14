@@ -26,7 +26,15 @@ fn main() -> std::io::Result<()> {
         let depth = QUEUE_DEPTH.load(Ordering::Relaxed);
         let err = LAST_ERROR.load(Ordering::Relaxed);
         let payload = ((depth as u32) << 16) | (err as u32);
-        let _ = agent.beat(varta_client::Status::Ok, payload);
+        match agent.beat(varta_client::Status::Ok, payload) {
+            varta_client::BeatOutcome::Sent => {}
+            varta_client::BeatOutcome::Dropped => {
+                eprintln!("varta: beat dropped (observer down or queue full)");
+            }
+            varta_client::BeatOutcome::Failed(e) => {
+                eprintln!("varta: beat failed: {e}");
+            }
+        }
         std::thread::sleep(std::time::Duration::from_millis(500));
     }
 }

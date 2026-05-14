@@ -274,7 +274,7 @@ pub fn install_panic_handler_secure_udp(
 ///
 /// This function captures the previously registered hook via
 /// [`std::panic::take_hook`] and invokes it after firing the secure VLP frame.
-#[cfg(all(feature = "panic-handler", feature = "secure-udp"))]
+#[cfg(feature = "accept-degraded-entropy")]
 pub fn install_panic_handler_secure_udp_accept_degraded_entropy(
     addr: std::net::SocketAddr,
     key: Key,
@@ -319,6 +319,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "accept-degraded-entropy")]
     #[test]
     fn accept_degraded_entropy_always_succeeds() {
         // The degraded-entropy variant must never panic or return an error.

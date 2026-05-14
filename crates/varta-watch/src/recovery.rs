@@ -536,6 +536,13 @@ pub struct Recovery {
     /// as `varta_recovery_refused_total{reason="debounce_capacity"}`.
     /// See [`RecoveryOutcome::RefusedDebounceCapacity`].
     refused_debounce_capacity: u64,
+    /// Scratch buffer reused across [`Recovery::try_reap`] calls to snapshot
+    /// the keys of `outstanding` without per-tick allocation. Bounded by
+    /// `outstanding.len()`, which is in turn bounded by the observer's
+    /// `tracker_capacity`. Pre-sized via
+    /// [`Recovery::with_reap_scratch_capacity`] from the observer's
+    /// configured tracker capacity; otherwise grows on first use.
+    reap_scratch: Vec<u32>,
 }
 
 impl Recovery {
@@ -590,7 +597,17 @@ impl Recovery {
             allow_cross_namespace: false,
             refused_cross_namespace: 0,
             refused_debounce_capacity: 0,
+            reap_scratch: Vec::new(),
         }
+    }
+
+    /// Pre-size the scratch buffer used by [`Recovery::try_reap`] to the
+    /// observer's `tracker_capacity`. Optional — the buffer grows on first
+    /// use if not pre-sized. Sizing here makes the first stall storm
+    /// allocation-free.
+    pub fn with_reap_scratch_capacity(mut self, capacity: usize) -> Self {
+        self.reap_scratch.reserve_exact(capacity);
+        self
     }
 
     /// Permit recovery to fire for agents whose kernel-attested PID namespace
@@ -1176,21 +1193,24 @@ impl Recovery {
         let mut outcomes = Vec::new();
         outcomes.append(&mut self.pending_outcomes);
 
-        // Outstanding recovery children are rare (typically 0–2, bounded by
-        // the number of tracked agents).  Use stack storage to avoid a
-        // per-tick allocation.
-        let mut pids_buf = [0u32; 64];
-        let mut pid_count = 0;
-        for &pid in self.outstanding.keys() {
-            if pid_count >= pids_buf.len() {
-                break;
-            }
-            pids_buf[pid_count] = pid;
-            pid_count += 1;
-        }
-        let pids = &pids_buf[..pid_count];
-
-        for &pid in pids {
+        // Snapshot the outstanding keys into a reusable scratch buffer.
+        // `clear()` keeps the backing allocation; `extend` grows it the
+        // first time it must (and never thereafter in steady state).
+        // Bounded by `outstanding.len()`, which is itself bounded by
+        // `tracker_capacity` — there is no silent cap.
+        self.reap_scratch.clear();
+        self.reap_scratch.extend(self.outstanding.keys().copied());
+        debug_assert!(
+            self.reap_scratch.len() == self.outstanding.len(),
+            "reap_scratch must mirror outstanding exactly"
+        );
+        // Iterate by index so we don't hold an immutable borrow on
+        // `self.reap_scratch` across the `&mut self` method calls below.
+        // The buffer is never mutated inside the loop, so indices remain
+        // stable.
+        let n = self.reap_scratch.len();
+        for i in 0..n {
+            let pid = self.reap_scratch[i];
             if let Some(outcome) = self.reap_finished_child(pid) {
                 outcomes.push(outcome);
                 continue;

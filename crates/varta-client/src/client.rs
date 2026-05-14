@@ -426,6 +426,15 @@ impl<T: BeatTransport> Varta<T> {
             self.nonce = 0;
         }
         let pid = std::process::id();
+        // Saturate the nanosecond timestamp at `u64::MAX as u128` so the cast
+        // never wraps. `u64::MAX` itself is reserved as a wire-level sentinel
+        // (`DecodeError::BadTimestamp`); reaching it would require ~584.5
+        // years of continuous uptime on a single connect handle, which is
+        // physically unreachable. Note the resulting decode/encode asymmetry:
+        // a hypothetical saturated agent observes `BeatOutcome::Sent` from
+        // `send(2)` while the observer drops the frame as `BadTimestamp`.
+        // Documented for completeness; matches `Frame::decode` in
+        // `varta-vlp/src/lib.rs`.
         let raw_elapsed = self.start.elapsed().as_nanos().min(u64::MAX as u128) as u64;
         if raw_elapsed < self.last_timestamp {
             // Underlying Instant::now() regressed — surface via the counter
@@ -550,6 +559,9 @@ mod tests {
     fn clock_regression_counter_stays_zero_on_forward_clock() {
         let (_listener, path) = bind_listener();
         let mut agent = Varta::connect(&path).expect("connect");
+        // Outcome is irrelevant; this test asserts on the regression counter
+        // side effect, not the send result. The explicit `let _` discharges
+        // the `#[must_use]` on `BeatOutcome`.
         let _ = agent.beat(Status::Ok, 0);
         let _ = agent.beat(Status::Ok, 0);
         assert_eq!(
@@ -571,6 +583,8 @@ mod tests {
         agent.last_timestamp = u64::MAX / 2;
         let baseline_ts = agent.last_timestamp;
 
+        // Outcome is irrelevant; this test asserts on the regression counter
+        // side effect. The explicit `let _` discharges `#[must_use]`.
         let _ = agent.beat(Status::Ok, 0);
         assert_eq!(agent.clock_regressions(), 1);
         // Wire timestamp must remain monotonic — `.max()` is unchanged.

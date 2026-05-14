@@ -214,6 +214,13 @@ impl Frame {
     ///   saturates at this value with `.min(u64::MAX as u128) as u64`, and
     ///   reaching it through real elapsed time (~584 years) is impossible.
     ///   The sentinel is reserved.
+    ///
+    ///   *Asymmetry note*: a hypothetical agent whose monotonic clock
+    ///   saturates still observes `BeatOutcome::Sent` from `send(2)` (the
+    ///   kernel sees a well-formed 32-byte datagram), while the observer
+    ///   drops the frame as `DecodeError::BadTimestamp`. The divergence is
+    ///   physically unreachable on a single `Varta::connect` handle and is
+    ///   documented for completeness only.
     /// * `nonce == NONCE_TERMINAL` is allowed only when paired with
     ///   `Status::Critical`; the sentinel is the panic-hook's terminal
     ///   marker and is never emitted on the regular beat path.

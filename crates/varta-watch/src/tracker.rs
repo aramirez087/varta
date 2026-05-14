@@ -313,19 +313,19 @@ pub enum EvictionPolicy {
 #[derive(Clone, Copy, Debug)]
 pub struct Slot {
     /// OS process id of the tracked agent.
-    pub pid: u32,
+    pub(crate) pid: u32,
     /// Most recent nonce accepted from this pid.
-    pub last_nonce: u64,
+    pub(crate) last_nonce: u64,
     /// Observer-local timestamp (nanoseconds since [`crate::observer::Observer`]
     /// start) of the last accepted beat for this pid.
-    pub last_ns: u64,
+    pub(crate) last_ns: u64,
     /// Most recent [`Status`] reported by this pid.
-    pub status: Status,
+    pub(crate) status: Status,
     /// Transport origin pinned at the slot's first beat. Used to gate
     /// recovery-eligibility — beats from a different origin than the pinned
     /// one are rejected as [`Update::OriginConflict`] without mutating the
     /// slot. See [`BeatOrigin`] for the trust model.
-    pub origin: BeatOrigin,
+    pub(crate) origin: BeatOrigin,
     /// PID-namespace inode pinned at the slot's first beat (Linux only).
     ///
     /// `None` on non-Linux platforms, for UDP transports (no kernel attestation),
@@ -335,7 +335,7 @@ pub struct Slot {
     /// slot. A `None → Some(_)` upgrade is permitted exactly once — it
     /// represents a peer whose namespace became readable after a transient
     /// failure (e.g. peer died briefly between `recvmsg` and `readlink`).
-    pub pid_ns_inode: Option<u64>,
+    pub(crate) pid_ns_inode: Option<u64>,
     /// False iff this slot has never been written; observers treat the
     /// slot's other fields as undefined when `used == false`.
     pub(crate) used: bool,

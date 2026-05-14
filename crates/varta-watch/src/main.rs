@@ -725,6 +725,7 @@ fn run(cfg: Config) -> std::io::Result<()> {
             .with_source(recovery_source.clone())
             .with_audit_sink(recovery_audit_sink)
             .with_allow_cross_namespace(cfg.allow_cross_namespace_agents)
+            .with_reap_scratch_capacity(cfg.tracker_capacity)
     });
     let mut file_export: Option<FileExporter> = match cfg.file_export.as_ref() {
         Some(path) => Some(FileExporter::create(path, cfg.export_file_max_bytes)?),
@@ -1151,6 +1152,18 @@ fn run(cfg: Config) -> std::io::Result<()> {
             }
         }
 
+        // PID-above-max frame drops at receive (Linux-only signal; 0 on
+        // other platforms where `pid_max == u32::MAX`).
+        let pid_above_max = observer.drain_pid_above_max_drops();
+        if pid_above_max > 0 {
+            #[cfg(feature = "prometheus-exporter")]
+            if let Some(pe) = prom_export.as_mut() {
+                pe.record_pid_above_max_drops(pid_above_max);
+            }
+            #[cfg(not(feature = "prometheus-exporter"))]
+            let _ = pid_above_max;
+        }
+
         // Tracker namespace conflicts (rebind with a different inode).
         let tracker_ns_conflicts = observer.drain_namespace_conflicts();
         if tracker_ns_conflicts > 0 {
@@ -1341,6 +1354,13 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
+    /// Serializes tests that install global signal handlers or read/write
+    /// the `SHUTDOWN` static. Cargo runs tests in parallel by default; two
+    /// SIGINT-touching tests racing on the same process-wide handler would
+    /// be flaky. Zero-dep alternative to the `serial_test` crate.
+    #[cfg(unix)]
+    static SIGNAL_TEST_LOCK: Mutex<()> = Mutex::new(());
+
     #[test]
     fn watchdog_expired_returns_false_before_first_tick() {
         // last == 0 means no tick yet — must never fire.
@@ -1438,6 +1458,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn signal_handler_returns_ok_under_normal_conditions() {
+        let _guard = SIGNAL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // Verifies the new error-propagation path doesn't misclassify success.
         // SAFETY: single-threaded test process; no other signal handlers active.
         let result = unsafe { install_signal_handlers() };
@@ -1445,6 +1466,64 @@ mod tests {
             result.is_ok(),
             "install_signal_handlers failed: {:?}",
             result
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn signal_handler_real_sigint_flips_shutdown() {
+        // Hold the global lock so we don't race the other SHUTDOWN-touching
+        // test that runs in this same binary.
+        let _guard = SIGNAL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        // Reset SHUTDOWN to a known state before the exercise.
+        SHUTDOWN.store(false, Ordering::Release);
+
+        // SAFETY: `install_signal_handlers` registers our async-signal-safe
+        // handler. The handler does nothing but `SHUTDOWN.store(true)` —
+        // safe to deliver from any thread.
+        unsafe { install_signal_handlers() }.expect("install signal handlers");
+
+        // Confirm the handler hasn't already fired from some stray signal.
+        assert!(
+            !SHUTDOWN.load(Ordering::Acquire),
+            "SHUTDOWN was already true before signal delivery"
+        );
+
+        // Deliver SIGINT to ourselves via raw FFI — no `libc` crate dep.
+        // The signal is delivered to one (unspecified) thread of this
+        // process; the handler is the same regardless of which thread.
+        extern "C" {
+            fn kill(pid: i32, sig: i32) -> i32;
+            fn getpid() -> i32;
+        }
+        const SIGINT: i32 = 2;
+        // SAFETY: `kill(2)` and `getpid(2)` are POSIX, with no preconditions
+        // on the caller beyond the right to signal our own pid.
+        let rc = unsafe { kill(getpid(), SIGINT) };
+        assert_eq!(
+            rc,
+            0,
+            "kill(getpid(), SIGINT) failed: {:?}",
+            io::Error::last_os_error()
+        );
+
+        // Signal delivery is asynchronous — spin briefly while yielding.
+        // 50 ms is several orders of magnitude longer than typical kernel
+        // signal delivery latency (single-digit microseconds).
+        let deadline = std::time::Instant::now() + Duration::from_millis(50);
+        while std::time::Instant::now() < deadline && !SHUTDOWN.load(Ordering::Acquire) {
+            std::thread::yield_now();
+        }
+
+        let fired = SHUTDOWN.load(Ordering::Acquire);
+
+        // Reset so subsequent tests in this binary see a clean slate.
+        SHUTDOWN.store(false, Ordering::Release);
+
+        assert!(
+            fired,
+            "SHUTDOWN was not set within 50ms of SIGINT delivery — handler did not fire"
         );
     }
 

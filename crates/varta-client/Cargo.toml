@@ -26,6 +26,22 @@ secure-udp = ["udp", "varta-vlp/crypto", "varta-vlp/std"]
 # features remain empty; the feature compiles to nothing when absent.
 # Adds no security surface — does NOT use the `unsafe-` prefix.
 test-hooks = []
+# Enables the degraded-entropy panic-hook variant
+# (`install_panic_handler_secure_udp_accept_degraded_entropy`) and the
+# underlying `fallback_iv_random` / `fallback_iv_session_salt` helpers.
+# Off by default — opt-in only for deployments that cannot reach an OS
+# entropy source (QNX, VxWorks, some RTOS) AND have explicitly accepted
+# the non-cryptographic IV-derivation trade-off. Incompatible with
+# `safety-profile-strict` (see compile_error! in lib.rs).
+accept-degraded-entropy = ["panic-handler", "secure-udp"]
+# Class-A / safety-critical posture marker. Refuses to compile alongside
+# any feature that would expose a non-cryptographic IV fallback to the
+# wire. Currently mutually exclusive with `accept-degraded-entropy`. The
+# feature is a no-op at runtime — its only effect is the compile_error!
+# gate in lib.rs that proves the degraded-entropy path is structurally
+# absent from the crate's symbol set. Mirror of `compile-time-config` in
+# varta-watch.
+safety-profile-strict = []
 
 [lints]
 workspace = true

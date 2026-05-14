@@ -14,6 +14,21 @@
 //! The crate re-exports [`Frame`], [`Status`], and [`DecodeError`] from
 //! `varta-vlp` so downstream consumers depend on a single facade.
 
+// Class-A safety guard: refuse to compile a build that combines the
+// degraded-entropy panic-hook fallback with the strict safety profile.
+// The fallback path derives IVs through a SipHash mixer rather than an OS
+// entropy source — acceptable for embedded targets that have explicitly
+// opted in, never acceptable when `safety-profile-strict` is asserted.
+// Mirrors the `prometheus-exporter` + `compile-time-config` exclusion in
+// `crates/varta-watch/src/lib.rs`.
+#[cfg(all(feature = "accept-degraded-entropy", feature = "safety-profile-strict"))]
+compile_error!(
+    "`accept-degraded-entropy` cannot be combined with `safety-profile-strict` \
+     — Class-A safety-critical builds intentionally exclude the non-cryptographic \
+     IV-derivation fallback (`fallback_iv_random`). Choose one: drop the \
+     degraded-entropy variant, or drop the strict safety profile."
+);
+
 pub mod client;
 pub mod transport;
 
@@ -55,5 +70,9 @@ pub use panic::install_panic_handler_secure_udp;
 /// Install the secure UDP panic hook with non-cryptographic IV fallback — see
 /// [`panic::install_panic_handler_secure_udp_accept_degraded_entropy`] for
 /// the full contract including nonce-reuse risk.
-#[cfg(all(feature = "panic-handler", feature = "secure-udp"))]
+///
+/// Gated behind the explicit `accept-degraded-entropy` feature. Builds
+/// that pin `safety-profile-strict` cannot enable this feature (see the
+/// `compile_error!` at the top of this crate).
+#[cfg(feature = "accept-degraded-entropy")]
 pub use panic::install_panic_handler_secure_udp_accept_degraded_entropy;

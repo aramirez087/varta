@@ -40,6 +40,7 @@ pub mod log_ratelimit;
 pub mod notify;
 pub mod observer;
 pub mod peer_cred;
+pub mod pid_max;
 pub mod recovery;
 pub mod tracker;
 

@@ -740,6 +740,11 @@ pub struct PromExporter {
     /// differs from the observer's. Linux-only signal; 0 on other platforms.
     /// Surfaced as `varta_frame_namespace_mismatch_total`.
     frame_namespace_mismatch_total: u64,
+    /// Frames dropped at receive because `frame.pid` exceeded the kernel's
+    /// configured `pid_max` (Linux: `/proc/sys/kernel/pid_max`). Linux-only
+    /// signal; 0 on other platforms where the gate defaults to `u32::MAX`.
+    /// Surfaced as `varta_frame_rejected_pid_above_max_total`.
+    frame_rejected_pid_above_max_total: u64,
     /// Tracker-level namespace conflicts — beats dropped because the slot's
     /// pinned PID-namespace inode disagreed with the beat's inode
     /// (first-namespace-wins). Surfaced as
@@ -901,6 +906,7 @@ impl PromExporter {
             recovery_invariant_violations_total: 0,
             origin_conflict_total: 0,
             frame_namespace_mismatch_total: 0,
+            frame_rejected_pid_above_max_total: 0,
             tracker_namespace_conflict_total: 0,
             tracker_invariant_violations_total: 0,
             tracker_pid_index_probe_exhausted_total: 0,
@@ -1143,6 +1149,16 @@ impl PromExporter {
     pub fn record_frame_namespace_mismatches(&mut self, count: u64) {
         self.frame_namespace_mismatch_total =
             self.frame_namespace_mismatch_total.saturating_add(count);
+    }
+
+    /// Record one or more frames rejected because `frame.pid` exceeded the
+    /// kernel's configured `pid_max`. See
+    /// [`crate::observer::Observer::drain_pid_above_max_drops`]. Surfaced
+    /// as `varta_frame_rejected_pid_above_max_total`.
+    pub fn record_pid_above_max_drops(&mut self, count: u64) {
+        self.frame_rejected_pid_above_max_total = self
+            .frame_rejected_pid_above_max_total
+            .saturating_add(count);
     }
 
     /// Record one or more tracker namespace conflicts — beats dropped because
@@ -1709,6 +1725,19 @@ impl PromExporter {
             self.body_buf,
             "varta_frame_namespace_mismatch_total {}",
             self.frame_namespace_mismatch_total
+        );
+        // varta_frame_rejected_pid_above_max_total — frames dropped because
+        // `frame.pid` exceeded the kernel's `pid_max`. Always emitted so
+        // `absent()` rules stay green-on-green; Linux-only signal.
+        self.body_buf.push_str(
+            "# HELP varta_frame_rejected_pid_above_max_total Frames dropped at receive because frame.pid exceeded the kernel's configured pid_max.\n",
+        );
+        self.body_buf
+            .push_str("# TYPE varta_frame_rejected_pid_above_max_total counter\n");
+        let _ = writeln!(
+            self.body_buf,
+            "varta_frame_rejected_pid_above_max_total {}",
+            self.frame_rejected_pid_above_max_total
         );
         // varta_tracker_namespace_conflict_total — beats dropped because the
         // slot's pinned PID-namespace inode disagreed with the beat's inode

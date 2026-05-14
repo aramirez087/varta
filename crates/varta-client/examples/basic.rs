@@ -10,7 +10,15 @@
 fn main() -> std::io::Result<()> {
     let mut agent = varta_client::Varta::connect("/tmp/varta.sock")?;
     loop {
-        let _ = agent.beat(varta_client::Status::Ok, 0);
+        match agent.beat(varta_client::Status::Ok, 0) {
+            varta_client::BeatOutcome::Sent => {}
+            varta_client::BeatOutcome::Dropped => {
+                eprintln!("varta: beat dropped (observer down or queue full)");
+            }
+            varta_client::BeatOutcome::Failed(e) => {
+                eprintln!("varta: beat failed: {e}");
+            }
+        }
         std::thread::sleep(std::time::Duration::from_millis(500));
     }
 }

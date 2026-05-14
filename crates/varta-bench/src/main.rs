@@ -132,7 +132,7 @@ fn run_latency() -> ExitCode {
     // Warmup: prime caches and branch predictors.
     const WARMUP: usize = 100_000;
     for _ in 0..WARMUP {
-        let _ = agent.beat(Status::Ok, 0);
+        let _ = std::hint::black_box(agent.beat(Status::Ok, 0));
     }
 
     // Calibrate measurement overhead — Instant::now() + elapsed() cost
@@ -151,7 +151,7 @@ fn run_latency() -> ExitCode {
     let mut lats: Vec<u64> = Vec::with_capacity(ITERS);
     for _ in 0..ITERS {
         let t0 = Instant::now();
-        let _ = agent.beat(Status::Ok, 0);
+        let _ = std::hint::black_box(agent.beat(Status::Ok, 0));
         lats.push(t0.elapsed().as_nanos() as u64);
     }
 
@@ -299,7 +299,7 @@ fn run_cpu_50_agents() -> ExitCode {
                     Err(_) => return,
                 };
                 for _ in 0..AGENT_BEATS {
-                    let _ = agent.beat(Status::Ok, 0);
+                    let _ = std::hint::black_box(agent.beat(Status::Ok, 0));
                     thread::sleep(Duration::from_secs(1));
                 }
             })
@@ -701,7 +701,7 @@ fn run_tick_distribution() -> ExitCode {
                     Err(_) => return,
                 };
                 while !stop.load(Ordering::Relaxed) {
-                    let _ = agent.beat(Status::Ok, 0);
+                    let _ = std::hint::black_box(agent.beat(Status::Ok, 0));
                     thread::sleep(Duration::from_millis(10));
                 }
             })
@@ -907,7 +907,7 @@ fn run_udp_latency() -> ExitCode {
 
     let mut agent = varta_client::Varta::connect_udp(drainer_addr).expect("connect_udp");
     for _ in 0..100_000 {
-        let _ = agent.beat(Status::Ok, 0);
+        let _ = std::hint::black_box(agent.beat(Status::Ok, 0));
     }
 
     // Calibrate measurement overhead.
@@ -924,7 +924,7 @@ fn run_udp_latency() -> ExitCode {
     let mut samples = Vec::with_capacity(iterations as usize);
     for _ in 0..iterations {
         let t0 = Instant::now();
-        let _ = agent.beat(Status::Ok, 0);
+        let _ = std::hint::black_box(agent.beat(Status::Ok, 0));
         let ns = t0.elapsed().as_nanos() as u64;
         samples.push(ns);
     }

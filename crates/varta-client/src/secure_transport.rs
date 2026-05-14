@@ -462,10 +462,8 @@ pub(crate) fn read_iv_session_salt() -> io::Result<[u8; 16]> {
 ///
 /// **Not cryptographically secure.**  Use only when the above sources are
 /// unavailable.
-#[cfg_attr(
-    not(any(test, all(feature = "panic-handler", feature = "secure-udp"))),
-    allow(dead_code)
-)]
+#[cfg(any(feature = "accept-degraded-entropy", test))]
+#[cfg_attr(not(any(test, feature = "accept-degraded-entropy")), allow(dead_code))]
 pub(crate) fn fallback_iv_random() -> [u8; 8] {
     use std::collections::hash_map::RandomState;
     use std::hash::{BuildHasher, Hash, Hasher};
@@ -505,6 +503,7 @@ pub(crate) fn fallback_iv_random() -> [u8; 8] {
 /// parity API for a future panic-hook `accept_degraded_entropy` variant
 /// that needs a 16-byte salt (mirroring the existing 8-byte
 /// `install_panic_handler_secure_udp_accept_degraded_entropy`).
+#[cfg(any(feature = "accept-degraded-entropy", test))]
 #[allow(dead_code)]
 pub(crate) fn fallback_iv_session_salt() -> [u8; 16] {
     let lo = fallback_iv_random();
