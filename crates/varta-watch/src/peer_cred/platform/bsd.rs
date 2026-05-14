@@ -5,8 +5,17 @@
 //! socket; the kernel then attaches `SCM_CREDS` ancillary data containing a
 //! `struct cmsgcred` (pid, uid, euid, gid, groups) to every datagram.
 //! Extraction is done by walking the ancillary buffer with the shared
-//! `super::super::cmsg_*` helpers (still in `peer_cred/mod.rs` at this
-//! commit).
+//! `super::super::cmsg_*` helpers.
+//!
+//! On Linux this module is compiled for one reason only: the cmsg miri
+//! tests in `super::super::cmsg` drive the BSD walker arm against a
+//! fabricated BSD-shaped buffer. The unused items on that target are
+//! intentional, so we silence `dead_code` for non-BSD compilations.
+
+#![cfg_attr(
+    not(any(target_os = "freebsd", target_os = "dragonfly", target_os = "netbsd")),
+    allow(dead_code)
+)]
 
 use core::ffi::c_void;
 use core::mem;
@@ -83,7 +92,13 @@ pub(crate) const LOCAL_CREDS: i32 = 0x0001;
 pub(crate) const SCM_CREDS: i32 = 0x03;
 
 // --- FFI ------------------------------------------------------------------
+//
+// Gated to actual BSD targets so the symbols don't get accidentally invoked
+// on a Linux host that compiles this module for its pure-data types
+// (see `peer_cred/platform/mod.rs` — Linux includes `mod bsd;` so the
+// `unsafe impl CmsgPlatform for BsdCmsg` body is available for miri tests).
 
+#[cfg(any(target_os = "freebsd", target_os = "dragonfly", target_os = "netbsd"))]
 extern "C" {
     pub(crate) fn setsockopt(
         fd: i32,

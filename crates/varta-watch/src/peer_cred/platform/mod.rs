@@ -22,7 +22,17 @@ mod macos;
 #[cfg(target_os = "macos")]
 pub(super) use macos::*;
 
-#[cfg(any(target_os = "freebsd", target_os = "dragonfly", target_os = "netbsd"))]
-mod bsd;
+// The BSD module is compiled on the actual BSD targets *and* on Linux. On
+// Linux it provides pure-data types and the `unsafe impl CmsgPlatform for
+// BsdCmsg` body so the cmsg miri tests can drive the BSD walker arm on a
+// Linux CI host. The `extern "C"` FFI, `LOCAL_CREDS`, and `peer_pid_after_recv`
+// stay gated to actual BSD targets via inner `#[cfg]` attributes.
+#[cfg(any(
+    target_os = "linux",
+    target_os = "freebsd",
+    target_os = "dragonfly",
+    target_os = "netbsd",
+))]
+pub(super) mod bsd;
 #[cfg(any(target_os = "freebsd", target_os = "dragonfly", target_os = "netbsd"))]
 pub(super) use bsd::*;

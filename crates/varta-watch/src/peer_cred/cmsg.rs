@@ -400,6 +400,74 @@ mod miri_cmsg_tests {
         assert_eq!(result, Some((999, 42)));
     }
 
+    /// Drives the unified walker through the BSD-family arm
+    /// (`SCM_CREDS` + `struct cmsgcred`) on the Linux test host.
+    ///
+    /// The BSD `Cmsghdr` / `Cmsgcred` / `Msghdr` type definitions plus the
+    /// `unsafe impl CmsgPlatform for BsdCmsg` body are compiled unconditionally
+    /// on Linux (see `peer_cred/platform/mod.rs`). The FFI and `LOCAL_CREDS`
+    /// constants stay gated to the actual BSD targets. This test fabricates a
+    /// well-formed BSD ancillary buffer and asserts `find_credential::<BsdCmsg>`
+    /// returns the expected `(pid, euid)` pair.
+    ///
+    /// Without this test, the BSD walker arm is only exercised on a real
+    /// BSD CI host — which CI doesn't currently provide. Running it under
+    /// Miri here proves the pointer arithmetic of the unified walker is
+    /// provenance-clean for the BSD-shaped layout too.
+    #[test]
+    fn bsd_shape_buffer_returns_pid_euid() {
+        use super::super::platform::bsd::{BsdCmsg, Cmsgcred, Cmsghdr, Msghdr};
+        use core::mem;
+
+        // BSD: cmsg_align uses sizeof(usize) on 64-bit, same as Linux.
+        // BSD Cmsghdr is 12 bytes; cmsg_align(12) = 16.
+        let bsd_hdr_size = <BsdCmsg as CmsgPlatform>::cmsg_hdr_size();
+        assert_eq!(bsd_hdr_size, cmsg_align(mem::size_of::<Cmsghdr>()));
+        assert_eq!(bsd_hdr_size, 16);
+
+        let total = bsd_hdr_size + mem::size_of::<Cmsgcred>();
+        let aligned_total = cmsg_align(total);
+        let mut buf = vec![0u8; aligned_total];
+
+        // Write BSD cmsghdr at offset 0:
+        //   cmsg_len (u32, 4 bytes), cmsg_level (i32, 4), cmsg_type (i32, 4)
+        let cmsg_len: u32 = total as u32;
+        let sol_socket: i32 = 0xffff; // SOL_SOCKET on BSD
+        let scm_creds: i32 = 0x03; // SCM_CREDS
+        buf[0..4].copy_from_slice(&cmsg_len.to_ne_bytes());
+        buf[4..8].copy_from_slice(&sol_socket.to_ne_bytes());
+        buf[8..12].copy_from_slice(&scm_creds.to_ne_bytes());
+
+        // Write cmsgcred at offset bsd_hdr_size (16):
+        //   cmcred_pid (i32, 4) @ 0, cmcred_uid (u32, 4) @ 4,
+        //   cmcred_euid (u32, 4) @ 8, ... (rest zeroed)
+        let expected_pid: i32 = 9999;
+        let expected_uid: u32 = 33;
+        let expected_euid: u32 = 1500;
+        let cred_off = bsd_hdr_size;
+        buf[cred_off..cred_off + 4].copy_from_slice(&expected_pid.to_ne_bytes());
+        buf[cred_off + 4..cred_off + 8].copy_from_slice(&expected_uid.to_ne_bytes());
+        buf[cred_off + 8..cred_off + 12].copy_from_slice(&expected_euid.to_ne_bytes());
+
+        // Construct a BSD Msghdr pointing at the fabricated buffer. The
+        // pure-data struct layout is identical to actual BSD on the Linux
+        // test host (see compile-time offset asserts in platform/bsd.rs).
+        let mhdr = Msghdr {
+            msg_name: core::ptr::null_mut(),
+            msg_namelen: 0,
+            _pad1: 0,
+            msg_iov: core::ptr::null_mut(),
+            msg_iovlen: 0,
+            _pad2: 0,
+            msg_control: buf.as_mut_ptr() as *mut _,
+            msg_controllen: aligned_total as u32,
+            msg_flags: 0,
+        };
+
+        let result = find_credential::<BsdCmsg>(&mhdr);
+        assert_eq!(result, Some((expected_pid as u32, expected_euid)));
+    }
+
     /// Defense-in-depth: an attacker-supplied cmsg_len of 0 must not loop
     /// forever. The walker advances by at least `cmsg_hdr_size` per step.
     #[test]
