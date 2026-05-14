@@ -89,7 +89,7 @@ pub(crate) const ANCILLARY_BUFFER_SIZE: usize = 256;
 // Compile-time guard: the ancillary buffer must fit at least one
 // SCM_CREDENTIALS message (aligned cmsghdr + struct ucred).
 const _: () = assert!(
-    ANCILLARY_BUFFER_SIZE >= super::super::cmsg_hdr_size() + core::mem::size_of::<Ucred>()
+    ANCILLARY_BUFFER_SIZE >= super::super::cmsg::cmsg_hdr_size() + core::mem::size_of::<Ucred>()
 );
 
 /// Extract peer PID and UID after a successful `recvmsg` — on Linux this is
@@ -103,8 +103,8 @@ pub(crate) fn peer_pid_after_recv(
         mhdr.msg_control as *const u8, anc_base,
         "msg_control and ancillary buffer base must be the same address"
     );
-    let hdr = unsafe { super::super::cmsg_firsthdr(mhdr) };
-    unsafe { super::super::find_credential_pid(hdr, mhdr, anc_base) }
+    let hdr = unsafe { super::super::cmsg::cmsg_firsthdr(mhdr) };
+    unsafe { super::super::cmsg::find_credential_pid(hdr, mhdr, anc_base) }
 }
 
 // Compile-time invariant: glibc/Linux msghdr is 56 bytes on every 64-bit
