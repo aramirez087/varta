@@ -306,7 +306,7 @@ fn main() -> ExitCode {
     };
     #[cfg(feature = "compile-time-config")]
     let cfg_result: Result<Config, ConfigError> = {
-        if std::env::args().skip(1).next().is_some() {
+        if std::env::args().nth(1).is_some() {
             Err(ConfigError::CompileTimeArgvForbidden)
         } else {
             Config::compile_time()
