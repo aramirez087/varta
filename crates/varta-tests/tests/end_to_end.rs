@@ -2012,7 +2012,7 @@ fn status_degraded_visible_in_metrics() {
 /// output would be silently discarded (or leak to a shared terminal if
 /// the null redirection were removed).
 fn run_panic_child(socket_path: &str) {
-    install_panic_handler(PathBuf::from(socket_path));
+    install_panic_handler(PathBuf::from(socket_path)).expect("panic child: install hook");
     let mut agent = Varta::connect(socket_path).expect("panic child: connect");
     let _ = agent.beat(Status::Ok, 0);
     // Give the daemon a moment to consume the warmup beat before the

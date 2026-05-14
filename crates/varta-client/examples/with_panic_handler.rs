@@ -11,8 +11,11 @@
 //! ```
 
 fn main() -> std::io::Result<()> {
-    // Register the hook before connecting so any early panic is still signalled.
-    varta_client::install_panic_handler("/tmp/varta.sock");
+    // Register the hook before connecting so any early panic is still
+    // signalled. The observer must already be running and listening at
+    // the socket path — `install_panic_handler` performs the connect at
+    // install time so the hook body itself stays async-signal-safe.
+    varta_client::install_panic_handler("/tmp/varta.sock")?;
 
     let mut agent = varta_client::Varta::connect("/tmp/varta.sock")?;
     for _ in 0..10 {

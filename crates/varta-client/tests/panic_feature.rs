@@ -26,7 +26,7 @@ fn panic_handler_emits_critical_beat_before_unwind() {
 
     let path = temp.path.clone();
     let handle = std::thread::spawn(move || {
-        install_panic_handler(path);
+        install_panic_handler(path).expect("install hook");
         panic!("boom");
     });
     assert!(handle.join().is_err(), "thread must have panicked");
@@ -45,12 +45,20 @@ fn panic_handler_emits_critical_beat_before_unwind() {
 #[test]
 fn panic_handler_preserves_original_panic_outcome() {
     let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    // No bound server — the hook will fail to connect and swallow the error.
-    // The test verifies the panic propagates unchanged regardless.
+    // Bind a server so install() succeeds, then drop+unlink it before
+    // panicking. The pre-bound hook socket now sends to a defunct peer
+    // (ECONNREFUSED on macOS, ENOENT on Linux); the error is swallowed
+    // inside the closure and the panic payload must propagate unchanged.
+    // This is the post-async-signal-safety contract: install is loud,
+    // but hook errors at send time stay silent.
     let temp = TempSocket::new("panic-preserve");
+    let server = UnixDatagram::bind(&temp.path).expect("bind server");
     let path = temp.path.clone();
+    let unlink_path = temp.path.clone();
     let handle = std::thread::spawn(move || {
-        install_panic_handler(path);
+        install_panic_handler(path).expect("install hook");
+        drop(server);
+        let _ = std::fs::remove_file(&unlink_path);
         panic!("original payload");
     });
     let result = handle.join();
@@ -69,5 +77,25 @@ fn panic_module_excluded_without_feature() {
     // means that without the feature the file is excluded entirely —
     // install_panic_handler, this test, and all S04 tests cease to exist.
     // Verify the exported symbol has the expected shape.
-    let _: fn(PathBuf) = install_panic_handler;
+    let _: fn(PathBuf) -> std::io::Result<()> = install_panic_handler;
+}
+
+#[test]
+fn install_returns_err_on_invalid_socket_path() {
+    // POSIX async-signal-safety contract: socket(2)/connect(2)/fcntl(2)
+    // run at install time (NOT inside the panic hook). A bind/connect
+    // failure therefore surfaces as a loud `Err` instead of a silently
+    // broken hook.
+    let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    // Path under a non-existent directory: connect(2) returns ENOENT.
+    let bogus = PathBuf::from("/nonexistent-dir-varta-panic-test/sock");
+    let err = install_panic_handler(bogus).expect_err("must fail at connect");
+    assert!(
+        matches!(
+            err.kind(),
+            std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied
+        ),
+        "expected NotFound/PermissionDenied, got {:?}",
+        err.kind(),
+    );
 }

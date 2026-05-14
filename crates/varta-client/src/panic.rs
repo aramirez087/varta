@@ -15,8 +15,9 @@ use crate::transport::bind_ephemeral;
 use varta_vlp::crypto::Key;
 use varta_vlp::{Frame, Status, NONCE_TERMINAL};
 
-/// Error returned by [`install_panic_handler_secure_udp`] when entropy is
-/// unavailable at install time.
+/// Error returned by [`install_panic_handler_secure_udp`] when installation
+/// fails — either entropy is unavailable at install time, or the underlying
+/// UDP socket cannot be bound/connected.
 ///
 /// This type is not `#[non_exhaustive]`; adding a variant is a deliberate
 /// breaking change (consistent with the project's exhaustiveness policy for
@@ -30,6 +31,11 @@ pub enum PanicInstallError {
     /// once. Use [`install_panic_handler_secure_udp_accept_degraded_entropy`]
     /// to opt in explicitly.
     EntropyUnavailable(std::io::Error),
+    /// `bind(2)`, `connect(2)`, or `fcntl(2)` failed at install time. The
+    /// socket is pre-bound at install time so the panic-hook closure body
+    /// performs only async-signal-safe operations (`send(2)`); a failure
+    /// here means the hook cannot be registered at all.
+    SocketBind(std::io::Error),
 }
 
 #[cfg(all(feature = "panic-handler", feature = "secure-udp"))]
@@ -42,6 +48,12 @@ impl core::fmt::Display for PanicInstallError {
                     "varta: panic-hook install failed — entropy unavailable: {e}"
                 )
             }
+            PanicInstallError::SocketBind(e) => {
+                write!(
+                    f,
+                    "varta: panic-hook install failed — socket bind/connect: {e}"
+                )
+            }
         }
     }
 }
@@ -51,6 +63,7 @@ impl std::error::Error for PanicInstallError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             PanicInstallError::EntropyUnavailable(e) => Some(e),
+            PanicInstallError::SocketBind(e) => Some(e),
         }
     }
 }
@@ -58,10 +71,27 @@ impl std::error::Error for PanicInstallError {
 /// Register a panic hook that emits a [`Status::Critical`] VLP frame on the
 /// Unix Domain Socket at `socket_path` before resuming normal unwinding.
 ///
-/// The hook creates a fresh [`UnixDatagram`], connects to `socket_path`,
-/// encodes a 32-byte frame into a stack buffer, and calls `send`. All I/O
-/// errors are silently swallowed — panicking inside a panic hook triggers an
-/// immediate process abort, which is far worse than losing one datagram.
+/// The [`UnixDatagram`] is created, connected, and switched to non-blocking
+/// mode **at install time**. The hook closure body then performs only
+/// `send(2)` on the pre-bound socket. All I/O errors inside the closure are
+/// silently swallowed — panicking inside a panic hook triggers an immediate
+/// process abort, which is far worse than losing one datagram.
+///
+/// # Async-signal safety
+///
+/// The hook closure invokes only `send(2)`, which is on POSIX.1-2017's
+/// async-signal-safe syscall list (§2.4.3). The socket FD and `Instant`
+/// baseline are captured at install time. The closure performs no
+/// `socket(2)`, `connect(2)`, `fcntl(2)`, or `malloc(3)`, so it is safe to
+/// fire from a signal-driven panic (e.g., a user `SIGSEGV` handler that
+/// calls `panic!()`).
+///
+/// # Errors
+///
+/// Returns `Err` if [`UnixDatagram::unbound`], `connect`, or
+/// `set_nonblocking` fails at install time. In that case the hook is **not**
+/// registered and the previously installed hook remains in place —
+/// installation is loud rather than silently broken.
 ///
 /// # Nonce sentinel
 ///
@@ -72,50 +102,65 @@ impl std::error::Error for PanicInstallError {
 /// # Allocation
 ///
 /// The sole heap allocation is the `Box` created by [`std::panic::set_hook`]
-/// at install time. The hook closure body performs no heap allocations;
-/// kernel-side allocation inside connect(2) and send(2) is out of our
-/// control but does not affect the Rust allocator.
+/// at install time. The hook closure body performs no heap allocations.
 ///
 /// # Chaining
 ///
 /// This function captures the previously registered hook via
 /// [`std::panic::take_hook`] and invokes it after firing the VLP frame,
 /// preserving the default panic message and any user-installed hooks.
-pub fn install(socket_path: impl Into<PathBuf>) {
+pub fn install(socket_path: impl Into<PathBuf>) -> std::io::Result<()> {
     let path: PathBuf = socket_path.into();
     let start = Instant::now();
+    // Pre-bind the socket at install time: socket(2)/connect(2)/fcntl(2)
+    // are NOT async-signal-safe per POSIX.1-2017 §2.4.3. Doing them here
+    // (normal code path) means the hook closure body only needs send(2),
+    // which IS async-signal-safe.
+    let sock = UnixDatagram::unbound()?;
+    sock.connect(&path)?;
+    sock.set_nonblocking(true)?;
     let prev = std::panic::take_hook();
-    // The Box allocation happens here, at install time — not in the hot path.
+    // The Box allocation happens here, at install time — not in the hook body.
     std::panic::set_hook(Box::new(move |info| {
         // All errors are swallowed. Panicking inside a panic hook triggers an
         // immediate process abort, bypassing unwinding entirely.
-        let _ = (|| {
-            let sock = UnixDatagram::unbound().ok()?;
-            sock.connect(&path).ok()?;
-            sock.set_nonblocking(true).ok()?;
-            let timestamp = start.elapsed().as_nanos().min(u64::MAX as u128) as u64;
-            let frame = Frame::new(
-                Status::Critical,
-                std::process::id(),
-                timestamp,
-                NONCE_TERMINAL,
-                0,
-            );
-            let mut buf = [0u8; 32];
-            frame.encode(&mut buf);
-            sock.send(&buf).ok()
-        })();
+        let timestamp = start.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+        let frame = Frame::new(
+            Status::Critical,
+            std::process::id(),
+            timestamp,
+            NONCE_TERMINAL,
+            0,
+        );
+        let mut buf = [0u8; 32];
+        frame.encode(&mut buf);
+        let _ = sock.send(&buf);
         prev(info);
     }));
+    Ok(())
 }
 
 /// Register a panic hook that emits a [`Status::Critical`] VLP frame over UDP
 /// to `addr` before resuming normal unwinding.
 ///
-/// The hook creates a fresh [`UdpSocket`] on an ephemeral source port, connects
-/// to `addr`, encodes a 32-byte frame into a stack buffer, and calls `send`.
-/// All I/O errors are silently swallowed — panicking inside a panic hook
-/// triggers an immediate process abort.
+/// A fresh [`std::net::UdpSocket`] on an ephemeral source port is bound,
+/// connected to `addr`, and switched to non-blocking mode **at install
+/// time**. The hook closure body then performs only `send(2)` on the
+/// pre-bound socket. All I/O errors inside the closure are silently
+/// swallowed — panicking inside a panic hook triggers an immediate process
+/// abort.
+///
+/// # Async-signal safety
+///
+/// The hook closure invokes only `send(2)`, which is on POSIX.1-2017's
+/// async-signal-safe syscall list (§2.4.3). The socket FD and `Instant`
+/// baseline are captured at install time; the closure performs no
+/// `socket(2)`, `bind(2)`, `connect(2)`, `fcntl(2)`, or `malloc(3)`.
+///
+/// # Errors
+///
+/// Returns `Err` if [`bind_ephemeral`], `connect`, or `set_nonblocking`
+/// fails. In that case the hook is **not** registered.
 ///
 /// # Nonce sentinel
 ///
@@ -132,28 +177,30 @@ pub fn install(socket_path: impl Into<PathBuf>) {
 /// This function captures the previously registered hook via
 /// [`std::panic::take_hook`] and invokes it after firing the VLP frame.
 #[cfg(feature = "udp")]
-pub fn install_panic_handler_udp(addr: std::net::SocketAddr) {
+pub fn install_panic_handler_udp(addr: std::net::SocketAddr) -> std::io::Result<()> {
     let start = Instant::now();
+    // Pre-bind at install time — see async-signal-safety rationale on
+    // [`install`]. bind(2)/connect(2)/fcntl(2) are NOT in the POSIX
+    // async-signal-safe list.
+    let sock = bind_ephemeral(&addr)?;
+    sock.connect(addr)?;
+    sock.set_nonblocking(true)?;
     let prev = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        let _ = (|| {
-            let sock = bind_ephemeral(&addr).ok()?;
-            sock.connect(addr).ok()?;
-            sock.set_nonblocking(true).ok()?;
-            let timestamp = start.elapsed().as_nanos().min(u64::MAX as u128) as u64;
-            let frame = Frame::new(
-                Status::Critical,
-                std::process::id(),
-                timestamp,
-                NONCE_TERMINAL,
-                0,
-            );
-            let mut buf = [0u8; 32];
-            frame.encode(&mut buf);
-            sock.send(&buf).ok()
-        })();
+        let timestamp = start.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+        let frame = Frame::new(
+            Status::Critical,
+            std::process::id(),
+            timestamp,
+            NONCE_TERMINAL,
+            0,
+        );
+        let mut buf = [0u8; 32];
+        frame.encode(&mut buf);
+        let _ = sock.send(&buf);
         prev(info);
     }));
+    Ok(())
 }
 
 /// Inner implementation used by both public secure-UDP panic-hook installers.
@@ -192,6 +239,16 @@ where
     // same key — a catastrophic AEAD nonce collision. We detect the fork
     // by PID mismatch and re-run the entropy chain via `refresh`.
     let install_pid = std::process::id();
+    // Pre-bind the UDP socket at install time. bind(2)/connect(2)/fcntl(2)
+    // are NOT async-signal-safe per POSIX.1-2017 §2.4.3, so the hook
+    // closure must never call them. Socket FD is inherited across fork(2);
+    // send(2) on the inherited FD routes to the connected peer in both
+    // parent and child. Cross-fork nonce reuse is prevented by the
+    // PID-mismatch entropy refresh above.
+    let sock = bind_ephemeral(&addr).map_err(PanicInstallError::SocketBind)?;
+    sock.connect(addr).map_err(PanicInstallError::SocketBind)?;
+    sock.set_nonblocking(true)
+        .map_err(PanicInstallError::SocketBind)?;
     let prev = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         let _ = (|| {
@@ -206,9 +263,6 @@ where
                 iv_random
             };
 
-            let sock = bind_ephemeral(&addr).ok()?;
-            sock.connect(addr).ok()?;
-            sock.set_nonblocking(true).ok()?;
             let timestamp = start.elapsed().as_nanos().min(u64::MAX as u128) as u64;
             let frame = Frame::new(Status::Critical, panic_pid, timestamp, NONCE_TERMINAL, 0);
             let mut buf = [0u8; 32];
@@ -239,11 +293,19 @@ where
 
 /// Install a UDP panic handler with ChaCha20-Poly1305 encryption.
 ///
-/// On panic, creates a one-shot secure UDP socket, encrypts a `Critical`
-/// frame with `NONCE_TERMINAL` using the provided key, and sends it to
-/// `addr`.
+/// The UDP socket is bound, connected, and switched to non-blocking mode
+/// **at install time**. On panic, the hook encrypts a `Critical` frame
+/// with `NONCE_TERMINAL` using the provided key and sends it via the
+/// pre-bound socket. All I/O and crypto errors inside the hook are
+/// silently ignored.
 ///
-/// All I/O and crypto errors are silently ignored.
+/// # Async-signal safety
+///
+/// The hook closure invokes only `send(2)`, AEAD encryption on stack
+/// buffers, and `getpid(2)`/`clock_gettime(2)` — all on POSIX.1-2017's
+/// async-signal-safe syscall list (§2.4.3). The socket FD, AEAD key, and
+/// IV material are captured at install time; the closure performs no
+/// `socket(2)`, `bind(2)`, `connect(2)`, `fcntl(2)`, or `malloc(3)`.
 ///
 /// # Entropy requirement
 ///
@@ -256,6 +318,12 @@ where
 ///
 /// To opt into a non-cryptographic IV fallback (with nonce-reuse risk),
 /// use [`install_panic_handler_secure_udp_accept_degraded_entropy`] instead.
+///
+/// # Errors
+///
+/// - [`PanicInstallError::EntropyUnavailable`] — entropy chain failed.
+/// - [`PanicInstallError::SocketBind`] — UDP socket bind, connect, or
+///   non-blocking flag failed at install time.
 ///
 /// # Chaining
 ///
@@ -280,7 +348,15 @@ pub fn install_panic_handler_secure_udp(
 /// Identical to [`install_panic_handler_secure_udp`] except that when
 /// `getrandom`/`getentropy` and `/dev/urandom` all fail, the IV is derived
 /// from a non-cryptographic mix of PID, TID, monotonic time, and a counter
-/// (SipHash-2-4 keyed by `RandomState`). This always succeeds.
+/// (SipHash-2-4 keyed by `RandomState`). The entropy step always succeeds;
+/// only socket bind/connect can fail.
+///
+/// # Async-signal safety
+///
+/// Inherits the async-signal-safety contract of
+/// [`install_panic_handler_secure_udp`]: the hook closure invokes only
+/// `send(2)`, AEAD encryption on stack buffers, and async-signal-safe
+/// clock/PID syscalls.
 ///
 /// # Safety / Correctness
 ///
@@ -292,6 +368,12 @@ pub fn install_panic_handler_secure_udp(
 /// the operator must type the risk out explicitly (matching the project's
 /// `--i-accept-<risk>` convention for safety-critical configuration).
 ///
+/// # Errors
+///
+/// Returns `Err` if UDP socket bind, connect, or non-blocking flag fails
+/// at install time. The entropy step never fails (the degraded fallback
+/// always returns a value).
+///
 /// # Chaining
 ///
 /// This function captures the previously registered hook via
@@ -300,18 +382,26 @@ pub fn install_panic_handler_secure_udp(
 pub fn install_panic_handler_secure_udp_accept_degraded_entropy(
     addr: std::net::SocketAddr,
     key: Key,
-) {
+) -> std::io::Result<()> {
     use crate::secure_transport::{fallback_iv_random, read_iv_random};
     // Both install-time and fork-time refresh fall through to the
     // non-cryptographic `fallback_iv_random` when OS entropy is
     // unreachable. This always returns `Some`, so the panic frame
     // is always emitted — at the documented degraded-entropy risk.
-    let _ = install_with_entropy_provider(
+    match install_with_entropy_provider(
         addr,
         key,
         || Ok(read_iv_random().unwrap_or_else(|_| fallback_iv_random())),
         || Some(read_iv_random().unwrap_or_else(|_| fallback_iv_random())),
-    );
+    ) {
+        Ok(()) => Ok(()),
+        Err(PanicInstallError::SocketBind(e)) => Err(e),
+        // The degraded-entropy provider above always returns `Ok`, so the
+        // entropy arm is structurally unreachable.
+        Err(PanicInstallError::EntropyUnavailable(_)) => {
+            unreachable!("degraded-entropy provider is infallible by construction")
+        }
+    }
 }
 
 #[cfg(all(test, feature = "panic-handler", feature = "secure-udp"))]
@@ -321,7 +411,12 @@ mod tests {
     use std::net::SocketAddr;
 
     fn dummy_addr() -> SocketAddr {
-        "127.0.0.1:0".parse().unwrap()
+        // Use a non-zero destination port: UDP `connect(2)` rejects port 0
+        // with `EADDRNOTAVAIL` on macOS (and the POSIX spec is silent on
+        // it). The target need not be listening — UDP `connect` only
+        // records the peer address. Picking a high arbitrary port avoids
+        // any possible privileged-port issues.
+        "127.0.0.1:65535".parse().unwrap()
     }
 
     fn dummy_key() -> Key {
@@ -354,15 +449,39 @@ mod tests {
             Err(PanicInstallError::EntropyUnavailable(inner)) => {
                 assert_eq!(inner.kind(), io::ErrorKind::NotFound);
             }
+            Err(PanicInstallError::SocketBind(e)) => {
+                panic!("expected EntropyUnavailable, got SocketBind({e})")
+            }
             Ok(()) => panic!("expected Err but got Ok"),
         }
+    }
+
+    #[test]
+    fn socket_bind_error_display_and_source() {
+        // Validate the new variant's Display/source impls. Construction is
+        // direct (no syscall) so this test is deterministic across
+        // platforms.
+        let inner = io::Error::from(io::ErrorKind::PermissionDenied);
+        let err = PanicInstallError::SocketBind(inner);
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("socket bind/connect"),
+            "Display must mention socket bind/connect; got: {msg}"
+        );
+        assert!(
+            std::error::Error::source(&err).is_some(),
+            "source() must return the inner io::Error"
+        );
     }
 
     #[cfg(feature = "accept-degraded-entropy")]
     #[test]
     fn accept_degraded_entropy_always_succeeds() {
-        // The degraded-entropy variant must never panic or return an error.
-        install_panic_handler_secure_udp_accept_degraded_entropy(dummy_addr(), dummy_key());
+        // The degraded-entropy variant must never fail at the entropy step.
+        // (Socket bind/connect to 127.0.0.1:0 also succeeds on every
+        // platform Varta supports.)
+        install_panic_handler_secure_udp_accept_degraded_entropy(dummy_addr(), dummy_key())
+            .expect("degraded-entropy install must succeed for loopback addr");
         let _ = std::panic::take_hook();
     }
 }
