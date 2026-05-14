@@ -54,3 +54,10 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "flag_catalogue_lookup"
+path = "fuzz_targets/flag_catalogue_lookup.rs"
+test = false
+doc = false
+bench = false
+
