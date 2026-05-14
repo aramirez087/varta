@@ -1,0 +1,1361 @@
+use std::net::SocketAddr;
+use std::path::PathBuf;
+use std::time::Duration;
+
+use crate::clock::ClockSource;
+
+use super::types::{
+    Config, ConfigError, DEFAULT_PROM_RATE_LIMIT_BURST, DEFAULT_PROM_RATE_LIMIT_PER_SEC,
+    DEFAULT_SHUTDOWN_GRACE_MS, MIN_SHUTDOWN_GRACE_MS, MIN_THRESHOLD_MS,
+};
+use super::validate::{parse_exec_cmd, validate_secret_file};
+
+fn args(toks: &[&str]) -> Vec<String> {
+    toks.iter().map(|s| s.to_string()).collect()
+}
+
+#[test]
+fn parses_minimal_required_flags() {
+    let cfg = Config::from_args(args(&["--socket", "/tmp/x.sock", "--threshold-ms", "250"]))
+        .expect("parse");
+    assert_eq!(cfg.socket, PathBuf::from("/tmp/x.sock"));
+    assert_eq!(cfg.threshold, Duration::from_millis(250));
+    assert_eq!(cfg.recovery_debounce, Duration::from_millis(1000));
+    assert_eq!(cfg.socket_mode, 0o600);
+    assert!(cfg.recovery_cmd.is_none());
+    assert!(cfg.prom_addr.is_none());
+}
+
+#[cfg(feature = "prometheus-exporter")]
+#[test]
+fn parses_full_flag_surface() {
+    // --prom-addr now requires --prom-token-file; the file does not
+    // need to exist at parse time (it's only validated when load_prom_token
+    // is actually called by main()).
+    let cfg = Config::from_args(args(&[
+        "--socket",
+        "/s",
+        "--threshold-ms",
+        "100",
+        "--recovery-cmd",
+        "echo $1",
+        "--i-accept-shell-risk",
+        "--recovery-debounce-ms",
+        "750",
+        "--export-file",
+        "/tmp/e.log",
+        "--prom-addr",
+        "127.0.0.1:9090",
+        "--prom-token-file",
+        "/tmp/varta-prom.token",
+        "--shutdown-after-secs",
+        "3",
+    ]))
+    .expect("parse");
+    assert_eq!(cfg.recovery_cmd.as_deref(), Some("echo $1"));
+    assert!(cfg.i_accept_shell_risk);
+    assert_eq!(cfg.recovery_debounce, Duration::from_millis(750));
+    assert_eq!(cfg.file_export, Some(PathBuf::from("/tmp/e.log")));
+    assert_eq!(
+        cfg.prom_addr,
+        Some("127.0.0.1:9090".parse::<SocketAddr>().unwrap())
+    );
+    assert_eq!(
+        cfg.prom_token_file,
+        Some(PathBuf::from("/tmp/varta-prom.token"))
+    );
+    assert_eq!(cfg.shutdown_after, Some(Duration::from_secs(3)));
+}
+
+#[test]
+fn help_returns_help_requested() {
+    match Config::from_args(args(&["--help"])) {
+        Err(ConfigError::HelpRequested) => {}
+        other => panic!("expected HelpRequested, got {other:?}"),
+    }
+}
+
+#[test]
+fn unknown_flag_is_rejected() {
+    match Config::from_args(args(&["--nope"])) {
+        Err(ConfigError::UnknownFlag(s)) => assert_eq!(s, "--nope"),
+        other => panic!("expected UnknownFlag, got {other:?}"),
+    }
+}
+
+#[test]
+fn missing_required_socket_is_rejected() {
+    match Config::from_args(args(&["--threshold-ms", "100"])) {
+        Err(ConfigError::MissingRequired("--socket")) => {}
+        other => panic!("expected MissingRequired(--socket), got {other:?}"),
+    }
+}
+
+#[test]
+fn help_text_lists_every_known_flag() {
+    for flag in [
+        "--socket",
+        "--threshold-ms",
+        "--recovery-cmd",
+        "--recovery-exec",
+        "--recovery-cmd-file",
+        "--recovery-exec-file",
+        "--recovery-debounce-ms",
+        "--recovery-env",
+        "--recovery-timeout-ms",
+        "--read-timeout-ms",
+        "--tracker-capacity",
+        "--export-file",
+        "--export-file-max-bytes",
+        "--prom-addr",
+        "--prom-token-file",
+        "--shutdown-grace-ms",
+        "--socket-mode",
+        "--shutdown-after-secs",
+        "--udp-port",
+        "--udp-bind-addr",
+        "--key-file",
+        "--accepted-key-file",
+        "--master-key-file",
+        "--max-beat-rate",
+        "--heartbeat-file",
+        "--prom-rate-limit-per-sec",
+        "--prom-rate-limit-burst",
+        "--i-accept-plaintext-udp",
+        "--i-accept-shell-risk",
+        "--help",
+    ] {
+        assert!(
+            Config::HELP.contains(flag),
+            "Config::HELP missing flag {flag}"
+        );
+    }
+}
+
+#[test]
+fn parses_recovery_timeout_ms() {
+    let cfg = Config::from_args(args(&[
+        "--socket",
+        "/s",
+        "--threshold-ms",
+        "100",
+        "--recovery-timeout-ms",
+        "2500",
+    ]))
+    .expect("parse");
+    assert_eq!(cfg.recovery_timeout, Some(Duration::from_millis(2500)));
+}
+
+#[test]
+fn recovery_timeout_omitted_is_none() {
+    let cfg =
+        Config::from_args(args(&["--socket", "/s", "--threshold-ms", "100"])).expect("parse");
+    assert!(cfg.recovery_timeout.is_none());
+}
+
+#[test]
+fn parses_socket_mode_octal() {
+    let cfg = Config::from_args(args(&[
+        "--socket",
+        "/s",
+        "--threshold-ms",
+        "100",
+        "--socket-mode",
+        "660",
+    ]))
+    .expect("parse");
+    assert_eq!(cfg.socket_mode, 0o660);
+}
+
+#[test]
+fn socket_mode_rejects_non_octal() {
+    match Config::from_args(args(&[
+        "--socket",
+        "/s",
+        "--threshold-ms",
+        "100",
+        "--socket-mode",
+        "999",
+    ])) {
+        Err(ConfigError::BadSocketMode(_)) => {}
+        other => panic!("expected BadSocketMode, got {other:?}"),
+    }
+}
+
+#[test]
+fn socket_mode_accepts_0o_prefix() {
+    let cfg = Config::from_args(args(&[
+        "--socket",
+        "/s",
+        "--threshold-ms",
+        "100",
+        "--socket-mode",
+        "0o640",
+    ]))
+    .expect("parse");
+    assert_eq!(cfg.socket_mode, 0o640);
+}
+
+#[test]
+fn socket_mode_accepts_uppercase_0o_prefix() {
+    let cfg = Config::from_args(args(&[
+        "--socket",
+        "/s",
+        "--threshold-ms",
+        "100",
+        "--socket-mode",
+        "0O640",
+    ]))
+    .expect("parse");
+    assert_eq!(cfg.socket_mode, 0o640);
+}
+
+#[test]
+fn socket_mode_accepts_leading_zero() {
+    let cfg = Config::from_args(args(&[
+        "--socket",
+        "/s",
+        "--threshold-ms",
+        "100",
+        "--socket-mode",
+        "0644",
+    ]))
+    .expect("parse");
+    assert_eq!(cfg.socket_mode, 0o644);
+}
+
+#[test]
+fn socket_mode_rejects_empty_after_prefix() {
+    match Config::from_args(args(&[
+        "--socket",
+        "/s",
+        "--threshold-ms",
+        "100",
+        "--socket-mode",
+        "0o",
+    ])) {
+        Err(ConfigError::BadSocketMode(raw)) => assert_eq!(raw, "0o"),
+        other => panic!("expected BadSocketMode, got {other:?}"),
+    }
+}
+
+#[cfg(feature = "prometheus-exporter")]
+#[test]
+fn prom_addr_without_token_file_is_rejected() {
+    match Config::from_args(args(&[
+        "--socket",
+        "/s",
+        "--threshold-ms",
+        "100",
+        "--prom-addr",
+        "127.0.0.1:9100",
+    ])) {
+        Err(ConfigError::PromAddrRequiresToken) => {}
+        other => panic!("expected PromAddrRequiresToken, got {other:?}"),
+    }
+}
+
+#[cfg(feature = "prometheus-exporter")]
+#[test]
+fn prom_token_file_without_prom_addr_is_rejected() {
+    match Config::from_args(args(&[
+        "--socket",
+        "/s",
+        "--threshold-ms",
+        "100",
+        "--prom-token-file",
+        "/dev/null",
+    ])) {
+        Err(ConfigError::MutuallyExclusive { a, b: _ }) => {
+            assert_eq!(a, "--prom-token-file");
+        }
+        other => panic!("expected MutuallyExclusive(--prom-token-file, ..), got {other:?}"),
+    }
+}
+
+#[test]
+fn parses_shutdown_grace_ms() {
+    let cfg = Config::from_args(args(&[
+        "--socket",
+        "/s",
+        "--threshold-ms",
+        "100",
+        "--shutdown-grace-ms",
+        "1500",
+    ]))
+    .expect("parse");
+    assert_eq!(cfg.shutdown_grace, Duration::from_millis(1500));
+}
+
+#[test]
+fn shutdown_grace_omitted_is_default() {
+    let cfg =
+        Config::from_args(args(&["--socket", "/s", "--threshold-ms", "100"])).expect("parse");
+    assert_eq!(
+        cfg.shutdown_grace,
+        Duration::from_millis(DEFAULT_SHUTDOWN_GRACE_MS)
+    );
+}
+
+#[test]
+fn shutdown_grace_below_minimum_is_rejected() {
+    match Config::from_args(args(&[
+        "--socket",
+        "/s",
+        "--threshold-ms",
+        "100",
+        "--shutdown-grace-ms",
+        "50",
+    ])) {
+        Err(ConfigError::ShutdownGraceTooLow { value, min }) => {
+            assert_eq!(value, 50);
+            assert_eq!(min, MIN_SHUTDOWN_GRACE_MS);
+        }
+        other => panic!("expected ShutdownGraceTooLow, got {other:?}"),
+    }
+}
+
+#[test]
+fn key_env_flag_returns_removed_flag_error() {
+    match Config::from_args(args(&[
+        "--socket",
+        "/s",
+        "--threshold-ms",
+        "100",
+        "--key-env",
+        "VARTA_KEY",
+    ])) {
+        Err(ConfigError::RemovedFlag { flag, replacement }) => {
+            assert_eq!(flag, "--key-env");
+            assert!(replacement.contains("--key-file"));
+        }
+        other => panic!("expected RemovedFlag(--key-env, ..), got {other:?}"),
+    }
+}
+
+#[test]
+fn parses_read_timeout_ms() {
+    let cfg = Config::from_args(args(&[
+        "--socket",
+        "/s",
+        "--threshold-ms",
+        "100",
+        "--read-timeout-ms",
+        "50",
+    ]))
+    .expect("parse");
+    assert_eq!(cfg.read_timeout, Duration::from_millis(50));
+}
+
+#[test]
+fn read_timeout_omitted_is_default() {
+    let cfg =
+        Config::from_args(args(&["--socket", "/s", "--threshold-ms", "100"])).expect("parse");
+    assert_eq!(cfg.read_timeout, Duration::from_millis(100));
+}
+
+#[test]
+fn read_timeout_rejects_non_numeric() {
+    match Config::from_args(args(&[
+        "--socket",
+        "/s",
+        "--threshold-ms",
+        "100",
+        "--read-timeout-ms",
+        "abc",
+    ])) {
+        Err(ConfigError::BadInteger { flag, .. }) => assert_eq!(flag, "--read-timeout-ms"),
+        other => panic!("expected BadInteger, got {other:?}"),
+    }
+}
+
+#[test]
+fn threshold_zero_is_rejected() {
+    match Config::from_args(args(&["--socket", "/s", "--threshold-ms", "0"])) {
+        Err(ConfigError::ThresholdTooLow { value, min }) => {
+            assert_eq!(value, 0);
+            assert_eq!(min, MIN_THRESHOLD_MS);
+        }
+        other => panic!("expected ThresholdTooLow, got {other:?}"),
+    }
+}
+
+#[test]
+fn threshold_below_min_is_rejected() {
+    match Config::from_args(args(&["--socket", "/s", "--threshold-ms", "5"])) {
+        Err(ConfigError::ThresholdTooLow { value, .. }) => assert_eq!(value, 5),
+        other => panic!("expected ThresholdTooLow, got {other:?}"),
+    }
+}
+
+#[test]
+fn threshold_at_min_is_accepted() {
+    let cfg = Config::from_args(args(&[
+        "--socket",
+        "/s",
+        "--threshold-ms",
+        &MIN_THRESHOLD_MS.to_string(),
+    ]))
+    .expect("parse");
+    assert_eq!(cfg.threshold, Duration::from_millis(MIN_THRESHOLD_MS));
+}
+
+#[test]
+fn parses_recovery_exec_cmd() {
+    let cfg = Config::from_args(args(&[
+        "--socket",
+        "/s",
+        "--threshold-ms",
+        "100",
+        "--recovery-exec",
+        "/usr/bin/kill -HUP {pid}",
+    ]))
+    .expect("parse");
+    assert!(cfg.recovery_exec_cmd.is_some());
+    assert!(cfg.recovery_cmd.is_none());
+    let mode = cfg.resolve_recovery_mode().expect("resolve").expect("some");
+    #[allow(unreachable_patterns)]
+    match mode {
+        crate::recovery::RecoveryMode::Exec { program, args } => {
+            assert_eq!(program, "/usr/bin/kill");
+            assert_eq!(args, vec!["-HUP", "{pid}"]);
+        }
+        other => panic!("expected Exec mode, got {other:?}"),
+    }
+}
+
+#[test]
+fn recovery_exec_and_recovery_cmd_are_mutually_exclusive() {
+    let cfg = Config::from_args(args(&[
+        "--socket",
+        "/s",
+        "--threshold-ms",
+        "100",
+        "--recovery-cmd",
+        "echo $1",
+        "--i-accept-shell-risk",
+        "--recovery-exec",
+        "true",
+    ]))
+    .expect("parse");
+    let err = cfg.resolve_recovery_mode().unwrap_err();
+    assert!(
+        err.to_string().contains("mutually exclusive"),
+        "expected mutual exclusion error, got: {err}"
+    );
+}
+
+#[test]
+fn recovery_cmd_and_cmd_file_are_mutually_exclusive() {
+    let cfg = Config::from_args(args(&[
+        "--socket",
+        "/s",
+        "--threshold-ms",
+        "100",
+        "--recovery-cmd",
+        "echo $1",
+        "--i-accept-shell-risk",
+        "--recovery-cmd-file",
+        "/nonexistent",
+    ]))
+    .expect("parse");
+    let err = cfg.resolve_recovery_mode().unwrap_err();
+    assert!(
+        err.to_string().contains("mutually exclusive"),
+        "expected mutual exclusion error, got: {err}"
+    );
+}
+
+#[cfg(feature = "unsafe-shell-recovery")]
+#[test]
+fn resolve_shell_mode_from_cmd_flag() {
+    let cfg = Config::from_args(args(&[
+        "--socket",
+        "/s",
+        "--threshold-ms",
+        "100",
+        "--recovery-cmd",
+        "echo $1",
+        "--i-accept-shell-risk",
+    ]))
+    .expect("parse");
+    let mode = cfg.resolve_recovery_mode().expect("resolve").expect("some");
+    match mode {
+        crate::recovery::RecoveryMode::Shell(tpl) => assert_eq!(tpl, "echo $1"),
+        other => panic!("expected Shell mode, got {other:?}"),
+    }
+}
+
+#[cfg(not(feature = "unsafe-shell-recovery"))]
+#[test]
+fn shell_recovery_not_compiled_in_is_rejected() {
+    let cfg = Config::from_args(args(&[
+        "--socket",
+        "/s",
+        "--threshold-ms",
+        "100",
+        "--recovery-cmd",
+        "echo $1",
+        "--i-accept-shell-risk",
+    ]))
+    .expect("parse");
+    let err = cfg.resolve_recovery_mode().expect_err("must reject");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("unsafe-shell-recovery"),
+        "error must name the feature, got: {msg}"
+    );
+    assert!(
+        msg.contains("--recovery-exec"),
+        "error must recommend --recovery-exec, got: {msg}"
+    );
+}
+
+#[cfg(feature = "unsafe-shell-recovery")]
+#[test]
+fn shell_mode_inline_without_accept_flag_is_rejected() {
+    let cfg = Config::from_args(args(&[
+        "--socket",
+        "/s",
+        "--threshold-ms",
+        "100",
+        "--recovery-cmd",
+        "echo $1",
+    ]))
+    .expect("parse");
+    let err = cfg.resolve_recovery_mode().expect_err("must reject");
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    let msg = err.to_string();
+    assert!(
+        msg.contains("--i-accept-shell-risk"),
+        "expected error to name the accept flag, got: {msg}"
+    );
+    assert!(
+        msg.contains("--recovery-exec"),
+        "expected error to recommend --recovery-exec, got: {msg}"
+    );
+}
+
+#[cfg(feature = "unsafe-shell-recovery")]
+#[test]
+fn shell_mode_file_without_accept_flag_is_rejected() {
+    // The file does not need to exist — the accept-flag check runs
+    // before the file-permission validation, so we never read it.
+    let cfg = Config::from_args(args(&[
+        "--socket",
+        "/s",
+        "--threshold-ms",
+        "100",
+        "--recovery-cmd-file",
+        "/nonexistent",
+    ]))
+    .expect("parse");
+    let err = cfg.resolve_recovery_mode().expect_err("must reject");
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    assert!(err.to_string().contains("--i-accept-shell-risk"));
+}
+
+#[test]
+fn exec_mode_does_not_require_shell_risk_flag() {
+    // --recovery-exec is the safe path; no accept flag should be needed.
+    let cfg = Config::from_args(args(&[
+        "--socket",
+        "/s",
+        "--threshold-ms",
+        "100",
+        "--recovery-exec",
+        "/bin/true",
+    ]))
+    .expect("parse");
+    let mode = cfg.resolve_recovery_mode().expect("resolve").expect("some");
+    #[allow(unreachable_patterns)]
+    match mode {
+        crate::recovery::RecoveryMode::Exec { program, .. } => {
+            assert_eq!(program, "/bin/true");
+        }
+        other => panic!("expected Exec mode, got {other:?}"),
+    }
+}
+
+#[test]
+fn parses_i_accept_plaintext_udp_flag() {
+    let cfg = Config::from_args(args(&[
+        "--socket",
+        "/s",
+        "--threshold-ms",
+        "100",
+        "--i-accept-plaintext-udp",
+    ]))
+    .expect("parse");
+    assert!(cfg.i_accept_plaintext_udp);
+}
+
+#[test]
+fn i_accept_plaintext_udp_defaults_to_false() {
+    let cfg =
+        Config::from_args(args(&["--socket", "/s", "--threshold-ms", "100"])).expect("parse");
+    assert!(!cfg.i_accept_plaintext_udp);
+}
+
+#[test]
+fn parses_secure_udp_i_accept_recovery_flag() {
+    let cfg = Config::from_args(args(&[
+        "--socket",
+        "/s",
+        "--threshold-ms",
+        "100",
+        "--secure-udp-i-accept-recovery-on-unauthenticated-transport",
+    ]))
+    .expect("parse");
+    assert!(cfg.i_accept_recovery_on_secure_udp);
+    assert!(!cfg.i_accept_recovery_on_plaintext_udp);
+}
+
+#[test]
+fn parses_plaintext_udp_i_accept_recovery_flag() {
+    let cfg = Config::from_args(args(&[
+        "--socket",
+        "/s",
+        "--threshold-ms",
+        "100",
+        "--plaintext-udp-i-accept-recovery-on-unauthenticated-transport",
+    ]))
+    .expect("parse");
+    assert!(!cfg.i_accept_recovery_on_secure_udp);
+    assert!(cfg.i_accept_recovery_on_plaintext_udp);
+}
+
+#[test]
+fn recovery_accept_flags_default_to_false() {
+    let cfg =
+        Config::from_args(args(&["--socket", "/s", "--threshold-ms", "100"])).expect("parse");
+    assert!(!cfg.i_accept_recovery_on_secure_udp);
+    assert!(!cfg.i_accept_recovery_on_plaintext_udp);
+}
+
+#[test]
+fn parses_allow_cross_namespace_agents_flag() {
+    let cfg = Config::from_args(args(&[
+        "--socket",
+        "/s",
+        "--threshold-ms",
+        "100",
+        "--allow-cross-namespace-agents",
+    ]))
+    .expect("parse");
+    assert!(cfg.allow_cross_namespace_agents);
+    assert!(!cfg.strict_namespace_check);
+}
+
+#[test]
+fn parses_strict_namespace_check_flag() {
+    let cfg = Config::from_args(args(&[
+        "--socket",
+        "/s",
+        "--threshold-ms",
+        "100",
+        "--strict-namespace-check",
+    ]))
+    .expect("parse");
+    assert!(cfg.strict_namespace_check);
+    assert!(!cfg.allow_cross_namespace_agents);
+}
+
+#[test]
+fn namespace_flags_default_to_false() {
+    let cfg =
+        Config::from_args(args(&["--socket", "/s", "--threshold-ms", "100"])).expect("parse");
+    assert!(!cfg.allow_cross_namespace_agents);
+    assert!(!cfg.strict_namespace_check);
+}
+
+#[test]
+fn recovery_plus_plaintext_udp_without_accept_flag_is_rejected() {
+    // H2 mitigation: plaintext UDP + recovery without per-listener flag must fail.
+    let err = Config::from_args(args(&[
+        "--socket",
+        "/s",
+        "--threshold-ms",
+        "100",
+        "--udp-port",
+        "9000",
+        "--i-accept-plaintext-udp",
+        "--recovery-exec",
+        "/bin/true",
+    ]))
+    .expect_err("must reject");
+    match err {
+        ConfigError::RecoveryRequiresAuthenticatedTransport { ref udp_addr } => {
+            assert!(udp_addr.contains(":9000"), "udp_addr = {udp_addr}");
+        }
+        other => panic!("expected RecoveryRequiresAuthenticatedTransport, got {other:?}"),
+    }
+    assert!(err
+        .to_string()
+        .contains("--plaintext-udp-i-accept-recovery-on-unauthenticated-transport"));
+}
+
+#[test]
+fn recovery_plus_secure_udp_without_accept_flag_is_rejected() {
+    // H2 mitigation: secure UDP + recovery without per-listener flag must fail.
+    let err = Config::from_args(args(&[
+        "--socket",
+        "/s",
+        "--threshold-ms",
+        "100",
+        "--udp-port",
+        "9000",
+        "--key-file",
+        "/nonexistent-key",
+        "--recovery-exec",
+        "/bin/true",
+    ]))
+    .expect_err("must reject");
+    match err {
+        ConfigError::RecoveryRequiresAuthenticatedTransport { ref udp_addr } => {
+            assert!(udp_addr.contains(":9000"), "udp_addr = {udp_addr}");
+        }
+        other => panic!("expected RecoveryRequiresAuthenticatedTransport, got {other:?}"),
+    }
+    assert!(err
+        .to_string()
+        .contains("--secure-udp-i-accept-recovery-on-unauthenticated-transport"));
+}
+
+#[test]
+fn recovery_plus_plaintext_udp_with_accept_flag_succeeds() {
+    let cfg = Config::from_args(args(&[
+        "--socket",
+        "/s",
+        "--threshold-ms",
+        "100",
+        "--udp-port",
+        "9000",
+        "--i-accept-plaintext-udp",
+        "--recovery-exec",
+        "/bin/true",
+        "--plaintext-udp-i-accept-recovery-on-unauthenticated-transport",
+    ]))
+    .expect("parse");
+    assert!(cfg.i_accept_recovery_on_plaintext_udp);
+    assert!(!cfg.i_accept_recovery_on_secure_udp);
+    assert_eq!(cfg.udp_port, Some(9000));
+}
+
+#[test]
+fn recovery_plus_secure_udp_with_accept_flag_succeeds() {
+    let cfg = Config::from_args(args(&[
+        "--socket",
+        "/s",
+        "--threshold-ms",
+        "100",
+        "--udp-port",
+        "9000",
+        "--key-file",
+        "/nonexistent-key",
+        "--recovery-exec",
+        "/bin/true",
+        "--secure-udp-i-accept-recovery-on-unauthenticated-transport",
+    ]))
+    .expect("parse");
+    assert!(cfg.i_accept_recovery_on_secure_udp);
+    assert!(!cfg.i_accept_recovery_on_plaintext_udp);
+    assert_eq!(cfg.udp_port, Some(9000));
+}
+
+#[test]
+fn recovery_without_udp_port_does_not_require_accept_flag() {
+    let cfg = Config::from_args(args(&[
+        "--socket",
+        "/s",
+        "--threshold-ms",
+        "100",
+        "--recovery-exec",
+        "/bin/true",
+    ]))
+    .expect("parse");
+    assert!(!cfg.i_accept_recovery_on_secure_udp);
+    assert!(!cfg.i_accept_recovery_on_plaintext_udp);
+    assert!(cfg.udp_port.is_none());
+}
+
+// ----- H4: secure-UDP non-loopback bind requires explicit opt-in -----
+
+#[test]
+fn parses_i_accept_secure_udp_non_loopback_flag() {
+    let cfg = Config::from_args(args(&[
+        "--socket",
+        "/s",
+        "--threshold-ms",
+        "100",
+        "--i-accept-secure-udp-non-loopback",
+    ]))
+    .expect("parse");
+    assert!(cfg.i_accept_secure_udp_non_loopback);
+}
+
+#[test]
+fn i_accept_secure_udp_non_loopback_defaults_to_false() {
+    let cfg =
+        Config::from_args(args(&["--socket", "/s", "--threshold-ms", "100"])).expect("parse");
+    assert!(!cfg.i_accept_secure_udp_non_loopback);
+}
+
+#[test]
+fn secure_udp_non_loopback_without_accept_flag_is_rejected() {
+    // H4: any non-loopback --udp-bind-addr + secure-UDP keys must fail.
+    let err = Config::from_args(args(&[
+        "--socket",
+        "/s",
+        "--threshold-ms",
+        "100",
+        "--udp-port",
+        "9000",
+        "--udp-bind-addr",
+        "0.0.0.0",
+        "--key-file",
+        "/nonexistent-key",
+    ]))
+    .expect_err("must reject");
+    match err {
+        ConfigError::SecureUdpRequiresLoopbackBind { ref udp_addr } => {
+            assert!(udp_addr.contains("0.0.0.0:9000"), "udp_addr = {udp_addr}");
+        }
+        other => panic!("expected SecureUdpRequiresLoopbackBind, got {other:?}"),
+    }
+    let msg = err.to_string();
+    assert!(
+        msg.contains("--i-accept-secure-udp-non-loopback"),
+        "error must name the accept flag, got: {msg}"
+    );
+}
+
+#[test]
+fn secure_udp_non_loopback_ipv6_unspecified_is_rejected() {
+    // Defensive: ::0 (IPv6 wildcard) is not a loopback address.
+    let err = Config::from_args(args(&[
+        "--socket",
+        "/s",
+        "--threshold-ms",
+        "100",
+        "--udp-port",
+        "9000",
+        "--udp-bind-addr",
+        "::",
+        "--key-file",
+        "/nonexistent-key",
+    ]))
+    .expect_err("must reject ::");
+    assert!(matches!(
+        err,
+        ConfigError::SecureUdpRequiresLoopbackBind { .. }
+    ));
+}
+
+#[test]
+fn secure_udp_loopback_bind_is_accepted_without_flag() {
+    // 127.0.0.1 (and any 127.0.0.0/8) is the safe default.
+    let cfg = Config::from_args(args(&[
+        "--socket",
+        "/s",
+        "--threshold-ms",
+        "100",
+        "--udp-port",
+        "9000",
+        "--udp-bind-addr",
+        "127.0.0.1",
+        "--key-file",
+        "/nonexistent-key",
+    ]))
+    .expect("loopback bind must parse cleanly");
+    assert_eq!(cfg.udp_port, Some(9000));
+    assert!(!cfg.i_accept_secure_udp_non_loopback);
+}
+
+#[test]
+fn secure_udp_ipv6_loopback_is_accepted_without_flag() {
+    // ::1 is the IPv6 loopback equivalent of 127.0.0.1.
+    let cfg = Config::from_args(args(&[
+        "--socket",
+        "/s",
+        "--threshold-ms",
+        "100",
+        "--udp-port",
+        "9000",
+        "--udp-bind-addr",
+        "::1",
+        "--key-file",
+        "/nonexistent-key",
+    ]))
+    .expect("::1 bind must parse cleanly");
+    assert_eq!(cfg.udp_port, Some(9000));
+}
+
+#[test]
+fn secure_udp_non_loopback_with_accept_flag_succeeds() {
+    let cfg = Config::from_args(args(&[
+        "--socket",
+        "/s",
+        "--threshold-ms",
+        "100",
+        "--udp-port",
+        "9000",
+        "--udp-bind-addr",
+        "0.0.0.0",
+        "--key-file",
+        "/nonexistent-key",
+        "--i-accept-secure-udp-non-loopback",
+    ]))
+    .expect("non-loopback with explicit opt-in must parse");
+    assert!(cfg.i_accept_secure_udp_non_loopback);
+    assert_eq!(cfg.udp_port, Some(9000));
+}
+
+#[test]
+fn plaintext_udp_non_loopback_does_not_require_secure_udp_accept_flag() {
+    // The H4 gate is specific to secure UDP — plaintext is gated by
+    // --i-accept-plaintext-udp regardless of bind address.
+    let cfg = Config::from_args(args(&[
+        "--socket",
+        "/s",
+        "--threshold-ms",
+        "100",
+        "--udp-port",
+        "9000",
+        "--udp-bind-addr",
+        "0.0.0.0",
+        "--i-accept-plaintext-udp",
+    ]))
+    .expect("plaintext UDP non-loopback must parse without secure-UDP flag");
+    assert!(!cfg.i_accept_secure_udp_non_loopback);
+}
+
+#[test]
+fn secure_udp_no_bind_addr_parses_cleanly() {
+    // When --udp-bind-addr is omitted, the Config layer leaves it as
+    // None — main.rs resolves the default (127.0.0.1 for secure UDP).
+    let cfg = Config::from_args(args(&[
+        "--socket",
+        "/s",
+        "--threshold-ms",
+        "100",
+        "--udp-port",
+        "9000",
+        "--key-file",
+        "/nonexistent-key",
+    ]))
+    .expect("absent bind addr must defer to runtime default");
+    assert!(cfg.udp_bind_addr.is_none());
+}
+
+#[cfg(feature = "prometheus-exporter")]
+#[test]
+fn parses_prom_rate_limit_flags() {
+    let cfg = Config::from_args(args(&[
+        "--socket",
+        "/s",
+        "--threshold-ms",
+        "100",
+        "--prom-rate-limit-per-sec",
+        "20",
+        "--prom-rate-limit-burst",
+        "50",
+    ]))
+    .expect("parse");
+    assert_eq!(cfg.prom_rate_limit_per_sec, 20);
+    assert_eq!(cfg.prom_rate_limit_burst, 50);
+}
+
+#[test]
+fn prom_rate_limit_defaults() {
+    let cfg =
+        Config::from_args(args(&["--socket", "/s", "--threshold-ms", "100"])).expect("parse");
+    assert_eq!(cfg.prom_rate_limit_per_sec, DEFAULT_PROM_RATE_LIMIT_PER_SEC);
+    assert_eq!(cfg.prom_rate_limit_burst, DEFAULT_PROM_RATE_LIMIT_BURST);
+}
+
+#[test]
+fn no_recovery_flags_yields_none() {
+    let cfg =
+        Config::from_args(args(&["--socket", "/s", "--threshold-ms", "100"])).expect("parse");
+    let mode = cfg.resolve_recovery_mode().expect("resolve");
+    assert!(mode.is_none());
+}
+
+#[test]
+fn parse_exec_cmd_splits_whitespace() {
+    let (program, args) = parse_exec_cmd("kill -HUP {pid}").expect("parse");
+    assert_eq!(program, "kill");
+    assert_eq!(args, vec!["-HUP", "{pid}"]);
+}
+
+#[test]
+fn parse_exec_cmd_rejects_empty() {
+    assert!(parse_exec_cmd("").is_err());
+    assert!(parse_exec_cmd("   ").is_err());
+}
+
+#[test]
+fn parses_recovery_env_repeatable() {
+    let cfg = Config::from_args(args(&[
+        "--socket",
+        "/s",
+        "--threshold-ms",
+        "100",
+        "--recovery-exec",
+        "/bin/true",
+        "--recovery-env",
+        "FOO=bar",
+        "--recovery-env",
+        "BAZ=qux",
+    ]))
+    .expect("parse");
+    assert_eq!(cfg.recovery_env, vec!["FOO=bar", "BAZ=qux"]);
+}
+
+#[test]
+fn recovery_env_defaults_to_empty() {
+    let cfg =
+        Config::from_args(args(&["--socket", "/s", "--threshold-ms", "100"])).expect("parse");
+    assert!(cfg.recovery_env.is_empty());
+}
+
+#[test]
+fn parses_heartbeat_file() {
+    let cfg = Config::from_args(args(&[
+        "--socket",
+        "/s",
+        "--threshold-ms",
+        "100",
+        "--heartbeat-file",
+        "/tmp/varta-hb",
+    ]))
+    .expect("parse");
+    assert_eq!(cfg.heartbeat_file, Some(PathBuf::from("/tmp/varta-hb")));
+}
+
+#[test]
+fn heartbeat_file_omitted_is_none() {
+    let cfg =
+        Config::from_args(args(&["--socket", "/s", "--threshold-ms", "100"])).expect("parse");
+    assert!(cfg.heartbeat_file.is_none());
+}
+
+// ----- validate_secret_file tests (M2: TOCTOU hardening) -----
+
+/// Mint a unique tempdir under `$TMPDIR` for a single test. Tests cannot
+/// rely on a shared dir because some of them deliberately set permissions
+/// other tests would race on.
+fn mk_tmpdir(tag: &str) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let pid = std::process::id();
+    let dir = std::env::temp_dir().join(format!("varta-vsf-{tag}-{pid}-{nanos}"));
+    std::fs::create_dir(&dir).expect("create tempdir");
+    // A parallel `UnixDatagram::bind` in another test installs a
+    // 0o177 umask that strips the `x` bit from new directories,
+    // breaking subsequent open() inside this dir. Restore explicitly.
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755))
+        .expect("chmod tempdir");
+    dir
+}
+
+fn write_mode(path: &std::path::Path, content: &[u8], mode: u32) {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(mode)
+        .open(path)
+        .expect("open mode");
+    f.write_all(content).expect("write");
+    // Reassert mode (umask may have masked it on create).
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).expect("set perms");
+}
+
+#[test]
+fn validate_secret_file_reads_content_after_validation() {
+    let dir = mk_tmpdir("happy");
+    let p = dir.join("secret");
+    write_mode(&p, b"hello-world\n", 0o600);
+    let out = validate_secret_file(&p).expect("validate");
+    assert_eq!(out, "hello-world\n");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn validate_secret_file_rejects_symlink() {
+    let dir = mk_tmpdir("sym");
+    let target = dir.join("real");
+    write_mode(&target, b"x", 0o600);
+    let link = dir.join("link");
+    std::os::unix::fs::symlink(&target, &link).expect("symlink");
+    let err = validate_secret_file(&link).expect_err("should reject symlink");
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    assert!(
+        err.to_string().contains("must not be a symlink"),
+        "unexpected error: {err}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn validate_secret_file_rejects_bad_mode() {
+    let dir = mk_tmpdir("mode");
+    let p = dir.join("perms");
+    write_mode(&p, b"x", 0o644);
+    let err = validate_secret_file(&p).expect_err("should reject 0644");
+    assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+    assert!(
+        err.to_string().contains("insecure permissions"),
+        "unexpected error: {err}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn validate_secret_file_rejects_non_regular_file() {
+    // A unix-domain socket bound at a path is a non-regular inode.
+    // O_NOFOLLOW lets it through (it's not a symlink) so the post-open
+    // file_type check is what defends us.
+    let dir = mk_tmpdir("sock");
+    let p = dir.join("sock");
+    let _listener = std::os::unix::net::UnixListener::bind(&p).expect("bind sock");
+    // Tighten mode so we exercise the regular-file check rather than
+    // the mode check.
+    use std::os::unix::fs::PermissionsExt;
+    let _ = std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600));
+    let err = validate_secret_file(&p).expect_err("should reject socket");
+    // On platforms that block open(2) on a UDS path entirely we accept
+    // either InvalidInput (our check) or whatever errno the kernel
+    // returns from open(); the important property is "does not succeed".
+    assert_ne!(err.kind(), std::io::ErrorKind::Other);
+    let _ = std::fs::remove_file(&p);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// TOCTOU stress: race a writer that swaps the file between a
+/// well-formed 0600 secret and a symlink to a sensitive path, while a
+/// reader loops `validate_secret_file`. The reader must never return
+/// content from the symlink target.
+///
+/// The test is probabilistic (relies on scheduling); marked `#[ignore]`
+/// so it does not flake the normal test run. Invoke via
+/// `cargo test -p varta-watch validate_secret_file_toctou_stress -- --ignored --nocapture`.
+#[test]
+#[ignore = "probabilistic stress test; run with --ignored"]
+fn validate_secret_file_toctou_stress() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    let dir = mk_tmpdir("toctou");
+    let target = dir.join("file");
+    let attacker_target = dir.join("attacker-content");
+    write_mode(&target, b"GOOD\n", 0o600);
+    write_mode(&attacker_target, b"BAD-DO-NOT-READ\n", 0o600);
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop_w = stop.clone();
+    let target_w = target.clone();
+    let atk = attacker_target.clone();
+    let writer = std::thread::spawn(move || {
+        while !stop_w.load(Ordering::Relaxed) {
+            // Try to swap GOOD ⇄ symlink-to-BAD as fast as we can.
+            let tmp = target_w.with_extension("swap");
+            let _ = std::fs::remove_file(&tmp);
+            if std::os::unix::fs::symlink(&atk, &tmp).is_ok() {
+                let _ = std::fs::rename(&tmp, &target_w);
+            }
+            let _ = std::fs::remove_file(&target_w);
+            write_mode(&target_w, b"GOOD\n", 0o600);
+        }
+    });
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+    let mut iters = 0u64;
+    while std::time::Instant::now() < deadline {
+        // Any error is fine — race lost on the writer's swap window.
+        if let Ok(s) = validate_secret_file(&target) {
+            assert!(
+                !s.contains("BAD"),
+                "TOCTOU: validate_secret_file returned attacker content after {iters} iters"
+            );
+        }
+        iters += 1;
+    }
+    stop.store(true, Ordering::Relaxed);
+    writer.join().expect("writer thread");
+    eprintln!("toctou_stress: {iters} validate calls");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn parses_eviction_scan_window() {
+    let args = [
+        "--socket",
+        "/tmp/t.sock",
+        "--threshold-ms",
+        "100",
+        "--eviction-scan-window",
+        "64",
+    ];
+    let cfg = Config::from_args(args.iter().map(|s| s.to_string())).unwrap();
+    assert_eq!(cfg.eviction_scan_window, 64);
+}
+
+#[test]
+fn rejects_eviction_scan_window_zero() {
+    let args = [
+        "--socket",
+        "/tmp/t.sock",
+        "--threshold-ms",
+        "100",
+        "--eviction-scan-window",
+        "0",
+    ];
+    let err = Config::from_args(args.iter().map(|s| s.to_string())).unwrap_err();
+    assert!(
+        matches!(
+            err,
+            ConfigError::EvictionScanWindowOutOfRange { value: 0, .. }
+        ),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
+fn rejects_eviction_scan_window_above_max() {
+    let args = [
+        "--socket",
+        "/tmp/t.sock",
+        "--threshold-ms",
+        "100",
+        "--eviction-scan-window",
+        "9999",
+    ];
+    let err = Config::from_args(args.iter().map(|s| s.to_string())).unwrap_err();
+    assert!(
+        matches!(
+            err,
+            ConfigError::EvictionScanWindowOutOfRange { value: 9999, .. }
+        ),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
+fn clock_source_default_is_monotonic() {
+    let args = ["--socket", "/tmp/t.sock", "--threshold-ms", "100"];
+    let cfg = Config::from_args(args.iter().map(|s| s.to_string())).unwrap();
+    assert_eq!(cfg.clock_source, ClockSource::Monotonic);
+}
+
+#[test]
+fn clock_source_parses_monotonic() {
+    let args = [
+        "--socket",
+        "/tmp/t.sock",
+        "--threshold-ms",
+        "100",
+        "--clock-source",
+        "monotonic",
+    ];
+    let cfg = Config::from_args(args.iter().map(|s| s.to_string())).unwrap();
+    assert_eq!(cfg.clock_source, ClockSource::Monotonic);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn clock_source_parses_boottime_on_linux() {
+    let args = [
+        "--socket",
+        "/tmp/t.sock",
+        "--threshold-ms",
+        "100",
+        "--clock-source",
+        "boottime",
+    ];
+    let cfg = Config::from_args(args.iter().map(|s| s.to_string())).unwrap();
+    assert_eq!(cfg.clock_source, ClockSource::Boottime);
+}
+
+#[cfg(not(target_os = "linux"))]
+#[test]
+fn clock_source_boottime_rejected_on_unsupported_platform() {
+    let args = [
+        "--socket",
+        "/tmp/t.sock",
+        "--threshold-ms",
+        "100",
+        "--clock-source",
+        "boottime",
+    ];
+    let err = Config::from_args(args.iter().map(|s| s.to_string())).unwrap_err();
+    match err {
+        ConfigError::ClockSourceUnsupported { source, .. } => {
+            assert_eq!(source, ClockSource::Boottime);
+        }
+        other => panic!("expected ClockSourceUnsupported, got {other}"),
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+#[test]
+fn clock_source_parses_monotonic_raw_on_macos() {
+    let args = [
+        "--socket",
+        "/tmp/t.sock",
+        "--threshold-ms",
+        "100",
+        "--clock-source",
+        "monotonic-raw",
+    ];
+    let cfg = Config::from_args(args.iter().map(|s| s.to_string())).unwrap();
+    assert_eq!(cfg.clock_source, ClockSource::MonotonicRaw);
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "ios")))]
+#[test]
+fn clock_source_monotonic_raw_rejected_off_macos() {
+    let args = [
+        "--socket",
+        "/tmp/t.sock",
+        "--threshold-ms",
+        "100",
+        "--clock-source",
+        "monotonic-raw",
+    ];
+    let err = Config::from_args(args.iter().map(|s| s.to_string())).unwrap_err();
+    match err {
+        ConfigError::ClockSourceUnsupported { source, .. } => {
+            assert_eq!(source, ClockSource::MonotonicRaw);
+        }
+        other => panic!("expected ClockSourceUnsupported, got {other}"),
+    }
+}
+
+#[test]
+fn clock_source_rejects_unknown_value() {
+    let args = [
+        "--socket",
+        "/tmp/t.sock",
+        "--threshold-ms",
+        "100",
+        "--clock-source",
+        "wallclock",
+    ];
+    let err = Config::from_args(args.iter().map(|s| s.to_string())).unwrap_err();
+    match err {
+        ConfigError::BadValue { flag, raw } => {
+            assert_eq!(flag, "--clock-source");
+            assert_eq!(raw, "wallclock");
+        }
+        other => panic!("expected BadValue, got {other}"),
+    }
+}
