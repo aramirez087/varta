@@ -80,15 +80,22 @@
 //! pushes its size over the limit: `PATH` → `PATH.1` → … → `PATH.5`. Same
 //! generation count as the event-stream `FileExporter`.
 
+use std::collections::VecDeque;
 use std::fmt::Write as _;
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// Number of rotated file generations kept. Mirrors
 /// `crate::exporter::MAX_ROTATION_GENERATIONS`.
 const AUDIT_ROTATION_GENERATIONS: u32 = 5;
+
+/// Maximum number of fully-formatted lines held in the in-memory ring while
+/// waiting for the maintenance phase to drain them via [`RecoveryAuditLog::flush_pending`].
+/// Oldest entries are kept; lines that arrive when the ring is full are dropped
+/// and counted in [`RecoveryAuditLog::take_audit_dropped`].
+const AUDIT_RING_CAP: usize = 256;
 
 /// Header line written to a freshly-created v2 audit file.
 const AUDIT_HEADER_V2: &str = "# varta-watch recovery audit v2\n";
@@ -323,6 +330,14 @@ pub struct RecoveryAuditLog {
     /// threshold is crossed by the boot record itself would re-trigger
     /// rotation recursively until the stack overflows.
     rotating: bool,
+    /// Ring buffer of fully-formatted lines awaiting the maintenance phase
+    /// drain. Hot-path callers enqueue here; `flush_pending` does the actual
+    /// BufWriter write + fdatasync, bounded by a per-tick time budget.
+    pending_lines: VecDeque<String>,
+    /// Lines dropped because the ring was at capacity when they arrived.
+    audit_dropped_total: u64,
+    /// Ticks where `flush_pending` ran out of budget before draining the ring.
+    audit_flush_budget_exceeded_total: u64,
 }
 
 /// Configuration accepted by [`RecoveryAuditLog::create`]. Grouped into a
@@ -475,6 +490,9 @@ impl RecoveryAuditLog {
             writes_since_sync: 0,
             daemon_pid: cfg.daemon_pid,
             rotating: false,
+            pending_lines: VecDeque::with_capacity(AUDIT_RING_CAP),
+            audit_dropped_total: 0,
+            audit_flush_budget_exceeded_total: 0,
         };
 
         // Write the opening boot record covering whichever continuity case
@@ -568,6 +586,33 @@ impl RecoveryAuditLog {
         self.pending_err.take()
     }
 
+    /// Drain buffered lines to the BufWriter, stopping when `budget` elapses.
+    /// Called once per tick from the maintenance phase. Lines that remain after
+    /// budget exhaustion are kept in the ring and tried next tick.
+    pub fn flush_pending(&mut self, budget: Duration) {
+        let start = Instant::now();
+        while !self.pending_lines.is_empty() {
+            if start.elapsed() >= budget {
+                self.audit_flush_budget_exceeded_total =
+                    self.audit_flush_budget_exceeded_total.saturating_add(1);
+                break;
+            }
+            let line = self.pending_lines.pop_front().unwrap();
+            self.direct_write_line(&line);
+        }
+    }
+
+    /// Take and reset the count of lines dropped because the ring was full.
+    pub fn take_audit_dropped(&mut self) -> u64 {
+        core::mem::replace(&mut self.audit_dropped_total, 0)
+    }
+
+    /// Take and reset the count of ticks where `flush_pending` hit its budget
+    /// before emptying the ring.
+    pub fn take_audit_flush_budget_exceeded(&mut self) -> u64 {
+        core::mem::replace(&mut self.audit_flush_budget_exceeded_total, 0)
+    }
+
     /// Emit a `boot` record. `prev` is the prior chain to record in the
     /// `prev_chain` column (rendered as hex). Pass `None` to record `-`.
     fn emit_boot(&mut self, reason: BootReason, prev: Option<[u8; 32]>) {
@@ -586,11 +631,10 @@ impl RecoveryAuditLog {
             prev = prev_str,
             reason = reason.as_str(),
         );
-        self.emit(AuditKind::Boot, &body);
+        self.emit_direct(AuditKind::Boot, &body);
     }
 
-    /// Common emit path. Owns seq assignment, chain computation, line
-    /// write, durability sync, and rotation.
+    /// Common emit path — enqueues to the ring (hot path).
     fn emit(&mut self, kind: AuditKind, body: &str) {
         let seq = self.next_seq;
         self.next_seq = self.next_seq.saturating_add(1);
@@ -604,6 +648,21 @@ impl RecoveryAuditLog {
         let mut line = String::with_capacity(hash_body.len() + chain_hex.len() + 2);
         let _ = writeln!(line, "{hash_body}\t{chain_hex}");
         self.write_line(&line);
+    }
+
+    /// Like `emit` but writes directly to the BufWriter — used for boot
+    /// records (startup / rotation) where durability must not be deferred.
+    fn emit_direct(&mut self, kind: AuditKind, body: &str) {
+        let seq = self.next_seq;
+        self.next_seq = self.next_seq.saturating_add(1);
+        let mut hash_body = String::with_capacity(body.len() + 24);
+        let _ = write!(hash_body, "{seq}\t{body}");
+
+        let chain_hex = self.compute_and_advance_chain(kind, hash_body.as_bytes());
+
+        let mut line = String::with_capacity(hash_body.len() + chain_hex.len() + 2);
+        let _ = writeln!(line, "{hash_body}\t{chain_hex}");
+        self.direct_write_line(&line);
     }
 
     /// Compute the next chain hash, advance `self.prev_chain`, and return
@@ -623,7 +682,20 @@ impl RecoveryAuditLog {
         }
     }
 
+    /// Enqueue a fully-formatted line into the in-memory ring. Called by
+    /// `emit` on the hot path; the actual BufWriter write is deferred to
+    /// `flush_pending` in the maintenance phase.
     fn write_line(&mut self, line: &str) {
+        if self.pending_lines.len() >= AUDIT_RING_CAP {
+            self.audit_dropped_total = self.audit_dropped_total.saturating_add(1);
+            return;
+        }
+        self.pending_lines.push_back(line.to_owned());
+    }
+
+    /// Write `line` directly to the BufWriter — bypass the ring. Used for
+    /// boot records (startup / rotation) and by `flush_pending` when draining.
+    fn direct_write_line(&mut self, line: &str) {
         match self.sink.write_all(line.as_bytes()) {
             Ok(()) => {
                 self.bytes_written = self.bytes_written.saturating_add(line.len() as u64);
@@ -883,8 +955,13 @@ impl RecoveryAuditLog {
 
 impl Drop for RecoveryAuditLog {
     fn drop(&mut self) {
+        // Drain any buffered lines through the normal write path so the
+        // fdatasync cadence is maintained on shutdown.
+        while let Some(line) = self.pending_lines.pop_front() {
+            self.direct_write_line(&line);
+        }
+        // Best-effort final flush+sync for any remainder not covered by cadence.
         let _ = self.sink.flush();
-        // Best-effort durability on shutdown.
         let _ = self.sink.get_ref().sync_data();
     }
 }
@@ -1021,6 +1098,9 @@ mod tests {
             writes_since_sync: 0,
             daemon_pid: 1234,
             rotating: false,
+            pending_lines: VecDeque::with_capacity(AUDIT_RING_CAP),
+            audit_dropped_total: 0,
+            audit_flush_budget_exceeded_total: 0,
         };
         (log, ctr)
     }
@@ -1137,6 +1217,8 @@ mod tests {
                 template_len: 9,
             });
         }
+        // Flush the ring so rotation logic fires via direct_write_line/maybe_rotate.
+        log.flush_pending(Duration::MAX);
         drop(log);
         assert!(path.with_extension("log.1").exists());
 
@@ -1358,10 +1440,12 @@ mod tests {
             source: "inline",
             template_len: 0,
         });
+        // Drain the ring so the fdatasync cadence fires.
+        log.flush_pending(Duration::MAX);
+        let syncs = *ctr.syncs.lock().unwrap();
         drop(log);
         // Two records → at least two syncs from the emit path (Drop adds
         // another best-effort flush+sync, but we test the cadence itself).
-        let syncs = *ctr.syncs.lock().unwrap();
         assert!(syncs >= 2, "sync_every=1 must sync per record, got {syncs}");
     }
 
@@ -1382,6 +1466,7 @@ mod tests {
         }
         // 6 record_spawn calls → exactly 2 sync_data invocations from the
         // emit cadence (Drop adds 1 more best-effort).
+        log.flush_pending(Duration::MAX);
         let syncs_pre_drop = *ctr.syncs.lock().unwrap();
         drop(log);
         let syncs_post_drop = *ctr.syncs.lock().unwrap();

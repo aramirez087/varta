@@ -39,6 +39,14 @@ use crate::audit::{CompleteOutcome, CompleteRecord, RecoveryAuditLog, RefusedRec
 use crate::outstanding_table::{InsertError as OutstandingInsertError, OutstandingTable};
 use crate::peer_cred::BeatOrigin;
 
+/// Maximum number of outstanding pids visited per [`Recovery::try_reap`] call.
+///
+/// Bounds the `waitpid(2, WNOHANG)` + optional `kill(2)` syscall budget to at
+/// most 64 per poll tick, preventing a large outstanding-child fan from
+/// blowing the `recovery_reap` phase budget. A rotating cursor ensures
+/// fairness: pids not visited this tick are visited first next tick.
+const REAP_MAX_PER_TICK: usize = 64;
+
 // fcntl(2) flags. Hand-rolled to avoid pulling `libc` into a production crate.
 #[cfg(target_os = "linux")]
 const O_NONBLOCK_FCNTL: i32 = 0x800;
@@ -574,6 +582,21 @@ pub struct Recovery {
     /// [`Recovery::with_reap_scratch_capacity`] from the observer's
     /// configured tracker capacity; otherwise grows on first use.
     reap_scratch: Vec<u32>,
+    /// Rotating index into `reap_scratch` used to ensure fairness across
+    /// ticks. When [`REAP_MAX_PER_TICK`] is less than the current
+    /// outstanding count, the cursor advances by the number of pids visited
+    /// so pids deferred this tick are visited first next tick.
+    reap_cursor: usize,
+    /// Count of [`try_reap`] calls that were truncated because the outstanding
+    /// count exceeded [`REAP_MAX_PER_TICK`]. Surfaced as
+    /// `varta_recovery_reap_truncated_total`.
+    ///
+    /// [`try_reap`]: Recovery::try_reap
+    reap_truncated_total: u64,
+    /// Per-tick reap cap. Always [`REAP_MAX_PER_TICK`] in production;
+    /// lowerable in tests via [`Self::shrink_reap_max_for_test`] to exercise
+    /// the truncation path without spawning 65+ child processes.
+    reap_max: usize,
 }
 
 impl Recovery {
@@ -631,6 +654,9 @@ impl Recovery {
             refused_cross_namespace: 0,
             refused_debounce_capacity: 0,
             reap_scratch: Vec::new(),
+            reap_cursor: 0,
+            reap_truncated_total: 0,
+            reap_max: REAP_MAX_PER_TICK,
         }
     }
 
@@ -724,6 +750,22 @@ impl Recovery {
         n
     }
 
+    /// Take and reset the count of [`try_reap`] calls that were truncated
+    /// because the outstanding-child count exceeded [`REAP_MAX_PER_TICK`].
+    /// Surfaced as `varta_recovery_reap_truncated_total`.
+    ///
+    /// A sustained non-zero rate indicates that the outstanding fan-out
+    /// exceeds 64 children per tick. Operators should alert and investigate
+    /// whether recovery templates are hung or the debounce window is too
+    /// short.
+    ///
+    /// [`try_reap`]: Recovery::try_reap
+    pub fn take_reap_truncated(&mut self) -> u64 {
+        let n = self.reap_truncated_total;
+        self.reap_truncated_total = 0;
+        n
+    }
+
     /// Take and reset the count of [`LastFiredTable`] evictions —
     /// stale entries dropped to make room for a new pid when the table
     /// is at capacity and the evicted entry's debounce window had
@@ -751,6 +793,13 @@ impl Recovery {
         self.last_fired = LastFiredTable::with_capacity(cap);
     }
 
+    /// Test-only: lower the per-tick reap cap so tests can exercise the
+    /// truncation path without spawning [`REAP_MAX_PER_TICK`] child processes.
+    #[cfg(test)]
+    pub(crate) fn shrink_reap_max_for_test(&mut self, max: usize) {
+        self.reap_max = max.max(1); // 0 would loop forever
+    }
+
     /// Attach a recovery audit sink. Every spawn and completion will be
     /// appended as a TSV record. Passing `None` (the default) disables
     /// audit emission without altering the recovery behavior.
@@ -771,6 +820,30 @@ impl Recovery {
     /// Returns `None` if no sink is configured or no error is pending.
     pub fn drain_audit_err(&mut self) -> Option<std::io::Error> {
         self.audit_sink.as_mut().and_then(|s| s.take_pending_err())
+    }
+
+    /// Flush buffered audit lines to the BufWriter, bounded by `budget`.
+    /// Call once per maintenance phase tick.
+    pub fn flush_audit_pending(&mut self, budget: std::time::Duration) {
+        if let Some(s) = self.audit_sink.as_mut() {
+            s.flush_pending(budget);
+        }
+    }
+
+    /// Take and reset the count of audit lines dropped due to ring-full.
+    pub fn take_audit_dropped(&mut self) -> u64 {
+        self.audit_sink
+            .as_mut()
+            .map(|s| s.take_audit_dropped())
+            .unwrap_or(0)
+    }
+
+    /// Take and reset the count of ticks where audit flush exceeded its budget.
+    pub fn take_audit_flush_budget_exceeded(&mut self) -> u64 {
+        self.audit_sink
+            .as_mut()
+            .map(|s| s.take_audit_flush_budget_exceeded())
+            .unwrap_or(0)
     }
 
     /// Enable bounded stdout/stderr capture for child processes. `cap` is
@@ -1329,6 +1402,16 @@ impl Recovery {
     ///
     /// Never blocks; returns an empty vector when no children have
     /// transitioned since the last tick.
+    /// Drain completed or timeout-exceeded children.
+    ///
+    /// At most [`REAP_MAX_PER_TICK`] outstanding pids are visited per call,
+    /// bounding `waitpid(2, WNOHANG)` syscall budget per poll tick. A
+    /// rotating `reap_cursor` advances past the visited window so pids
+    /// deferred this tick are visited first on the next call. When the full
+    /// outstanding set exceeds the cap, `varta_recovery_reap_truncated_total`
+    /// is incremented; drain the value via [`take_reap_truncated`].
+    ///
+    /// [`take_reap_truncated`]: Recovery::take_reap_truncated
     pub fn try_reap(&mut self) -> Vec<RecoveryOutcome> {
         let mut outcomes = Vec::new();
         outcomes.append(&mut self.pending_outcomes);
@@ -1337,20 +1420,34 @@ impl Recovery {
         // `clear()` keeps the backing allocation; `extend` grows it the
         // first time it must (and never thereafter in steady state).
         // Bounded by `outstanding.len()`, which is itself bounded by
-        // `tracker_capacity` — there is no silent cap.
+        // `tracker_capacity`.
         self.reap_scratch.clear();
         self.reap_scratch.extend(self.outstanding.iter_pids());
         debug_assert!(
             self.reap_scratch.len() == self.outstanding.len(),
             "reap_scratch must mirror outstanding exactly"
         );
+        let n = self.reap_scratch.len();
+        if n == 0 {
+            return outcomes;
+        }
+
+        // Clamp work to the per-tick cap and advance the rotating cursor.
+        let limit = self.reap_max.min(n);
+        let start = self.reap_cursor % n;
+        if limit < n {
+            self.reap_truncated_total = self.reap_truncated_total.saturating_add(1);
+        }
+        // Advance cursor so the window slides forward each tick.
+        self.reap_cursor = (start + limit) % n;
+
         // Iterate by index so we don't hold an immutable borrow on
         // `self.reap_scratch` across the `&mut self` method calls below.
         // The buffer is never mutated inside the loop, so indices remain
         // stable.
-        let n = self.reap_scratch.len();
-        for i in 0..n {
-            let pid = self.reap_scratch[i];
+        for offset in 0..limit {
+            let idx = (start + offset) % n;
+            let pid = self.reap_scratch[idx];
             if let Some(outcome) = self.reap_finished_child(pid) {
                 outcomes.push(outcome);
                 continue;
@@ -2393,5 +2490,80 @@ mod tests {
         // distinct refusal class.
         assert_eq!(rec.take_refused_unauthenticated_source(), 0);
         assert_eq!(rec.take_refused_cross_namespace(), 0);
+    }
+
+    /// When the outstanding count is within the per-tick cap, no truncation
+    /// occurs and all children are visited.
+    #[test]
+    #[cfg_attr(miri, ignore)] // JUSTIFY: spawns real child processes via Command
+    fn try_reap_no_truncation_within_cap() {
+        let mut rec = Recovery::new_exec("true".to_string(), vec![], Duration::from_secs(10));
+        // Spawn 3 children — well within the default cap of 64.
+        for pid in 1u32..=3 {
+            rec.on_stall(pid, BeatOrigin::KernelAttested, false);
+        }
+        // Give children time to exit.
+        std::thread::sleep(Duration::from_millis(50));
+        // First try_reap should collect all 3 with no truncation.
+        let outcomes = rec.try_reap();
+        assert_eq!(rec.take_reap_truncated(), 0, "no truncation expected");
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|o| matches!(o, RecoveryOutcome::Reaped { .. }))
+                .count(),
+            3,
+            "all 3 children should be reaped"
+        );
+    }
+
+    /// When outstanding children exceed the test-reduced cap, exactly `cap`
+    /// pids are visited per tick, the truncation counter is incremented, and
+    /// the cursor advances so the next tick visits the remaining pids.
+    #[test]
+    #[cfg_attr(miri, ignore)] // JUSTIFY: spawns real child processes via Command
+    fn try_reap_caps_and_cursor_advances() {
+        let mut rec = Recovery::new_exec("true".to_string(), vec![], Duration::from_secs(10));
+        // Spawn 5 children and lower the cap to 2 so truncation triggers.
+        for pid in 1u32..=5 {
+            rec.on_stall(pid, BeatOrigin::KernelAttested, false);
+        }
+        rec.shrink_reap_max_for_test(2);
+        // Give all children time to exit.
+        std::thread::sleep(Duration::from_millis(100));
+
+        let mut total_reaped = 0;
+        let mut total_ticks = 0;
+        // 3 ticks of 2 should drain all 5 (ceil(5/2) = 3).
+        for _ in 0..3 {
+            let outcomes = rec.try_reap();
+            total_reaped += outcomes
+                .iter()
+                .filter(|o| matches!(o, RecoveryOutcome::Reaped { .. }))
+                .count();
+            total_ticks += 1;
+            if rec.outstanding.len() == 0 {
+                break;
+            }
+        }
+        assert_eq!(total_reaped, 5, "all 5 children eventually reaped");
+        assert!(total_ticks <= 3, "at most 3 ticks to drain 5 with cap=2");
+    }
+
+    /// The truncation counter increments once per truncated tick and resets
+    /// on drain.
+    #[test]
+    #[cfg_attr(miri, ignore)] // JUSTIFY: spawns real child processes via Command
+    fn try_reap_truncation_counter_increments_and_resets() {
+        let mut rec = Recovery::new_exec("true".to_string(), vec![], Duration::from_secs(10));
+        for pid in 1u32..=4 {
+            rec.on_stall(pid, BeatOrigin::KernelAttested, false);
+        }
+        rec.shrink_reap_max_for_test(2);
+        std::thread::sleep(Duration::from_millis(100));
+
+        rec.try_reap(); // tick 1: visits 2 of 4 → truncated
+        assert_eq!(rec.take_reap_truncated(), 1, "one truncated tick");
+        assert_eq!(rec.take_reap_truncated(), 0, "counter reset after drain");
     }
 }

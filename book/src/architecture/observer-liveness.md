@@ -43,6 +43,27 @@ varta-watch --self-watchdog-secs 4 ...
   core dumps, and triggers `Restart=on-abort` in systemd units.
 - The deadline should be set to roughly 2× the expected worst-case poll
   latency (typically `--threshold-ms` + reaping time).
+- **Per-stage wedge detection (H6):** in addition to the full-iteration check,
+  the watchdog reads two atomics written by the main thread —
+  `CURRENT_STAGE` (which of the six loop phases is running) and
+  `LAST_STAGE_ENTRY_NS` (monotonic ns at which that phase started).  Each
+  stage has an independent hard abort threshold in `STAGE_ABORT_NS` (≥ 5×
+  the stage's soft budget):
+
+  | Stage | Hard abort threshold |
+  |---|---|
+  | `drain_pending` | 2 s |
+  | `poll` | 2 s |
+  | `maintenance` | 500 ms |
+  | `recovery_reap` | 1 s |
+  | `serve_pending` | 2 s |
+  | `housekeeping` | 1 s |
+
+  A stage wedge (e.g. an `fdatasync` blocking indefinitely, or a single
+  `waitpid` hanging) trips the per-stage threshold long before the
+  full-iteration watchdog fires.  The watchdog logs which stage wedged and
+  aborts.  Between iterations `CURRENT_STAGE` is set to `u8::MAX` (idle
+  sentinel) so the per-stage check is suppressed during throttle sleeps.
 - **H5 (post-2026-05-13):** the watchdog thread is ALSO the sole emitter of
   systemd `WATCHDOG=1`.  Emission used to live on the main loop, which left
   a silent-failure window: if the watchdog thread died while the main loop
@@ -225,14 +246,13 @@ upper-bound source for each:
 
 | Phase                                  | Worst case        | Source / constant                                                                                                 | Observable as                                              |
 |---|---|---|---|
-| 1. Drain queued stall events           | O(queue)·~1 µs    | `Observer::poll_pending` — one stack pop per call                                                                 | (subsumed in `iteration_seconds`)                          |
-| 2. `Observer::poll()` (one recv each)  | ≤ `read_timeout`·*N* | UDS `recv(2)` blocks up to `--read-timeout-ms` (default 100 ms) per listener; UDP listeners are non-blocking   | (subsumed in `iteration_seconds`)                          |
-| 3. Maintenance counter drains          | <1 ms             | Constant work over `observer.drain_*` counters                                                                    | (subsumed in `iteration_seconds`)                          |
-| 3. `Recovery::try_reap`                | ~64 µs            | ≤64 `waitpid(2, WNOHANG)` syscalls (bounded outstanding-pids fan)                                                 | (subsumed in `iteration_seconds`)                          |
-| 3. `PromExporter::serve_pending`       | ≤200 ms           | 100 ms serve deadline + 100 ms drain deadline (see `exporter.rs`)                                                 | `varta_observer_serve_pending_seconds` (independent histo) |
-| 4. Heartbeat-file atomic write         | <5 ms             | Same-dir write + rename (`write_heartbeat_atomic`)                                                                | (subsumed in `iteration_seconds`)                          |
-| 4. `sd_notify` + HW watchdog kicks     | <1 ms             | One `sendmsg(2)` + one `write(2)`                                                                                 | (subsumed in `iteration_seconds`)                          |
-| **Iteration total (worst case)**       | **~310 ms**       | UDS read_timeout (100 ms) + serve_pending (≤200 ms) + small fixed work — assuming a single UDS listener           | `varta_observer_iteration_seconds`                         |
+| 1. Drain queued stall events           | O(queue)·~1 µs    | `Observer::poll_pending` — one stack pop per call                                                                 | `varta_observer_stage_seconds{stage="drain_pending"}`      |
+| 2. `Observer::poll()` (one recv each)  | ≤ `read_timeout`·*N* | UDS `recv(2)` blocks up to `--read-timeout-ms` (default 100 ms) per listener; UDP listeners are non-blocking   | `varta_observer_stage_seconds{stage="poll"}`               |
+| 3. Maintenance: counter drains + audit ring flush | ≤10 ms | Constant counter work + `flush_pending(10 ms budget)` draining the 256-line audit ring to BufWriter+fdatasync | `varta_observer_stage_seconds{stage="maintenance"}`        |
+| 4. `Recovery::try_reap`                | ~64 µs            | ≤64 `waitpid(2, WNOHANG)` syscalls; rotating cursor (bounded outstanding-pids fan)                                | `varta_observer_stage_seconds{stage="recovery_reap"}`      |
+| 5. `PromExporter::serve_pending`       | ≤200 ms           | 100 ms serve deadline + 100 ms drain deadline (see `exporter.rs`)                                                 | `varta_observer_stage_seconds{stage="serve_pending"}` + independent `varta_observer_serve_pending_seconds` histo |
+| 6. Heartbeat-file write + watchdog kicks | <6 ms           | `write_heartbeat_atomic` (rename) + one `sendmsg(2)` + one `write(2)`                                            | `varta_observer_stage_seconds{stage="housekeeping"}`       |
+| **Iteration total (worst case)**       | **~320 ms**       | UDS read_timeout (100 ms) + serve_pending (≤200 ms) + maintenance ≤10 ms + small fixed work                       | `varta_observer_iteration_seconds`                         |
 
 Two observations the table makes explicit:
 
@@ -320,6 +340,64 @@ when scrape overruns dominate the budget overruns.
 Alarms that should fire on **scrape-storm** pressure route off
 `scrape_budget_exceeded_total` and `serve_pending_seconds` quantiles
 directly.
+
+### Per-stage histograms (`varta_observer_stage_seconds`)
+
+Each of the six loop phases emits an independent histogram with the same
+bucket boundaries as `varta_observer_iteration_seconds`:
+
+| Label value | Phase |
+|---|---|
+| `drain_pending` | Stall-event queue drain |
+| `poll` | Non-blocking I/O receive + frame decode + auth |
+| `maintenance` | Counter drains + audit-ring flush |
+| `recovery_reap` | Bounded `waitpid(2, WNOHANG)` + kill |
+| `serve_pending` | Prometheus `/metrics` accept + response loop |
+| `housekeeping` | Heartbeat write + watchdog kick |
+
+Every stage emits every bucket from the first scrape (stable label set) so
+`absent()` alert rules stay valid before the first observation.
+
+Use `rate(varta_observer_stage_seconds_sum[5m]) / rate(varta_observer_stage_seconds_count[5m])`
+per stage to isolate which phase is contributing to latency.
+
+### Audit-ring back-pressure metrics
+
+The recovery audit log uses an in-memory ring (cap 256) to decouple
+`fdatasync` from the hot path.  `record_spawn` / `record_complete` enqueue
+formatted lines; the maintenance phase drains them within a 10 ms budget.
+
+| Metric | Meaning |
+|---|---|
+| `varta_recovery_audit_dropped_total` | Lines dropped because the ring was full when they arrived |
+| `varta_recovery_audit_flush_budget_exceeded_total` | Ticks where `flush_pending` exhausted its budget before emptying the ring |
+| `varta_recovery_reap_truncated_total` | Ticks where `try_reap` hit `REAP_MAX_PER_TICK=64` before checking all outstanding children |
+
+Non-zero `audit_dropped_total` means audit records are being permanently
+lost — either the disk is too slow, the budget is too tight, or the event
+rate is unsustainably high.  Non-zero `audit_flush_budget_exceeded_total`
+is a precursor: lines are accumulating faster than they drain, but no data
+is lost yet.
+
+```promql
+# Page immediately — audit records are being permanently dropped.
+alert: VartaAuditRecordDropped
+expr: increase(varta_recovery_audit_dropped_total[5m]) > 0
+for: 0m
+labels: { severity: critical }
+
+# Warn — audit flush is consistently running out of budget.
+alert: VartaAuditFlushBudgetPressure
+expr: rate(varta_recovery_audit_flush_budget_exceeded_total[5m]) > 0.1
+for: 5m
+labels: { severity: warning }
+
+# Warn — recovery reap is capping at REAP_MAX_PER_TICK=64 each tick.
+alert: VartaRecoveryReapTruncated
+expr: rate(varta_recovery_reap_truncated_total[5m]) > 0.1
+for: 5m
+labels: { severity: warning }
+```
 
 ### Recommended Prometheus alerts
 

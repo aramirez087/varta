@@ -26,6 +26,8 @@ use std::time::{Duration, Instant};
 use varta_watch::log_ratelimit::LogKind;
 #[cfg(feature = "prometheus-exporter")]
 use varta_watch::PromExporter;
+#[cfg(feature = "prometheus-exporter")]
+use varta_watch::exporter::IterStage;
 use varta_watch::{
     varta_error, varta_error_err, varta_error_pid, varta_error_rl, varta_info_pid_child,
     varta_warn, varta_warn_child, varta_warn_rl, Config, ConfigError, Event, Exporter,
@@ -57,6 +59,44 @@ static SHUTDOWN: AtomicBool = AtomicBool::new(false);
 /// Initialised to 0; the watchdog ignores the zero value to avoid spurious
 /// aborts before the first tick.
 static LAST_TICK_NS: AtomicU64 = AtomicU64::new(0);
+
+/// Per-stage entry timestamps written by the main thread at the START of each
+/// poll-loop phase.  The self-watchdog thread reads these to detect a wedge
+/// inside a single stage (e.g. a hung `serve_pending`) without waiting for
+/// the full [`LAST_TICK_NS`] deadline.  Indexed by [`IterStage as usize`].
+///
+/// Initialised to 0; the watchdog treats 0 as "stage not yet entered".
+#[cfg(feature = "prometheus-exporter")]
+static LAST_STAGE_ENTRY_NS: [AtomicU64; 6] = [
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+];
+
+/// Index of the stage the main thread is currently executing, or `u8::MAX`
+/// when the loop is idle (between iterations or in the throttle sleep).
+/// Written by the main thread, read by the self-watchdog thread.
+#[cfg(feature = "prometheus-exporter")]
+static CURRENT_STAGE: AtomicU8 = AtomicU8::new(u8::MAX);
+
+/// Per-stage hard abort threshold in nanoseconds.  If the main thread stays
+/// in the same stage for longer than this value, the watchdog calls
+/// `process::abort()`.  Each threshold is ≥ 5× the stage's soft budget so
+/// transient overruns under scrape load do not trigger a false positive.
+///
+/// Indexed by [`IterStage as usize`] — must stay in sync with the enum.
+#[cfg(feature = "prometheus-exporter")]
+const STAGE_ABORT_NS: [u64; 6] = [
+    2_000 * 1_000_000,   // DrainPending: 2 s (5× 20 ms soft budget)
+    2_000 * 1_000_000,   // Poll:         2 s (≈18× read_timeout default)
+      500 * 1_000_000,   // Maintenance:  500 ms (50× 10 ms)
+    1_000 * 1_000_000,   // RecoveryReap: 1 s (50× 20 ms)
+    2_000 * 1_000_000,   // ServePending: 2 s (10× 200 ms structural cap)
+    1_000 * 1_000_000,   // Housekeeping: 1 s (100× 10 ms)
+];
 
 /// Kernel clock source for `observer_now_ns()`.  Set exactly once in
 /// `run()` before the self-watchdog thread spawns, so both threads agree
@@ -1120,10 +1160,13 @@ fn run(cfg: Config) -> std::io::Result<()> {
         // (the historical cadence) and below by half_interval/2 when systemd
         // is supervising — a tight WatchdogSec (e.g. 500 ms) demands faster
         // ticks than a fixed 500 ms could deliver.
+        // Sleep floor reduced to 25 ms to improve stage-wedge detection
+        // resolution.  This costs one extra relaxed-load wake-up per 25 ms —
+        // negligible CPU for a single background thread.
         let tick_sleep = match wdt_notifier.as_ref() {
             Some(n) => (n.half_interval() / 2)
                 .min(Duration::from_millis(500))
-                .max(Duration::from_millis(50)),
+                .max(Duration::from_millis(25)),
             None => Duration::from_millis(500),
         };
         let mut wdt_notifier = wdt_notifier;
@@ -1134,12 +1177,49 @@ fn run(cfg: Config) -> std::io::Result<()> {
                 if SHUTDOWN.load(Ordering::Acquire) {
                     return;
                 }
-                let last = LAST_TICK_NS.load(Ordering::Relaxed);
                 let now = observer_now_ns();
+
+                // Check 1: full-iteration deadline (existing).  Fires when the
+                // poll loop has not completed a full tick in `deadline` seconds.
+                let last = LAST_TICK_NS.load(Ordering::Relaxed);
                 if watchdog_expired(now, last, deadline_ns) {
                     eprintln!("varta-watch poll loop wedged for >{secs}s; aborting");
                     std::process::abort();
                 }
+
+                // Check 2: per-stage deadline.  If the main thread is stuck
+                // inside one phase for longer than STAGE_ABORT_NS[stage], abort
+                // even if the full-iteration deadline has not yet expired.  This
+                // catches e.g. a hung serve_pending that takes 1.9 s — visible
+                // via the stage histogram immediately but not caught by the 4 s
+                // iteration deadline until two full cycles later.
+                //
+                // Gated on `prometheus-exporter` because LAST_STAGE_ENTRY_NS and
+                // CURRENT_STAGE are only compiled under that feature.
+                #[cfg(feature = "prometheus-exporter")]
+                {
+                    let stage_idx = CURRENT_STAGE.load(Ordering::Relaxed);
+                    if stage_idx != u8::MAX {
+                        let stage_idx = stage_idx as usize;
+                        if let (Some(abort_ns), Some(entry_atom)) = (
+                            STAGE_ABORT_NS.get(stage_idx),
+                            LAST_STAGE_ENTRY_NS.get(stage_idx),
+                        ) {
+                            let entry_ns = entry_atom.load(Ordering::Relaxed);
+                            if entry_ns != 0 && now.saturating_sub(entry_ns) > *abort_ns {
+                                let stage_label = varta_watch::exporter::STAGE_LABELS
+                                    .get(stage_idx)
+                                    .copied()
+                                    .unwrap_or("unknown");
+                                eprintln!(
+                                    "varta-watch stage '{stage_label}' wedged for >{abort_ns}ns; aborting"
+                                );
+                                std::process::abort();
+                            }
+                        }
+                    }
+                }
+
                 // Main loop is still ticking — emit WATCHDOG=1 to keep
                 // systemd informed of *our* liveness (not just the main
                 // thread's).  No-op when WATCHDOG_USEC is unset.
@@ -1199,6 +1279,17 @@ fn run(cfg: Config) -> std::io::Result<()> {
         // or wedged sd_notify socket would be a real budget event.
         #[cfg(feature = "prometheus-exporter")]
         let iter_start = Instant::now();
+        // Per-stage timer reused across phases; reset before each phase.
+        // DrainPending starts at iter_start (no separate Instant needed).
+        #[cfg(feature = "prometheus-exporter")]
+        let mut stage_start = iter_start;
+        // Signal to the watchdog that DrainPending is now active.
+        #[cfg(feature = "prometheus-exporter")]
+        {
+            CURRENT_STAGE.store(IterStage::DrainPending as u8, Ordering::Relaxed);
+            LAST_STAGE_ENTRY_NS.get(IterStage::DrainPending as usize)
+                .map(|a| a.store(observer_now_ns(), Ordering::Relaxed));
+        }
 
         // ------ 1. Drain queued stall events before I/O or maintenance ------
         // Surface every pending stall immediately; this prevents a batch of
@@ -1338,6 +1429,16 @@ fn run(cfg: Config) -> std::io::Result<()> {
             }
         }
 
+        // Record drain_pending stage, then reset timer for the poll phase.
+        #[cfg(feature = "prometheus-exporter")]
+        if let Some(pe) = prom_export.as_mut() {
+            pe.record_stage_duration(IterStage::DrainPending, stage_start.elapsed());
+            stage_start = Instant::now();
+            CURRENT_STAGE.store(IterStage::Poll as u8, Ordering::Relaxed);
+            LAST_STAGE_ENTRY_NS.get(IterStage::Poll as usize)
+                .map(|a| a.store(observer_now_ns(), Ordering::Relaxed));
+        }
+
         // ----- 2. One non-blocking I/O poll for new beats / decode / auth ------
         // poll() never returns stalls — those are surfaced exclusively via
         // poll_pending() above.
@@ -1380,6 +1481,16 @@ fn run(cfg: Config) -> std::io::Result<()> {
         } else {
             false
         };
+
+        // Record poll stage, then reset timer for the maintenance phase.
+        #[cfg(feature = "prometheus-exporter")]
+        if let Some(pe) = prom_export.as_mut() {
+            pe.record_stage_duration(IterStage::Poll, stage_start.elapsed());
+            stage_start = Instant::now();
+            CURRENT_STAGE.store(IterStage::Maintenance as u8, Ordering::Relaxed);
+            LAST_STAGE_ENTRY_NS.get(IterStage::Maintenance as usize)
+                .map(|a| a.store(observer_now_ns(), Ordering::Relaxed));
+        }
 
         // ------ 3. Maintenance (evictions, capacity, reaping, /metrics) ------
         let evicted = observer.drain_evictions();
@@ -1558,6 +1669,26 @@ fn run(cfg: Config) -> std::io::Result<()> {
             }
         }
 
+        // Flush buffered audit lines to disk (bounded by 10 ms). This
+        // decouples fdatasync from the hot path: record_spawn / record_complete
+        // enqueue into the ring, and this call drains up to 10 ms worth per
+        // tick. Lines that cannot be written within budget stay in the ring
+        // and are retried next tick.
+        if let Some(rec) = recovery.as_mut() {
+            rec.flush_audit_pending(std::time::Duration::from_millis(10));
+            #[cfg(feature = "prometheus-exporter")]
+            if let Some(pe) = prom_export.as_mut() {
+                let dropped = rec.take_audit_dropped();
+                if dropped > 0 {
+                    pe.record_audit_dropped(dropped);
+                }
+                let budget_exceeded = rec.take_audit_flush_budget_exceeded();
+                if budget_exceeded > 0 {
+                    pe.record_audit_flush_budget_exceeded(budget_exceeded);
+                }
+            }
+        }
+
         // Drain any latched audit-sink IO error. The audit log latches
         // failed writes / rotations / fsyncs internally so the recovery
         // hot path never blocks on disk I/O — but silently dropping audit
@@ -1567,6 +1698,16 @@ fn run(cfg: Config) -> std::io::Result<()> {
             if let Some(err) = rec.drain_audit_err() {
                 varta_warn_rl!(LogKind::AuditIo, "recovery audit IO error: {err}");
             }
+        }
+
+        // Record maintenance stage, then reset timer for the recovery_reap phase.
+        #[cfg(feature = "prometheus-exporter")]
+        if let Some(pe) = prom_export.as_mut() {
+            pe.record_stage_duration(IterStage::Maintenance, stage_start.elapsed());
+            stage_start = Instant::now();
+            CURRENT_STAGE.store(IterStage::RecoveryReap as u8, Ordering::Relaxed);
+            LAST_STAGE_ENTRY_NS.get(IterStage::RecoveryReap as usize)
+                .map(|a| a.store(observer_now_ns(), Ordering::Relaxed));
         }
 
         // Reap completed or timeout-exceeded children each tick.
@@ -1600,10 +1741,29 @@ fn run(cfg: Config) -> std::io::Result<()> {
                     _ => {}
                 }
             }
+            // Drain the per-tick truncation counter separately so the
+            // outcomes loop above doesn't need to borrow rec again.
+            #[cfg(feature = "prometheus-exporter")]
+            if let Some(pe) = prom_export.as_mut() {
+                let truncated = rec.take_reap_truncated();
+                if truncated > 0 {
+                    pe.record_recovery_reap_truncated(truncated);
+                }
+            }
+            #[cfg(not(feature = "prometheus-exporter"))]
+            {
+                let _ = rec.take_reap_truncated();
+            }
         }
 
         #[cfg(feature = "prometheus-exporter")]
         if let Some(pe) = prom_export.as_mut() {
+            // Record recovery_reap stage before entering serve_pending.
+            pe.record_stage_duration(IterStage::RecoveryReap, stage_start.elapsed());
+            CURRENT_STAGE.store(IterStage::ServePending as u8, Ordering::Relaxed);
+            LAST_STAGE_ENTRY_NS.get(IterStage::ServePending as usize)
+                .map(|a| a.store(observer_now_ns(), Ordering::Relaxed));
+
             // Bracket serve_pending so its wall time is observable
             // independently of beat-path latency.  See
             // `book/src/architecture/observer-liveness.md` ("Why /metrics is on
@@ -1616,7 +1776,13 @@ fn run(cfg: Config) -> std::io::Result<()> {
                 varta_error_rl!(LogKind::PromServe, "/metrics serve error: {e}");
             }
             pe.record_loop_tick();
-            pe.record_serve_pending_duration(serve_start.elapsed());
+            let serve_elapsed = serve_start.elapsed();
+            pe.record_serve_pending_duration(serve_elapsed);
+            pe.record_stage_duration(IterStage::ServePending, serve_elapsed);
+            stage_start = Instant::now(); // housekeeping starts after serve_pending
+            CURRENT_STAGE.store(IterStage::Housekeeping as u8, Ordering::Relaxed);
+            LAST_STAGE_ENTRY_NS.get(IterStage::Housekeeping as usize)
+                .map(|a| a.store(observer_now_ns(), Ordering::Relaxed));
         }
 
         // ----- 4. Heartbeat file, self-watchdog tick, and HW watchdog kick ------
@@ -1647,7 +1813,7 @@ fn run(cfg: Config) -> std::io::Result<()> {
             hw.kick();
         }
 
-        // ----- 5. Record per-iteration wall time ------
+        // ----- 5. Record per-stage and per-iteration wall time ------
         // H5: capture the duration of the work portion of this iteration
         // (everything from `iter_start` at the top of the loop body through
         // the watchdog kicks).  Excludes the idle sleep below and the
@@ -1655,8 +1821,13 @@ fn run(cfg: Config) -> std::io::Result<()> {
         // real work.  See `book/src/architecture/observer-liveness.md`.
         #[cfg(feature = "prometheus-exporter")]
         if let Some(pe) = prom_export.as_mut() {
+            pe.record_stage_duration(IterStage::Housekeeping, stage_start.elapsed());
             pe.record_iteration_duration(iter_start.elapsed());
         }
+        // Mark the loop as idle — the watchdog should not enforce a stage
+        // deadline between iterations (the throttle sleep is not work).
+        #[cfg(feature = "prometheus-exporter")]
+        CURRENT_STAGE.store(u8::MAX, Ordering::Relaxed);
 
         // ----- 6. Throttle: sleep only when truly idle ------
         // Avoid busy-waiting when there are no I/O events and no queued

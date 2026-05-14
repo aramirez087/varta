@@ -573,6 +573,43 @@ const PROM_MAX_DRAIN_PER_SERVE: usize = 50;
 const ITERATION_BUCKET_BOUNDS_S: [f64; 8] =
     [0.001, 0.005, 0.010, 0.050, 0.100, 0.250, 0.500, 1.000];
 
+/// Observer poll-loop stage identifier for per-stage timing attribution.
+///
+/// Variants are ordered to match the poll-loop execution order in `main.rs`.
+/// `STAGE_LABELS[stage as usize]` gives the Prometheus `stage=` label value.
+/// Every stage emits on every scrape (including zero-count stages) so
+/// `absent()` alert rules and `histogram_quantile()` stay correct from the
+/// first scrape.
+#[cfg(feature = "prometheus-exporter")]
+#[derive(Clone, Copy)]
+pub enum IterStage {
+    /// Drain queued stall events from the observer stall queue.
+    DrainPending = 0,
+    /// One non-blocking I/O poll for new beats, decode, and authentication.
+    Poll         = 1,
+    /// Maintenance: eviction drains, capacity counters, and audit-error drain.
+    Maintenance  = 2,
+    /// Recovery reap: non-blocking `waitpid(2)` and optional kill for timed-out children.
+    RecoveryReap = 3,
+    /// Prometheus `/metrics` serving: `serve_pending` accept + response loop.
+    ServePending = 4,
+    /// Housekeeping: heartbeat-file write, self-watchdog tick, and hardware watchdog kick.
+    Housekeeping = 5,
+}
+
+/// Prometheus `stage=` label values for each [`IterStage`] variant, indexed
+/// by `stage as usize`. Stable-label-set contract: emit every element on
+/// every scrape, even at zero.
+#[cfg(feature = "prometheus-exporter")]
+pub const STAGE_LABELS: [&str; 6] = [
+    "drain_pending",
+    "poll",
+    "maintenance",
+    "recovery_reap",
+    "serve_pending",
+    "housekeeping",
+];
+
 /// Default soft budget for a single observer poll iteration. Overruns
 /// increment `varta_observer_iteration_budget_exceeded_total`; the budget
 /// is advisory — hard wedges remain the responsibility of
@@ -868,6 +905,10 @@ pub struct PromExporter {
     /// `varta_recovery_outstanding_probe_exhausted_total`.  Mirrors the
     /// tracker's counter for the cold recovery path.
     recovery_outstanding_probe_exhausted_total: u64,
+    /// Count of [`try_reap`](crate::recovery::Recovery::try_reap) calls
+    /// truncated because outstanding children exceeded `REAP_MAX_PER_TICK`.
+    /// Surfaced as `varta_recovery_reap_truncated_total`.
+    recovery_reap_truncated_total: u64,
     /// `IpStateTable` ip-index probe-exhaustion events. Surfaced as
     /// `varta_prom_ip_state_probe_exhausted_total`.
     prom_ip_state_probe_exhausted_total: u64,
@@ -924,6 +965,24 @@ pub struct PromExporter {
     /// Times a single `serve_pending` exceeded [`Self::scrape_budget`].
     /// Exposed as `varta_observer_scrape_budget_exceeded_total`. Advisory.
     scrape_budget_exceeded_total: u64,
+    /// Per-stage iteration timing histograms. Row index is `IterStage as
+    /// usize`; column index is the [`ITERATION_BUCKET_BOUNDS_S`] slot (with
+    /// the final column reserved for `+Inf`). Non-cumulative storage; summed
+    /// at render time. Every stage emits every bucket on every scrape so
+    /// `absent()` alert rules stay correct before the first observation.
+    stage_buckets: [[u64; ITERATION_BUCKET_BOUNDS_S.len() + 1]; STAGE_LABELS.len()],
+    /// Per-stage sum of observed durations in nanoseconds.
+    stage_duration_ns_sum: [u64; STAGE_LABELS.len()],
+    /// Per-stage observation count.
+    stage_count_total: [u64; STAGE_LABELS.len()],
+    /// Lines enqueued by the hot path that were dropped because the audit
+    /// ring was at capacity. Surfaced as
+    /// `varta_recovery_audit_dropped_total`.
+    audit_dropped_total: u64,
+    /// Ticks where `flush_pending` ran out of budget before draining the
+    /// audit ring. Surfaced as
+    /// `varta_recovery_audit_flush_budget_exceeded_total`.
+    audit_flush_budget_exceeded_total: u64,
     /// Soft per-call budget for `serve_pending`. Configurable via
     /// `--scrape-budget-ms`; defaults to [`DEFAULT_SCRAPE_BUDGET`].
     scrape_budget: Duration,
@@ -1023,6 +1082,7 @@ impl PromExporter {
             tracker_invariant_violations_total: 0,
             tracker_pid_index_probe_exhausted_total: 0,
             recovery_outstanding_probe_exhausted_total: 0,
+            recovery_reap_truncated_total: 0,
             prom_ip_state_probe_exhausted_total: 0,
             recovery_duration_ns_sum: 0,
             recovery_duration_count_total: 0,
@@ -1037,6 +1097,11 @@ impl PromExporter {
             serve_pending_duration_ns_sum: 0,
             serve_pending_count_total: 0,
             scrape_budget_exceeded_total: 0,
+            stage_buckets: [[0; ITERATION_BUCKET_BOUNDS_S.len() + 1]; STAGE_LABELS.len()],
+            stage_duration_ns_sum: [0; STAGE_LABELS.len()],
+            stage_count_total: [0; STAGE_LABELS.len()],
+            audit_dropped_total: 0,
+            audit_flush_budget_exceeded_total: 0,
             scrape_budget: DEFAULT_SCRAPE_BUDGET,
             ip_state: IpStateTable::with_capacity(MAX_PROM_IP_STATES),
             rate_per_sec,
@@ -1340,6 +1405,30 @@ impl PromExporter {
             .saturating_add(count);
     }
 
+    /// Record [`try_reap`](crate::recovery::Recovery::try_reap) calls that
+    /// were truncated because outstanding children exceeded the per-tick cap.
+    /// See [`crate::recovery::Recovery::take_reap_truncated`].
+    pub fn record_recovery_reap_truncated(&mut self, count: u64) {
+        self.recovery_reap_truncated_total = self
+            .recovery_reap_truncated_total
+            .saturating_add(count);
+    }
+
+    /// Record audit lines dropped because the ring was at capacity when they
+    /// arrived. See [`crate::recovery::Recovery::take_audit_dropped`].
+    pub fn record_audit_dropped(&mut self, count: u64) {
+        self.audit_dropped_total = self.audit_dropped_total.saturating_add(count);
+    }
+
+    /// Record ticks where `flush_pending` ran out of budget before draining
+    /// the audit ring. See
+    /// [`crate::recovery::Recovery::take_audit_flush_budget_exceeded`].
+    pub fn record_audit_flush_budget_exceeded(&mut self, count: u64) {
+        self.audit_flush_budget_exceeded_total = self
+            .audit_flush_budget_exceeded_total
+            .saturating_add(count);
+    }
+
     /// Record one or more scrapes served from cache (scrape arrived before
     /// [`PROM_MIN_SCRAPE_INTERVAL`] elapsed since the last fresh render).
     pub fn record_scrape_skipped(&mut self, count: u64) {
@@ -1423,6 +1512,37 @@ impl PromExporter {
         if d > self.iteration_budget {
             self.iteration_budget_exceeded_total =
                 self.iteration_budget_exceeded_total.saturating_add(1);
+        }
+    }
+
+    /// Record the wall-clock duration of one observer poll-loop stage.
+    ///
+    /// Updates `varta_observer_stage_seconds{stage="..."}` for the given
+    /// [`IterStage`] variant. Every stage emits on every scrape (including
+    /// zero-count stages) so `absent()` alert rules and
+    /// `histogram_quantile()` stay correct from the first scrape.
+    ///
+    /// Buckets are stored non-cumulatively here and summed at exposition
+    /// time — same contract as [`record_iteration_duration`].
+    ///
+    /// [`record_iteration_duration`]: Self::record_iteration_duration
+    pub fn record_stage_duration(&mut self, stage: IterStage, d: Duration) {
+        let idx = stage as usize;
+        let secs = d.as_secs_f64();
+        let ns = u64::try_from(d.as_nanos()).unwrap_or(u64::MAX);
+        self.stage_duration_ns_sum[idx] = self.stage_duration_ns_sum[idx].saturating_add(ns);
+        self.stage_count_total[idx] = self.stage_count_total[idx].saturating_add(1);
+        let mut placed = false;
+        for (i, &bound) in ITERATION_BUCKET_BOUNDS_S.iter().enumerate() {
+            if secs <= bound {
+                self.stage_buckets[idx][i] = self.stage_buckets[idx][i].saturating_add(1);
+                placed = true;
+                break;
+            }
+        }
+        if !placed {
+            let inf_i = ITERATION_BUCKET_BOUNDS_S.len();
+            self.stage_buckets[idx][inf_i] = self.stage_buckets[idx][inf_i].saturating_add(1);
         }
     }
 
@@ -1935,6 +2055,41 @@ impl PromExporter {
             "varta_recovery_outstanding_probe_exhausted_total {}",
             self.recovery_outstanding_probe_exhausted_total
         );
+        // Recovery reap-truncated — fires when outstanding fan-out exceeds
+        // REAP_MAX_PER_TICK (64). Non-zero sustained rate means children are
+        // accumulating faster than they're reaped; check debounce and timeout
+        // settings.
+        self.body_buf.push_str(
+            "# HELP varta_recovery_reap_truncated_total try_reap calls cut short because outstanding children exceeded the per-tick cap (REAP_MAX_PER_TICK=64).\n",
+        );
+        self.body_buf
+            .push_str("# TYPE varta_recovery_reap_truncated_total counter\n");
+        let _ = writeln!(
+            self.body_buf,
+            "varta_recovery_reap_truncated_total {}",
+            self.recovery_reap_truncated_total
+        );
+        // Audit ring back-pressure counters.
+        self.body_buf.push_str(
+            "# HELP varta_recovery_audit_dropped_total Audit lines dropped because the ring was full when they arrived.\n",
+        );
+        self.body_buf
+            .push_str("# TYPE varta_recovery_audit_dropped_total counter\n");
+        let _ = writeln!(
+            self.body_buf,
+            "varta_recovery_audit_dropped_total {}",
+            self.audit_dropped_total
+        );
+        self.body_buf.push_str(
+            "# HELP varta_recovery_audit_flush_budget_exceeded_total Ticks where flush_pending hit its budget before emptying the audit ring.\n",
+        );
+        self.body_buf
+            .push_str("# TYPE varta_recovery_audit_flush_budget_exceeded_total counter\n");
+        let _ = writeln!(
+            self.body_buf,
+            "varta_recovery_audit_flush_budget_exceeded_total {}",
+            self.audit_flush_budget_exceeded_total
+        );
         // IpStateTable probe-exhaustion — /metrics accept path.
         self.body_buf.push_str(
             "# HELP varta_prom_ip_state_probe_exhausted_total IpStateTable lookups/inserts that ran the full MAX_PROBE budget.\n",
@@ -2118,6 +2273,43 @@ impl PromExporter {
             "varta_observer_scrape_budget_exceeded_total {}",
             self.scrape_budget_exceeded_total
         );
+        // Per-stage iteration histogram — one labeled series per IterStage.
+        // Same bucket boundaries as iteration_seconds and serve_pending_seconds
+        // so operators can decompose per-iteration latency in a single PromQL
+        // expression. Emits every stage×bucket combination on every scrape
+        // (stable-label-set contract) so absent() alert rules and
+        // histogram_quantile() work from the first scrape.
+        self.body_buf.push_str(
+            "# HELP varta_observer_stage_seconds Per-stage observer poll-loop wall time for latency attribution.\n",
+        );
+        self.body_buf
+            .push_str("# TYPE varta_observer_stage_seconds histogram\n");
+        for (stage_idx, stage_label) in STAGE_LABELS.iter().enumerate() {
+            let mut cum_st: u64 = 0;
+            for (b_idx, bound) in ITERATION_BUCKET_BOUNDS_S.iter().enumerate() {
+                cum_st = cum_st.saturating_add(self.stage_buckets[stage_idx][b_idx]);
+                let _ = writeln!(
+                    self.body_buf,
+                    "varta_observer_stage_seconds_bucket{{stage=\"{stage_label}\",le=\"{bound}\"}} {cum_st}",
+                );
+            }
+            let inf_i = ITERATION_BUCKET_BOUNDS_S.len();
+            cum_st = cum_st.saturating_add(self.stage_buckets[stage_idx][inf_i]);
+            let _ = writeln!(
+                self.body_buf,
+                "varta_observer_stage_seconds_bucket{{stage=\"{stage_label}\",le=\"+Inf\"}} {cum_st}"
+            );
+            let sum_s = (self.stage_duration_ns_sum[stage_idx] as f64) / 1e9;
+            let _ = writeln!(
+                self.body_buf,
+                "varta_observer_stage_seconds_sum{{stage=\"{stage_label}\"}} {sum_s:.9}"
+            );
+            let _ = writeln!(
+                self.body_buf,
+                "varta_observer_stage_seconds_count{{stage=\"{stage_label}\"}} {}",
+                self.stage_count_total[stage_idx]
+            );
+        }
         // Authentication failures on /metrics — emit unconditionally
         // (even at zero) so `absent()` alert rules stay green-on-green
         // until the first incident.  Same contract as
@@ -2929,6 +3121,64 @@ mod tests {
         assert!(
             body.contains("varta_recovery_refused_total{reason=\"debounce_capacity\"} 1"),
             "refused-reason counter must increment under debounce_capacity; body:\n{body}"
+        );
+    }
+
+    /// Every stage label must appear in the rendered body even before any
+    /// observation has landed (stable-label-set contract). Also verifies the
+    /// `+Inf` literal (not `inf`) is used for the implicit bucket.
+    #[test]
+    fn stage_histogram_emits_all_labels_at_zero_on_first_scrape() {
+        let mut prom =
+            PromExporter::bind("127.0.0.1:0".parse().unwrap(), make_token()).expect("bind");
+        prom.render_body();
+        let body = &prom.body_buf;
+        for stage_label in STAGE_LABELS.iter() {
+            let inf_key = format!(
+                "varta_observer_stage_seconds_bucket{{stage=\"{stage_label}\",le=\"+Inf\"}} 0"
+            );
+            assert!(
+                body.contains(&inf_key),
+                "stage={stage_label} +Inf bucket missing or non-zero at first scrape; body:\n{body}"
+            );
+            let count_key = format!(
+                "varta_observer_stage_seconds_count{{stage=\"{stage_label}\"}} 0"
+            );
+            assert!(
+                body.contains(&count_key),
+                "stage={stage_label} _count missing at first scrape; body:\n{body}"
+            );
+        }
+    }
+
+    /// A single observation lands in the correct stage bucket and increments
+    /// the per-stage count and sum.
+    #[test]
+    fn stage_histogram_records_observation_in_correct_bucket() {
+        let mut prom =
+            PromExporter::bind("127.0.0.1:0".parse().unwrap(), make_token()).expect("bind");
+        // Record a 2 ms duration for Poll — should land in le="0.005" bucket.
+        prom.record_stage_duration(IterStage::Poll, Duration::from_millis(2));
+        prom.render_body();
+        let body = &prom.body_buf;
+        // le="0.005" bucket for Poll must be cumulative 1.
+        assert!(
+            body.contains(
+                "varta_observer_stage_seconds_bucket{stage=\"poll\",le=\"0.005\"} 1"
+            ),
+            "Poll 2 ms must land in le=0.005; body:\n{body}"
+        );
+        // count must be 1.
+        assert!(
+            body.contains("varta_observer_stage_seconds_count{stage=\"poll\"} 1"),
+            "Poll count must be 1; body:\n{body}"
+        );
+        // Other stages must still have count 0.
+        assert!(
+            body.contains(
+                "varta_observer_stage_seconds_count{stage=\"drain_pending\"} 0"
+            ),
+            "drain_pending count must remain 0; body:\n{body}"
         );
     }
 }
