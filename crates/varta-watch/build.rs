@@ -25,6 +25,11 @@ use std::env;
 use std::fs;
 use std::path::PathBuf;
 
+// Pull in FlagKind, FlagSpec, and FLAGS from the flag catalogue.  The catalogue
+// is the single source of truth for both the CLI parser and the build script.
+// It uses only `std`-level identifiers so it compiles cleanly here.
+include!("src/config/flag_catalogue.rs");
+
 fn main() {
     let out_dir = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR not set by Cargo"));
     let target = out_dir.join("compile_time_config.rs");
@@ -73,105 +78,13 @@ fn main() {
     fs::write(&target, rust).expect("write generated compile_time_config.rs");
 }
 
-// --- KEY catalogue ----------------------------------------------------------
-//
-// The single source of truth for which keys are accepted in the
-// compile-time-config file and what type each key resolves to.  Mirrored in
-// `book/src/architecture/compile-time-config.md`.
-// Allow dead variants: the catalogue lists every shape we might emit, even
-// when no current `Config` field uses it.  Removing variants only to
-// re-add them later is friction with no benefit.
-#[allow(dead_code)]
-#[derive(Clone, Copy, Debug)]
-enum KeyType {
-    /// Path on disk (no validation beyond presence).
-    PathBuf,
-    /// Free-form string (e.g. recovery command template).
-    String,
-    /// `true` / `false`, case-insensitive.
-    Bool,
-    /// Unsigned 64-bit decimal integer.
-    U64,
-    /// Unsigned 32-bit decimal integer.
-    U32,
-    /// Unsigned 16-bit decimal integer.
-    U16,
-    /// `usize` decimal.
-    Usize,
-    /// Octal file mode (e.g. `0600`, `0o600`, `600`).
-    Octal,
-    /// `IP:PORT` parsed via `SocketAddr::from_str` at build time.
-    SocketAddr,
-    /// IP address parsed via `IpAddr::from_str`.
-    IpAddr,
-    /// `monotonic` or `boottime`.
-    ClockSourceEnum,
-    /// `strict` or `balanced`.
-    EvictionPolicyEnum,
-    /// May repeat; values accumulate into a `Vec<String>`.
-    ListString,
-}
-
-/// `(key_name, KeyType)` catalogue — exhaustively covers the runtime-tunable
-/// surface of `Config`.  Adding a new field to `Config` requires adding a
-/// matching entry here AND a matching emitter arm in [`render_constructor`].
-const KNOWN_KEYS: &[(&str, KeyType)] = &[
-    // --- required ---
-    ("socket", KeyType::PathBuf),
-    ("threshold_ms", KeyType::U64),
-    // --- transport ---
-    ("socket_mode", KeyType::Octal),
-    ("read_timeout_ms", KeyType::U64),
-    ("udp_port", KeyType::U16),
-    ("udp_bind_addr", KeyType::IpAddr),
-    ("secure_key_file", KeyType::PathBuf),
-    ("accepted_key_file", KeyType::PathBuf),
-    ("master_key_file", KeyType::PathBuf),
-    // --- recovery ---
-    ("recovery_cmd", KeyType::String),
-    ("recovery_exec_cmd", KeyType::String),
-    ("recovery_cmd_file", KeyType::PathBuf),
-    ("recovery_exec_file", KeyType::PathBuf),
-    ("recovery_debounce_ms", KeyType::U64),
-    ("recovery_env", KeyType::ListString),
-    ("recovery_timeout_ms", KeyType::U64),
-    ("recovery_audit_file", KeyType::PathBuf),
-    ("recovery_audit_max_bytes", KeyType::U64),
-    ("recovery_audit_sync_every", KeyType::U32),
-    ("recovery_capture_stdio", KeyType::Bool),
-    ("recovery_capture_bytes", KeyType::U32),
-    // --- exporters & misc ---
-    ("file_export", KeyType::PathBuf),
-    ("export_file_max_bytes", KeyType::U64),
-    ("export_file_sync_every", KeyType::U32),
-    ("heartbeat_file", KeyType::PathBuf),
-    // --- tracker / observer ---
-    ("tracker_capacity", KeyType::Usize),
-    ("tracker_eviction_policy", KeyType::EvictionPolicyEnum),
-    ("eviction_scan_window", KeyType::Usize),
-    ("max_beat_rate", KeyType::U32),
-    ("clock_source", KeyType::ClockSourceEnum),
-    ("iteration_budget_ms", KeyType::U64),
-    ("scrape_budget_ms", KeyType::U64),
-    // --- watchdogs / shutdown ---
-    ("shutdown_after_secs", KeyType::U64),
-    ("shutdown_grace_ms", KeyType::U64),
-    ("self_watchdog_secs", KeyType::U64),
-    ("hw_watchdog", KeyType::PathBuf),
-    // --- safety acknowledgements ---
-    ("i_accept_plaintext_udp", KeyType::Bool),
-    ("i_accept_shell_risk", KeyType::Bool),
-    ("i_accept_recovery_on_secure_udp", KeyType::Bool),
-    ("i_accept_recovery_on_plaintext_udp", KeyType::Bool),
-    ("i_accept_secure_udp_non_loopback", KeyType::Bool),
-    ("allow_cross_namespace_agents", KeyType::Bool),
-    ("strict_namespace_check", KeyType::Bool),
-    // --- test-hooks (only emitted when feature active) ---
-    ("inject_wedge_ms", KeyType::U64),
-];
+// FlagKind, FlagSpec, and FLAGS are provided by the `include!` above.
+// The catalogue replaces the former local `KeyType` / `KNOWN_KEYS` pair.
+// Config-file keys are looked up by `FlagSpec::key`; CLI flags are looked
+// up by `FlagSpec::cli` (used only by the runtime parser, not by build.rs).
 
 // Parsed shape — string-keyed for simplicity.  Singleton vs list semantics
-// are enforced in [`parse_kv`] using the KeyType from KNOWN_KEYS.
+// are enforced in [`parse_kv`] using the FlagKind from the catalogue.
 //
 // `pub` so that the unit-test crate
 // (`tests/build_script_grammar.rs`) can `#[path]`-include build.rs and
@@ -202,12 +115,15 @@ pub fn parse_kv(input: &str) -> Result<ParsedConfig, String> {
         let key = k_raw.trim();
         let value = v_raw.trim();
 
-        let (_, kty) = match KNOWN_KEYS.iter().find(|(k, _)| *k == key) {
-            Some(entry) => entry,
+        // Look up the key in the catalogue using the `key` field (config-file
+        // form, underscored).  Entries whose `key` is empty are CLI-only flags
+        // with no config-file equivalent and are not valid here.
+        let spec = match FLAGS.iter().find(|s| !s.key.is_empty() && s.key == key) {
+            Some(s) => s,
             None => {
                 let mut catalogue = String::new();
-                for (k, _) in KNOWN_KEYS {
-                    catalogue.push_str(k);
+                for s in FLAGS.iter().filter(|s| !s.key.is_empty()) {
+                    catalogue.push_str(s.key);
                     catalogue.push(' ');
                 }
                 return Err(format!(
@@ -219,8 +135,8 @@ pub fn parse_kv(input: &str) -> Result<ParsedConfig, String> {
             }
         };
 
-        match kty {
-            KeyType::ListString => {
+        match spec.kind {
+            FlagKind::List => {
                 out.lists
                     .entry(key.to_string())
                     .or_default()

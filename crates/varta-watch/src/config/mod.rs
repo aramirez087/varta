@@ -6,6 +6,9 @@
 //! `cli_help_lists_every_documented_flag` acceptance test.
 
 mod compile_time;
+/// Single source of truth for every accepted CLI flag and compile-time-config
+/// key.  See [`flag_catalogue::FLAGS`] for the full table.
+pub mod flag_catalogue;
 mod help;
 mod loaders;
 mod parse_helpers;
