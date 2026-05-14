@@ -356,6 +356,10 @@ fn render_constructor(parsed: &ParsedConfig, test_hooks_active: bool) -> String 
     }
     emit_option_path(&mut s, parsed, "file_export");
     emit_option_u64(&mut s, parsed, "export_file_max_bytes");
+    let export_sync_every: u32 = singleton_u32(parsed, "export_file_sync_every", 0);
+    s.push_str(&format!(
+        "        export_file_sync_every: {export_sync_every},\n"
+    ));
     // prom_addr / prom_token_file etc. — these fields exist on Config
     // unconditionally, but the prometheus-exporter feature is mutually
     // exclusive with compile-time-config (compile_error in lib.rs), so the

@@ -234,7 +234,7 @@ fn prom_exporter_scrape_budget_exceeded_increments_when_observation_exceeds_budg
 #[test]
 fn file_exporter_appends_one_line_per_event() {
     let path = unique_tmp("export");
-    let mut fe = FileExporter::create(path.as_path(), None).expect("create file exporter");
+    let mut fe = FileExporter::create(path.as_path(), None, 0).expect("create file exporter");
     let events = [
         Event::Beat {
             pid: 1,
