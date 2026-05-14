@@ -1,3 +1,4 @@
+#[cfg(feature = "prometheus-exporter")]
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -91,44 +92,102 @@ fn missing_required_socket_is_rejected() {
     }
 }
 
+/// Every CLI flag in the catalogue must appear somewhere in the help text.
+/// This replaces the former hand-written list and is automatically kept in
+/// sync as new entries are added to FLAGS.
+///
+/// Flags gated behind features are skipped when those features are not
+/// compiled in — this mirrors the parser's own `#[cfg(feature = "...")]` arms.
 #[test]
-fn help_text_lists_every_known_flag() {
-    for flag in [
-        "--socket",
-        "--threshold-ms",
-        "--recovery-cmd",
-        "--recovery-exec",
-        "--recovery-cmd-file",
-        "--recovery-exec-file",
-        "--recovery-debounce-ms",
-        "--recovery-env",
-        "--recovery-timeout-ms",
-        "--read-timeout-ms",
-        "--tracker-capacity",
-        "--export-file",
-        "--export-file-max-bytes",
-        "--prom-addr",
-        "--prom-token-file",
-        "--shutdown-grace-ms",
-        "--socket-mode",
-        "--shutdown-after-secs",
-        "--udp-port",
-        "--udp-bind-addr",
-        "--key-file",
-        "--accepted-key-file",
-        "--master-key-file",
-        "--max-beat-rate",
-        "--heartbeat-file",
-        "--prom-rate-limit-per-sec",
-        "--prom-rate-limit-burst",
-        "--i-accept-plaintext-udp",
-        "--i-accept-shell-risk",
-        "--help",
-    ] {
+fn catalogue_covers_help_text() {
+    use super::flag_catalogue::{FlagKind, FLAGS};
+
+    // Flags that intentionally do NOT appear in the help output:
+    //   - test-hooks flags (never in production help)
+    //   - Bool flags whose help appears under a merged heading rather than
+    //     the individual --flag-name substring (none today)
+    const EXEMPT_FROM_HELP: &[&str] = &["--inject-wedge-ms"];
+
+    for spec in FLAGS {
+        if spec.cli.is_empty() {
+            continue;
+        }
+        if EXEMPT_FROM_HELP.contains(&spec.cli) {
+            continue;
+        }
+        // Skip feature-gated flags when the feature is not compiled in.
+        // We cannot gate test code on arbitrary feature strings at runtime,
+        // so we enumerate the known gates explicitly.
+        let skip = match spec.feature {
+            "prometheus-exporter" => !cfg!(feature = "prometheus-exporter"),
+            "unsafe-shell-recovery" => !cfg!(feature = "unsafe-shell-recovery"),
+            "unsafe-plaintext-udp" => !cfg!(feature = "unsafe-plaintext-udp"),
+            "secure-udp" => !cfg!(feature = "secure-udp"),
+            "test-hooks" => true, // always skip test-only flags
+            _ => false,
+        };
+        if skip {
+            continue;
+        }
+        // Bool flags with a `key` are treated as `true/false` in the config
+        // file.  Check the CLI name appears in the help text.
+        if matches!(spec.kind, FlagKind::Bool) {
+            // Some long bool flags span multiple lines; just check the
+            // leading substring that appears on the first line.
+            let prefix = spec.cli;
+            assert!(
+                Config::HELP.contains(prefix),
+                "Config::HELP missing bool flag {prefix}"
+            );
+        } else {
+            assert!(
+                Config::HELP.contains(spec.cli),
+                "Config::HELP missing flag {}",
+                spec.cli
+            );
+        }
+    }
+    // --help / -h is not in FLAGS (it is handled inline in the parser before
+    // the flag dispatch loop) but must still appear in the help text.
+    assert!(
+        Config::HELP.contains("--help"),
+        "Config::HELP missing --help"
+    );
+}
+
+/// The catalogue must have no two entries with the same non-empty `cli` name.
+#[test]
+fn catalogue_has_no_duplicate_cli_names() {
+    use super::flag_catalogue::FLAGS;
+    let mut seen: Vec<&'static str> = Vec::new();
+    for spec in FLAGS {
+        if spec.cli.is_empty() {
+            continue;
+        }
         assert!(
-            Config::HELP.contains(flag),
-            "Config::HELP missing flag {flag}"
+            !seen.contains(&spec.cli),
+            "duplicate cli name in FLAGS: {}",
+            spec.cli
         );
+        seen.push(spec.cli);
+    }
+}
+
+/// The catalogue must have no two entries with the same non-empty `key` name.
+#[test]
+fn catalogue_has_no_duplicate_keys() {
+    use super::flag_catalogue::FLAGS;
+    let mut seen: Vec<&'static str> = Vec::new();
+    for spec in FLAGS {
+        if spec.key.is_empty() {
+            continue;
+        }
+        assert!(
+            !seen.contains(&spec.key),
+            "duplicate key in FLAGS: {}",
+            spec.key
+        );
+        seen.push(spec.key);
     }
 }
 
