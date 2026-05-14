@@ -1024,7 +1024,11 @@ fn run(cfg: Config) -> std::io::Result<()> {
             .with_reap_scratch_capacity(cfg.tracker_capacity)
     });
     let mut file_export: Option<FileExporter> = match cfg.file_export.as_ref() {
-        Some(path) => Some(FileExporter::create(path, cfg.export_file_max_bytes)?),
+        Some(path) => Some(FileExporter::create(
+            path,
+            cfg.export_file_max_bytes,
+            cfg.export_file_sync_every,
+        )?),
         None => None,
     };
     #[cfg(feature = "prometheus-exporter")]
@@ -1411,6 +1415,14 @@ fn run(cfg: Config) -> std::io::Result<()> {
             #[cfg(feature = "prometheus-exporter")]
             if let Some(pe) = prom_export.as_mut() {
                 pe.record_rate_limited(rate_limited);
+            }
+        }
+
+        let clock_regressions = observer.drain_clock_regressions();
+        if clock_regressions > 0 {
+            #[cfg(feature = "prometheus-exporter")]
+            if let Some(pe) = prom_export.as_mut() {
+                pe.record_clock_regressions(clock_regressions);
             }
         }
 

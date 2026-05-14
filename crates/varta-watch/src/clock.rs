@@ -3,26 +3,51 @@
 //! The observer's stall detector decides "this PID has been silent for too
 //! long" by subtracting a recorded `last_beat_ns` from a "now_ns" derived
 //! from a monotonic clock.  Which kernel clock backs that "now_ns" depends
-//! on the deployment profile:
+//! on the deployment profile.
 //!
-//! - **SRE / cloud (default `monotonic`)** — `CLOCK_MONOTONIC`.  Pauses
-//!   when the host is suspended (live migration, hypervisor pause,
-//!   `systemctl suspend` for maintenance).  This is the right semantic
-//!   for fleet observability: a 30-minute host suspend should NOT fire a
-//!   stall alert across every agent on that host.
+//! # Per-platform semantics
 //!
-//! - **Medical / embedded (`boottime`, Linux only)** — `CLOCK_BOOTTIME`.
+//! `CLOCK_MONOTONIC` is not a POSIX-mandated numeric constant, and its
+//! behavior across system suspend / sleep differs by kernel. The shipped
+//! clock sources are:
+//!
+//! - **`monotonic` (default, all platforms)** — `CLOCK_MONOTONIC`.
+//!   - Linux (`clk_id = 1`): pauses while the host is suspended.
+//!     NTP-slewable.
+//!   - BSD (`clk_id = 4`): pauses while the host is suspended.
+//!     Linux-compatible semantics.
+//!   - macOS / iOS (`clk_id = 6`): backed by `mach_absolute_time`. Pauses
+//!     during sleep on 10.12 (Sierra) and later — the same observable
+//!     semantics as Linux. The underlying tick rate is host-dependent
+//!     (≈24 MHz on Apple Silicon, ≈1 GHz on Intel); `clock_gettime`
+//!     reports nanoseconds regardless, so downstream stall arithmetic
+//!     is unaffected by the hardware difference.
+//!
+//!   `monotonic` is the right semantic for fleet observability: a
+//!   30-minute host suspend should NOT fire a stall alert across every
+//!   agent on that host.
+//!
+//! - **`boottime` (Linux only)** — `CLOCK_BOOTTIME` (`clk_id = 7`).
 //!   Continues to advance during suspend.  This is the right semantic for
 //!   battery-conscious clinical devices (insulin pumps, holter monitors)
 //!   that aggressively suspend to sleep: a 4-hour suspend IS a 4-hour
-//!   silence and MUST register as a stall on wake-up.  See
-//!   `book/src/architecture/safety-profiles.md` for the deployment matrix.
+//!   silence and MUST register as a stall on wake-up. Rejected at startup
+//!   on every non-Linux target.
 //!
-//! macOS / BSD have no equivalent of `CLOCK_BOOTTIME` — `CLOCK_UPTIME_RAW`
-//! on Darwin *excludes* suspend (opposite semantics).  `boottime` is
-//! therefore rejected at startup on every non-Linux target.  Choosing
-//! `boottime` on macOS would silently break the medical-device contract;
-//! a hard error makes the misconfiguration visible.
+//! - **`monotonic-raw` (macOS / iOS only)** — `CLOCK_MONOTONIC_RAW`
+//!   (`clk_id = 4`), backed by `mach_continuous_time`. Continues to
+//!   advance during sleep — the Darwin equivalent of Linux's
+//!   `CLOCK_BOOTTIME`. This is the right choice for macOS-hosted clinical
+//!   devices or any deployment where "wall-clock silence including sleep"
+//!   is the stall semantic. Rejected at startup on every non-macOS
+//!   target; Linux operators should use `boottime` and BSD operators have
+//!   no equivalent. (Note: Linux also defines `CLOCK_MONOTONIC_RAW`, but
+//!   there it merely opts out of NTP slewing — it still pauses during
+//!   suspend. Exposing it on Linux would invite a name collision with
+//!   different semantics, so the variant is structurally macOS-only.)
+//!
+//! See `book/src/architecture/safety-profiles.md` for the deployment
+//! matrix.
 //!
 //! # Implementation
 //!
@@ -74,18 +99,32 @@ const CLOCK_MONOTONIC: i32 = 1; // Last-resort default — most kernels follow L
 #[cfg(target_os = "linux")]
 const CLOCK_BOOTTIME: i32 = 7;
 
+/// Darwin: `<sys/_types/_clock_id.h>` — `_CLOCK_MONOTONIC_RAW = 4` (10.12+),
+/// backed by `mach_continuous_time`. Unlike Linux's same-numbered constant
+/// (which still pauses during suspend) this advances through sleep — the
+/// Darwin equivalent of Linux's `CLOCK_BOOTTIME`. The variant is exposed to
+/// operators only on macOS / iOS; using it on any other platform is a hard
+/// error at startup.
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+const CLOCK_MONOTONIC_RAW: i32 = 4;
+
 /// Kernel clock backing stall-threshold accounting.
 ///
 /// Wire-format and observer semantics are unchanged; only the kernel
 /// clock that drives "now_ns" is configurable.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub enum ClockSource {
-    /// `CLOCK_MONOTONIC` — pauses on system suspend. SRE default.
+    /// `CLOCK_MONOTONIC` — pauses on system suspend. SRE default,
+    /// available on every supported platform.
     #[default]
     Monotonic,
     /// `CLOCK_BOOTTIME` (Linux only) — advances through suspend.
     /// Medical / embedded deployment.
     Boottime,
+    /// `CLOCK_MONOTONIC_RAW` (macOS / iOS only) — backed by
+    /// `mach_continuous_time`; advances through sleep. Darwin equivalent
+    /// of Linux's `Boottime`. Rejected at startup on non-Darwin targets.
+    MonotonicRaw,
 }
 
 impl std::fmt::Display for ClockSource {
@@ -93,6 +132,7 @@ impl std::fmt::Display for ClockSource {
         match self {
             ClockSource::Monotonic => f.write_str("monotonic"),
             ClockSource::Boottime => f.write_str("boottime"),
+            ClockSource::MonotonicRaw => f.write_str("monotonic-raw"),
         }
     }
 }
@@ -104,6 +144,7 @@ impl std::str::FromStr for ClockSource {
         match s {
             "monotonic" => Ok(ClockSource::Monotonic),
             "boottime" => Ok(ClockSource::Boottime),
+            "monotonic-raw" | "monotonic_raw" => Ok(ClockSource::MonotonicRaw),
             other => Err(ClockSourceParseError {
                 raw: other.to_string(),
             }),
@@ -122,7 +163,7 @@ impl std::fmt::Display for ClockSourceParseError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "unknown clock source {:?}: expected one of `monotonic`, `boottime`",
+            "unknown clock source {:?}: expected one of `monotonic`, `boottime`, `monotonic-raw`",
             self.raw
         )
     }
@@ -134,11 +175,13 @@ impl std::error::Error for ClockSourceParseError {}
 /// in `main.rs` to communicate the chosen source to the background
 /// watchdog thread without an `Arc`.
 impl ClockSource {
-    /// 0 → `Monotonic`, 1 → `Boottime`. Stable across versions.
+    /// 0 → `Monotonic`, 1 → `Boottime`, 2 → `MonotonicRaw`. Stable across
+    /// versions; only ever produced by `as_u8` on the same enum.
     pub fn as_u8(self) -> u8 {
         match self {
             ClockSource::Monotonic => 0,
             ClockSource::Boottime => 1,
+            ClockSource::MonotonicRaw => 2,
         }
     }
 
@@ -147,6 +190,7 @@ impl ClockSource {
     pub fn from_u8(byte: u8) -> Self {
         match byte {
             1 => ClockSource::Boottime,
+            2 => ClockSource::MonotonicRaw,
             _ => ClockSource::Monotonic,
         }
     }
@@ -154,7 +198,7 @@ impl ClockSource {
     /// Kernel `clk_id` argument for `clock_gettime(2)`.
     ///
     /// Returns `None` when the source is unsupported on the current
-    /// platform (e.g. `Boottime` on macOS).
+    /// platform (e.g. `Boottime` on macOS, `MonotonicRaw` on Linux/BSD).
     pub fn clk_id(self) -> Option<i32> {
         match self {
             ClockSource::Monotonic => Some(CLOCK_MONOTONIC),
@@ -162,6 +206,10 @@ impl ClockSource {
             ClockSource::Boottime => Some(CLOCK_BOOTTIME),
             #[cfg(not(target_os = "linux"))]
             ClockSource::Boottime => None,
+            #[cfg(any(target_os = "macos", target_os = "ios"))]
+            ClockSource::MonotonicRaw => Some(CLOCK_MONOTONIC_RAW),
+            #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+            ClockSource::MonotonicRaw => None,
         }
     }
 }
@@ -185,11 +233,21 @@ pub enum ClockError {
 impl std::fmt::Display for ClockError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ClockError::Unsupported { source, platform } => write!(
-                f,
-                "clock source `{source}` is not supported on `{platform}` \
-                 (no equivalent of Linux CLOCK_BOOTTIME)"
-            ),
+            ClockError::Unsupported { source, platform } => {
+                let hint = match source {
+                    ClockSource::Boottime => {
+                        " (Linux only; on macOS use `monotonic-raw` for advance-through-sleep semantics)"
+                    }
+                    ClockSource::MonotonicRaw => {
+                        " (macOS / iOS only; on Linux use `boottime` for advance-through-sleep semantics)"
+                    }
+                    ClockSource::Monotonic => "",
+                };
+                write!(
+                    f,
+                    "clock source `{source}` is not supported on `{platform}`{hint}"
+                )
+            }
             ClockError::Os(e) => write!(f, "clock_gettime: {e}"),
         }
     }
@@ -362,7 +420,7 @@ mod tests {
     use std::str::FromStr;
 
     #[test]
-    fn parse_monotonic_and_boottime() {
+    fn parse_all_clock_source_variants() {
         assert_eq!(
             ClockSource::from_str("monotonic").unwrap(),
             ClockSource::Monotonic
@@ -370,6 +428,15 @@ mod tests {
         assert_eq!(
             ClockSource::from_str("boottime").unwrap(),
             ClockSource::Boottime
+        );
+        assert_eq!(
+            ClockSource::from_str("monotonic-raw").unwrap(),
+            ClockSource::MonotonicRaw
+        );
+        // Underscore spelling is accepted as a convenience.
+        assert_eq!(
+            ClockSource::from_str("monotonic_raw").unwrap(),
+            ClockSource::MonotonicRaw
         );
     }
 
@@ -381,7 +448,11 @@ mod tests {
 
     #[test]
     fn display_round_trip() {
-        for src in [ClockSource::Monotonic, ClockSource::Boottime] {
+        for src in [
+            ClockSource::Monotonic,
+            ClockSource::Boottime,
+            ClockSource::MonotonicRaw,
+        ] {
             let s = format!("{src}");
             assert_eq!(ClockSource::from_str(&s).unwrap(), src);
         }
@@ -389,7 +460,11 @@ mod tests {
 
     #[test]
     fn as_u8_from_u8_round_trip() {
-        for src in [ClockSource::Monotonic, ClockSource::Boottime] {
+        for src in [
+            ClockSource::Monotonic,
+            ClockSource::Boottime,
+            ClockSource::MonotonicRaw,
+        ] {
             assert_eq!(ClockSource::from_u8(src.as_u8()), src);
         }
     }
@@ -420,6 +495,28 @@ mod tests {
             }
             Err(other) => panic!("expected Unsupported, got {other:?}"),
             Ok(_) => panic!("expected Boottime to be rejected on non-Linux"),
+        }
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    #[test]
+    fn monotonic_raw_forward_only_on_macos() {
+        let clk = Clock::new(ClockSource::MonotonicRaw)
+            .expect("CLOCK_MONOTONIC_RAW must work on macOS");
+        let a = clk.now_ns();
+        let b = clk.now_ns();
+        assert!(b >= a, "monotonic-raw clock regressed: {a} -> {b}");
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+    #[test]
+    fn monotonic_raw_rejected_on_non_macos() {
+        match Clock::new(ClockSource::MonotonicRaw) {
+            Err(ClockError::Unsupported { source, .. }) => {
+                assert_eq!(source, ClockSource::MonotonicRaw);
+            }
+            Err(other) => panic!("expected Unsupported, got {other:?}"),
+            Ok(_) => panic!("expected MonotonicRaw to be rejected outside macOS / iOS"),
         }
     }
 

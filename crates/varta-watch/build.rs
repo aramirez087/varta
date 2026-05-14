@@ -143,6 +143,7 @@ const KNOWN_KEYS: &[(&str, KeyType)] = &[
     // --- exporters & misc ---
     ("file_export", KeyType::PathBuf),
     ("export_file_max_bytes", KeyType::U64),
+    ("export_file_sync_every", KeyType::U32),
     ("heartbeat_file", KeyType::PathBuf),
     // --- tracker / observer ---
     ("tracker_capacity", KeyType::Usize),
@@ -464,6 +465,7 @@ fn render_constructor(parsed: &ParsedConfig, test_hooks_active: bool) -> String 
     ));
     let clock_source = match parsed.singletons.get("clock_source").map(String::as_str) {
         Some("boottime") => "crate::clock::ClockSource::Boottime",
+        Some("monotonic-raw") | Some("monotonic_raw") => "crate::clock::ClockSource::MonotonicRaw",
         _ => "crate::clock::ClockSource::Monotonic",
     };
     if test_hooks_active {

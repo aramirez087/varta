@@ -151,6 +151,13 @@ pub struct Observer {
     /// Monotonicity guard — last `now_ns()` value, clamped forward-only to
     /// survive TSC drift and VM live migration.
     last_now_ns: u64,
+    /// Count of times the underlying monotonic clock returned a value
+    /// strictly less than `last_now_ns` and the clamp absorbed the
+    /// regression. Surfaced as `varta_observer_clock_regression_total` so
+    /// operators can alert on TSC drift / VM-live-migration events that
+    /// would otherwise be invisible. Drained via
+    /// [`Observer::drain_clock_regressions`].
+    clock_regressions: u64,
     /// When true, beats from agents whose kernel-attested PID namespace
     /// differs from the observer's are admitted into the tracker (and may
     /// later be passed to recovery). Set by `--allow-cross-namespace-agents`.
@@ -221,6 +228,7 @@ impl Observer {
             rate_limit_interval_ns,
             rate_limited_total: 0,
             last_now_ns: 0,
+            clock_regressions: 0,
             allow_cross_namespace: false,
             cross_namespace_drops: 0,
             pid_max: crate::pid_max::read_pid_max(),
@@ -503,8 +511,23 @@ impl Observer {
     /// deployment matrix.
     pub fn now_ns(&mut self) -> u64 {
         let raw = self.clock.now_ns();
+        if raw < self.last_now_ns {
+            self.clock_regressions = self.clock_regressions.saturating_add(1);
+        }
         self.last_now_ns = self.last_now_ns.max(raw);
         self.last_now_ns
+    }
+
+    /// Drain and reset the clock-regression counter — number of times the
+    /// kernel monotonic clock returned a value strictly less than the
+    /// previously observed one and the forward clamp absorbed the
+    /// regression. Non-zero values surface TSC drift, VM live migration,
+    /// or other anomalous clock behavior that would otherwise be invisible.
+    /// Surfaced as `varta_observer_clock_regression_total`.
+    pub fn drain_clock_regressions(&mut self) -> u64 {
+        let n = self.clock_regressions;
+        self.clock_regressions = 0;
+        n
     }
 
     /// Inspect the kernel clock backing this observer's stall accounting.
@@ -712,6 +735,64 @@ mod tests {
         assert!(
             !path.exists(),
             "socket file must be removed after observer drop"
+        );
+    }
+
+    #[test]
+    fn clock_regression_counter_increments_on_backward_clock() {
+        let mut obs = Observer::new(
+            Duration::from_secs(1),
+            64,
+            EvictionPolicy::Strict,
+            DEFAULT_EVICTION_SCAN_WINDOW,
+            None,
+            ClockSource::Monotonic,
+        )
+        .expect("Observer::new should succeed");
+
+        // Baseline reading — the forward clamp seeds `last_now_ns` from the
+        // current monotonic value. No regression yet.
+        let _ = obs.now_ns();
+        assert_eq!(
+            obs.drain_clock_regressions(),
+            0,
+            "no regressions after the first reading"
+        );
+
+        // Simulate the kernel clock having previously reported a value far
+        // in the future (e.g. before a VM live migration that rewound the
+        // TSC). The next `now_ns()` call reads a real value strictly less
+        // than `last_now_ns`, so the forward clamp absorbs it AND the
+        // regression counter must increment.
+        obs.last_now_ns = u64::MAX / 2;
+        let clamped = obs.now_ns();
+        assert_eq!(
+            clamped,
+            u64::MAX / 2,
+            "forward clamp preserves the larger value"
+        );
+        assert_eq!(
+            obs.drain_clock_regressions(),
+            1,
+            "exactly one regression observed"
+        );
+
+        // Drain resets — a second drain reads zero.
+        assert_eq!(
+            obs.drain_clock_regressions(),
+            0,
+            "drain must reset the counter"
+        );
+
+        // A second backward excursion bumps the counter again.
+        obs.last_now_ns = u64::MAX / 2;
+        let _ = obs.now_ns();
+        obs.last_now_ns = u64::MAX / 2;
+        let _ = obs.now_ns();
+        assert_eq!(
+            obs.drain_clock_regressions(),
+            2,
+            "counter is saturating-add cumulative until drained"
         );
     }
 }

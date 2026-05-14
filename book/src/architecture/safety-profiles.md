@@ -180,27 +180,41 @@ is *correct* depends on the deployment profile:
 | Profile | `--clock-source` | Rationale |
 |---|---|---|
 | SRE / cloud server / VM | `monotonic` (default) | `CLOCK_MONOTONIC` pauses on host suspend, hypervisor pause, and live-migration freeze.  A 30-minute host-suspend-for-maintenance must NOT fan out a stall alert across every agent. |
-| Medical implant / holter / insulin pump | `boottime` (Linux only) | `CLOCK_BOOTTIME` advances during suspend.  A 4-hour deep-sleep IS a 4-hour silence; stall detection MUST fire on wake-up regardless of whether the device suspended itself. |
-| Embedded sensor with deep sleep | `boottime` (Linux only) | Same as medical — battery-conscious devices that aggressively suspend need stall semantics that count the suspended time. |
+| Medical implant / holter / insulin pump (Linux) | `boottime` (Linux only) | `CLOCK_BOOTTIME` advances during suspend.  A 4-hour deep-sleep IS a 4-hour silence; stall detection MUST fire on wake-up regardless of whether the device suspended itself. |
+| Embedded sensor with deep sleep (Linux) | `boottime` (Linux only) | Same as medical — battery-conscious devices that aggressively suspend need stall semantics that count the suspended time. |
+| macOS / iOS-hosted device with sleep semantics | `monotonic-raw` (macOS / iOS only) | `CLOCK_MONOTONIC_RAW` on Darwin is backed by `mach_continuous_time` and advances through sleep — the Darwin equivalent of Linux's `CLOCK_BOOTTIME`. |
 
 ### Platform support
 
 `boottime` semantics require Linux's `CLOCK_BOOTTIME` clock (clk_id `7`,
-available since 2.6.39).  macOS / iOS / BSD have no kernel equivalent —
-Darwin's `CLOCK_UPTIME_RAW` *excludes* suspend (the opposite semantics).
-The CLI parser therefore rejects `--clock-source boottime` at startup on
-every non-Linux target with `ConfigError::ClockSourceUnsupported`:
+available since 2.6.39). The Darwin equivalent is `CLOCK_MONOTONIC_RAW`
+(`clk_id = 4`), backed by `mach_continuous_time`; it advances through
+sleep just like `CLOCK_BOOTTIME`. Because the same numeric `clk_id = 4`
+on Linux refers to `CLOCK_MONOTONIC_RAW` with *different* semantics (it
+opts out of NTP slewing but still pauses during suspend), the two are
+exposed as distinct `ClockSource` variants — `boottime` (Linux only) and
+`monotonic-raw` (macOS / iOS only) — and each is rejected at startup on
+the other family with `ConfigError::ClockSourceUnsupported`.
+
+BSD operators have only `monotonic`: no kernel clock on FreeBSD /
+NetBSD / OpenBSD / DragonFly advances through suspend in a way usable
+by `clock_gettime(2)`.
+
+Example rejection messages:
 
 ```text
---clock-source boottime is not supported on `macos`. `boottime` semantics
-(advance during suspend) require Linux's CLOCK_BOOTTIME; macOS / BSD have
-no equivalent kernel clock. Use `--clock-source monotonic` (the default)
-or switch to a Linux host.
+clock source `boottime` is not supported on `macos` (Linux only; on
+macOS use `monotonic-raw` for advance-through-sleep semantics)
 ```
 
-This is structural enforcement: a misconfigured medical-device deployment
-on macOS exits non-zero rather than silently picking a clock that pauses
-on sleep.
+```text
+clock source `monotonic-raw` is not supported on `linux` (macOS / iOS
+only; on Linux use `boottime` for advance-through-sleep semantics)
+```
+
+This is structural enforcement: a misconfigured medical-device
+deployment exits non-zero rather than silently picking a clock that
+pauses on sleep.
 
 ### Self-watchdog alignment
 

@@ -130,6 +130,13 @@ pub struct Config {
     /// Optional byte limit for the file export. When exceeded, the current
     /// file is rotated (up to 5 generations) and a new one is opened.
     pub export_file_max_bytes: Option<u64>,
+    /// Records between forced `fdatasync(2)` calls on the file exporter.
+    /// `0` (default) preserves the v0.1 behavior — flush only on clean
+    /// shutdown and during rotation. Non-zero values trade IO for
+    /// crash-time durability; `1` matches the recovery audit log's
+    /// per-record durability guarantee. Set via
+    /// `--export-file-sync-every <N>`.
+    pub export_file_sync_every: u32,
     /// Optional listening address for the Prometheus exporter.
     pub prom_addr: Option<SocketAddr>,
     /// Path to a file containing the 32-byte (64-hex-character) bearer token
@@ -604,13 +611,28 @@ impl core::fmt::Display for ConfigError {
                 f,
                 "--eviction-scan-window: {value} is outside the accepted range [{min}, {max}]"
             ),
-            ConfigError::ClockSourceUnsupported { source, platform } => write!(
-                f,
-                "--clock-source {source} is not supported on `{platform}`. \
-                 `boottime` semantics (advance during suspend) require Linux's \
-                 CLOCK_BOOTTIME; macOS / BSD have no equivalent kernel clock. \
-                 Use `--clock-source monotonic` (the default) or switch to a Linux host."
-            ),
+            ConfigError::ClockSourceUnsupported { source, platform } => {
+                let hint = match source {
+                    crate::clock::ClockSource::Boottime => {
+                        "`boottime` semantics (advance through suspend) require Linux's \
+                         CLOCK_BOOTTIME. On macOS / iOS use `--clock-source monotonic-raw` \
+                         (mach_continuous_time) for the same semantics; BSD has no equivalent \
+                         kernel clock."
+                    }
+                    crate::clock::ClockSource::MonotonicRaw => {
+                        "`monotonic-raw` is macOS / iOS only (CLOCK_MONOTONIC_RAW = \
+                         mach_continuous_time). On Linux use `--clock-source boottime` \
+                         (CLOCK_BOOTTIME) for advance-through-suspend semantics; BSD \
+                         has no equivalent kernel clock."
+                    }
+                    crate::clock::ClockSource::Monotonic => "",
+                };
+                write!(
+                    f,
+                    "--clock-source {source} is not supported on `{platform}`. {hint} \
+                     Otherwise use `--clock-source monotonic` (the default)."
+                )
+            }
             ConfigError::CompileTimeArgvForbidden => f.write_str(
                 "this binary was configured at compile time \
                  (--features compile-time-config); refusing to accept argv. \
@@ -748,6 +770,16 @@ OPTIONAL:
                                      N bytes (keeps up to 5 generations:
                                      PATH.1 .. PATH.5).  Without this flag
                                      the file grows without bound.
+    --export-file-sync-every <N>    Force fdatasync(2) on the export file
+                                     every N records appended. 0 (default)
+                                     disables per-record durability — the
+                                     BufWriter is flushed only on clean
+                                     shutdown and during rotation, so a
+                                     crash can lose up to one BufWriter
+                                     worth of events. Non-zero values
+                                     trade IO for crash-time durability;
+                                     `1` matches the recovery audit log's
+                                     per-record guarantee.
     --prom-addr <IP:PORT>          Bind a Prometheus text-format endpoint at
                                     GET /metrics on this address.  Requires
                                     --prom-token-file; /metrics has no
@@ -791,10 +823,18 @@ OPTIONAL:
                                       evicting the oldest active slot to
                                       prevent capacity-exhaustion attacks.
     --clock-source <MODE>          Kernel clock for stall-threshold
-                                     accounting: monotonic (default; pauses
-                                     on suspend — SRE semantics) or
-                                     boottime (Linux only; advances during
-                                     suspend — medical/embedded semantics).
+                                     accounting:
+                                       monotonic     (default; pauses during
+                                                     suspend on Linux/BSD/
+                                                     macOS — SRE semantics)
+                                       boottime      (Linux only; advances
+                                                     through suspend —
+                                                     medical/embedded)
+                                       monotonic-raw (macOS/iOS only;
+                                                     mach_continuous_time;
+                                                     advances through sleep —
+                                                     macOS equivalent of
+                                                     boottime)
                                      See book/src/architecture/safety-profiles.md.
     --shutdown-after-secs <SECS>   Exit cleanly after the given uptime
                                      (used by integration tests).
@@ -1002,6 +1042,7 @@ OPTIONAL:
         let mut recovery_env: Vec<String> = Vec::new();
         let mut file_export: Option<PathBuf> = None;
         let mut export_file_max_bytes: Option<u64> = None;
+        let mut export_file_sync_every: u32 = 0;
         // `prom_*` locals are mutated only by `--prom-*` arms gated under
         // `feature = "prometheus-exporter"`.  Without the feature the
         // arms vanish and the `mut` becomes redundant; allow the lint so
@@ -1117,6 +1158,19 @@ OPTIONAL:
                         .next()
                         .ok_or(ConfigError::MissingValue("--export-file-max-bytes"))?;
                     export_file_max_bytes = Some(parse_u64("--export-file-max-bytes", &v)?);
+                }
+                "--export-file-sync-every" => {
+                    let v = iter
+                        .next()
+                        .ok_or(ConfigError::MissingValue("--export-file-sync-every"))?;
+                    let parsed = parse_u64("--export-file-sync-every", &v)?;
+                    if parsed > u32::MAX as u64 {
+                        return Err(ConfigError::BadValue {
+                            flag: "--export-file-sync-every",
+                            value: v,
+                        });
+                    }
+                    export_file_sync_every = parsed as u32;
                 }
                 #[cfg(feature = "prometheus-exporter")]
                 "--prom-addr" => {
@@ -1560,9 +1614,9 @@ OPTIONAL:
             None => DEFAULT_EVICTION_SCAN_WINDOW,
         };
 
-        // H7: reject `--clock-source boottime` on platforms where it has
-        // no kernel equivalent.  This fires before any listener bind so
-        // the operator sees the misconfiguration immediately.
+        // H7: reject platform-restricted clock sources (`boottime` on
+        // non-Linux, `monotonic-raw` on non-macOS) before any listener
+        // bind so the operator sees the misconfiguration immediately.
         if let Some(src) = clock_source {
             if src.clk_id().is_none() {
                 return Err(ConfigError::ClockSourceUnsupported {
@@ -1583,6 +1637,7 @@ OPTIONAL:
             recovery_env,
             file_export,
             export_file_max_bytes,
+            export_file_sync_every,
             prom_addr,
             prom_token_file,
             shutdown_after: shutdown_after_secs.map(Duration::from_secs),
@@ -2147,9 +2202,11 @@ impl Config {
     /// Returning `Ok(self)` lets the caller chain `?` against the
     /// validation step without an extra `let` binding.
     pub(crate) fn validate_runtime(self) -> Result<Config, ConfigError> {
-        // H7 — `boottime` requires Linux's CLOCK_BOOTTIME; non-Linux
-        // targets have no equivalent clock and must fail loudly rather
-        // than silently picking a clock that pauses on suspend.
+        // H7 — platform-restricted clock sources must fail loudly rather
+        // than silently picking a clock that pauses on suspend:
+        // `boottime` is Linux-only (CLOCK_BOOTTIME = 7), `monotonic-raw`
+        // is macOS/iOS-only (CLOCK_MONOTONIC_RAW = 4 = mach_continuous_time).
+        // `clk_id()` returns `None` for the wrong-platform combinations.
         if self.clock_source.clk_id().is_none() {
             return Err(ConfigError::ClockSourceUnsupported {
                 source: self.clock_source,
@@ -3454,6 +3511,41 @@ mod tests {
         match err {
             ConfigError::ClockSourceUnsupported { source, .. } => {
                 assert_eq!(source, ClockSource::Boottime);
+            }
+            other => panic!("expected ClockSourceUnsupported, got {other}"),
+        }
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    #[test]
+    fn clock_source_parses_monotonic_raw_on_macos() {
+        let args = [
+            "--socket",
+            "/tmp/t.sock",
+            "--threshold-ms",
+            "100",
+            "--clock-source",
+            "monotonic-raw",
+        ];
+        let cfg = Config::from_args(args.iter().map(|s| s.to_string())).unwrap();
+        assert_eq!(cfg.clock_source, ClockSource::MonotonicRaw);
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+    #[test]
+    fn clock_source_monotonic_raw_rejected_off_macos() {
+        let args = [
+            "--socket",
+            "/tmp/t.sock",
+            "--threshold-ms",
+            "100",
+            "--clock-source",
+            "monotonic-raw",
+        ];
+        let err = Config::from_args(args.iter().map(|s| s.to_string())).unwrap_err();
+        match err {
+            ConfigError::ClockSourceUnsupported { source, .. } => {
+                assert_eq!(source, ClockSource::MonotonicRaw);
             }
             other => panic!("expected ClockSourceUnsupported, got {other}"),
         }

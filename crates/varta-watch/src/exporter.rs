@@ -38,13 +38,38 @@ use crate::log_ratelimit::{LogKind, LOG_RATE_LIMITER};
 use crate::observer::Event;
 
 /// Sink for an [`Event`] stream.
+///
+/// `varta-watch` runs the observer poll loop, event recording, recovery
+/// reaping, and the `/metrics` HTTP server on a single thread. Every
+/// method on this trait executes inside that thread's per-tick budget.
+/// Implementations MAY perform synchronous I/O — both shipped exporters
+/// do — but MUST respect a hard wall-clock bound so the beat pipeline
+/// cannot stall behind a slow disk or a slow scrape client:
+///
+/// - [`FileExporter::record`] performs a synchronous `write(2)` into a
+///   `BufWriter<File>`. With `--export-file-sync-every <N>`, every Nth
+///   record adds an `fdatasync(2)`. Latency is bounded by disk and
+///   `fdatasync` cost; operators on slow / contended disks should keep
+///   the event file on a dedicated volume.
+/// - [`PromExporter::serve_pending`] accepts and serves up to
+///   `PROM_MAX_CONNECTIONS_PER_SERVE` TCP connections per call, gated by
+///   `PROM_SERVE_DEADLINE` (≈100 ms accept + 100 ms drain) and per
+///   connection `PROM_READ_DEADLINE` (10 ms) / `PROM_WRITE_TIMEOUT`
+///   (50 ms). See `book/src/architecture/observer-liveness.md`
+///   §"Why /metrics is on the poll thread".
+///
+/// Implementations MUST NOT panic. Transient I/O failures are returned
+/// as `Err` so the caller can log, retry, or fall back.
 pub trait Exporter {
-    /// Record a single observer event. Implementations should never panic
-    /// or block the caller for IO; transient failures are returned as
-    /// `Err` so the caller can react (log, retry, or fall back).
+    /// Record a single observer event. May perform synchronous I/O bounded
+    /// by the per-implementation budget documented on the trait. Errors are
+    /// returned as `Err`, never panicked.
     fn record(&mut self, ev: &Event) -> io::Result<()>;
     /// Flush any internally buffered output. For network exporters that
     /// hold no per-event buffer this is a no-op that returns `Ok(())`.
+    /// File-backed exporters flush the `BufWriter` to the kernel; the
+    /// per-record `fdatasync` cadence is controlled separately by
+    /// `--export-file-sync-every`.
     fn flush(&mut self) -> io::Result<()>;
 }
 
@@ -72,6 +97,18 @@ pub struct FileExporter {
     path: PathBuf,
     max_bytes: Option<u64>,
     bytes_written: u64,
+    /// Records between forced `fdatasync(2)` calls. `0` (default) means
+    /// "no per-record sync"; the BufWriter is only flushed on clean
+    /// shutdown and during rotation. Non-zero values trade IO for
+    /// crash-time durability — operator sets via
+    /// `--export-file-sync-every <N>`. Mirrors the audit log's
+    /// `AuditConfig::sync_every` pattern.
+    sync_every: u32,
+    /// Records appended since the last successful `flush_and_sync`. Reset
+    /// to 0 every time durability is forced. Counts every successful
+    /// `writeln!` (beats, stalls, decode errors, IO errors, AuthFailures,
+    /// evictions) and is checked at the bottom of `after_write`.
+    writes_since_sync: u32,
 }
 
 /// Number of rotated file generations kept.
@@ -83,7 +120,18 @@ impl FileExporter {
     ///
     /// `max_bytes` is the optional size limit after which the file is
     /// rotated.
-    pub fn create(path: impl AsRef<Path>, max_bytes: Option<u64>) -> io::Result<Self> {
+    ///
+    /// `sync_every` is the number of records between forced `fdatasync(2)`
+    /// calls. `0` disables per-record durability — the BufWriter is only
+    /// flushed on clean shutdown and during rotation, matching the v0.1
+    /// behavior. Non-zero values trade IO for crash-time durability
+    /// (mirrors the audit log's `AuditConfig::sync_every`). Operators set
+    /// this via `--export-file-sync-every <N>`.
+    pub fn create(
+        path: impl AsRef<Path>,
+        max_bytes: Option<u64>,
+        sync_every: u32,
+    ) -> io::Result<Self> {
         let file = OpenOptions::new()
             .create(true)
             .append(true)
@@ -95,7 +143,18 @@ impl FileExporter {
             path: path.as_ref().to_path_buf(),
             max_bytes,
             bytes_written,
+            sync_every,
+            writes_since_sync: 0,
         })
+    }
+
+    /// Flush the `BufWriter` to the kernel and then `fdatasync(2)` the
+    /// underlying file. Both must succeed for the data to be considered
+    /// durable across a host-level crash. Mirrors the audit log's
+    /// `flush_and_sync` (`audit.rs::flush_and_sync`).
+    fn flush_and_sync(&mut self) -> io::Result<()> {
+        self.sink.flush()?;
+        self.sink.get_ref().sync_data()
     }
 
     /// Record an evicted pid line into the file export. This is called from
@@ -123,9 +182,26 @@ impl FileExporter {
         }
     }
 
-    /// Called after every successful write. When `max_bytes` is set and
-    /// exceeded, rotates the file.
+    /// Called after every successful write. Drives optional per-record
+    /// `fdatasync` (when `--export-file-sync-every` is set) and file
+    /// rotation (when `--export-file-max-bytes` is set).
     fn after_write(&mut self, line_len: u64) {
+        // Per-record durability: mirror `audit.rs::write_line`. When
+        // disabled (sync_every == 0) the counter is never touched.
+        if self.sync_every > 0 {
+            self.writes_since_sync = self.writes_since_sync.saturating_add(1);
+            if self.writes_since_sync >= self.sync_every {
+                match self.flush_and_sync() {
+                    Ok(()) => self.writes_since_sync = 0,
+                    Err(e) => {
+                        // Latch the error; rotation below still runs so
+                        // we don't deadlock on a stuck sync.
+                        self.pending_err = Some(e);
+                    }
+                }
+            }
+        }
+
         let Some(max) = self.max_bytes else {
             return;
         };
@@ -150,6 +226,7 @@ impl FileExporter {
             Ok(file) => {
                 self.sink = BufWriter::new(file);
                 self.bytes_written = 0;
+                self.writes_since_sync = 0;
             }
             Err(e) => {
                 self.pending_err = Some(e);
@@ -697,6 +774,12 @@ pub struct PromExporter {
     /// `frames_received * (keys.len() + master_key_configured as u64)`.
     secure_aead_attempts_total: u64,
     rate_limited_total: u64,
+    /// Times the observer's monotonic clock returned a value strictly less
+    /// than the previously observed one and the forward clamp absorbed the
+    /// regression. Surfaced as `varta_observer_clock_regression_total`;
+    /// non-zero values mean TSC drift, VM live migration, or another
+    /// clock anomaly the operator should investigate.
+    clock_regressions_total: u64,
     nonce_wrap_total: u64,
     /// Count of bounded eviction-scan calls that ran the full
     /// `eviction_scan_window` without finding a victim. Surfaced as
@@ -898,6 +981,7 @@ impl PromExporter {
             sender_state_full_total: 0,
             secure_aead_attempts_total: 0,
             rate_limited_total: 0,
+            clock_regressions_total: 0,
             nonce_wrap_total: 0,
             eviction_scan_truncated_total: 0,
             tracker_capacity_cfg: 0,
@@ -1065,6 +1149,13 @@ impl PromExporter {
     /// Record one or more beats dropped by per-pid rate limiting.
     pub fn record_rate_limited(&mut self, count: u64) {
         self.rate_limited_total = self.rate_limited_total.saturating_add(count);
+    }
+
+    /// Record one or more observer clock-regression events drained from
+    /// [`crate::observer::Observer::drain_clock_regressions`]. Surfaced as
+    /// `varta_observer_clock_regression_total`.
+    pub fn record_clock_regressions(&mut self, count: u64) {
+        self.clock_regressions_total = self.clock_regressions_total.saturating_add(count);
     }
 
     /// Record one or more nonce-space wrap events (agent exhausted u64 nonce
@@ -1829,6 +1920,16 @@ impl PromExporter {
             self.body_buf,
             "varta_rate_limited_total {}",
             self.rate_limited_total
+        );
+        self.body_buf.push_str(
+            "# HELP varta_observer_clock_regression_total Times the observer monotonic clock returned a value strictly less than the previously observed one and the forward clamp absorbed the regression. Non-zero values indicate TSC drift, VM live migration, or another clock anomaly.\n",
+        );
+        self.body_buf
+            .push_str("# TYPE varta_observer_clock_regression_total counter\n");
+        let _ = writeln!(
+            self.body_buf,
+            "varta_observer_clock_regression_total {}",
+            self.clock_regressions_total
         );
         self.body_buf.push_str(
             "# HELP varta_scrape_skipped_total Number of /metrics scrapes served from cache (rate-limited).\n",
