@@ -13,250 +13,25 @@
 //!
 //! The module uses only inline `extern "C"` FFI — no `libc` crate — to
 //! satisfy the workspace's zero-registry-dependency constraint.
+//!
+//! ## Module layout
+//!
+//! - [`types`] — public [`BeatOrigin`] / [`RecvResult`] enums and the cached
+//!   observer-UID accessor.
+//! - [`ns_inode`] — Linux `/proc/<pid>/ns/pid` namespace-inode reader (with
+//!   non-Linux stub).
+//! - the cmsg walker, the per-platform `plat` modules, and
+//!   `enable_credential_passing` / `recv_authenticated` currently live in this
+//!   file; later commits split them out.
+
+mod ns_inode;
+mod types;
+
+pub(crate) use ns_inode::{observer_pid_namespace_inode, read_pid_namespace_inode};
+pub(crate) use types::observer_uid;
+pub use types::{BeatOrigin, RecvResult};
 
 use std::io;
-use std::sync::OnceLock;
-
-extern "C" {
-    fn getuid() -> u32;
-}
-
-/// Cached observer UID — called once at startup, then read from the static.
-/// On platforms where `getuid()` isn't available as a direct symbol (e.g.
-/// musl), caching avoids per-datagram syscall overhead and portability issues.
-pub(crate) fn observer_uid() -> u32 {
-    static UID: OnceLock<u32> = OnceLock::new();
-    *UID.get_or_init(|| unsafe { getuid() })
-}
-
-// ---------------------------------------------------------------------------
-// PID namespace inode reader (Linux only)
-// ---------------------------------------------------------------------------
-//
-// PID namespaces are a Linux kernel concept (`pid_namespaces(7)`). The inode
-// number of `/proc/<pid>/ns/pid` uniquely identifies the namespace a process
-// belongs to. The observer reads its own inode once at startup and compares
-// the peer's inode on every kernel-attested datagram to detect cross-namespace
-// senders. macOS and the BSDs return `None` from these helpers — namespaces
-// don't exist as a concept there, so the gate short-circuits to "match".
-
-#[cfg(target_os = "linux")]
-extern "C" {
-    fn readlink(
-        path: *const core::ffi::c_char,
-        buf: *mut core::ffi::c_char,
-        bufsiz: usize,
-    ) -> isize;
-}
-
-/// Read the PID-namespace inode for `pid` via `readlink("/proc/<pid>/ns/pid")`.
-///
-/// Returns `Some(inode)` if the symlink resolves to the canonical `pid:[N]`
-/// form. Returns `None` if the platform is not Linux, the symlink is
-/// unreadable (peer died, permission denied via `ptrace_may_access`, `/proc`
-/// not mounted), or the target string is malformed.
-///
-/// Zero allocations — uses two stack buffers (32 bytes for the path, 64 bytes
-/// for the readlink target).
-#[cfg(target_os = "linux")]
-pub(crate) fn read_pid_namespace_inode(pid: u32) -> Option<u64> {
-    let mut path = [0u8; 32];
-    write_proc_pid_ns_pid(&mut path, pid)?;
-    let mut link_buf = [0u8; 64];
-    // SAFETY: `path` is NUL-terminated by `write_proc_pid_ns_pid`. `link_buf`
-    // is a fixed-size stack buffer of known length. `readlink` does not write
-    // a NUL terminator (we read only the returned length bytes).
-    let ret = unsafe {
-        readlink(
-            path.as_ptr() as *const core::ffi::c_char,
-            link_buf.as_mut_ptr() as *mut core::ffi::c_char,
-            link_buf.len(),
-        )
-    };
-    if ret <= 0 {
-        return None;
-    }
-    parse_ns_inode(&link_buf[..ret as usize])
-}
-
-/// Format `/proc/<pid>/ns/pid\0` into `out` without allocation. Returns the
-/// number of bytes written including the NUL terminator on success, or `None`
-/// if the buffer is too small (statically impossible for u32 PIDs given the
-/// 32-byte buffer, but defensive).
-#[cfg(target_os = "linux")]
-fn write_proc_pid_ns_pid(out: &mut [u8; 32], pid: u32) -> Option<usize> {
-    let prefix = b"/proc/";
-    let suffix = b"/ns/pid\0";
-    let mut i = 0;
-    for &b in prefix {
-        if i >= out.len() {
-            return None;
-        }
-        out[i] = b;
-        i += 1;
-    }
-    // u32 decimal is at most 10 digits.
-    let mut digit_buf = [0u8; 10];
-    let mut n = pid;
-    let mut len = 0usize;
-    if n == 0 {
-        digit_buf[0] = b'0';
-        len = 1;
-    } else {
-        while n > 0 {
-            digit_buf[len] = b'0' + (n % 10) as u8;
-            n /= 10;
-            len += 1;
-        }
-    }
-    for k in 0..len {
-        if i >= out.len() {
-            return None;
-        }
-        out[i] = digit_buf[len - 1 - k];
-        i += 1;
-    }
-    for &b in suffix {
-        if i >= out.len() {
-            return None;
-        }
-        out[i] = b;
-        i += 1;
-    }
-    Some(i)
-}
-
-/// Parse the inode out of a `pid:[NNNNN]` readlink target.
-#[cfg(target_os = "linux")]
-fn parse_ns_inode(bytes: &[u8]) -> Option<u64> {
-    let prefix = b"pid:[";
-    if bytes.len() < prefix.len() + 2 || &bytes[..prefix.len()] != prefix {
-        return None;
-    }
-    let after = &bytes[prefix.len()..];
-    let close = after.iter().position(|&b| b == b']')?;
-    let digits = &after[..close];
-    if digits.is_empty() {
-        return None;
-    }
-    let mut acc: u64 = 0;
-    for &c in digits {
-        if !c.is_ascii_digit() {
-            return None;
-        }
-        acc = acc.checked_mul(10)?.checked_add((c - b'0') as u64)?;
-    }
-    Some(acc)
-}
-
-/// Non-Linux stub: PID namespaces are a Linux kernel concept.
-#[cfg(not(target_os = "linux"))]
-#[inline]
-pub(crate) fn read_pid_namespace_inode(_pid: u32) -> Option<u64> {
-    None
-}
-
-/// Cached observer PID-namespace inode. Linux processes cannot change PID
-/// namespaces after `unshare`, so caching at first call is safe for the
-/// observer's lifetime. On non-Linux platforms returns `None`.
-pub(crate) fn observer_pid_namespace_inode() -> Option<u64> {
-    static NS: OnceLock<Option<u64>> = OnceLock::new();
-    *NS.get_or_init(|| {
-        #[cfg(target_os = "linux")]
-        {
-            read_pid_namespace_inode(std::process::id())
-        }
-        #[cfg(not(target_os = "linux"))]
-        {
-            None
-        }
-    })
-}
-
-// ---------------------------------------------------------------------------
-// Platform-agnostic result type
-// ---------------------------------------------------------------------------
-
-/// Classification of a received beat's transport origin.
-///
-/// This is the structural distinction between **kernel-attested** transports
-/// (Unix Domain Sockets, where the kernel reports the sender's PID/UID per
-/// datagram) and **network-unverified** transports (any UDP variant, where
-/// the only authentication is cryptographic and the operator-controlled
-/// `frame.pid` field cannot be tied back to a specific sending process).
-///
-/// Recovery commands fire safety-critical actions (`kill -9 {pid}`,
-/// `systemctl restart agent@{pid}.service`) against the PID in the frame.
-/// They must NEVER fire for a pid whose beat lifetime is not
-/// kernel-attested — see `book/src/architecture/peer-authentication.md`.
-#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
-pub enum BeatOrigin {
-    /// Beat arrived on a Unix Domain Socket with kernel credential passing
-    /// enabled (`SO_PASSCRED` / `LOCAL_PEERTOKEN` / `SCM_CREDS`). The kernel
-    /// attests the sender's PID and UID per-datagram; the observer has
-    /// already verified `frame.pid == peer_pid`.
-    KernelAttested,
-    /// Beat arrived on a UDP listener that the operator explicitly declared
-    /// recovery-eligible at bind time (via
-    /// `--secure-udp-i-accept-recovery-on-unauthenticated-transport` or
-    /// `--plaintext-udp-i-accept-recovery-on-unauthenticated-transport`).
-    ///
-    /// The kernel cannot attest the sender, but the operator has accepted the
-    /// risk *for this specific listener*. Recovery commands are allowed to
-    /// fire for stalls on this transport, just as they would on UDS.
-    OperatorAttestedTransport,
-    /// Beat arrived on a UDP listener (plain or secure) with no operator
-    /// trust declaration. Recovery commands must NOT fire — the `frame.pid`
-    /// is purely operator-controlled and cannot be tied back to a kernel
-    /// attestation. Any holder of a shared PSK, or a leaked master key, can
-    /// forge a beat for any pid.
-    NetworkUnverified,
-}
-
-/// Outcome of a single `recvmsg(2)` call with credential extraction.
-pub enum RecvResult {
-    /// A full 32-byte frame was received along with credentials. `peer_pid`
-    /// is the PID the kernel attributes the datagram to and `peer_uid` is
-    /// the effective UID. On Linux this is derived from SCM_CREDENTIALS
-    /// (SO_PASSCRED); on macOS it's obtained via `getsockopt(LOCAL_PEERTOKEN)`.
-    ///
-    /// `origin` is the transport-class classification: kernel-attested for
-    /// UDS, network-unverified for any UDP variant. Plumbed end-to-end to
-    /// gate recovery commands on transport trust — see [`BeatOrigin`].
-    Authenticated {
-        /// Kernel-attested PID of the sending process. Zero for transports
-        /// without kernel credential passing (any UDP variant).
-        peer_pid: u32,
-        /// Kernel-attested effective UID of the sending process. Zero for
-        /// transports without kernel credential passing.
-        peer_uid: u32,
-        /// PID-namespace inode of the sending process (Linux only).
-        ///
-        /// `None` when the platform doesn't expose PID namespaces (macOS,
-        /// BSD), when the peer's `/proc/<pid>/ns/pid` symlink is unreadable
-        /// (peer exited, `ptrace_may_access` denial, `/proc` not mounted), or
-        /// for UDP transports where `peer_pid` is 0.
-        peer_pid_ns_inode: Option<u64>,
-        /// Transport-class classification of the beat.
-        origin: BeatOrigin,
-        /// Received frame payload (always 32 bytes).
-        data: [u8; 32],
-    },
-    /// The read timed out (`EAGAIN` / `EWOULDBLOCK`).
-    WouldBlock,
-    /// A short (non-32-byte) read — dropped.
-    ShortRead,
-    /// Fatal I/O error.  Also surfaced when the kernel fails to attach
-    /// `SCM_CREDENTIALS` despite `SO_PASSCRED` being set — that case is
-    /// observable as `Event::Io` rather than a silent drop so operators
-    /// can detect kernel/socket misconfiguration.
-    IoError(io::Error),
-    /// Ancillary data truncated by the kernel (`MSG_CTRUNC` on Linux).
-    /// Indicates `ANCILLARY_BUFFER_SIZE` is too small for the kernel's
-    /// per-message metadata — a kernel buffer sizing issue that operators
-    /// should monitor separately from generic I/O errors.
-    CtrlTruncated(io::Error),
-}
 
 // ---------------------------------------------------------------------------
 // CMSG alignment helpers (shared by all CMSG-using platforms)
@@ -1090,46 +865,6 @@ unsafe fn find_credential_pid(
         hdr = unsafe { cmsg_nxthdr(mhdr, cmsg, base) };
     }
     None
-}
-
-#[cfg(all(test, target_os = "linux"))]
-mod ns_tests {
-    use super::*;
-
-    #[test]
-    fn parse_ns_inode_known_format() {
-        assert_eq!(parse_ns_inode(b"pid:[4026531836]"), Some(4026531836));
-        assert_eq!(parse_ns_inode(b"pid:[1]"), Some(1));
-    }
-
-    #[test]
-    fn parse_ns_inode_rejects_malformed() {
-        assert_eq!(parse_ns_inode(b"xxx"), None);
-        assert_eq!(parse_ns_inode(b"pid:[]"), None);
-        assert_eq!(parse_ns_inode(b"pid:[abc]"), None);
-        assert_eq!(parse_ns_inode(b"pid:[42"), None); // missing close bracket
-        assert_eq!(parse_ns_inode(b"net:[42]"), None); // wrong namespace prefix
-    }
-
-    #[test]
-    fn write_proc_pid_ns_pid_formats_correctly() {
-        let mut buf = [0u8; 32];
-        let n = write_proc_pid_ns_pid(&mut buf, 12345).expect("fits");
-        // Expect "/proc/12345/ns/pid\0" — 18 chars + NUL = 19 bytes.
-        assert_eq!(n, 19);
-        assert_eq!(&buf[..n], b"/proc/12345/ns/pid\0");
-    }
-
-    #[test]
-    fn observer_can_read_its_own_namespace_inode() {
-        // /proc/self/ns/pid is always readable for the running process on
-        // Linux with /proc mounted. CI runners satisfy both.
-        let inode = observer_pid_namespace_inode();
-        assert!(
-            inode.is_some(),
-            "observer must resolve its own PID-ns inode"
-        );
-    }
 }
 
 /// Miri-compatible cmsg pointer-walk tests.
