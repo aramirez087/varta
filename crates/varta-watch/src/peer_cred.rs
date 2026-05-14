@@ -1185,6 +1185,7 @@ mod miri_cmsg_tests {
         plat::Msghdr {
             msg_name: core::ptr::null_mut(),
             msg_namelen: 0,
+            _pad1: 0,
             msg_iov: core::ptr::null_mut(),
             msg_iovlen: 0,
             msg_control: anc_buf.as_ptr() as *mut _,

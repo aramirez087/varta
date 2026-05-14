@@ -10,6 +10,7 @@
 //! `compile-time-config` profile, which rejects all argv input.
 
 #![cfg(not(feature = "compile-time-config"))]
+#![allow(unsafe_code)]
 
 use std::os::unix::net::UnixDatagram;
 use std::path::PathBuf;

@@ -36,6 +36,7 @@ fn assert_absent(haystack: &str, needles: &[&str]) {
 
 const SHELL_LITERAL: &[&str] = &["/bin/sh"];
 
+#[cfg(feature = "compile-time-config")]
 const HTTP_LITERALS: &[&str] = &[
     "GET /metrics",
     "HTTP/1.0",
@@ -44,6 +45,7 @@ const HTTP_LITERALS: &[&str] = &[
     "Bearer realm",
 ];
 
+#[cfg(feature = "compile-time-config")]
 const ARGV_FLAG_LITERALS: &[&str] = &[
     "--socket",
     "--threshold-ms",

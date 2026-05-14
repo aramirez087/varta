@@ -1322,7 +1322,7 @@ impl PromExporter {
     pub fn serve_pending(&mut self) -> io::Result<()> {
         let render_fresh = self
             .last_scrape
-            .is_none_or(|last| last.elapsed() >= PROM_MIN_SCRAPE_INTERVAL);
+            .map_or(true, |last| last.elapsed() >= PROM_MIN_SCRAPE_INTERVAL);
         let serve_deadline = Instant::now() + Duration::from_millis(100);
         let mut served = 0;
         let result = loop {
