@@ -16,6 +16,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::thread;
 use std::time::Duration;
 
+use varta_vlp::crypto::BearerToken;
 use varta_vlp::{DecodeError, Status};
 use varta_watch::{Event, Exporter, FileExporter, PromExporter};
 
@@ -26,6 +27,10 @@ static TMP_COUNTER: AtomicU32 = AtomicU32::new(0);
 /// `Authorization: Bearer` header.
 const TEST_TOKEN: [u8; 32] = [0xcd; 32];
 const TEST_TOKEN_HEX: &str = "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd";
+
+fn make_token() -> BearerToken {
+    BearerToken::from_bytes(TEST_TOKEN)
+}
 
 fn unique_tmp(tag: &str) -> TempPath {
     let pid = std::process::id();
@@ -84,7 +89,7 @@ fn http_get(prom: &mut PromExporter, addr: SocketAddr, path: &str) -> String {
 
 #[test]
 fn prom_exporter_reports_beats_total_per_pid() {
-    let mut prom = PromExporter::bind("127.0.0.1:0".parse().unwrap(), TEST_TOKEN).expect("bind");
+    let mut prom = PromExporter::bind("127.0.0.1:0".parse().unwrap(), make_token()).expect("bind");
     let addr = prom.local_addr().expect("local_addr");
     for n in 1..=3 {
         prom.record(&Event::Beat {
@@ -107,7 +112,7 @@ fn prom_exporter_reports_beats_total_per_pid() {
 
 #[test]
 fn prom_exporter_reports_stalls_total_per_pid() {
-    let mut prom = PromExporter::bind("127.0.0.1:0".parse().unwrap(), TEST_TOKEN).expect("bind");
+    let mut prom = PromExporter::bind("127.0.0.1:0".parse().unwrap(), make_token()).expect("bind");
     let addr = prom.local_addr().expect("local_addr");
     prom.record(&Event::Beat {
         pid: 9,
@@ -150,7 +155,7 @@ fn prom_exporter_emits_serve_pending_seconds_buckets_at_zero_on_first_scrape() {
     // rules and `histogram_quantile()` queries stay green from the first
     // observation.  Same discipline as `iteration_seconds`,
     // `decode_errors_total`, and `prom_connections_dropped_total`.
-    let mut prom = PromExporter::bind("127.0.0.1:0".parse().unwrap(), TEST_TOKEN).expect("bind");
+    let mut prom = PromExporter::bind("127.0.0.1:0".parse().unwrap(), make_token()).expect("bind");
     let addr = prom.local_addr().expect("local_addr");
     let body = http_get(&mut prom, addr, "/metrics");
     for le in EXPECTED_BUCKET_LE {
@@ -172,7 +177,7 @@ fn prom_exporter_emits_serve_pending_seconds_buckets_at_zero_on_first_scrape() {
 
 #[test]
 fn prom_exporter_emits_scrape_budget_exceeded_at_zero_on_first_scrape() {
-    let mut prom = PromExporter::bind("127.0.0.1:0".parse().unwrap(), TEST_TOKEN).expect("bind");
+    let mut prom = PromExporter::bind("127.0.0.1:0".parse().unwrap(), make_token()).expect("bind");
     let addr = prom.local_addr().expect("local_addr");
     let body = http_get(&mut prom, addr, "/metrics");
     assert!(
@@ -183,7 +188,7 @@ fn prom_exporter_emits_scrape_budget_exceeded_at_zero_on_first_scrape() {
 
 #[test]
 fn prom_exporter_serve_pending_histogram_records_observed_durations() {
-    let mut prom = PromExporter::bind("127.0.0.1:0".parse().unwrap(), TEST_TOKEN).expect("bind");
+    let mut prom = PromExporter::bind("127.0.0.1:0".parse().unwrap(), make_token()).expect("bind");
     let addr = prom.local_addr().expect("local_addr");
     // Record three observations directly — http_get itself calls
     // serve_pending() but the test helper does NOT call
@@ -211,7 +216,7 @@ fn prom_exporter_serve_pending_histogram_records_observed_durations() {
 
 #[test]
 fn prom_exporter_scrape_budget_exceeded_increments_when_observation_exceeds_budget() {
-    let mut prom = PromExporter::bind("127.0.0.1:0".parse().unwrap(), TEST_TOKEN)
+    let mut prom = PromExporter::bind("127.0.0.1:0".parse().unwrap(), make_token())
         .expect("bind")
         .with_scrape_budget(Duration::from_millis(10));
     let addr = prom.local_addr().expect("local_addr");

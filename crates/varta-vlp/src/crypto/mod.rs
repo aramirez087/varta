@@ -157,6 +157,40 @@ impl core::fmt::Debug for Key {
     }
 }
 
+/// In-process container for the Prometheus `/metrics` bearer secret used
+/// by `varta-watch`.
+///
+/// Mirrors [`Key`]'s `!Clone + ZeroizeOnDrop` posture: bytes are zeroed on
+/// drop and can never be silently duplicated across a `Clone` call.  Lives
+/// alongside `Key` here so the same audited `zeroize` dependency covers
+/// both secrets — `varta-watch` carries no registry deps of its own.
+///
+/// Regression: see the `_bearer_token_must_not_be_clone` `compile_fail`
+/// doctest at the bottom of this module.
+#[derive(Zeroize, ZeroizeOnDrop)]
+pub struct BearerToken {
+    bytes: [u8; 32],
+}
+
+impl BearerToken {
+    /// Wrap a decoded 32-byte secret.
+    pub fn from_bytes(bytes: [u8; 32]) -> Self {
+        BearerToken { bytes }
+    }
+
+    /// Returns a reference to the raw bytes for constant-time comparison
+    /// (see [`crate::ct_eq`]).
+    pub fn as_bytes(&self) -> &[u8; 32] {
+        &self.bytes
+    }
+}
+
+impl core::fmt::Debug for BearerToken {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("BearerToken").finish_non_exhaustive()
+    }
+}
+
 pub use crate::util::{ct_eq, decode_hex_32, HexDecodeError};
 
 /// Regression: `Key` must never gain a `Clone` impl. Silent duplication
@@ -170,6 +204,18 @@ pub use crate::util::{ct_eq, decode_hex_32, HexDecodeError};
 /// ```
 #[cfg(all(doc, feature = "crypto"))]
 pub fn _key_must_not_be_clone() {}
+
+/// Regression: `BearerToken` must never gain a `Clone` impl. Silent
+/// duplication defeats the `ZeroizeOnDrop` guarantee that the secret is
+/// wiped exactly once at a deterministic site.
+///
+/// ```compile_fail,E0277
+/// use varta_vlp::crypto::BearerToken;
+/// fn assert_clone<T: Clone>() {}
+/// assert_clone::<BearerToken>();
+/// ```
+#[cfg(all(doc, feature = "crypto"))]
+pub fn _bearer_token_must_not_be_clone() {}
 
 #[cfg(test)]
 mod tests {

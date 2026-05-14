@@ -27,6 +27,8 @@ use std::net::{IpAddr, Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 #[cfg(feature = "prometheus-exporter")]
+use varta_vlp::crypto::BearerToken;
+#[cfg(feature = "prometheus-exporter")]
 use varta_vlp::DecodeError;
 use varta_vlp::Status;
 
@@ -669,11 +671,11 @@ pub struct PromExporter {
     /// rules stay green; see the matching contract on
     /// `varta_decode_errors_total`.
     auth_failures_total: u64,
-    /// Pre-shared 32-byte secret enforced on every scrape via the
+    /// Pre-shared bearer secret enforced on every scrape via the
     /// `Authorization: Bearer <hex>` request header.  Loaded once at
     /// startup from `--prom-token-file`; the exporter never reads the
-    /// file again.
-    token: [u8; 32],
+    /// file again.  Zeroed on drop.
+    token: BearerToken,
     /// Per-kind decode failure counters, indexed by [`decode_kind_index`].
     /// Always emitted in full (even at zero) so `absent()` alert rules and
     /// dashboards stay green-on-green instead of disappearing until the
@@ -849,7 +851,7 @@ impl PromExporter {
     ///
     /// `token` is the 32-byte bearer secret enforced on every scrape; see
     /// [`Self::bind_with_rate_limit`].
-    pub fn bind(addr: SocketAddr, token: [u8; 32]) -> io::Result<Self> {
+    pub fn bind(addr: SocketAddr, token: BearerToken) -> io::Result<Self> {
         Self::bind_with_rate_limit(
             addr,
             token,
@@ -872,7 +874,7 @@ impl PromExporter {
     /// `varta_prom_auth_failures_total`.
     pub fn bind_with_rate_limit(
         addr: SocketAddr,
-        token: [u8; 32],
+        token: BearerToken,
         rate_per_sec: u32,
         rate_burst: u32,
     ) -> io::Result<Self> {
@@ -1438,7 +1440,7 @@ impl PromExporter {
         // paths bump `auth_failures_total` and return 401 without ever
         // touching the response body.
         let authorized = match parse_authorization_bearer(&buf[..total]) {
-            Some(presented) => varta_vlp::ct_eq(&presented, &self.token),
+            Some(presented) => varta_vlp::ct_eq(&presented, self.token.as_bytes()),
             None => false,
         };
         if !authorized {
@@ -2257,10 +2259,14 @@ mod tests {
     const TEST_TOKEN: [u8; 32] = [0xab; 32];
     const TEST_TOKEN_HEX: &str = "abababababababababababababababababababababababababababababababab";
 
+    fn make_token() -> BearerToken {
+        BearerToken::from_bytes(TEST_TOKEN)
+    }
+
     #[test]
     fn render_body_sorts_pids_numerically() {
         let mut prom =
-            PromExporter::bind("127.0.0.1:0".parse().unwrap(), TEST_TOKEN).expect("bind");
+            PromExporter::bind("127.0.0.1:0".parse().unwrap(), make_token()).expect("bind");
         prom.record(&Event::Beat {
             pid: 30,
             status: Status::Ok,
@@ -2302,7 +2308,7 @@ mod tests {
     #[test]
     fn decode_and_io_events_do_not_create_rows() {
         let mut prom =
-            PromExporter::bind("127.0.0.1:0".parse().unwrap(), TEST_TOKEN).expect("bind");
+            PromExporter::bind("127.0.0.1:0".parse().unwrap(), make_token()).expect("bind");
         prom.record(&Event::Decode(varta_vlp::DecodeError::BadMagic, 0))
             .unwrap();
         prom.record(&Event::Io(io::Error::other("x"), 0)).unwrap();
@@ -2312,7 +2318,7 @@ mod tests {
     #[test]
     fn decode_errors_emit_kind_label_for_every_variant_even_at_zero() {
         let mut prom =
-            PromExporter::bind("127.0.0.1:0".parse().unwrap(), TEST_TOKEN).expect("bind");
+            PromExporter::bind("127.0.0.1:0".parse().unwrap(), make_token()).expect("bind");
         // Bump bad_magic twice, bad_status once, leave bad_version at zero.
         prom.record(&Event::Decode(DecodeError::BadMagic, 0))
             .unwrap();
@@ -2342,7 +2348,7 @@ mod tests {
     #[test]
     fn non_get_request_returns_405() {
         let mut prom =
-            PromExporter::bind("127.0.0.1:0".parse().unwrap(), TEST_TOKEN).expect("bind");
+            PromExporter::bind("127.0.0.1:0".parse().unwrap(), make_token()).expect("bind");
         let addr = prom.local_addr().expect("local_addr");
         let mut stream = TcpStream::connect(addr).expect("connect");
         stream
@@ -2396,7 +2402,7 @@ mod tests {
     #[test]
     fn metrics_requires_bearer_token() {
         let mut prom =
-            PromExporter::bind("127.0.0.1:0".parse().unwrap(), TEST_TOKEN).expect("bind");
+            PromExporter::bind("127.0.0.1:0".parse().unwrap(), make_token()).expect("bind");
         let addr = prom.local_addr().expect("local_addr");
         let response = one_get(&mut prom, addr, None);
         assert!(
@@ -2416,7 +2422,7 @@ mod tests {
     #[test]
     fn metrics_rejects_wrong_token() {
         let mut prom =
-            PromExporter::bind("127.0.0.1:0".parse().unwrap(), TEST_TOKEN).expect("bind");
+            PromExporter::bind("127.0.0.1:0".parse().unwrap(), make_token()).expect("bind");
         let addr = prom.local_addr().expect("local_addr");
         let bad = "Bearer 0000000000000000000000000000000000000000000000000000000000000000";
         let response = one_get(&mut prom, addr, Some(bad));
@@ -2433,7 +2439,7 @@ mod tests {
     #[test]
     fn metrics_accepts_valid_token() {
         let mut prom =
-            PromExporter::bind("127.0.0.1:0".parse().unwrap(), TEST_TOKEN).expect("bind");
+            PromExporter::bind("127.0.0.1:0".parse().unwrap(), make_token()).expect("bind");
         let addr = prom.local_addr().expect("local_addr");
         let good = format!("Bearer {TEST_TOKEN_HEX}");
         let response = one_get(&mut prom, addr, Some(&good));
@@ -2450,7 +2456,7 @@ mod tests {
     #[test]
     fn metrics_authorization_header_is_case_insensitive() {
         let mut prom =
-            PromExporter::bind("127.0.0.1:0".parse().unwrap(), TEST_TOKEN).expect("bind");
+            PromExporter::bind("127.0.0.1:0".parse().unwrap(), make_token()).expect("bind");
         let addr = prom.local_addr().expect("local_addr");
         // Lowercase `bearer` and uppercase hex must both succeed.
         let token_upper = TEST_TOKEN_HEX.to_uppercase();
@@ -2475,7 +2481,7 @@ mod tests {
     #[test]
     fn auth_failures_counter_emitted_at_zero_in_body() {
         let mut prom =
-            PromExporter::bind("127.0.0.1:0".parse().unwrap(), TEST_TOKEN).expect("bind");
+            PromExporter::bind("127.0.0.1:0".parse().unwrap(), make_token()).expect("bind");
         prom.render_body();
         assert!(
             prom.body_buf.contains("varta_prom_auth_failures_total 0"),
@@ -2509,7 +2515,7 @@ mod tests {
     #[test]
     fn record_evicted_pid_removes_row() {
         let mut prom =
-            PromExporter::bind("127.0.0.1:0".parse().unwrap(), TEST_TOKEN).expect("bind");
+            PromExporter::bind("127.0.0.1:0".parse().unwrap(), make_token()).expect("bind");
         prom.record(&Event::Beat {
             pid: 42,
             status: Status::Ok,
@@ -2531,7 +2537,7 @@ mod tests {
     #[test]
     fn record_evicted_pid_ignores_unknown_pid() {
         let mut prom =
-            PromExporter::bind("127.0.0.1:0".parse().unwrap(), TEST_TOKEN).expect("bind");
+            PromExporter::bind("127.0.0.1:0".parse().unwrap(), make_token()).expect("bind");
         // Should not panic when called for a pid that was never tracked.
         prom.record_evicted_pid(99);
         // Verify rows is still empty.
@@ -2541,7 +2547,7 @@ mod tests {
     #[test]
     fn self_health_metrics_are_emitted() {
         let mut prom =
-            PromExporter::bind("127.0.0.1:0".parse().unwrap(), TEST_TOKEN).expect("bind");
+            PromExporter::bind("127.0.0.1:0".parse().unwrap(), make_token()).expect("bind");
         // Add a tracked PID so pids_tracked > 0
         prom.record(&Event::Beat {
             pid: 7,
@@ -2587,7 +2593,7 @@ mod tests {
     #[test]
     fn connections_dropped_emit_every_reason_label_at_zero() {
         let mut prom =
-            PromExporter::bind("127.0.0.1:0".parse().unwrap(), TEST_TOKEN).expect("bind");
+            PromExporter::bind("127.0.0.1:0".parse().unwrap(), make_token()).expect("bind");
         prom.render_body();
         let body = &prom.body_buf;
         for reason in DROP_REASON_LABELS {
@@ -2607,7 +2613,7 @@ mod tests {
     fn allow_ip_denies_after_burst_and_records_rate_limit() {
         let mut prom = PromExporter::bind_with_rate_limit(
             "127.0.0.1:0".parse().unwrap(),
-            TEST_TOKEN,
+            make_token(),
             /* rate_per_sec */ 1,
             /* rate_burst   */ 3,
         )
@@ -2639,7 +2645,7 @@ mod tests {
     fn allow_ip_burst_zero_is_unlimited() {
         let mut prom = PromExporter::bind_with_rate_limit(
             "127.0.0.1:0".parse().unwrap(),
-            TEST_TOKEN,
+            make_token(),
             /* rate_per_sec */ 5,
             /* rate_burst   */ 0,
         )
@@ -2662,7 +2668,7 @@ mod tests {
     fn allow_ip_table_full_force_evicts_and_records() {
         let mut prom = PromExporter::bind_with_rate_limit(
             "127.0.0.1:0".parse().unwrap(),
-            TEST_TOKEN,
+            make_token(),
             /* rate_per_sec */ 1000,
             /* rate_burst   */ 1000,
         )
@@ -2706,7 +2712,7 @@ mod tests {
     #[test]
     fn recovery_refused_debounce_capacity_label_emitted_at_zero() {
         let mut prom =
-            PromExporter::bind("127.0.0.1:0".parse().unwrap(), TEST_TOKEN).expect("bind");
+            PromExporter::bind("127.0.0.1:0".parse().unwrap(), make_token()).expect("bind");
         prom.render_body();
         let body = &prom.body_buf;
         for reason in RECOVERY_REFUSED_REASON_LABELS.iter() {
@@ -2735,7 +2741,7 @@ mod tests {
     #[test]
     fn recovery_refused_debounce_capacity_outcome_drives_counters() {
         let mut prom =
-            PromExporter::bind("127.0.0.1:0".parse().unwrap(), TEST_TOKEN).expect("bind");
+            PromExporter::bind("127.0.0.1:0".parse().unwrap(), make_token()).expect("bind");
         let outcome = crate::recovery::RecoveryOutcome::RefusedDebounceCapacity { pid: 42 };
         prom.record_recovery_outcome(&outcome, None);
         prom.render_body();

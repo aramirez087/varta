@@ -73,7 +73,7 @@ test-hooks = []
 # builds where a network-reachable HTTP server in the observer's address
 # space is a liability.  Cannot be combined with `compile-time-config`
 # (enforced by `compile_error!` in lib.rs).
-prometheus-exporter = []
+prometheus-exporter = ["varta-vlp/crypto"]
 # Replace runtime argv parsing with a compile-time-baked Config produced
 # by `build.rs` from the file at $VARTA_CONFIG_FILE.  The 292-arm
 # `Config::from_args` and the multi-page `Config::HELP` flag listing are

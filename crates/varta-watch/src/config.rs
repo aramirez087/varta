@@ -1898,6 +1898,7 @@ OPTIONAL:
         })
     }
 
+    #[cfg(feature = "prometheus-exporter")]
     /// Load the Prometheus `/metrics` bearer token from
     /// [`Self::prom_token_file`].
     ///
@@ -1912,15 +1913,7 @@ OPTIONAL:
     ///
     /// Returns an `io::Error` if the file fails validation or the contents
     /// cannot be decoded as 64 hex characters.
-    //
-    // SECURITY: this returns the bearer token as a bare `[u8; 32]`, which is
-    // `Copy` and not zeroize-on-drop. Once threaded into `PromExporter`, the
-    // token can be silently spilled across moves and the heap page is never
-    // wiped on drop. Tracked for a follow-up hardening plan: wrap in a
-    // `BearerToken` newtype that mirrors `varta_vlp::crypto::Key`'s
-    // `!Clone + ZeroizeOnDrop` posture. Out of scope for the `Key`-only fix
-    // landed in `varta-vlp` 0.2.0.
-    pub fn load_prom_token(&self) -> std::io::Result<Option<[u8; 32]>> {
+    pub fn load_prom_token(&self) -> std::io::Result<Option<varta_vlp::crypto::BearerToken>> {
         use std::io;
         let Some(ref path) = self.prom_token_file else {
             return Ok(None);
@@ -1933,7 +1926,7 @@ OPTIONAL:
                 format!("{}: {e}", path.display()),
             )
         })?;
-        Ok(Some(bytes))
+        Ok(Some(varta_vlp::crypto::BearerToken::from_bytes(bytes)))
     }
 }
 
