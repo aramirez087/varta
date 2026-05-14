@@ -337,6 +337,45 @@ jobs:
             exit 1
           fi
 
+  kani-proofs:
+    name: kani-proofs (symbolic verification of varta-vlp)
+    # Symbolic verification of `Frame::decode` and the CRC-32C primitive.
+    # Required gate on every PR that touches the protocol crate.  See
+    # docs/architecture/verification.md for the strategy and a mapping
+    # from harness names to invariants proved.
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: checkout
+        uses: actions/checkout@v4
+
+      - name: detect varta-vlp-relevant changes
+        id: changes
+        uses: dorny/paths-filter@v3
+        with:
+          filters: |
+            vlp:
+              - 'crates/varta-vlp/**'
+              - '.github/workflows/ci.yml'
+
+      - name: rust toolchain (stable — Kani works on stable)
+        if: steps.changes.outputs.vlp == 'true' || github.event_name == 'push'
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: install kani-verifier
+        if: steps.changes.outputs.vlp == 'true' || github.event_name == 'push'
+        run: |
+          cargo install --locked kani-verifier
+          cargo kani setup
+
+      - name: cargo kani -p varta-vlp
+        if: steps.changes.outputs.vlp == 'true' || github.event_name == 'push'
+        run: cargo kani -p varta-vlp
+
+      - name: skip notice
+        if: steps.changes.outputs.vlp != 'true' && github.event_name != 'push'
+        run: echo "no varta-vlp changes — Kani proofs skipped"
+
   book:
     name: build-book
     runs-on: ubuntu-latest
@@ -349,4 +388,4 @@ jobs:
           mv mdbook /usr/local/bin/
 
       - name: build book
-        run: mdbook build
+        run: mdbook build book
