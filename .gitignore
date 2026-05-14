@@ -29,3 +29,7 @@ fuzz/target
 fuzz/corpus
 fuzz/artifacts
 scripts/resolve-wolf.sh
+
+# mdBook build output
+book/book/
+

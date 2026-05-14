@@ -65,7 +65,7 @@ varta-vlp  ←  varta-client  ←  (consumers)
 
 **`varta-tests`** — end-to-end contract tests (`harness = false`) that spawn real built binaries and assert against the live Prometheus endpoint. Must be run after `cargo build --release`.
 
-**`varta-bench`** — latency, CPU, and binary-size benchmarks. Results are host-dependent and documented in `docs/benchmarks/results.md`.
+**`varta-bench`** — latency, CPU, and binary-size benchmarks. Results are host-dependent and documented in `book/src/benchmarks/results.md`.
 
 ## Hard Constraints
 

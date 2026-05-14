@@ -186,7 +186,7 @@ pub struct CompleteRecord {
 /// Currently fired by the transport-origin gate: a `NetworkUnverified` stall
 /// (any UDP variant) is refused unless the operator has explicitly opted in
 /// via `--i-accept-recovery-on-unauthenticated-transport`.  See
-/// `docs/architecture/peer-authentication.md` for the trust model.
+/// `book/src/architecture/peer-authentication.md` for the trust model.
 #[derive(Debug)]
 pub struct RefusedRecord<'a> {
     /// Wall-clock time of the refusal, milliseconds since UNIX epoch.

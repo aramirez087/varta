@@ -18,7 +18,7 @@
 //!
 //! The build script never depends on any registry crate — only `std`.  This
 //! preserves the "zero registry dependencies" invariant for the production
-//! crate.  See `docs/architecture/compile-time-config.md` for the canonical
+//! crate.  See `book/src/architecture/compile-time-config.md` for the canonical
 //! grammar and key catalogue.
 
 use std::env;
@@ -52,7 +52,7 @@ fn main() {
         None => panic!(
             "VARTA_CONFIG_FILE must be set when building with \
              --features compile-time-config.  See \
-             docs/architecture/compile-time-config.md for the canonical \
+             book/src/architecture/compile-time-config.md for the canonical \
              KEY=VALUE grammar."
         ),
     };
@@ -77,7 +77,7 @@ fn main() {
 //
 // The single source of truth for which keys are accepted in the
 // compile-time-config file and what type each key resolves to.  Mirrored in
-// `docs/architecture/compile-time-config.md`.
+// `book/src/architecture/compile-time-config.md`.
 // Allow dead variants: the catalogue lists every shape we might emit, even
 // when no current `Config` field uses it.  Removing variants only to
 // re-add them later is friction with no benefit.

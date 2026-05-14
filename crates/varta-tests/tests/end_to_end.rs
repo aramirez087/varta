@@ -3085,7 +3085,7 @@ fn clock_source_monotonic_smoke() {
 /// H7 — same smoke test under `--clock-source boottime` (Linux only).
 /// CI cannot actually `systemctl suspend` the test host, so this is a
 /// startup-and-poll smoke test only; suspend behaviour is verified
-/// manually per `docs/architecture/safety-profiles.md`.
+/// manually per `book/src/architecture/safety-profiles.md`.
 #[cfg(target_os = "linux")]
 fn clock_source_boottime_smoke() {
     let tmp = TempDir::new("clock-boot");

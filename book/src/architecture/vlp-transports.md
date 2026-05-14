@@ -76,7 +76,7 @@ a `UdpListener` is added alongside the UDS listener.
 > the runtime origin gate still refuses to fire recovery for UDP-origin
 > stalls — flipping `Recovery::with_allow_unauthenticated_source(true)` is
 > a separate, conscious choice.  See
-> `docs/architecture/peer-authentication.md` for the full threat model.
+> `book/src/architecture/peer-authentication.md` for the full threat model.
 
 ## CLI additions
 
@@ -157,7 +157,7 @@ varta-watch --socket /tmp/varta.sock --threshold-ms 500 \
     install time and **fails closed** if all sources (`getrandom`, `getentropy`,
     `/dev/urandom`) are unavailable. In chrooted environments without `/dev`,
     use `install_panic_handler_secure_udp_accept_degraded_entropy` to opt into a
-    non-cryptographic fallback — see `docs/architecture/peer-authentication.md`
+    non-cryptographic fallback — see `book/src/architecture/peer-authentication.md`
     for the full nonce-reuse risk analysis.
 
 - **Recovery commands**: Two execution modes:

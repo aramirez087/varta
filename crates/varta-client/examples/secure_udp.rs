@@ -4,7 +4,7 @@
 //! The agent reads its pre-shared key from a 0600-mode file (the same path
 //! shape the observer uses); environment-variable keys are intentionally
 //! not supported because they leak through `/proc/<pid>/environ` and
-//! `docker inspect`.  See `docs/architecture/peer-authentication.md`.
+//! `docker inspect`.  See `book/src/architecture/peer-authentication.md`.
 //!
 //! # Usage
 //!

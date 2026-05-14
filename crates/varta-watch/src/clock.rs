@@ -16,7 +16,7 @@
 //!   battery-conscious clinical devices (insulin pumps, holter monitors)
 //!   that aggressively suspend to sleep: a 4-hour suspend IS a 4-hour
 //!   silence and MUST register as a stall on wake-up.  See
-//!   `docs/architecture/safety-profiles.md` for the deployment matrix.
+//!   `book/src/architecture/safety-profiles.md` for the deployment matrix.
 //!
 //! macOS / BSD have no equivalent of `CLOCK_BOOTTIME` — `CLOCK_UPTIME_RAW`
 //! on Darwin *excludes* suspend (opposite semantics).  `boottime` is

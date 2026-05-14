@@ -5,6 +5,9 @@ multilingual = false
 src = "src"
 title = "The Varta Book"
 
+[build]
+build-dir = "book"
+
 [output.html]
 git-repository-url = "https://github.com/aramirez087/Varta"
 edit-url-template = "https://github.com/aramirez087/Varta/edit/main/book/{path}"

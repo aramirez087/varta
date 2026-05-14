@@ -326,7 +326,7 @@ pub struct Config {
     ///   suspend. Correct for embedded clinical devices that aggressively
     ///   sleep (insulin pumps, holter monitors).
     ///
-    /// See `docs/architecture/safety-profiles.md` for the deployment
+    /// See `book/src/architecture/safety-profiles.md` for the deployment
     /// matrix. Set by `--clock-source <monotonic|boottime>`.
     pub clock_source: ClockSource,
 }
@@ -510,7 +510,7 @@ pub enum ConfigError {
 //    regardless of `#[cfg]` on the code paths that consume it).
 //
 // The Class-A wording uses `config key` instead of `--flag-name` and refers
-// the operator to `docs/architecture/compile-time-config.md` for any
+// the operator to `book/src/architecture/compile-time-config.md` for any
 // remediation.  The two impls are mutually exclusive at the `#[cfg]` layer.
 
 #[cfg(not(feature = "compile-time-config"))]
@@ -590,7 +590,7 @@ impl core::fmt::Display for ConfigError {
                  rotate the shadow and replay a captured frame against a target sender. \
                  Either bind to a loopback address (default 127.0.0.1) or pass \
                  --i-accept-secure-udp-non-loopback to explicitly accept this risk. \
-                 See docs/architecture/vlp-transports.md for the threat-boundary derivation."
+                 See book/src/architecture/vlp-transports.md for the threat-boundary derivation."
             ),
             ConfigError::IterationBudgetOutOfRange { value, min, max } => write!(
                 f,
@@ -614,7 +614,7 @@ impl core::fmt::Display for ConfigError {
             ConfigError::CompileTimeArgvForbidden => f.write_str(
                 "this binary was configured at compile time \
                  (--features compile-time-config); refusing to accept argv. \
-                 See docs/architecture/compile-time-config.md for the \
+                 See book/src/architecture/compile-time-config.md for the \
                  supported configuration mechanism.",
             ),
             ConfigError::CompileTimeConfigInvalid { reason } => write!(
@@ -633,7 +633,7 @@ impl core::fmt::Display for ConfigError {
         // producer, `Config::from_args`, is excluded from compilation),
         // but the Display impl must still cover them.  Neutral wording
         // keeps argv flag names out of the binary's `strings` output.
-        const REF: &str = "see docs/architecture/compile-time-config.md";
+        const REF: &str = "see book/src/architecture/compile-time-config.md";
         match self {
             ConfigError::MissingValue(_)
             | ConfigError::MissingRequired(_)
@@ -692,7 +692,7 @@ impl Config {
     /// them out of the constant body itself.
     #[cfg(feature = "compile-time-config")]
     pub const HELP: &'static str = "varta-watch (compile-time configured; no argv accepted; see \
-         docs/architecture/compile-time-config.md)\n";
+         book/src/architecture/compile-time-config.md)\n";
 
     /// Verbatim `--help` text. The acceptance test asserts that every
     /// documented long-flag substring appears in this body.
@@ -795,7 +795,7 @@ OPTIONAL:
                                      on suspend — SRE semantics) or
                                      boottime (Linux only; advances during
                                      suspend — medical/embedded semantics).
-                                     See docs/architecture/safety-profiles.md.
+                                     See book/src/architecture/safety-profiles.md.
     --shutdown-after-secs <SECS>   Exit cleanly after the given uptime
                                      (used by integration tests).
     --udp-port <PORT>              Bind a UDP listener on this port for
@@ -833,7 +833,7 @@ OPTIONAL:
                                      its own cadence.  Catches hung poll
                                      loops AND silent watchdog-thread
                                      deaths (H5 — see
-                                     docs/architecture/observer-liveness.md).
+                                     book/src/architecture/observer-liveness.md).
                                      Auto-enabled with a 4 s deadline when
                                      $WATCHDOG_USEC is set by the service
                                      manager.  Minimum 1.
@@ -880,7 +880,7 @@ OPTIONAL:
                                      Restrict the listener's reach with
                                      firewall rules or a private VLAN
                                      before enabling.  See
-                                     docs/architecture/vlp-transports.md.
+                                     book/src/architecture/vlp-transports.md.
     --i-accept-shell-risk          UNSAFE: explicitly accept the security
                                      risk of shell-mode recovery
                                      (--recovery-cmd / --recovery-cmd-file).
@@ -927,7 +927,7 @@ OPTIONAL:
                                      recovery template — otherwise kill(2)
                                      would target the wrong process. Linux
                                      only; no-op on other platforms. See
-                                     docs/architecture/namespaces.md.
+                                     book/src/architecture/namespaces.md.
     --strict-namespace-check       Treat a cross-namespace agent as a fatal
                                      startup error instead of the default
                                      refuse-recovery behaviour. Useful when
@@ -971,7 +971,7 @@ OPTIONAL:
                                      wedges are caught by
                                      --self-watchdog-secs.  Default 250.
                                      Range [50, 60000].  See
-                                     docs/architecture/observer-liveness.md
+                                     book/src/architecture/observer-liveness.md
                                      for the worst-case derivation.
     --scrape-budget-ms <MS>        Soft per-call budget for serve_pending
                                      (the /metrics serving phase of one
@@ -1239,7 +1239,7 @@ OPTIONAL:
                 "--key-env" | "--master-key-env" | "--accepted-key-env" => {
                     // Removed for security: env-var keys are exposed via
                     // /proc/<pid>/environ and `docker inspect`. See
-                    // docs/architecture/peer-authentication.md.
+                    // book/src/architecture/peer-authentication.md.
                     let flag = match tok.as_str() {
                         "--key-env" => "--key-env",
                         "--master-key-env" => "--master-key-env",

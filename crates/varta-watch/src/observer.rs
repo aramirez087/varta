@@ -294,7 +294,7 @@ impl Observer {
     /// `N_listeners × per-listener-recv-cost + eviction_scan_window`.
     /// Under the canonical stress profile (3 listeners, 4096 tracker
     /// capacity, 256-slot eviction window) the p99 iteration time is
-    /// ≤ 5 ms — see `docs/architecture/observer-liveness.md` and the
+    /// ≤ 5 ms — see `book/src/architecture/observer-liveness.md` and the
     /// `tick-distribution` bench (`cargo run -p varta-bench --release --
     /// tick-distribution`) which asserts this bound under sustained load.
     ///
@@ -477,7 +477,7 @@ impl Observer {
     ///
     /// The kernel clock backing this reading is selected via
     /// [`crate::clock::ClockSource`] (`--clock-source` CLI flag); see
-    /// `docs/architecture/safety-profiles.md` for the SRE vs. medical
+    /// `book/src/architecture/safety-profiles.md` for the SRE vs. medical
     /// deployment matrix.
     pub fn now_ns(&mut self) -> u64 {
         let raw = self.clock.now_ns();

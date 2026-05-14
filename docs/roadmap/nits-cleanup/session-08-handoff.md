@@ -39,7 +39,7 @@ All 11 nits (n1–n11) addressed across sessions 02–07. Zero production deps i
 
 | File | Change |
 |------|--------|
-| `docs/architecture/nits-cleanup-decisions.md` | Created: 11 nit design decisions locked |
+| `book/src/architecture/nits-cleanup-decisions.md` | Created: 11 nit design decisions locked |
 | `tools/acceptance-contract.tsv` | Created: 23-entry acceptance contract manifest |
 | `docs/roadmap/nits-cleanup/session-01-handoff.md` | Created |
 | `crates/varta-vlp/src/lib.rs` | n1: `.expect("len N")` → `.unwrap()` in Frame::decode |

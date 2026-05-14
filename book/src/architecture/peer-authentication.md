@@ -461,7 +461,7 @@ structural enforcement matching the project's `--i-accept-<risk>` convention.
 The VLP wire format uses little-endian integer encoding natively.
 Protocol correctness depends on the host being little-endian (all tier-1
 targets — x86_64 and aarch64 — satisfy this). Building on a big-endian
-host is a compile error. See `docs/architecture/vlp-frame.md` for design
+host is a compile error. See `book/src/architecture/vlp-frame.md` for design
 rationale.
 
 ---

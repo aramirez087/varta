@@ -194,7 +194,7 @@ cat audit.log.5 audit.log.4 audit.log.3 audit.log.2 audit.log.1 audit.log \
 
 # 2. Confirm chain validates (requires the daemon's
 # audit_chain_hash helper exposed in a verification tool — out of scope
-# for the daemon binary itself, see docs/architecture/peer-authentication.md
+# for the daemon binary itself, see book/src/architecture/peer-authentication.md
 # for the pattern).
 
 # 3. Cross-check that the chain head matches the latest sealed-log entry

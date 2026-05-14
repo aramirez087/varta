@@ -202,6 +202,18 @@ pub enum RecoveryOutcome {
         /// Agent pid whose stall was refused.
         pid: u32,
     },
+    /// Recovery was structurally declined because the per-pid debounce
+    /// ledger ([`LastFiredTable`]) was at capacity AND no entry's age
+    /// exceeded `debounce` — i.e. firing would either evict a fresh
+    /// entry (silently violating its debounce window) or skip
+    /// insertion (leaving the new pid unbounded).  The refusal is
+    /// logged to the audit sink and counted in Prometheus so operators
+    /// can detect both legitimate scale-out and the M8 adversarial
+    /// stall-burst pattern.
+    RefusedDebounceCapacity {
+        /// Agent pid whose stall was refused.
+        pid: u32,
+    },
 }
 
 /// Bookkeeping slot for one outstanding child.
@@ -228,16 +240,257 @@ struct Outstanding {
     truncated: bool,
 }
 
-/// Maximum number of pids tracked in `last_fired`. When the map is full and
-/// a new pid stalls, the debounce check is skipped and the recovery command
-/// fires. This prevents unbounded memory growth during a large stall burst.
-const MAX_LAST_FIRED_CAPACITY: usize = 256;
+/// Maximum number of pids tracked in [`LastFiredTable`].
+///
+/// Each slot is `Option<LastFiredSlot>` ≈ 24 bytes → ~96 KiB total table —
+/// within budget for the observer (which already carries
+/// `MAX_SENDER_STATES = 1024` rate-limit tables and the `PidIndex`).
+///
+/// Sized to make the M8 debounce-bypass attack costly: under steady-state
+/// 4096 unique pids would have to stall faster than `debounce` cadence
+/// before the eviction policy kicks in.  Above that threshold the table
+/// fails closed via [`RecoveryOutcome::RefusedDebounceCapacity`].
+const MAX_LAST_FIRED_CAPACITY: usize = 4096;
+
+/// Per-pid entry in [`LastFiredTable`].
+///
+/// `pid` is the agent pid (always ≥ 2 because [`crate::varta_vlp::Frame::decode`]
+/// rejects 0 and 1 with `BadPid`).  `fired_at` is a monotonic instant from
+/// [`Instant::now`] at the moment recovery fired for this pid.
+#[derive(Clone, Copy)]
+struct LastFiredSlot {
+    pid: u32,
+    fired_at: Instant,
+}
+
+/// Outcome of [`LastFiredTable::try_insert`].
+#[derive(Debug, Eq, PartialEq)]
+enum InsertOutcome {
+    /// Slot was newly allocated (either filling an empty slot or
+    /// updating an existing one for the same pid).
+    Inserted,
+    /// Table was at capacity; an entry whose age exceeded `debounce`
+    /// was evicted to make room.  Debounce semantics are preserved
+    /// because the evicted pid's window had already elapsed.
+    EvictedOldest {
+        /// Pid whose slot was evicted.
+        #[allow(dead_code)] // Reserved for future audit emission.
+        evicted_pid: u32,
+    },
+    /// Table is at capacity AND no entry is older than `debounce`.
+    /// The caller MUST treat this as a fail-closed refusal: firing
+    /// would either evict a fresh entry (violating its debounce
+    /// window) or skip insertion (leaving the new pid unbounded).
+    RefusedCapacity,
+}
+
+/// Fixed-capacity, array-backed ledger of recent recovery fires.
+///
+/// Replaces the original `HashMap<u32, Instant>` whose reactive pruning
+/// (`prune_threshold = debounce * 10`) created a debounce-bypass window
+/// under adversarial load: when the map stayed full of fresh entries,
+/// the `at_capacity` branch skipped the debounce check entirely and
+/// fired without throttling.
+///
+/// Design properties:
+///
+/// * **Bounded WCET.** Every operation is a linear scan over a
+///   fixed-size `[Option<LastFiredSlot>; MAX_LAST_FIRED_CAPACITY]`
+///   backing store — deterministic, no `HashMap` rehash, no
+///   randomised hash function.
+/// * **Fail-closed under capacity pressure.** When the table is full
+///   and no entry's age exceeds `debounce`, [`try_insert`] returns
+///   [`InsertOutcome::RefusedCapacity`]; the caller emits a refusal
+///   audit row and bumps a Prometheus counter so operators see the
+///   condition.
+/// * **Clock-regression defense.** All age comparisons use
+///   [`Instant::saturating_duration_since`], which returns
+///   [`Duration::ZERO`] on regression — preventing a backwards clock
+///   blip from auto-evicting the whole table.
+/// * **No-panic indexing.** All slot access goes through `.iter()` /
+///   `.iter_mut()`; defensive else-branches bump
+///   `invariant_violations`, mirroring the DO-178C pattern documented
+///   for `PidIndex` in `tracker.rs`.
+///
+/// See `book/src/architecture/observer-liveness.md` for the operator-facing
+/// semantics and alerting recommendation.
+///
+/// [`try_insert`]: LastFiredTable::try_insert
+struct LastFiredTable {
+    slots: Box<[Option<LastFiredSlot>]>,
+    /// Number of slots currently holding `Some`.  Tracked separately so
+    /// `len()` and the capacity check are O(1).  Kept in sync with the
+    /// `Some` count by every mutation; a divergence bumps
+    /// `invariant_violations`.
+    occupied: usize,
+    /// Monotonic count of evictions that occurred because the table was
+    /// at capacity and a slot's debounce window had elapsed.  Drained
+    /// by [`take_evictions`] for Prometheus exposition.
+    ///
+    /// [`take_evictions`]: LastFiredTable::take_evictions
+    evictions: u64,
+    /// Monotonic count of impossible-by-construction conditions
+    /// encountered at runtime — should stay at 0 forever.  Operators
+    /// alert on any non-zero value.
+    invariant_violations: u64,
+}
+
+impl LastFiredTable {
+    fn new() -> Self {
+        LastFiredTable {
+            slots: vec![None; MAX_LAST_FIRED_CAPACITY].into_boxed_slice(),
+            occupied: 0,
+            evictions: 0,
+            invariant_violations: 0,
+        }
+    }
+
+    /// Return the most recent fire instant for `pid`, if any.
+    fn get(&self, pid: u32) -> Option<Instant> {
+        for s in self.slots.iter().flatten() {
+            if s.pid == pid {
+                return Some(s.fired_at);
+            }
+        }
+        None
+    }
+
+    /// Insert or update the entry for `pid` at `now`.
+    ///
+    /// Three-pass strategy in a single linear scan:
+    ///
+    /// 1. If a slot for `pid` already exists, update its `fired_at` in
+    ///    place.
+    /// 2. Otherwise, if there is an empty slot, fill it.
+    /// 3. Otherwise, if the oldest slot's age is at least `debounce`,
+    ///    evict it and take its place.  This preserves the per-pid
+    ///    debounce invariant because the evicted pid's window has
+    ///    elapsed.
+    /// 4. Otherwise, return [`InsertOutcome::RefusedCapacity`].
+    fn try_insert(&mut self, pid: u32, now: Instant, debounce: Duration) -> InsertOutcome {
+        let mut existing_slot: Option<usize> = None;
+        let mut first_empty: Option<usize> = None;
+        let mut oldest: Option<(usize, Instant)> = None;
+
+        for (idx, slot) in self.slots.iter().enumerate() {
+            match slot {
+                Some(s) if s.pid == pid => {
+                    existing_slot = Some(idx);
+                    break;
+                }
+                Some(s) => {
+                    match oldest {
+                        Some((_, oldest_at)) if s.fired_at >= oldest_at => {}
+                        _ => oldest = Some((idx, s.fired_at)),
+                    }
+                }
+                None => {
+                    if first_empty.is_none() {
+                        first_empty = Some(idx);
+                    }
+                }
+            }
+        }
+
+        if let Some(idx) = existing_slot {
+            match self.slots.get_mut(idx) {
+                Some(slot) => *slot = Some(LastFiredSlot { pid, fired_at: now }),
+                None => {
+                    self.invariant_violations = self.invariant_violations.saturating_add(1);
+                    return InsertOutcome::RefusedCapacity;
+                }
+            }
+            return InsertOutcome::Inserted;
+        }
+
+        if let Some(idx) = first_empty {
+            match self.slots.get_mut(idx) {
+                Some(slot) => {
+                    *slot = Some(LastFiredSlot { pid, fired_at: now });
+                    self.occupied = self.occupied.saturating_add(1);
+                }
+                None => {
+                    self.invariant_violations = self.invariant_violations.saturating_add(1);
+                    return InsertOutcome::RefusedCapacity;
+                }
+            }
+            return InsertOutcome::Inserted;
+        }
+
+        // Table is full.  Check the oldest entry's age against debounce.
+        // `saturating_duration_since` returns ZERO on clock regression,
+        // which is treated as "not eligible for eviction" — preventing
+        // a backwards clock blip from auto-evicting the whole table.
+        if let Some((idx, oldest_at)) = oldest {
+            let age = now.saturating_duration_since(oldest_at);
+            if age >= debounce {
+                let evicted_pid = match self.slots.get(idx) {
+                    Some(Some(s)) => s.pid,
+                    _ => {
+                        self.invariant_violations = self.invariant_violations.saturating_add(1);
+                        return InsertOutcome::RefusedCapacity;
+                    }
+                };
+                match self.slots.get_mut(idx) {
+                    Some(slot) => *slot = Some(LastFiredSlot { pid, fired_at: now }),
+                    None => {
+                        self.invariant_violations = self.invariant_violations.saturating_add(1);
+                        return InsertOutcome::RefusedCapacity;
+                    }
+                }
+                self.evictions = self.evictions.saturating_add(1);
+                return InsertOutcome::EvictedOldest { evicted_pid };
+            }
+            return InsertOutcome::RefusedCapacity;
+        }
+
+        // Unreachable in correct operation: occupied == capacity but no
+        // oldest candidate was found.  Surface defensively rather than
+        // panicking.
+        self.invariant_violations = self.invariant_violations.saturating_add(1);
+        InsertOutcome::RefusedCapacity
+    }
+
+    /// Drop any entry whose age exceeds `threshold`.  Cheap quiet-period
+    /// optimisation: under steady-state the table self-trims so the
+    /// eviction policy is never engaged.
+    fn prune_expired(&mut self, now: Instant, threshold: Duration) {
+        for slot in self.slots.iter_mut() {
+            if let Some(s) = slot {
+                if now.saturating_duration_since(s.fired_at) >= threshold {
+                    *slot = None;
+                    self.occupied = self.occupied.saturating_sub(1);
+                }
+            }
+        }
+    }
+
+    /// Number of slots currently holding `Some`.
+    #[allow(dead_code)] // Useful for diagnostics / tests; not load-bearing.
+    fn len(&self) -> usize {
+        self.occupied
+    }
+
+    /// Drain the eviction counter for Prometheus exposition.
+    fn take_evictions(&mut self) -> u64 {
+        let n = self.evictions;
+        self.evictions = 0;
+        n
+    }
+
+    /// Drain the invariant-violation counter for Prometheus exposition.
+    fn take_invariant_violations(&mut self) -> u64 {
+        let n = self.invariant_violations;
+        self.invariant_violations = 0;
+        n
+    }
+}
 
 /// Per-pid debounced runner of a `recovery_cmd` template.
 pub struct Recovery {
     mode: RecoveryMode,
     debounce: Duration,
-    last_fired: HashMap<u32, Instant>,
+    last_fired: LastFiredTable,
     timeout: Option<Duration>,
     outstanding: HashMap<u32, Outstanding>,
     pending_outcomes: Vec<RecoveryOutcome>,
@@ -276,6 +529,11 @@ pub struct Recovery {
     /// agent's PID namespace differed from the observer's. Surfaced as
     /// `varta_recovery_refused_cross_namespace_total`.
     refused_cross_namespace: u64,
+    /// Count of recoveries refused because [`LastFiredTable`] was at
+    /// capacity AND no entry's debounce window had elapsed.  Surfaced
+    /// as `varta_recovery_refused_total{reason="debounce_capacity"}`.
+    /// See [`RecoveryOutcome::RefusedDebounceCapacity`].
+    refused_debounce_capacity: u64,
 }
 
 impl Recovery {
@@ -317,7 +575,7 @@ impl Recovery {
         Recovery {
             mode,
             debounce,
-            last_fired: HashMap::new(),
+            last_fired: LastFiredTable::new(),
             timeout,
             outstanding: HashMap::new(),
             pending_outcomes: Vec::new(),
@@ -329,6 +587,7 @@ impl Recovery {
             refused_unauthenticated_source: 0,
             allow_cross_namespace: false,
             refused_cross_namespace: 0,
+            refused_debounce_capacity: 0,
         }
     }
 
@@ -360,6 +619,32 @@ impl Recovery {
         let n = self.refused_unauthenticated_source;
         self.refused_unauthenticated_source = 0;
         n
+    }
+
+    /// Take and reset the count of recoveries refused because
+    /// [`LastFiredTable`] was at capacity and no entry's debounce
+    /// window had elapsed.  See [`RecoveryOutcome::RefusedDebounceCapacity`].
+    pub fn take_refused_debounce_capacity(&mut self) -> u64 {
+        let n = self.refused_debounce_capacity;
+        self.refused_debounce_capacity = 0;
+        n
+    }
+
+    /// Take and reset the count of [`LastFiredTable`] evictions —
+    /// stale entries dropped to make room for a new pid when the table
+    /// is at capacity and the evicted entry's debounce window had
+    /// elapsed.  Distinct from
+    /// [`Self::take_refused_debounce_capacity`]: an eviction is
+    /// debounce-respecting churn; a refusal is suppression.
+    pub fn take_last_fired_evictions(&mut self) -> u64 {
+        self.last_fired.take_evictions()
+    }
+
+    /// Take and reset the count of [`LastFiredTable`] invariant
+    /// violations — should be `0` forever in correct operation.
+    /// Operators alert on any non-zero value.
+    pub fn take_last_fired_invariant_violations(&mut self) -> u64 {
+        self.last_fired.take_invariant_violations()
     }
 
     /// Attach a recovery audit sink. Every spawn and completion will be
@@ -616,7 +901,7 @@ impl Recovery {
     /// [`Recovery::with_allow_unauthenticated_source`], the recovery
     /// command is **not** spawned and [`RecoveryOutcome::RefusedUnauthenticatedSource`]
     /// is returned (and audit-logged) — see the H2 mitigation in
-    /// `docs/architecture/peer-authentication.md`.
+    /// `book/src/architecture/peer-authentication.md`.
     ///
     /// `cross_namespace_agent` is `true` iff the caller has determined that
     /// the stalled agent's kernel-attested PID namespace differs from the
@@ -672,21 +957,22 @@ impl Recovery {
 
         let now = Instant::now();
 
+        // Quiet-period optimisation: drop entries past `debounce * 10`
+        // so the table self-trims under steady-state load and the
+        // eviction policy is rarely engaged.  Bounded WCET: linear
+        // scan over a fixed-size `[Option<LastFiredSlot>; 4096]`.
         let prune_threshold = self.debounce.saturating_mul(10);
-        self.last_fired
-            .retain(|_, &mut fired_at| now.duration_since(fired_at) < prune_threshold);
+        self.last_fired.prune_expired(now, prune_threshold);
 
-        // If the map is at capacity and this pid is not already tracked,
-        // skip the debounce to prevent unbounded memory growth. The
-        // outstanding map still prevents double-spawning for the same pid.
-        let at_capacity =
-            self.last_fired.len() >= MAX_LAST_FIRED_CAPACITY && !self.last_fired.contains_key(&pid);
-
-        if !at_capacity {
-            if let Some(prev) = self.last_fired.get(&pid) {
-                if now.duration_since(*prev) < self.debounce {
-                    return RecoveryOutcome::Debounced;
-                }
+        // Per-pid debounce check — ALWAYS honoured.  The pre-M8
+        // HashMap implementation skipped this branch when the map was
+        // at capacity, creating a silent debounce-bypass window under
+        // adversarial stall bursts.  `LastFiredTable::get` is a
+        // bounded linear scan; capacity has no effect on whether the
+        // check runs.
+        if let Some(prev) = self.last_fired.get(pid) {
+            if now.saturating_duration_since(prev) < self.debounce {
+                return RecoveryOutcome::Debounced;
             }
         }
 
@@ -698,8 +984,31 @@ impl Recovery {
             }
         }
 
-        if !at_capacity {
-            self.last_fired.insert(pid, now);
+        // Capacity-aware insertion.  Three outcomes:
+        //   - `Inserted` / `EvictedOldest`: proceed to spawn.  The
+        //     eviction path only fires when the oldest entry's
+        //     debounce window has already elapsed, so per-pid debounce
+        //     semantics are preserved.
+        //   - `RefusedCapacity`: table is full AND every entry is
+        //     fresh.  Fail closed — emit audit, bump Prometheus
+        //     counter, return `RefusedDebounceCapacity`.  See M8 in
+        //     `book/src/architecture/observer-liveness.md`.
+        match self.last_fired.try_insert(pid, now, self.debounce) {
+            InsertOutcome::Inserted | InsertOutcome::EvictedOldest { .. } => {
+                // fall through to spawn
+            }
+            InsertOutcome::RefusedCapacity => {
+                self.refused_debounce_capacity = self.refused_debounce_capacity.saturating_add(1);
+                if let Some(sink) = self.audit_sink.as_mut() {
+                    sink.record_refused(&RefusedRecord {
+                        wallclock_ms: RecoveryAuditLog::wallclock_ms_now(),
+                        observer_ns: 0,
+                        agent_pid: pid,
+                        reason: "debounce_capacity",
+                    });
+                }
+                return RecoveryOutcome::RefusedDebounceCapacity { pid };
+            }
         }
 
         let capture_on = self.capture_cap > 0;
@@ -963,7 +1272,7 @@ impl Drop for Recovery {
         // recovery template cannot stretch shutdown beyond the operator's
         // budget.  systemd's `TimeoutStopSec` should be at least
         // `shutdown_grace_ms` + a small reap margin (~2 s) — see
-        // `docs/architecture/peer-authentication.md`.
+        // `book/src/architecture/peer-authentication.md`.
         let deadline = Instant::now() + self.shutdown_grace;
         while !children.is_empty() && Instant::now() < deadline {
             children.retain_mut(|child| match child.try_wait() {

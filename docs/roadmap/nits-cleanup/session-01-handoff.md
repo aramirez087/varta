@@ -11,7 +11,7 @@ or `.github/**` modified.
 
 | Path | Action | One-line summary |
 |---|---|---|
-| `docs/architecture/nits-cleanup-decisions.md` | created | Single source of truth for n1–n11 decisions, with concrete `file:line` citations, owners, and a per-nit decision template downstream sessions append `**Landed in:**` notes to. |
+| `book/src/architecture/nits-cleanup-decisions.md` | created | Single source of truth for n1–n11 decisions, with concrete `file:line` citations, owners, and a per-nit decision template downstream sessions append `**Landed in:**` notes to. |
 | `tools/acceptance-contract.tsv` | created | Header-only TSV scaffold for n10. Tab-separated `name<TAB>file<TAB>kind`; session 07 fills the 22 rows currently in `.github/workflows/ci.yml:58-80`. |
 | `docs/roadmap/nits-cleanup/session-01-handoff.md` | created | This file. |
 
@@ -23,7 +23,7 @@ and `git diff --stat -- .github/` returning empty.
 ## Decisions made and rationale
 
 The locked decisions live in
-[`docs/architecture/nits-cleanup-decisions.md`](../../architecture/nits-cleanup-decisions.md).
+[`book/src/architecture/nits-cleanup-decisions.md`](../../architecture/nits-cleanup-decisions.md).
 The summary here is just the assignment table — the **why** for each nit
 is in that doc.
 
@@ -75,7 +75,7 @@ Each is documented in the decisions doc under "Process decisions":
 1. **n9 has no operator decision.** The session-01 prompt enumerated
    explicit decisions for 7 of 11 nits; n9 was not specified. Three
    plausible candidates are documented in
-   `docs/architecture/nits-cleanup-decisions.md` §n9:
+   `book/src/architecture/nits-cleanup-decisions.md` §n9:
    - empty `[dependencies]` table in `crates/varta-tests/Cargo.toml`;
    - centralising the per-crate `#![forbid(clippy::dbg_macro,
      clippy::print_stdout)]` headers via root `[workspace.lints]`;
@@ -116,7 +116,7 @@ named session; output paths follow the decisions doc.
 ### Session 02 — `varta-vlp` (n1, n5, n8)
 
 Read:
-- `docs/architecture/nits-cleanup-decisions.md` §n1, §n5, §n8, §P4.
+- `book/src/architecture/nits-cleanup-decisions.md` §n1, §n5, §n8, §P4.
 - `crates/varta-vlp/src/lib.rs` (lines 36-65 for Status, 142-167 for decode).
 - `crates/varta-vlp/Cargo.toml` (verify edition + zero deps).
 - `.gitignore` (lines 1-5 — append `fuzz/target`, `fuzz/corpus`,
@@ -136,7 +136,7 @@ Produce:
 ### Session 03 — `varta-watch` tracker + observer + config (n2, n4)
 
 Read:
-- `docs/architecture/nits-cleanup-decisions.md` §n2, §n4, §P1, §P2.
+- `book/src/architecture/nits-cleanup-decisions.md` §n2, §n4, §P1, §P2.
 - `crates/varta-watch/src/tracker.rs` (lines 24-48 for Slot, line 81
   for size guard).
 - `crates/varta-watch/src/observer.rs` (line 22 for the constant being
@@ -155,7 +155,7 @@ Produce:
 ### Session 04 — `varta-watch` exporter (n3, n6)
 
 Read:
-- `docs/architecture/nits-cleanup-decisions.md` §n3, §n6, §P3.
+- `book/src/architecture/nits-cleanup-decisions.md` §n3, §n6, §P3.
 - `crates/varta-watch/src/exporter.rs` (lines 119-135 for the two
   helpers, lines 248-311 for `serve_one`, lines 390-428 for the
   `record` callers).
@@ -168,7 +168,7 @@ Produce:
 ### Session 05 — `varta-client` docs (n7)
 
 Read:
-- `docs/architecture/nits-cleanup-decisions.md` §n7.
+- `book/src/architecture/nits-cleanup-decisions.md` §n7.
 - `crates/varta-client/src/panic.rs` (lines 28-32 for the disputed
   passage; lines 38-63 for the closure body that grounds the rewrite).
 - `crates/varta-client/src/lib.rs` and `crates/varta-client/src/client.rs`
@@ -180,7 +180,7 @@ Produce:
 ### Session 06 — `varta-tests` cleanup (n11, maybe part of n9)
 
 Read:
-- `docs/architecture/nits-cleanup-decisions.md` §n11, §n9 (candidate #1).
+- `book/src/architecture/nits-cleanup-decisions.md` §n11, §n9 (candidate #1).
 - `crates/varta-tests/Cargo.toml`.
 - `crates/varta-tests/src/lib.rs` (to be deleted).
 - `crates/varta-tests/tests/end_to_end.rs` (read only — confirms the
@@ -195,7 +195,7 @@ Produce:
 ### Session 07 — CI gate (n10, maybe part of n9)
 
 Read:
-- `docs/architecture/nits-cleanup-decisions.md` §n10, §P5, plus §n9 if
+- `book/src/architecture/nits-cleanup-decisions.md` §n10, §P5, plus §n9 if
   candidate #2 (workspace lints centralisation) is selected.
 - `.github/workflows/ci.yml` (lines 55-94 are the contract block).
 - `tools/acceptance-contract.tsv` (header-only scaffold landed by this

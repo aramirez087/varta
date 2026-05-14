@@ -612,7 +612,7 @@ fn cli_prom_token_file_with_world_readable_mode_is_rejected() {
 #[cfg_attr(miri, ignore)] // JUSTIFY: miri cannot model process spawning (Command::new)
 #[test]
 fn cli_recovery_plus_udp_port_without_accept_flag_is_rejected() {
-    // Cross-flag invariant from docs/architecture/peer-authentication.md:
+    // Cross-flag invariant from book/src/architecture/peer-authentication.md:
     // UDP transports cannot attest the sending process; combining a recovery
     // command with --udp-port is structurally unsafe and must hard-error at
     // startup unless the matching per-listener flag is passed.

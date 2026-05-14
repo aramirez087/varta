@@ -422,7 +422,7 @@ fn run(cfg: Config) -> std::io::Result<()> {
                  (--i-accept-secure-udp-non-loopback). The 1-deep replay shadow \
                  after capacity-forced eviction is inadequate for any reachable \
                  network; restrict reach via firewall / private VLAN. See \
-                 docs/architecture/vlp-transports.md for the threat-boundary \
+                 book/src/architecture/vlp-transports.md for the threat-boundary \
                  derivation."
             );
             #[cfg(feature = "compile-time-config")]
@@ -795,7 +795,7 @@ fn run(cfg: Config) -> std::io::Result<()> {
     // `AUTO_DEADLINE_SECS` is the conservative default deadline applied in
     // the auto-enable case (operator passed no explicit `--self-watchdog-secs`).
     // 4 s mirrors the documented L1 example in
-    // `docs/architecture/observer-liveness.md`.  Operators with tighter
+    // `book/src/architecture/observer-liveness.md`.  Operators with tighter
     // `WatchdogSec=` should pass `--self-watchdog-secs` to override.
     const AUTO_DEADLINE_SECS: u64 = 4;
     let wdt_notifier = sd_notify.take_watchdog_notifier();
@@ -978,6 +978,25 @@ fn run(cfg: Config) -> std::io::Result<()> {
                                  differs from observer's."
                             );
                         }
+                        RecoveryOutcome::RefusedDebounceCapacity { pid } => {
+                            // Class-A builds must not carry remediation
+                            // pointers that name CLI flags; SRE builds
+                            // surface enough context to tune capacity.
+                            #[cfg(not(feature = "compile-time-config"))]
+                            varta_warn!(
+                                "recovery for pid {pid} REFUSED: debounce ledger at \
+                                 capacity and no slot's debounce window has elapsed. \
+                                 This is the M8 fail-closed guard against stall-burst \
+                                 attacks. Alert on \
+                                 rate(varta_recovery_refused_total{{reason=\"debounce_capacity\"}}[5m]) > 0; \
+                                 see book/src/architecture/observer-liveness.md."
+                            );
+                            #[cfg(feature = "compile-time-config")]
+                            varta_warn!(
+                                "recovery for pid {pid} REFUSED: debounce ledger \
+                                 at capacity (M8 fail-closed guard)."
+                            );
+                        }
                         RecoveryOutcome::Reaped { .. }
                         | RecoveryOutcome::Killed { .. }
                         | RecoveryOutcome::ReapFailed(_) => {
@@ -1157,6 +1176,32 @@ fn run(cfg: Config) -> std::io::Result<()> {
             }
         }
 
+        // Drain LastFiredTable counters once per tick.  Evictions are
+        // debounce-respecting churn; invariant_violations should stay
+        // at 0 in correct operation.  See M8 in
+        // `book/src/architecture/observer-liveness.md`.
+        if let Some(rec) = recovery.as_mut() {
+            let evictions = rec.take_last_fired_evictions();
+            let invariants = rec.take_last_fired_invariant_violations();
+            #[cfg(feature = "prometheus-exporter")]
+            if let Some(pe) = prom_export.as_mut() {
+                if evictions > 0 {
+                    pe.record_recovery_last_fired_evictions(evictions);
+                }
+                if invariants > 0 {
+                    pe.record_recovery_invariant_violations(invariants);
+                }
+            }
+            #[cfg(not(feature = "prometheus-exporter"))]
+            {
+                // Silence unused-value lints when the exporter is gated
+                // out (Class-A builds).  The counters still drain so
+                // `LastFiredTable`'s internal accumulators stay bounded.
+                let _ = evictions;
+                let _ = invariants;
+            }
+        }
+
         // Drain any latched audit-sink IO error. The audit log latches
         // failed writes / rotations / fsyncs internally so the recovery
         // hot path never blocks on disk I/O — but silently dropping audit
@@ -1205,7 +1250,7 @@ fn run(cfg: Config) -> std::io::Result<()> {
         if let Some(pe) = prom_export.as_mut() {
             // Bracket serve_pending so its wall time is observable
             // independently of beat-path latency.  See
-            // `docs/architecture/observer-liveness.md` ("Why /metrics is on
+            // `book/src/architecture/observer-liveness.md` ("Why /metrics is on
             // the poll thread") — keeping it on the main thread is a
             // load-bearing invariant, and the separate histogram is the
             // observability primitive that lets scrape-storm alarms fire
@@ -1251,7 +1296,7 @@ fn run(cfg: Config) -> std::io::Result<()> {
         // (everything from `iter_start` at the top of the loop body through
         // the watchdog kicks).  Excludes the idle sleep below and the
         // test-hooks wedge — those are throttling / fault injection, not
-        // real work.  See `docs/architecture/observer-liveness.md`.
+        // real work.  See `book/src/architecture/observer-liveness.md`.
         #[cfg(feature = "prometheus-exporter")]
         if let Some(pe) = prom_export.as_mut() {
             pe.record_iteration_duration(iter_start.elapsed());

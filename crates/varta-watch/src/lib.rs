@@ -25,7 +25,7 @@
 compile_error!(
     "`prometheus-exporter` cannot be combined with `compile-time-config` \
      — Class-A safety-critical builds intentionally have no /metrics \
-     surface.  See docs/architecture/safety-profiles.md for the supported \
+     surface.  See book/src/architecture/safety-profiles.md for the supported \
      feature matrix."
 );
 

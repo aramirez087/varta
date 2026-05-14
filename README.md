@@ -26,7 +26,7 @@ A 32-byte heartbeat protocol for distributed local agents and networked clusters
   call operates on a stack buffer. Verified by a guard-allocator test in
   `varta-tests`.
 - **Sub-microsecond beat path.** The steady-state `beat()` encodes a 32-byte
-  frame and hands it to `send(2)`. See [benchmark results](docs/benchmarks/results.md)
+  frame and hands it to `send(2)`. See [benchmark results](book/src/benchmarks/results.md)
   for measured numbers.
 - **Non-blocking by design.** The agent socket is set to non-blocking at
   connect time. A missing or busy observer surfaces as `BeatOutcome::Dropped`
@@ -102,7 +102,7 @@ curl -s http://127.0.0.1:9100/metrics
 
 ## Performance
 
-Benchmark results are in [docs/benchmarks/results.md](docs/benchmarks/results.md).
+Benchmark results are in [book/src/benchmarks/results.md](book/src/benchmarks/results.md).
 The steady-state `beat()` path is designed to be invisible at runtime: one
 stack encode, one `send(2)`, no allocations.
 

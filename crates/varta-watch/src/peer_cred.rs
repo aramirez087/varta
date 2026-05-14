@@ -188,7 +188,7 @@ pub(crate) fn observer_pid_namespace_inode() -> Option<u64> {
 /// Recovery commands fire safety-critical actions (`kill -9 {pid}`,
 /// `systemctl restart agent@{pid}.service`) against the PID in the frame.
 /// They must NEVER fire for a pid whose beat lifetime is not
-/// kernel-attested — see `docs/architecture/peer-authentication.md`.
+/// kernel-attested — see `book/src/architecture/peer-authentication.md`.
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
 pub enum BeatOrigin {
     /// Beat arrived on a Unix Domain Socket with kernel credential passing

@@ -21,7 +21,7 @@ use std::time::{Duration, Instant};
 ///
 /// `WATCHDOG=1` emission is intentionally split out into a separate
 /// [`WatchdogNotifier`] that lives on the self-watchdog thread (see H5 in
-/// `docs/architecture/observer-liveness.md`).  Use [`SdNotify::take_watchdog_notifier`]
+/// `book/src/architecture/observer-liveness.md`).  Use [`SdNotify::take_watchdog_notifier`]
 /// to extract the watchdog half before spawning the thread; the original
 /// `SdNotify` retains `READY` / `STOPPING` capability on the main thread.
 pub struct SdNotify {

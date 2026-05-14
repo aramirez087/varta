@@ -341,7 +341,7 @@ jobs:
     name: kani-proofs (symbolic verification of varta-vlp)
     # Symbolic verification of `Frame::decode` and the CRC-32C primitive.
     # Required gate on every PR that touches the protocol crate.  See
-    # docs/architecture/verification.md for the strategy and a mapping
+    # book/src/architecture/verification.md for the strategy and a mapping
     # from harness names to invariants proved.
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -381,6 +381,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
       - name: install mdbook
         run: |
           tag=$(curl -s https://api.github.com/repos/rust-lang/mdBook/releases/latest | grep -oP '"tag_name": "\K[^"]+')

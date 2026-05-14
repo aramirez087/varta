@@ -114,4 +114,4 @@ deadline is killed via kill(2) and then reaped.
 ## See also
 
 - Protocol crate: [`crates/varta-vlp/README.md`](../varta-vlp/README.md)
-- Architecture: [`docs/architecture/vlp-frame.md`](../../docs/architecture/vlp-frame.md)
+- Architecture: [`book/src/architecture/vlp-frame.md`](../../book/src/architecture/vlp-frame.md)

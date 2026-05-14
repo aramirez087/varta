@@ -41,7 +41,7 @@ use varta_client::{Status, Varta};
 /// `bench_latency_p99_under_one_microsecond` — p99 of steady-state `beat()`
 /// must remain below ~1.2 microseconds on the host running the session.
 /// HOST-DEPENDENT: noisy CI runners may legitimately exceed this;
-/// `docs/benchmarks/results.md` records WARN status with measured ns.
+/// `book/src/benchmarks/results.md` records WARN status with measured ns.
 ///
 /// History: the threshold was 1_000 ns before VLP v0.2 added the CRC-32C
 /// wire trailer (~30 ns/frame on Apple Silicon, more variance under

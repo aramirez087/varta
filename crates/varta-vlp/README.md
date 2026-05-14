@@ -88,5 +88,5 @@ interpret.
 
 ## See also
 
-- Architecture doc: [`docs/architecture/vlp-frame.md`](../../docs/architecture/vlp-frame.md)
+- Architecture doc: [`book/src/architecture/vlp-frame.md`](../../book/src/architecture/vlp-frame.md)
 - Client crate: [`crates/varta-client/README.md`](../varta-client/README.md)

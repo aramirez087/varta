@@ -480,7 +480,7 @@ const PROM_MAX_DRAIN_PER_SERVE: usize = 50;
 // single-threaded by design: beat ingestion, stall detection, recovery
 // reaping, and Prometheus serving all share one thread. The aggregate
 // per-iteration budget is what bounds stall-detection latency under load
-// — see `docs/architecture/observer-liveness.md` for the formal derivation.
+// — see `book/src/architecture/observer-liveness.md` for the formal derivation.
 
 /// Cumulative Prometheus histogram cutoffs for observer iteration wall
 /// time (seconds). The implicit `+Inf` bucket is rendered last so the
@@ -495,7 +495,7 @@ const ITERATION_BUCKET_BOUNDS_S: [f64; 8] =
 /// Default soft budget for a single observer poll iteration. Overruns
 /// increment `varta_observer_iteration_budget_exceeded_total`; the budget
 /// is advisory — hard wedges remain the responsibility of
-/// `--self-watchdog-secs` (see `docs/architecture/observer-liveness.md`).
+/// `--self-watchdog-secs` (see `book/src/architecture/observer-liveness.md`).
 pub const DEFAULT_ITERATION_BUDGET: Duration = Duration::from_millis(250);
 
 /// Default soft budget for a single `serve_pending` call. Overruns increment
@@ -560,7 +560,7 @@ const DROP_REASON_LABELS: [&str; 3] = ["drain", "rate_limit", "ip_table_full"];
 /// [`recovery_outcome_index`]; emitted unconditionally (every value, even
 /// at zero) so `absent()` alert rules stay green.
 #[cfg(feature = "prometheus-exporter")]
-const RECOVERY_OUTCOME_LABELS: [&str; 8] = [
+const RECOVERY_OUTCOME_LABELS: [&str; 9] = [
     "spawned",
     "debounced",
     "reaped_zero",
@@ -569,14 +569,18 @@ const RECOVERY_OUTCOME_LABELS: [&str; 8] = [
     "spawn_failed",
     "refused_unauthenticated_transport",
     "refused_cross_namespace",
+    "refused_debounce_capacity",
 ];
 
 /// Reason label values for `varta_recovery_refused_total`. Indexed by
 /// [`refused_reason_index`]; emitted unconditionally so `absent()` rules
 /// stay green.
 #[cfg(feature = "prometheus-exporter")]
-const RECOVERY_REFUSED_REASON_LABELS: [&str; 2] =
-    ["unauthenticated_transport", "cross_namespace_agent"];
+const RECOVERY_REFUSED_REASON_LABELS: [&str; 3] = [
+    "unauthenticated_transport",
+    "cross_namespace_agent",
+    "debounce_capacity",
+];
 
 /// Map a [`crate::recovery::RecoveryOutcome`] to a stable index for the
 /// `varta_recovery_outcomes_total` array.
@@ -597,6 +601,7 @@ fn recovery_outcome_index(outcome: &crate::recovery::RecoveryOutcome) -> usize {
         RecoveryOutcome::SpawnFailed(_) => 5,
         RecoveryOutcome::RefusedUnauthenticatedSource { .. } => 6,
         RecoveryOutcome::RefusedCrossNamespace { .. } => 7,
+        RecoveryOutcome::RefusedDebounceCapacity { .. } => 8,
         // ReapFailed is not user-facing here — treat as a reap-nonzero
         // (it implies the child terminated abnormally from our POV).
         RecoveryOutcome::ReapFailed(_) => 3,
@@ -612,6 +617,7 @@ fn recovery_outcome_index(outcome: &crate::recovery::RecoveryOutcome) -> usize {
 enum RefusedReason {
     UnauthenticatedTransport,
     CrossNamespaceAgent,
+    DebounceCapacity,
 }
 
 #[cfg(feature = "prometheus-exporter")]
@@ -619,6 +625,7 @@ fn refused_reason_index(r: RefusedReason) -> usize {
     match r {
         RefusedReason::UnauthenticatedTransport => 0,
         RefusedReason::CrossNamespaceAgent => 1,
+        RefusedReason::DebounceCapacity => 2,
     }
 }
 
@@ -710,6 +717,21 @@ pub struct PromExporter {
     /// Surfaced as `varta_recovery_refused_total{reason=...}`. Always emitted
     /// at every scrape (even at zero) per the project's stable-label-set rule.
     recovery_refused_total: [u64; RECOVERY_REFUSED_REASON_LABELS.len()],
+    /// Total [`crate::recovery::LastFiredTable`] evictions — stale
+    /// entries dropped to make room for a new pid when the table was
+    /// at capacity and the evicted entry's debounce window had
+    /// elapsed.  Surfaced as `varta_recovery_last_fired_evictions_total`.
+    /// Distinct from `recovery_refused_total{reason="debounce_capacity"}`:
+    /// an eviction is debounce-respecting churn (operators tune
+    /// `MAX_LAST_FIRED_CAPACITY` on this signal); a refusal is
+    /// suppression (operators alert on this signal).
+    recovery_last_fired_evictions_total: u64,
+    /// Total [`crate::recovery::LastFiredTable`] invariant-violation
+    /// fall-throughs — defensive `.get()`/`.get_mut()` else-branches
+    /// that should be unreachable in correct operation.  Surfaced as
+    /// `varta_recovery_invariant_violations_total`; non-zero values
+    /// indicate a code bug, not load.
+    recovery_invariant_violations_total: u64,
     /// Tracker-level cross-origin conflicts — beats dropped because the
     /// slot's pinned transport origin disagreed with the beat's origin.
     /// Surfaced as `varta_origin_conflict_total`.
@@ -768,7 +790,7 @@ pub struct PromExporter {
     /// Soft per-iteration budget for the observer poll loop. Configurable
     /// via `--iteration-budget-ms`; defaults to
     /// [`DEFAULT_ITERATION_BUDGET`]. See
-    /// `docs/architecture/observer-liveness.md` for the worst-case
+    /// `book/src/architecture/observer-liveness.md` for the worst-case
     /// derivation that justifies the default.
     iteration_budget: Duration,
     /// Per-bucket count of `serve_pending` durations, indexed the same way
@@ -875,6 +897,8 @@ impl PromExporter {
             eviction_scan_window_max: 0,
             recovery_outcomes_total: [0; RECOVERY_OUTCOME_LABELS.len()],
             recovery_refused_total: [0; RECOVERY_REFUSED_REASON_LABELS.len()],
+            recovery_last_fired_evictions_total: 0,
+            recovery_invariant_violations_total: 0,
             origin_conflict_total: 0,
             frame_namespace_mismatch_total: 0,
             tracker_namespace_conflict_total: 0,
@@ -1064,8 +1088,11 @@ impl PromExporter {
     /// `RefusedUnauthenticatedSource` outcomes additionally bump
     /// `varta_recovery_refused_total{reason="unauthenticated_transport"}`;
     /// `RefusedCrossNamespace` outcomes bump
-    /// `varta_recovery_refused_total{reason="cross_namespace_agent"}`.
-    /// Operators can alert on either refusal independently of the broader
+    /// `varta_recovery_refused_total{reason="cross_namespace_agent"}`;
+    /// `RefusedDebounceCapacity` outcomes bump
+    /// `varta_recovery_refused_total{reason="debounce_capacity"}`
+    /// (M8 fail-closed guard against stall-burst attacks).
+    /// Operators can alert on each refusal independently of the broader
     /// outcome label.
     pub fn record_recovery_outcome(
         &mut self,
@@ -1082,6 +1109,11 @@ impl PromExporter {
             }
             crate::recovery::RecoveryOutcome::RefusedCrossNamespace { .. } => {
                 let r_idx = refused_reason_index(RefusedReason::CrossNamespaceAgent);
+                self.recovery_refused_total[r_idx] =
+                    self.recovery_refused_total[r_idx].saturating_add(1);
+            }
+            crate::recovery::RecoveryOutcome::RefusedDebounceCapacity { .. } => {
+                let r_idx = refused_reason_index(RefusedReason::DebounceCapacity);
                 self.recovery_refused_total[r_idx] =
                     self.recovery_refused_total[r_idx].saturating_add(1);
             }
@@ -1129,6 +1161,25 @@ impl PromExporter {
     pub fn record_tracker_invariant_violations(&mut self, count: u64) {
         self.tracker_invariant_violations_total = self
             .tracker_invariant_violations_total
+            .saturating_add(count);
+    }
+
+    /// Record one or more [`crate::recovery::LastFiredTable`] evictions
+    /// — debounce-respecting churn at table capacity.  Surfaced as
+    /// `varta_recovery_last_fired_evictions_total`.
+    pub fn record_recovery_last_fired_evictions(&mut self, count: u64) {
+        self.recovery_last_fired_evictions_total = self
+            .recovery_last_fired_evictions_total
+            .saturating_add(count);
+    }
+
+    /// Record one or more [`crate::recovery::LastFiredTable`]
+    /// invariant-violation fall-throughs.  Surfaced as
+    /// `varta_recovery_invariant_violations_total`; non-zero values
+    /// indicate a code bug.
+    pub fn record_recovery_invariant_violations(&mut self, count: u64) {
+        self.recovery_invariant_violations_total = self
+            .recovery_invariant_violations_total
             .saturating_add(count);
     }
 
@@ -1578,6 +1629,35 @@ impl PromExporter {
                 self.recovery_refused_total[idx]
             );
         }
+        // varta_recovery_last_fired_evictions_total — table churn at
+        // capacity that respected the debounce invariant (the evicted
+        // entry's window had elapsed).  Operators tune
+        // `MAX_LAST_FIRED_CAPACITY` on this signal.  Always emit so
+        // `absent()` alert rules stay green-on-green.
+        self.body_buf.push_str(
+            "# HELP varta_recovery_last_fired_evictions_total LastFiredTable entries dropped (debounce-respecting) to make room for a new pid at table capacity.\n",
+        );
+        self.body_buf
+            .push_str("# TYPE varta_recovery_last_fired_evictions_total counter\n");
+        let _ = writeln!(
+            self.body_buf,
+            "varta_recovery_last_fired_evictions_total {}",
+            self.recovery_last_fired_evictions_total
+        );
+        // varta_recovery_invariant_violations_total — defensive
+        // fall-throughs in `LastFiredTable`.  Non-zero values mean a
+        // code bug, not load.  Same alerting posture as
+        // `varta_tracker_invariant_violations_total`.
+        self.body_buf.push_str(
+            "# HELP varta_recovery_invariant_violations_total LastFiredTable defensive fall-throughs — should remain at 0 in correct operation.\n",
+        );
+        self.body_buf
+            .push_str("# TYPE varta_recovery_invariant_violations_total counter\n");
+        let _ = writeln!(
+            self.body_buf,
+            "varta_recovery_invariant_violations_total {}",
+            self.recovery_invariant_violations_total
+        );
         // varta_log_suppressed_total — messages suppressed by the per-kind
         // 1-second cooldown rate limiter.  Non-zero values indicate a
         // sustained error flood on that path (e.g. a broken file-export
@@ -1789,7 +1869,7 @@ impl PromExporter {
         // = iteration_seconds - serve_pending_seconds is meaningful in
         // PromQL.  Emit every bucket (including `+Inf`) on every scrape so
         // `absent()` alerts stay green from the first scrape onward.
-        // See `docs/architecture/observer-liveness.md` ("Why /metrics is on
+        // See `book/src/architecture/observer-liveness.md` ("Why /metrics is on
         // the poll thread") for the rationale for measuring this
         // separately rather than moving serving to a thread.
         self.body_buf.push_str(

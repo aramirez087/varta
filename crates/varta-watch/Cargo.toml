@@ -81,7 +81,7 @@ prometheus-exporter = []
 # non-empty argv is a startup error).  Removes the GNU-style argv parser
 # CVE surface from safety-critical (Class-A) builds.  Cannot be combined
 # with `prometheus-exporter` (the HTTP exporter has no opt-in path
-# without argv).  See docs/architecture/compile-time-config.md.
+# without argv).  See book/src/architecture/compile-time-config.md.
 compile-time-config = []
 
 [dependencies.varta-vlp]

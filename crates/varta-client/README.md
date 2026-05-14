@@ -100,4 +100,4 @@ message and any user hooks). The sole heap allocation is the `Box` created by
 
 - Protocol crate: [`crates/varta-vlp/README.md`](../varta-vlp/README.md)
 - Examples: [`crates/varta-client/examples/`](examples/)
-- Architecture: [`docs/architecture/vlp-frame.md`](../../docs/architecture/vlp-frame.md)
+- Architecture: [`book/src/architecture/vlp-frame.md`](../../book/src/architecture/vlp-frame.md)

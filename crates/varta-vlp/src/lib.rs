@@ -15,7 +15,7 @@
 //! usage; the optional `std` feature enables `Key::from_file` and related
 //! `std::path::Path`-typed conveniences.
 //!
-//! See `docs/architecture/vlp-frame.md` for the byte map and design notes.
+//! See `book/src/architecture/vlp-frame.md` for the byte map and design notes.
 
 // Unit tests live inside the lib crate and use `format!` / `assert_eq!` against
 // dynamic strings; pull `std` in for the test harness only. This does not
@@ -30,6 +30,15 @@ pub mod crc32c;
 pub mod util;
 pub use util::{ct_eq, decode_hex_32, HexDecodeError};
 
+// Symbolic-verification harnesses live in their own module gated
+// `#[cfg(kani)]` so they compile only under `cargo kani`.  The Kani crate
+// is injected by the verifier and never appears in [`Cargo.toml`]; the
+// zero-registry-dependency invariant for varta-vlp is preserved.
+//
+// See `book/src/architecture/verification.md`.
+#[cfg(kani)]
+pub mod proofs;
+
 /// Magic prefix on every VLP frame. ASCII `"VA"`, intentionally readable in
 /// hex dumps so a stray byte stream is easy to identify.
 pub const MAGIC: [u8; 2] = [0x56, 0x41];
@@ -40,11 +49,11 @@ pub const MAGIC: [u8; 2] = [0x56, 0x41];
 pub const VERSION: u8 = 0x02;
 
 // Compile-time guard: VLP frame layout is little-endian by specification
-// (see docs/architecture/vlp-frame.md). Building on a big-endian host would
+// (see book/src/architecture/vlp-frame.md). Building on a big-endian host would
 // silently produce broken frames.
 #[cfg(not(target_endian = "little"))]
 compile_error!(
-    "VLP frame protocol requires little-endian host (see docs/architecture/vlp-frame.md)"
+    "VLP frame protocol requires little-endian host (see book/src/architecture/vlp-frame.md)"
 );
 
 /// Sentinel nonce value reserved for terminal panic frames.

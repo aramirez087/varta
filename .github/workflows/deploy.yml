@@ -1,0 +1,66 @@
+name: deploy
+
+on:
+  push:
+    branches: [main]
+
+# Allow only one concurrent deployment
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    name: Build & Deploy to GitHub Pages
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+
+    steps:
+      - name: checkout
+        uses: actions/checkout@v4
+        # mdBook follows symlinks during build — checkout must preserve them.
+        with:
+          fetch-depth: 0
+
+      - name: install mdbook
+        run: |
+          tag=$(curl -s https://api.github.com/repos/rust-lang/mdBook/releases/latest \
+            | grep -oP '"tag_name": "\K[^"]+')
+          curl -L "https://github.com/rust-lang/mdBook/releases/download/${tag}/mdbook-${tag}-x86_64-unknown-linux-gnu.tar.gz" \
+            | tar xz
+          mv mdbook /usr/local/bin/
+
+      - name: build book
+        run: mdbook build book
+        # book/book.toml has build-dir = "book", so output lands in book/book/
+
+      - name: assemble site
+        run: |
+          mkdir -p _site
+          # Copy landing page assets into root
+          cp index.html _site/
+          cp style.css _site/
+          cp script.js _site/
+          cp sitemap.xml _site/ 2>/dev/null || true
+          cp robots.txt _site/ 2>/dev/null || true
+          cp llms.txt _site/ 2>/dev/null || true
+          cp favicon.svg _site/ 2>/dev/null || true
+          cp CNAME _site/
+          cp -r assets _site/assets
+          # Place the compiled book at /book
+          cp -r book/book _site/book
+
+      - name: upload pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
+      - name: deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
