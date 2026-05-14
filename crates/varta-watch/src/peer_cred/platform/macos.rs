@@ -188,6 +188,30 @@ fn get_peer_cred(fd: i32) -> super::super::macos_fallback::CredResult {
     }
 }
 
+/// Build a zero-initialised `Msghdr` for use as the `recvmsg(2)` argument.
+pub(crate) fn msghdr_for_recv(
+    iov: *mut Iovec,
+    ctrl: *mut core::ffi::c_void,
+    ctrl_len: usize,
+) -> Msghdr {
+    Msghdr {
+        msg_name: core::ptr::null_mut(),
+        msg_namelen: 0,
+        _pad1: 0,
+        msg_iov: iov,
+        msg_iovlen: 1,
+        _pad2: 0,
+        msg_control: ctrl,
+        msg_controllen: ctrl_len as u32,
+        msg_flags: 0,
+    }
+}
+
+/// macOS does not set `MSG_CTRUNC` for UDS credential data — always `false`.
+pub(crate) fn ctrl_truncated(_mhdr: &Msghdr) -> bool {
+    false
+}
+
 // Compile-time invariant: macOS msghdr is 48 bytes on x86_64 + aarch64.
 const _: () = assert!(mem::size_of::<Msghdr>() == 48);
 

@@ -62,15 +62,69 @@ populated by the kernel.  The observer extracts `cmcred_pid` and
 The ancillary buffer is sized at 256 bytes — sufficient for the 84-byte
 `cmsgcred` with generous headroom for future kernel extensions.
 
-> **Note:** On platforms other than Linux, macOS, FreeBSD, DragonFly, and
-> NetBSD (OpenBSD, Solaris, illumos, etc.), `varta-watch` emits a startup
-> warning via stderr:
-> `"per-datagram PID verification is unavailable. The only defence is
-> --socket-mode (default 0600); any process under the same UID can
-> impersonate any PID."` This is by design — the kernel does not expose
-> per-datagram peer credentials for unconnected `SOCK_DGRAM` on these
-> platforms. Containers that run multiple processes under the same UID
-> should be aware of this limitation.
+### illumos / Solaris
+
+On illumos and Solaris the observer sets `SO_RECVUCRED` (value `0x0400`,
+level `SOL_SOCKET = 0xffff`) on the socket.  Every `recvmsg(2)` then
+receives a `SCM_UCRED` ancillary message whose payload is an **opaque
+`ucred_t`**.  The layout of `ucred_t` is not a stable ABI contract, so
+field extraction goes through the `ucred_getpid(3C)` and `ucred_geteuid(3C)`
+accessor functions from the system's C library rather than a direct struct
+cast.
+
+This is a genuine per-datagram credential mechanism: the kernel attests
+the sender's identity on each `recvmsg(2)`, not just at connection time.
+The ancillary buffer is sized at 1 024 bytes to accommodate the additional
+audit and MAC-label attributes that illumos attaches under Trusted Solaris
+/ labelled-zone configurations.
+
+**`ucred_t` lifetime invariant.** Both `ucred_getpid(3C)` and
+`ucred_geteuid(3C)` are called inside `extract_pid_uid` while the cmsg
+buffer is still on the `recv_authenticated` stack frame.  Neither call
+stores the pointer past its return; the buffer is released after the call
+completes.
+
+**Zone isolation.** `ucred_getzoneid(3C)` is available for extracting the
+Solaris zone-id of the sender (analogous to the Linux PID-namespace inode).
+Cross-zone detection is a planned follow-up; for now, `peer_pid_ns_inode`
+is `None` on illumos/Solaris, which disables the cross-container recovery
+refusal.  See `book/src/architecture/namespaces.md` for the planned gate.
+
+### Platform support summary
+
+| Platform | Mechanism | Per-datagram? | Recovery-eligible? |
+|---|---|---|---|
+| Linux | `SO_PASSCRED` + `SCM_CREDENTIALS` (`struct ucred`) | Yes | Yes |
+| macOS | `getsockopt(LOCAL_PEERTOKEN)` / `LOCAL_PEERPID` | Yes | Yes |
+| FreeBSD / DragonFly / NetBSD | `LOCAL_CREDS` + `SCM_CREDS` (`struct cmsgcred`) | Yes | Yes |
+| illumos / Solaris | `SO_RECVUCRED` + `SCM_UCRED` + `ucred_t` (opaque) | Yes | Yes |
+| OpenBSD, AIX, HP-UX, other Unix | none — `--socket-mode 0600` only | **No** | **No** |
+
+### Socket-mode-only fallback
+
+On platforms that do not provide per-datagram kernel credential passing
+(currently: OpenBSD and any other Unix not listed above), `varta-watch`
+falls back to a plain `recv(2)` receive path and tags each beat with
+`BeatOrigin::SocketModeOnly`.
+
+**Trust model for SocketModeOnly beats.** The only defence is filesystem
+permissions (`--socket-mode 0600`, the default).  Any process running
+under the same UID as the observer can reach the socket and forge
+`frame.pid`.  Recovery commands **must not and do not fire** for these
+beats — the recovery gate at `recovery.rs::on_stall` refuses with
+`RecoveryOutcome::RefusedSocketModeOnly` and increments the Prometheus
+counter `varta_recovery_refused_total{reason="socket_mode_only"}`.  The
+audit log records the refusal with `reason=socket_mode_only`.
+
+At startup, `varta-watch` emits a warning on stderr when compiled for a
+socket-mode-only platform:
+
+```
+[WARN] per-datagram PID verification is unavailable on this platform.
+The only defence is --socket-mode (default 0600). Any process under the
+same UID can impersonate any PID. Beats will be tagged SocketModeOnly;
+recovery commands will not fire.
+```
 
 ## UDP transport authentication
 

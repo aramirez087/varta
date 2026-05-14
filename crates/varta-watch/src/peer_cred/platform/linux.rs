@@ -128,8 +128,13 @@ unsafe impl super::super::cmsg::CmsgPlatform for LinuxCmsg {
     fn msg_controllen(mhdr: &Msghdr) -> usize {
         mhdr.msg_controllen
     }
-    fn extract_pid_uid(cred: &Ucred) -> (u32, u32) {
-        (cred.pid as u32, cred.uid)
+    unsafe fn extract_pid_uid(data: *const u8, len: usize) -> Option<(u32, u32)> {
+        // find_credential guarantees len >= size_of::<Ucred>().
+        debug_assert!(len >= core::mem::size_of::<Ucred>());
+        // SAFETY: guaranteed by find_credential's pre-check and the caller's
+        // contract that `data` points to initialised kernel-supplied bytes.
+        let cred = unsafe { &*(data as *const Ucred) };
+        Some((cred.pid as u32, cred.uid))
     }
 }
 
@@ -137,6 +142,33 @@ unsafe impl super::super::cmsg::CmsgPlatform for LinuxCmsg {
 /// done via ancillary-data parsing.
 pub(crate) fn peer_pid_after_recv(_fd: i32, mhdr: &Msghdr) -> Option<(u32, u32)> {
     super::super::cmsg::find_credential::<LinuxCmsg>(mhdr)
+}
+
+/// Build a zero-initialised `Msghdr` for use as the `recvmsg(2)` argument.
+/// Isolates the per-platform field-order differences so `recv.rs` stays
+/// cfg-free.
+pub(crate) fn msghdr_for_recv(
+    iov: *mut Iovec,
+    ctrl: *mut core::ffi::c_void,
+    ctrl_len: usize,
+) -> Msghdr {
+    Msghdr {
+        msg_name: core::ptr::null_mut(),
+        msg_namelen: 0,
+        _pad1: 0,
+        msg_iov: iov,
+        msg_iovlen: 1,
+        msg_control: ctrl,
+        msg_controllen: ctrl_len,
+        msg_flags: 0,
+        _pad2: 0,
+    }
+}
+
+/// Return `true` when the kernel set `MSG_CTRUNC` on the received datagram,
+/// indicating the ancillary buffer was too small and credentials were dropped.
+pub(crate) fn ctrl_truncated(mhdr: &Msghdr) -> bool {
+    mhdr.msg_flags & MSG_CTRUNC != 0
 }
 
 // Compile-time invariant: glibc/Linux msghdr is 56 bytes on every 64-bit

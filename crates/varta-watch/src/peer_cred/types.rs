@@ -61,6 +61,18 @@ pub enum BeatOrigin {
     /// attestation. Any holder of a shared PSK, or a leaked master key, can
     /// forge a beat for any pid.
     NetworkUnverified,
+    /// Beat arrived on a Unix Domain Socket on a platform that does not
+    /// provide per-datagram kernel credential passing (OpenBSD, AIX, HP-UX,
+    /// and any other Unix without `SO_PASSCRED` / `LOCAL_CREDS` /
+    /// `LOCAL_PEERTOKEN` / `SO_RECVUCRED`).
+    ///
+    /// Trust derives from filesystem permissions only (`--socket-mode 0600`
+    /// restricts access to the owning UID). Recovery commands MUST NOT fire
+    /// for these beats — any process under the same UID can forge
+    /// `frame.pid` with no kernel contradiction. Operators on these
+    /// platforms see a startup warning and must treat the observer as
+    /// socket-mode-only secured.
+    SocketModeOnly,
 }
 
 /// Outcome of a single `recvmsg(2)` call with credential extraction.

@@ -36,3 +36,12 @@ pub(super) use macos::*;
 pub(super) mod bsd;
 #[cfg(any(target_os = "freebsd", target_os = "dragonfly", target_os = "netbsd"))]
 pub(super) use bsd::*;
+
+// The illumos module is also compiled on Linux so the Miri cmsg walker tests
+// can drive the illumos-shaped buffer layout on the Linux CI host — the same
+// pattern used for `mod bsd` above.  FFI symbols and `use illumos::*` stay
+// gated to the actual illumos/Solaris targets.
+#[cfg(any(target_os = "linux", target_os = "illumos", target_os = "solaris",))]
+pub(super) mod illumos;
+#[cfg(any(target_os = "illumos", target_os = "solaris"))]
+pub(super) use illumos::*;

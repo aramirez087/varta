@@ -34,7 +34,7 @@ pub(crate) fn validate_secret_file(path: &Path) -> std::io::Result<String> {
     ))]
     const O_NOFOLLOW: i32 = 0x0100;
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "illumos", target_os = "solaris"))]
     const O_NOFOLLOW: i32 = 0x20000;
 
     #[cfg(not(any(
@@ -45,11 +45,14 @@ pub(crate) fn validate_secret_file(path: &Path) -> std::io::Result<String> {
         target_os = "openbsd",
         target_os = "dragonfly",
         target_os = "linux",
+        target_os = "illumos",
+        target_os = "solaris",
     )))]
     compile_error!("O_NOFOLLOW value is unknown for this target — add it to the cfg gates above");
 
-    // ELOOP is raw 40 on Linux and 62 on the BSD family. On platforms outside
-    // both lists we fall through with the raw error message.
+    // ELOOP: 40 on Linux; 62 on BSD family; 90 on illumos/Solaris
+    // (sys/errno.h). On platforms outside these lists we fall through with
+    // the raw error message.
     #[cfg(target_os = "linux")]
     const ELOOP: i32 = 40;
     #[cfg(any(
@@ -61,6 +64,8 @@ pub(crate) fn validate_secret_file(path: &Path) -> std::io::Result<String> {
         target_os = "dragonfly",
     ))]
     const ELOOP: i32 = 62;
+    #[cfg(any(target_os = "illumos", target_os = "solaris"))]
+    const ELOOP: i32 = 90;
 
     let mut file = match std::fs::OpenOptions::new()
         .read(true)

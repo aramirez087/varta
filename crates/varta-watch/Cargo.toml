@@ -89,6 +89,13 @@ compile-time-config = []
 # production build; the CI `zero-dep audit` is not affected because no new
 # registry dependencies are introduced.
 fuzzing = ["prometheus-exporter"]
+# Test-only: force `recv_authenticated` to use the `SocketModeOnly` plain-recv
+# fallback on any platform, including Linux/macOS where the kernel-attested
+# path would normally be selected. Allows the `socket_mode_only_fallback`
+# integration test to exercise the `BeatOrigin::SocketModeOnly` recovery-
+# refusal path on the CI host without requiring a platform that lacks
+# per-datagram credentials. Never enabled in production builds.
+force-socketmode-fallback = []
 
 [dependencies.varta-vlp]
 path = "../varta-vlp"

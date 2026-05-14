@@ -659,21 +659,27 @@ fn run(cfg: Config) -> std::io::Result<()> {
     .with_allow_cross_namespace(cfg.allow_cross_namespace_agents);
 
     // On platforms lacking kernel-level per-datagram credential passing
-    // (OpenBSD, Solaris, illumos, and other exotic Unixen) the observer
-    // relies solely on --socket-mode (default 0600) as the trust boundary.
-    // Linux, macOS, FreeBSD, DragonFly, and NetBSD all have per-datagram
-    // credential mechanisms — the observer enforces them automatically.
+    // (OpenBSD, AIX, HP-UX, and other exotic Unixen) the observer relies
+    // solely on --socket-mode (default 0600) as the trust boundary. Beats
+    // are tagged BeatOrigin::SocketModeOnly; recovery commands are refused.
+    //
+    // Linux, macOS, FreeBSD, DragonFly, NetBSD, illumos, and Solaris all
+    // have per-datagram credential mechanisms — the observer enforces them
+    // automatically.
     #[cfg(not(any(
         target_os = "linux",
         target_os = "macos",
         target_os = "freebsd",
         target_os = "dragonfly",
         target_os = "netbsd",
+        target_os = "illumos",
+        target_os = "solaris",
     )))]
     varta_warn!(
         "running on {} — per-datagram PID verification is unavailable. \
-         The only defence is --socket-mode (default 0600); any process under the same \
-         UID can impersonate any PID.",
+         Beats are tagged socket-mode-only; recovery commands will be refused. \
+         The only trust boundary is --socket-mode (default 0600): any process \
+         under the same UID can forge frame.pid.",
         std::env::consts::OS,
     );
 
@@ -1311,6 +1317,15 @@ fn run(cfg: Config) -> std::io::Result<()> {
                             varta_warn!(
                                 "recovery for pid {pid} REFUSED: outstanding-child \
                                  table at capacity."
+                            );
+                        }
+                        RecoveryOutcome::RefusedSocketModeOnly { pid } => {
+                            varta_warn!(
+                                "recovery for pid {pid} REFUSED: observer is running \
+                                 on a platform without per-datagram kernel credential \
+                                 passing (socket-mode-only). frame.pid cannot be \
+                                 verified — spawning a recovery command against it is \
+                                 unsafe."
                             );
                         }
                         RecoveryOutcome::Reaped { .. }

@@ -17,6 +17,8 @@
     target_os = "freebsd",
     target_os = "dragonfly",
     target_os = "netbsd",
+    target_os = "illumos",
+    target_os = "solaris",
 ))]
 
 // ---------------------------------------------------------------------------
@@ -38,9 +40,9 @@ pub(super) const fn cmsg_align(len: usize) -> usize {
 
 /// Per-platform parameters for the cmsg walker.
 ///
-/// Implemented twice in this workspace: once for Linux (`SCM_CREDENTIALS` /
-/// `struct ucred` / `cmsg_len: usize`) and once for the BSD family
-/// (`SCM_CREDS` / `struct cmsgcred` / `cmsg_len: u32`).
+/// Implemented for Linux (`SCM_CREDENTIALS` / `struct ucred` /
+/// `cmsg_len: usize`), the BSD family (`SCM_CREDS` / `struct cmsgcred` /
+/// `cmsg_len: u32`), and illumos/Solaris (`SCM_UCRED` / opaque `ucred_t`).
 ///
 /// # Safety
 ///
@@ -49,8 +51,12 @@ pub(super) const fn cmsg_align(len: usize) -> usize {
 /// - `Hdr` is `#[repr(C)]` and matches the kernel's `struct cmsghdr` layout
 ///   on the implementing platform. Verified by compile-time `offset_of!`
 ///   assertions in `super::plat`.
-/// - `Cred` is `#[repr(C)]` and matches the kernel's credential payload
-///   (`struct ucred` on Linux, `struct cmsgcred` on the BSDs).
+/// - `Cred` is the platform's credential payload type. For typed payloads
+///   (Linux `struct ucred`, BSD `struct cmsgcred`) it must be `#[repr(C)]`
+///   with layout verified by compile-time `offset_of!` assertions. For
+///   opaque payloads (illumos `ucred_t`) it may be the unit type `()` — in
+///   that case `extract_pid_uid` receives a raw pointer and delegates to
+///   libc accessors rather than casting.
 /// - `Msghdr` is `#[repr(C)]` and matches the kernel's `struct msghdr` layout.
 /// - `cmsg_len`, `cmsg_level`, `cmsg_type` read the kernel-reported integers
 ///   faithfully — `cmsg_len` widened to `usize` if narrower on the platform.
@@ -60,12 +66,19 @@ pub(super) const fn cmsg_align(len: usize) -> usize {
 ///   `usize`.
 /// - `TARGET_LEVEL` / `TARGET_TYPE` are the `(level, type)` pair the kernel
 ///   uses for credential ancillary data on this platform.
-/// - `extract_pid_uid` reads only fields whose layout was offset-asserted at
-///   compile time and returns `(pid, effective_uid)`.
+/// - `extract_pid_uid` is called only while `data` (pointing into the
+///   ancillary buffer on `recv_authenticated`'s stack frame) is still live.
+///   It must not store `data` past the call.
 pub(super) unsafe trait CmsgPlatform {
     /// Platform's `struct cmsghdr`.
     type Hdr;
-    /// Platform's credential payload struct.
+    /// Platform's credential payload type.
+    ///
+    /// For typed payloads this is the concrete `#[repr(C)]` struct (`Ucred`,
+    /// `Cmsgcred`). For opaque payloads (illumos `ucred_t`) use `()` — the
+    /// `size_of::<Self::Cred>()` minimum-size guard in `find_credential` then
+    /// evaluates to zero, and the implementor's `extract_pid_uid` handles
+    /// any non-empty payload via libc accessors.
     type Cred;
     /// Platform's `struct msghdr`.
     type Msghdr;
@@ -79,7 +92,24 @@ pub(super) unsafe trait CmsgPlatform {
     fn cmsg_type(hdr: &Self::Hdr) -> i32;
     fn msg_control(mhdr: &Self::Msghdr) -> *const u8;
     fn msg_controllen(mhdr: &Self::Msghdr) -> usize;
-    fn extract_pid_uid(cred: &Self::Cred) -> (u32, u32);
+
+    /// Extract `(pid, effective_uid)` from the credential cmsg payload.
+    ///
+    /// `data` points to the first byte of the cmsg payload (after the
+    /// `cmsghdr`); `len` is the payload byte count as reported by
+    /// `cmsg_len - cmsg_hdr_size`. The `find_credential` entry point has
+    /// already verified `len >= size_of::<Self::Cred>()`.
+    ///
+    /// Returns `None` when extraction fails (e.g. opaque libc accessor
+    /// returns an error sentinel).
+    ///
+    /// # Safety
+    ///
+    /// `data` must point to at least `len` initialised bytes inside the
+    /// ancillary buffer supplied to `CmsgIter::new`. The buffer must outlive
+    /// this call (it lives on `recv_authenticated`'s stack frame — the normal
+    /// calling convention). `data` must not be stored past the call.
+    unsafe fn extract_pid_uid(data: *const u8, len: usize) -> Option<(u32, u32)>;
 
     /// Aligned size of one `cmsghdr` on this platform. Used for bounds
     /// checks and for computing the payload offset within a cmsg.
@@ -194,8 +224,9 @@ where
 /// type)` matches `P::TARGET_LEVEL` / `P::TARGET_TYPE`.
 ///
 /// Returns `None` if no credential cmsg is present, if a candidate cmsg
-/// has `cmsg_len` smaller than `cmsg_hdr_size + sizeof::<P::Cred>()`, or
-/// if the buffer is empty / malformed.
+/// has `cmsg_len` smaller than `cmsg_hdr_size + sizeof::<P::Cred>()`, if
+/// the buffer is empty / malformed, or if `P::extract_pid_uid` returns
+/// `None` (e.g. an opaque libc accessor returned an error sentinel).
 ///
 /// # Notes
 ///
@@ -220,13 +251,12 @@ pub(super) fn find_credential<P: CmsgPlatform>(mhdr: &P::Msghdr) -> Option<(u32,
         // - `cmsg_len(hdr) >= cmsg_hdr_size + sizeof::<P::Cred>()` checked
         //   immediately above.
         // - The iterator already proved `cursor + cmsg_len(hdr) <=
-        //   controllen`, so the `Cred` lies fully inside the readable region.
-        // - `P::Cred` is `#[repr(C)]` and its field layout is offset-asserted
-        //   at compile time in `super::plat` (the `CmsgPlatform`
-        //   implementation's safety contract).
+        //   controllen`, so the payload lies fully inside the readable region.
+        // - The buffer outlives this call (stack-allocated in
+        //   `recv_authenticated`) — satisfying `extract_pid_uid`'s contract.
         let data_ptr = unsafe { (hdr as *const P::Hdr as *const u8).add(P::cmsg_hdr_size()) };
-        let cred: &P::Cred = unsafe { &*(data_ptr as *const P::Cred) };
-        return Some(P::extract_pid_uid(cred));
+        let payload_len = P::cmsg_len(hdr).saturating_sub(P::cmsg_hdr_size());
+        return unsafe { P::extract_pid_uid(data_ptr, payload_len) };
     }
     None
 }
@@ -466,6 +496,144 @@ mod miri_cmsg_tests {
 
         let result = find_credential::<BsdCmsg>(&mhdr);
         assert_eq!(result, Some((expected_pid as u32, expected_euid)));
+    }
+
+    /// Drives the unified walker through the illumos/Solaris arm
+    /// (`SCM_UCRED` + opaque `ucred_t`) on the Linux test host.
+    ///
+    /// The illumos `Cmsghdr` / `Msghdr` type definitions and the
+    /// `unsafe impl CmsgPlatform for IllumosCmsg` body are compiled on Linux
+    /// too (see `peer_cred/platform/mod.rs`). The `extern "C"` `ucred_getpid`
+    /// / `ucred_geteuid` accessors are replaced by inline Rust shims that read
+    /// PID at offset 0 (i32) and UID at offset 4 (u32) of the test buffer.
+    ///
+    /// Without this test the illumos walker arm is only exercised on a real
+    /// illumos CI host.  Running it under Miri here proves pointer arithmetic
+    /// is provenance-clean for the illumos-shaped layout too.
+    #[test]
+    fn illumos_shape_buffer_returns_pid_euid() {
+        use super::super::platform::illumos::{Cmsghdr, IllumosCmsg, Msghdr};
+        use core::mem;
+
+        // illumos Cmsghdr is 12 bytes; cmsg_align(12) = 16 on LP64.
+        let illumos_hdr_size = <IllumosCmsg as CmsgPlatform>::cmsg_hdr_size();
+        assert_eq!(illumos_hdr_size, cmsg_align(mem::size_of::<Cmsghdr>()));
+        assert_eq!(illumos_hdr_size, 16);
+
+        // Payload: 4 bytes pid (i32) + 4 bytes uid (u32) = 8 bytes.
+        // The shim reads pid at offset 0, uid at offset 4 of the payload.
+        let payload_len = 8usize;
+        let total = illumos_hdr_size + payload_len;
+        let aligned_total = cmsg_align(total);
+        let mut buf = vec![0u8; aligned_total];
+
+        // Write illumos cmsghdr: cmsg_len (u32), cmsg_level (i32), cmsg_type (i32)
+        let cmsg_len: u32 = total as u32;
+        let sol_socket: i32 = 0xffff; // SOL_SOCKET on illumos
+        let scm_ucred: i32 = 0x1012; // SCM_UCRED
+        buf[0..4].copy_from_slice(&cmsg_len.to_ne_bytes());
+        buf[4..8].copy_from_slice(&sol_socket.to_ne_bytes());
+        buf[8..12].copy_from_slice(&scm_ucred.to_ne_bytes());
+
+        // Write test payload at illumos_hdr_size: pid at +0, uid at +4.
+        let expected_pid: i32 = 4321;
+        let expected_uid: u32 = 500;
+        let pay_off = illumos_hdr_size;
+        buf[pay_off..pay_off + 4].copy_from_slice(&expected_pid.to_ne_bytes());
+        buf[pay_off + 4..pay_off + 8].copy_from_slice(&expected_uid.to_ne_bytes());
+
+        let mhdr = Msghdr {
+            msg_name: core::ptr::null_mut(),
+            msg_namelen: 0,
+            _pad1: 0,
+            msg_iov: core::ptr::null_mut(),
+            msg_iovlen: 0,
+            _pad2: 0,
+            msg_control: buf.as_mut_ptr() as *mut _,
+            msg_controllen: aligned_total as u32,
+            msg_flags: 0,
+        };
+
+        let result = find_credential::<IllumosCmsg>(&mhdr);
+        assert_eq!(result, Some((expected_pid as u32, expected_uid)));
+    }
+
+    /// `ucred_getpid` shim returns -1 when the buffer encodes a negative pid
+    /// → `extract_pid_uid` returns `None`.
+    #[test]
+    fn illumos_opaque_extraction_returns_none_on_invalid() {
+        use super::super::platform::illumos::{Cmsghdr, IllumosCmsg, Msghdr};
+        use core::mem;
+
+        let illumos_hdr_size = <IllumosCmsg as CmsgPlatform>::cmsg_hdr_size();
+        let payload_len = 8usize;
+        let total = illumos_hdr_size + payload_len;
+        let aligned_total = cmsg_align(total);
+        let mut buf = vec![0u8; aligned_total];
+
+        let cmsg_len: u32 = total as u32;
+        let sol_socket: i32 = 0xffff;
+        let scm_ucred: i32 = 0x1012;
+        buf[0..4].copy_from_slice(&cmsg_len.to_ne_bytes());
+        buf[4..8].copy_from_slice(&sol_socket.to_ne_bytes());
+        buf[8..12].copy_from_slice(&scm_ucred.to_ne_bytes());
+
+        // Encode pid = -1 → shim returns -1 → extract_pid_uid returns None.
+        let neg_pid: i32 = -1;
+        let uid: u32 = 1000;
+        let pay_off = illumos_hdr_size;
+        buf[pay_off..pay_off + 4].copy_from_slice(&neg_pid.to_ne_bytes());
+        buf[pay_off + 4..pay_off + 8].copy_from_slice(&uid.to_ne_bytes());
+
+        let mhdr = Msghdr {
+            msg_name: core::ptr::null_mut(),
+            msg_namelen: 0,
+            _pad1: 0,
+            msg_iov: core::ptr::null_mut(),
+            msg_iovlen: 0,
+            _pad2: 0,
+            msg_control: buf.as_mut_ptr() as *mut _,
+            msg_controllen: aligned_total as u32,
+            msg_flags: 0,
+        };
+
+        let result = find_credential::<IllumosCmsg>(&mhdr);
+        assert_eq!(result, None, "negative pid must produce None");
+    }
+
+    /// `cmsg_len` smaller than the minimum (hdr_size + 0) must be rejected.
+    #[test]
+    fn illumos_walker_rejects_truncated_cmsg() {
+        use super::super::platform::illumos::{IllumosCmsg, Msghdr};
+
+        let illumos_hdr_size = <IllumosCmsg as CmsgPlatform>::cmsg_hdr_size();
+
+        // Claim cmsg_len = hdr_size - 1 (strictly less than needed = hdr_size).
+        let truncated_len: u32 = (illumos_hdr_size - 1) as u32;
+        let mut buf = vec![0u8; illumos_hdr_size + 8];
+        buf[0..4].copy_from_slice(&truncated_len.to_ne_bytes());
+        let sol_socket: i32 = 0xffff;
+        let scm_ucred: i32 = 0x1012;
+        buf[4..8].copy_from_slice(&sol_socket.to_ne_bytes());
+        buf[8..12].copy_from_slice(&scm_ucred.to_ne_bytes());
+
+        let mhdr = Msghdr {
+            msg_name: core::ptr::null_mut(),
+            msg_namelen: 0,
+            _pad1: 0,
+            msg_iov: core::ptr::null_mut(),
+            msg_iovlen: 0,
+            _pad2: 0,
+            msg_control: buf.as_mut_ptr() as *mut _,
+            msg_controllen: buf.len() as u32,
+            msg_flags: 0,
+        };
+
+        let result = find_credential::<IllumosCmsg>(&mhdr);
+        assert_eq!(
+            result, None,
+            "truncated illumos cmsg must not produce a pid"
+        );
     }
 
     /// Defense-in-depth: an attacker-supplied cmsg_len of 0 must not loop

@@ -164,14 +164,43 @@ unsafe impl super::super::cmsg::CmsgPlatform for BsdCmsg {
     fn msg_controllen(mhdr: &Msghdr) -> usize {
         mhdr.msg_controllen as usize
     }
-    fn extract_pid_uid(cred: &Cmsgcred) -> (u32, u32) {
-        (cred.cmcred_pid as u32, cred.cmcred_euid)
+    unsafe fn extract_pid_uid(data: *const u8, len: usize) -> Option<(u32, u32)> {
+        // find_credential guarantees len >= size_of::<Cmsgcred>().
+        debug_assert!(len >= core::mem::size_of::<Cmsgcred>());
+        // SAFETY: guaranteed by find_credential's pre-check and the caller's
+        // contract that `data` points to initialised kernel-supplied bytes.
+        let cred = unsafe { &*(data as *const Cmsgcred) };
+        Some((cred.cmcred_pid as u32, cred.cmcred_euid))
     }
 }
 
 /// Extract peer PID and effective UID after a successful `recvmsg` on BSD.
 pub(crate) fn peer_pid_after_recv(_fd: i32, mhdr: &Msghdr) -> Option<(u32, u32)> {
     super::super::cmsg::find_credential::<BsdCmsg>(mhdr)
+}
+
+/// Build a zero-initialised `Msghdr` for use as the `recvmsg(2)` argument.
+pub(crate) fn msghdr_for_recv(
+    iov: *mut Iovec,
+    ctrl: *mut core::ffi::c_void,
+    ctrl_len: usize,
+) -> Msghdr {
+    Msghdr {
+        msg_name: core::ptr::null_mut(),
+        msg_namelen: 0,
+        _pad1: 0,
+        msg_iov: iov,
+        msg_iovlen: 1,
+        _pad2: 0,
+        msg_control: ctrl,
+        msg_controllen: ctrl_len as u32,
+        msg_flags: 0,
+    }
+}
+
+/// BSD does not set `MSG_CTRUNC` for `SCM_CREDS` data — always `false`.
+pub(crate) fn ctrl_truncated(_mhdr: &Msghdr) -> bool {
+    false
 }
 
 // --- compile-time layout guards -------------------------------------------

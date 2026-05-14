@@ -191,6 +191,17 @@ pub enum RecoveryOutcome {
         /// Agent pid whose stall was refused.
         pid: u32,
     },
+    /// Recovery was structurally declined because the stalled pid's beat
+    /// arrived on a Unix Domain Socket on a platform without per-datagram
+    /// kernel credential passing (`BeatOrigin::SocketModeOnly`). The only
+    /// defence is `--socket-mode 0600`; any process under the same UID can
+    /// forge `frame.pid`, so spawning a recovery command against it is
+    /// unsafe. The refusal is logged to the audit sink and counted in
+    /// Prometheus.
+    RefusedSocketModeOnly {
+        /// Agent pid whose stall was refused.
+        pid: u32,
+    },
     /// Recovery was structurally declined because the stalled agent's
     /// kernel-attested PID namespace differs from the observer's. The
     /// numeric pid in this namespace would target a different (or no)
@@ -536,6 +547,10 @@ pub struct Recovery {
     /// [`Recovery::take_refused_unauthenticated_source`]. Surfaced as
     /// `varta_recovery_refused_total{reason="unauthenticated_transport"}`.
     refused_unauthenticated_source: u64,
+    /// Per-pid count of refused recoveries since the last call to
+    /// [`Recovery::take_refused_socket_mode_only`]. Surfaced as
+    /// `varta_recovery_refused_total{reason="socket_mode_only"}`.
+    refused_socket_mode_only: u64,
     /// If `true`, [`on_stall`] will spawn the recovery command even when the
     /// stalled agent's PID namespace differs from the observer's. Controlled
     /// by `--allow-cross-namespace-agents`. Default `false` — refuse and
@@ -611,6 +626,7 @@ impl Recovery {
             capture_cap: 0,
             source: "inline".to_string(),
             refused_unauthenticated_source: 0,
+            refused_socket_mode_only: 0,
             allow_cross_namespace: false,
             refused_cross_namespace: 0,
             refused_debounce_capacity: 0,
@@ -685,6 +701,17 @@ impl Recovery {
     pub fn take_refused_unauthenticated_source(&mut self) -> u64 {
         let n = self.refused_unauthenticated_source;
         self.refused_unauthenticated_source = 0;
+        n
+    }
+
+    /// Take and reset the count of recoveries refused because the stalled
+    /// agent's beat origin was [`crate::peer_cred::BeatOrigin::SocketModeOnly`]
+    /// — the observer is running on a platform without per-datagram kernel
+    /// credential passing. Surfaced as
+    /// `varta_recovery_refused_total{reason="socket_mode_only"}`.
+    pub fn take_refused_socket_mode_only(&mut self) -> u64 {
+        let n = self.refused_socket_mode_only;
+        self.refused_socket_mode_only = 0;
         n
     }
 
@@ -1017,9 +1044,10 @@ impl Recovery {
 
         // Structural origin gate. Refuse recovery when the stalled pid's
         // beat lifetime was on a transport the operator did not declare
-        // recovery-eligible at bind time. `NetworkUnverified` is always
-        // refused; `OperatorAttestedTransport` and `KernelAttested` flow
-        // through. Trust is per-listener, not daemon-wide.
+        // recovery-eligible at bind time. `NetworkUnverified` and
+        // `SocketModeOnly` are always refused; `OperatorAttestedTransport`
+        // and `KernelAttested` flow through. Trust is per-listener, not
+        // daemon-wide.
         if origin == BeatOrigin::NetworkUnverified {
             self.refused_unauthenticated_source =
                 self.refused_unauthenticated_source.saturating_add(1);
@@ -1032,6 +1060,18 @@ impl Recovery {
                 });
             }
             return RecoveryOutcome::RefusedUnauthenticatedSource { pid };
+        }
+        if origin == BeatOrigin::SocketModeOnly {
+            self.refused_socket_mode_only = self.refused_socket_mode_only.saturating_add(1);
+            if let Some(sink) = self.audit_sink.as_mut() {
+                sink.record_refused(&RefusedRecord {
+                    wallclock_ms: RecoveryAuditLog::wallclock_ms_now(),
+                    observer_ns: 0,
+                    agent_pid: pid,
+                    reason: "socket_mode_only",
+                });
+            }
+            return RecoveryOutcome::RefusedSocketModeOnly { pid };
         }
 
         let now = Instant::now();

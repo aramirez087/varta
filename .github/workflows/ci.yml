@@ -258,6 +258,45 @@ jobs:
         run: cargo miri test --locked -p varta-client --test classifier
         env: { MIRIFLAGS: "-Zmiri-strict-provenance" }
 
+  cross-compile-checks:
+    name: cross-compile-checks (illumos + OpenBSD)
+    # Verify that varta-watch compiles cleanly on the two Tier-2/Tier-3 targets
+    # that gained support in this branch: illumos (per-datagram SO_RECVUCRED
+    # attestation) and OpenBSD (SocketModeOnly fallback).  These are type-check
+    # only — no linking, no test execution — because we have no runners for
+    # those platforms.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: rust toolchain (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: install illumos target
+        run: rustup target add x86_64-unknown-illumos
+
+      - name: cargo check — x86_64-unknown-illumos
+        # illumos gets full per-datagram SO_RECVUCRED attestation; this check
+        # exercises the illumos module, IllumosCmsg CmsgPlatform impl, and the
+        # validate.rs O_NOFOLLOW / ELOOP constants.
+        run: cargo check --locked -p varta-watch --target x86_64-unknown-illumos
+
+      - name: rust toolchain (nightly — OpenBSD needs -Zbuild-std)
+        uses: dtolnay/rust-toolchain@nightly
+
+      - name: install OpenBSD target source (for -Zbuild-std)
+        run: rustup component add rust-src --toolchain nightly
+
+      - name: cargo check — x86_64-unknown-openbsd (SocketModeOnly fallback)
+        # OpenBSD has no per-datagram credential mechanism on SOCK_DGRAM
+        # (SO_PEERCRED returns ENOTCONN); varta-watch degrades to the
+        # SocketModeOnly plain-recv fallback.  -Zbuild-std is required because
+        # OpenBSD is a Tier-3 target with no pre-built std.
+        run: |
+          cargo +nightly check --locked -p varta-watch \
+            --target x86_64-unknown-openbsd \
+            -Zbuild-std=std,panic_abort
+
   safety-profiles:
     name: safety-profiles (production-safe binary audit)
     runs-on: ubuntu-latest
