@@ -788,14 +788,18 @@ mod tests {
     /// not early-exit on success.
     #[test]
     fn aead_attempts_equals_keys_len_when_last_key_matches() {
-        let key0 = Key::from_bytes([0x11u8; 32]);
-        let key1 = Key::from_bytes([0x22u8; 32]);
-        let key2 = Key::from_bytes([0x33u8; 32]);
-        let mut listener = bind_with_keys(vec![key0.clone(), key1.clone(), key2.clone()]);
+        // `Key` is `!Clone` by design; construct two instances over the same
+        // public test bytes rather than cloning the secret type.
+        let key2_bytes = [0x33u8; 32];
+        let mut listener = bind_with_keys(vec![
+            Key::from_bytes([0x11u8; 32]),
+            Key::from_bytes([0x22u8; 32]),
+            Key::from_bytes(key2_bytes),
+        ]);
         let target = listener.test_local_addr();
 
         let plaintext = [0x55u8; 32];
-        let wire = build_shared_frame(&key2, test_iv(), 1, &plaintext);
+        let wire = build_shared_frame(&Key::from_bytes(key2_bytes), test_iv(), 1, &plaintext);
         send_wire(target, &wire);
 
         let result = recv_one(&mut listener);
@@ -816,14 +820,16 @@ mod tests {
     /// attempt count as a last-key match — no early-exit timing signal.
     #[test]
     fn aead_attempts_equals_keys_len_when_first_key_matches() {
-        let key0 = Key::from_bytes([0x44u8; 32]);
-        let key1 = Key::from_bytes([0x55u8; 32]);
-        let key2 = Key::from_bytes([0x66u8; 32]);
-        let mut listener = bind_with_keys(vec![key0.clone(), key1.clone(), key2.clone()]);
+        let key0_bytes = [0x44u8; 32];
+        let mut listener = bind_with_keys(vec![
+            Key::from_bytes(key0_bytes),
+            Key::from_bytes([0x55u8; 32]),
+            Key::from_bytes([0x66u8; 32]),
+        ]);
         let target = listener.test_local_addr();
 
         let plaintext = [0xAAu8; 32];
-        let wire = build_shared_frame(&key0, test_iv(), 1, &plaintext);
+        let wire = build_shared_frame(&Key::from_bytes(key0_bytes), test_iv(), 1, &plaintext);
         send_wire(target, &wire);
 
         let result = recv_one(&mut listener);

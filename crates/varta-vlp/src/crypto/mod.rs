@@ -78,10 +78,23 @@ impl core::fmt::Display for KeyError {
 /// Created from a hex string (64 characters) or raw bytes. Both the agent
 /// and observer must share the same key.
 ///
-/// `Key` is intentionally **not** `Copy`. The `ZeroizeOnDrop` impl zeroes
-/// the secret bytes on drop; an implicit copy would defeat that wipe by
-/// leaving a silent duplicate behind in some other stack frame.
-#[derive(Clone, Zeroize, ZeroizeOnDrop)]
+/// `Key` is intentionally **not** `Copy` and **not** `Clone`. The
+/// `ZeroizeOnDrop` impl wipes the secret bytes on drop; both `Copy` and
+/// `Clone` would defeat that guarantee by producing silent duplicates
+/// whose wipe order is unpredictable and whose lifetime is unbounded
+/// (e.g. captured into `Box<dyn Fn>`, leaked via `Box::leak` /
+/// `mem::forget`, or shared across threads where one reference outlives
+/// the wipe of another).
+///
+/// Move semantics make duplication explicit: producing a second `Key`
+/// with the same bytes requires calling
+/// `Key::from_bytes(*existing.as_bytes())`, which is grep-able,
+/// audit-visible, and forces the caller to take responsibility for the
+/// second wipe.
+///
+/// Regression: see the `_key_must_not_be_clone` `compile_fail` doctest at
+/// the bottom of this module.
+#[derive(Zeroize, ZeroizeOnDrop)]
 pub struct Key {
     pub(crate) bytes: [u8; KEY_BYTES],
 }
@@ -145,6 +158,18 @@ impl core::fmt::Debug for Key {
 }
 
 pub use crate::util::{ct_eq, decode_hex_32, HexDecodeError};
+
+/// Regression: `Key` must never gain a `Clone` impl. Silent duplication
+/// defeats the `ZeroizeOnDrop` guarantee that secret bytes are wiped
+/// exactly once at a deterministic site.
+///
+/// ```compile_fail,E0277
+/// use varta_vlp::crypto::Key;
+/// fn assert_clone<T: Clone>() {}
+/// assert_clone::<Key>();
+/// ```
+#[cfg(all(doc, feature = "crypto"))]
+pub fn _key_must_not_be_clone() {}
 
 #[cfg(test)]
 mod tests {

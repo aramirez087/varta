@@ -50,7 +50,7 @@ workspace = true
 
 [dependencies.varta-vlp]
 path = "../varta-vlp"
-version = "0.1.0"
+version = "0.2.0"
 
 [[example]]
 name = "basic"

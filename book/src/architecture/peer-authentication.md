@@ -464,6 +464,43 @@ targets — x86_64 and aarch64 — satisfy this). Building on a big-endian
 host is a compile error. See `book/src/architecture/vlp-frame.md` for design
 rationale.
 
+### Panic-hook key lifetime — accepted residual
+
+The secure-UDP panic handler (`install_panic_handler_secure_udp`,
+`install_panic_handler_secure_udp_accept_degraded_entropy`) captures a `Key`
+by move into a `Box<dyn Fn>` registered via `std::panic::set_hook`. The Box
+is the **single owner** of the captured `Key` for the lifetime of the
+process — `Key` is `!Clone` (see `crates/varta-vlp/src/crypto/mod.rs`), so
+no duplicate of the secret bytes can exist anywhere else in the address
+space.
+
+The `!Clone` invariant pins the *count* of in-memory copies to one. The
+remaining concern is the *lifetime* of that one copy on process exit:
+
+* **Normal hook replacement** (`std::panic::take_hook`): the prior Box is
+  dropped, the captured `Key`'s `ZeroizeOnDrop` fires, and the 32 secret
+  bytes are wiped before the heap page is returned to the allocator. OK.
+* **`panic = "unwind"` profile, normal process exit**: the panic-hook Box
+  is leaked by the runtime — `Drop` is **not** called on registry-held
+  objects at exit. The captured `Key` bytes persist in heap memory until
+  the kernel reclaims the page. Linux does not zero pages on reclaim
+  (memory contents are reused; zero-on-allocation guarantees apply only
+  to *new* allocations into the same process).
+* **`panic = "abort"` profile**: the panic-hook closure never runs, but
+  `set_hook` still owns the Box — same residual as the normal-exit case.
+  Additionally, no `Drop` runs anywhere during `abort()`.
+
+This residual is **accepted**: there is no async-signal-safe mechanism
+that can reliably wipe a heap-resident secret at process exit. `atexit`
+handlers do not run on `abort()`, are not async-signal-safe, and race the
+panic hook firing. `mlock` / `memfd_secret` cannot prevent the kernel
+from copying the page during scheduler context switches or core dumps.
+The minimum-surface design is to keep the captured `Key` alive in a
+single Box and treat the OS process boundary as the security boundary:
+inspecting the memory of a live process requires `ptrace` or
+`/proc/<pid>/mem` privileges, at which point all in-memory secrets in
+any design are accessible.
+
 ---
 
 ## Cross-references
