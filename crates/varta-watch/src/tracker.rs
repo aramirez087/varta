@@ -81,208 +81,66 @@ const NONCE_WRAP_THRESHOLD: u64 = 1_048_576;
 
 /// Fixed-size, open-addressed `u32 → u32` map from agent pid to slot index.
 ///
-/// Replaces `std::collections::HashMap<u32, usize>` for two reasons relevant
-/// to DO-178C-style worst-case execution time (WCET) analysis:
+/// Thin newtype over the generic [`crate::probe_table::BoundedIndex`]; see
+/// that module for the full WCET argument. The hot tracker path uses this
+/// type directly so the call sites stay readable while the probe-table
+/// machinery is shared with `OutstandingTable` and `IpStateTable`.
 ///
-/// 1. `HashMap` keys with SipHash, which is randomized per process. The hot
-///    path therefore has a non-constant memory access pattern that defeats
-///    static WCET bounds.
-/// 2. `HashMap` can rehash on collision-driven growth; even pre-sized with
-///    `with_capacity`, growth is theoretically reachable.
-///
-/// `PidIndex` uses a deterministic integer mixer (Murmur3 finalizer) and
-/// linear probing with a fixed budget [`PidIndex::MAX_PROBE`]. The backing
-/// table is sized to `next_power_of_two(capacity * 2)` so the load factor
-/// stays ≤ 0.5 — at load factor 0.5 the expected probe distance is ≤ 2
-/// (Knuth TAOCP 6.4), and the 64-probe cap gives roughly 32× headroom.
-///
-/// `EMPTY` and `TOMBSTONE` are sentinel `slot_idx` values. Tombstones are
-/// reused on insert so a long churn of `record + evict` does not slowly
-/// fill the table with deletion markers.
-pub(crate) struct PidIndex {
-    table: Vec<PidEntry>,
-    mask: usize,
-    occupied: usize,
-    probe_exhausted: u64,
-}
+/// `Entry<u32>` in the generic table is still 8 bytes (see the
+/// `entry_u32_is_8_bytes` test in `probe_table`), so the per-slot cache
+/// pressure on the hot path is unchanged across the refactor.
+pub(crate) struct PidIndex(crate::probe_table::BoundedIndex<u32>);
 
-#[derive(Clone, Copy)]
-struct PidEntry {
-    pid: u32,
-    slot_idx: u32,
-}
-
-/// Slot is empty (never written or fully cleared).
-const EMPTY: u32 = u32::MAX;
-/// Slot held an entry that was removed; still consumes a probe step until
-/// reused by a subsequent insert.
-const TOMBSTONE: u32 = u32::MAX - 1;
-
-/// Outcome of a [`PidIndex::insert`] that could not find a free slot
-/// within the bounded probe budget. The caller treats this as
-/// [`Update::CapacityExceeded`] — same operator-visible behaviour as a
-/// full slot table.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct ProbeExhausted;
+/// Re-export the generic probe-exhaustion marker so the rest of the tracker
+/// keeps referring to a `ProbeExhausted` type local to this module.
+pub(crate) use crate::probe_table::ProbeExhausted;
 
 impl PidIndex {
-    /// Hard cap on the probe sequence length per `get` / `insert` / `remove`.
-    ///
-    /// At load factor 0.5 the expected probe distance is ≤ 2 with a p99 well
-    /// under 16; 64 gives ~32× margin and keeps every operation comfortably
-    /// inside one or two cache lines worth of work.
-    const MAX_PROBE: usize = 64;
+    /// Hard cap on the probe sequence length per `get` / `insert` /
+    /// `remove`.  Referenced from the doc comments above and from
+    /// `Tracker::take_probe_exhausted`'s remediation text; the actual
+    /// bound is enforced inside the generic `BoundedIndex`.
+    #[allow(dead_code)]
+    pub(crate) const MAX_PROBE: usize = crate::probe_table::BoundedIndex::<u32>::MAX_PROBE;
 
     /// Build a pid index sized for `capacity` agents.
-    ///
-    /// Table length is `next_power_of_two(capacity * 2).max(2)` so masks
-    /// (`table.len() - 1`) work without modular division and load factor
-    /// stays ≤ 0.5 at peak.
     pub(crate) fn new(capacity: usize) -> Self {
-        let target = capacity.saturating_mul(2).max(2);
-        let size = target.next_power_of_two();
-        let table = vec![
-            PidEntry {
-                pid: 0,
-                slot_idx: EMPTY,
-            };
-            size
-        ];
-        PidIndex {
-            table,
-            mask: size - 1,
-            occupied: 0,
-            probe_exhausted: 0,
-        }
+        Self(crate::probe_table::BoundedIndex::new(capacity))
     }
 
-    /// Look up the slot index recorded for `pid`. Returns `None` if not
-    /// present or if the probe budget was exhausted (treated as absent so
-    /// callers fall through to insert / capacity-exceeded paths).
+    /// Look up the slot index recorded for `pid`. Returns `None` if absent
+    /// or if the probe budget was exhausted (treated as absent so callers
+    /// fall through to insert / capacity-exceeded paths).
     pub(crate) fn get(&self, pid: u32) -> Option<usize> {
-        let mut i = (mix(pid) as usize) & self.mask;
-        for _ in 0..Self::MAX_PROBE {
-            let entry = self.table.get(i)?;
-            match entry.slot_idx {
-                EMPTY => return None,
-                TOMBSTONE => {}
-                _ if entry.pid == pid => return Some(entry.slot_idx as usize),
-                _ => {}
-            }
-            i = (i + 1) & self.mask;
-        }
-        None
+        self.0.get(pid)
     }
 
     /// Insert or update `pid → slot_idx`. Returns `Err(ProbeExhausted)` if
-    /// no free slot was found within [`Self::MAX_PROBE`] probes, in which
-    /// case the table state is unchanged and `probe_exhausted` is
-    /// incremented.
+    /// no free or matching slot was found within
+    /// [`Self::MAX_PROBE`] probes; table state is unchanged in that case
+    /// and the probe-exhausted counter is incremented.
     pub(crate) fn insert(&mut self, pid: u32, slot_idx: usize) -> Result<(), ProbeExhausted> {
-        debug_assert!((slot_idx as u32) < TOMBSTONE);
-        let mut i = (mix(pid) as usize) & self.mask;
-        let mut first_tombstone: Option<usize> = None;
-        for _ in 0..Self::MAX_PROBE {
-            let entry = match self.table.get(i) {
-                Some(e) => *e,
-                None => {
-                    self.probe_exhausted = self.probe_exhausted.saturating_add(1);
-                    return Err(ProbeExhausted);
-                }
-            };
-            match entry.slot_idx {
-                EMPTY => {
-                    let target = first_tombstone.unwrap_or(i);
-                    if let Some(slot) = self.table.get_mut(target) {
-                        *slot = PidEntry {
-                            pid,
-                            slot_idx: slot_idx as u32,
-                        };
-                        // Both paths (filling a true EMPTY slot and reusing a
-                        // tombstone) produce a new live entry. `remove()` already
-                        // decremented `occupied` when the tombstone was created,
-                        // so re-incrementing here restores the correct live count.
-                        self.occupied = self.occupied.saturating_add(1);
-                        return Ok(());
-                    }
-                    self.probe_exhausted = self.probe_exhausted.saturating_add(1);
-                    return Err(ProbeExhausted);
-                }
-                TOMBSTONE => {
-                    if first_tombstone.is_none() {
-                        first_tombstone = Some(i);
-                    }
-                }
-                _ if entry.pid == pid => {
-                    // Update in place. Does not change `occupied`.
-                    if let Some(slot) = self.table.get_mut(i) {
-                        slot.slot_idx = slot_idx as u32;
-                        return Ok(());
-                    }
-                    self.probe_exhausted = self.probe_exhausted.saturating_add(1);
-                    return Err(ProbeExhausted);
-                }
-                _ => {}
-            }
-            i = (i + 1) & self.mask;
-        }
-        // Probe budget exhausted without finding an EMPTY slot.  If we saw
-        // a tombstone along the way we *could* reuse it, but that would
-        // exceed the WCET budget callers signed up for — fall through to
-        // exhaustion and let the caller surface CapacityExceeded.
-        self.probe_exhausted = self.probe_exhausted.saturating_add(1);
-        Err(ProbeExhausted)
+        self.0.insert(pid, slot_idx)
     }
 
     /// Remove `pid` from the index. Returns the slot index it pointed to,
-    /// if any. Inserts a TOMBSTONE in place so subsequent lookups for
-    /// downstream-probed entries continue to walk past.
+    /// if any.
     pub(crate) fn remove(&mut self, pid: u32) -> Option<usize> {
-        let mut i = (mix(pid) as usize) & self.mask;
-        for _ in 0..Self::MAX_PROBE {
-            let entry = *self.table.get(i)?;
-            match entry.slot_idx {
-                EMPTY => return None,
-                TOMBSTONE => {}
-                _ if entry.pid == pid => {
-                    let prev = entry.slot_idx as usize;
-                    if let Some(slot) = self.table.get_mut(i) {
-                        *slot = PidEntry {
-                            pid: 0,
-                            slot_idx: TOMBSTONE,
-                        };
-                        self.occupied = self.occupied.saturating_sub(1);
-                    }
-                    return Some(prev);
-                }
-                _ => {}
-            }
-            i = (i + 1) & self.mask;
-        }
-        None
+        self.0.remove(pid)
     }
 
     /// Drain and reset the probe-exhausted counter.
     pub(crate) fn take_probe_exhausted(&mut self) -> u64 {
-        let n = self.probe_exhausted;
-        self.probe_exhausted = 0;
-        n
+        self.0.take_probe_exhausted()
     }
-}
 
-/// Murmur3 32-bit finalizer — a registry-dep-free integer mixer.
-///
-/// Deterministic across processes (no SipHash randomization), branchless,
-/// and produces good avalanche on 32-bit inputs — sufficient for hashing
-/// agent pids where adversarial collisions are not part of the threat
-/// model (every reachable pid value already passes through peer-cred or
-/// AEAD authentication upstream).
-#[inline]
-fn mix(pid: u32) -> u32 {
-    let mut x = pid;
-    x = (x ^ (x >> 16)).wrapping_mul(0x85eb_ca6b);
-    x = (x ^ (x >> 13)).wrapping_mul(0xc2b2_ae35);
-    x ^ (x >> 16)
+    /// Number of live entries.  Used by the existing occupancy invariant
+    /// tests below; production code reads occupancy through the tracker
+    /// itself, not the index.
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.0.len()
+    }
 }
 
 /// Controls which slot to reclaim when the tracker is at capacity and a
@@ -1250,11 +1108,11 @@ mod tests {
         // Update in place preserves occupied count.
         idx.insert(42, 9).expect("update");
         assert_eq!(idx.get(42), Some(9));
-        assert_eq!(idx.occupied, 1);
+        assert_eq!(idx.len(), 1);
 
         assert_eq!(idx.remove(42), Some(9));
         assert_eq!(idx.get(42), None);
-        assert_eq!(idx.occupied, 0);
+        assert_eq!(idx.len(), 0);
     }
 
     #[test]
@@ -1581,9 +1439,10 @@ mod tests {
                 expected_live += 1;
             }
             assert_eq!(
-                idx.occupied, expected_live as usize,
+                idx.len(),
+                expected_live as usize,
                 "i={i} pid={pid}: occupied={} expected={expected_live}",
-                idx.occupied
+                idx.len()
             );
         }
     }
@@ -1596,17 +1455,18 @@ mod tests {
         let mut idx = PidIndex::new(16);
 
         idx.insert(42, 0).expect("first insert");
-        assert_eq!(idx.occupied, 1);
+        assert_eq!(idx.len(), 1);
 
         idx.remove(42);
-        assert_eq!(idx.occupied, 0);
+        assert_eq!(idx.len(), 0);
 
         // Re-insert via the tombstone slot: live count must go back to 1.
         idx.insert(42, 5).expect("reinsert via tombstone");
         assert_eq!(
-            idx.occupied, 1,
+            idx.len(),
+            1,
             "reinsert via tombstone did not restore occupied to 1 (was {})",
-            idx.occupied
+            idx.len()
         );
     }
 }

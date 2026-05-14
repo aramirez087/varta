@@ -409,8 +409,7 @@ impl Config {
                     let v = iter
                         .next()
                         .ok_or(ConfigError::MissingValue("--recovery-audit-max-bytes"))?;
-                    recovery_audit_max_bytes =
-                        Some(parse_u64("--recovery-audit-max-bytes", &v)?);
+                    recovery_audit_max_bytes = Some(parse_u64("--recovery-audit-max-bytes", &v)?);
                 }
                 "--recovery-audit-sync-every" => {
                     let v = iter
@@ -654,9 +653,7 @@ impl Config {
             recovery_timeout: recovery_timeout_ms.map(Duration::from_millis),
             shutdown_grace: Duration::from_millis(shutdown_grace_ms),
             socket_mode: socket_mode.unwrap_or(DEFAULT_SOCKET_MODE),
-            read_timeout: Duration::from_millis(
-                read_timeout_ms.unwrap_or(DEFAULT_READ_TIMEOUT_MS),
-            ),
+            read_timeout: Duration::from_millis(read_timeout_ms.unwrap_or(DEFAULT_READ_TIMEOUT_MS)),
             tracker_capacity: tracker_capacity.unwrap_or(DEFAULT_CAPACITY),
             tracker_eviction_policy: tracker_eviction_policy.unwrap_or(EvictionPolicy::Strict),
             eviction_scan_window: eviction_scan_window_resolved,

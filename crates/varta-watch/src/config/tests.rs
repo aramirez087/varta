@@ -207,8 +207,7 @@ fn parses_recovery_timeout_ms() {
 
 #[test]
 fn recovery_timeout_omitted_is_none() {
-    let cfg =
-        Config::from_args(args(&["--socket", "/s", "--threshold-ms", "100"])).expect("parse");
+    let cfg = Config::from_args(args(&["--socket", "/s", "--threshold-ms", "100"])).expect("parse");
     assert!(cfg.recovery_timeout.is_none());
 }
 
@@ -348,8 +347,7 @@ fn parses_shutdown_grace_ms() {
 
 #[test]
 fn shutdown_grace_omitted_is_default() {
-    let cfg =
-        Config::from_args(args(&["--socket", "/s", "--threshold-ms", "100"])).expect("parse");
+    let cfg = Config::from_args(args(&["--socket", "/s", "--threshold-ms", "100"])).expect("parse");
     assert_eq!(
         cfg.shutdown_grace,
         Duration::from_millis(DEFAULT_SHUTDOWN_GRACE_MS)
@@ -408,8 +406,7 @@ fn parses_read_timeout_ms() {
 
 #[test]
 fn read_timeout_omitted_is_default() {
-    let cfg =
-        Config::from_args(args(&["--socket", "/s", "--threshold-ms", "100"])).expect("parse");
+    let cfg = Config::from_args(args(&["--socket", "/s", "--threshold-ms", "100"])).expect("parse");
     assert_eq!(cfg.read_timeout, Duration::from_millis(100));
 }
 
@@ -651,8 +648,7 @@ fn parses_i_accept_plaintext_udp_flag() {
 
 #[test]
 fn i_accept_plaintext_udp_defaults_to_false() {
-    let cfg =
-        Config::from_args(args(&["--socket", "/s", "--threshold-ms", "100"])).expect("parse");
+    let cfg = Config::from_args(args(&["--socket", "/s", "--threshold-ms", "100"])).expect("parse");
     assert!(!cfg.i_accept_plaintext_udp);
 }
 
@@ -686,8 +682,7 @@ fn parses_plaintext_udp_i_accept_recovery_flag() {
 
 #[test]
 fn recovery_accept_flags_default_to_false() {
-    let cfg =
-        Config::from_args(args(&["--socket", "/s", "--threshold-ms", "100"])).expect("parse");
+    let cfg = Config::from_args(args(&["--socket", "/s", "--threshold-ms", "100"])).expect("parse");
     assert!(!cfg.i_accept_recovery_on_secure_udp);
     assert!(!cfg.i_accept_recovery_on_plaintext_udp);
 }
@@ -722,8 +717,7 @@ fn parses_strict_namespace_check_flag() {
 
 #[test]
 fn namespace_flags_default_to_false() {
-    let cfg =
-        Config::from_args(args(&["--socket", "/s", "--threshold-ms", "100"])).expect("parse");
+    let cfg = Config::from_args(args(&["--socket", "/s", "--threshold-ms", "100"])).expect("parse");
     assert!(!cfg.allow_cross_namespace_agents);
     assert!(!cfg.strict_namespace_check);
 }
@@ -855,8 +849,7 @@ fn parses_i_accept_secure_udp_non_loopback_flag() {
 
 #[test]
 fn i_accept_secure_udp_non_loopback_defaults_to_false() {
-    let cfg =
-        Config::from_args(args(&["--socket", "/s", "--threshold-ms", "100"])).expect("parse");
+    let cfg = Config::from_args(args(&["--socket", "/s", "--threshold-ms", "100"])).expect("parse");
     assert!(!cfg.i_accept_secure_udp_non_loopback);
 }
 
@@ -1027,16 +1020,14 @@ fn parses_prom_rate_limit_flags() {
 
 #[test]
 fn prom_rate_limit_defaults() {
-    let cfg =
-        Config::from_args(args(&["--socket", "/s", "--threshold-ms", "100"])).expect("parse");
+    let cfg = Config::from_args(args(&["--socket", "/s", "--threshold-ms", "100"])).expect("parse");
     assert_eq!(cfg.prom_rate_limit_per_sec, DEFAULT_PROM_RATE_LIMIT_PER_SEC);
     assert_eq!(cfg.prom_rate_limit_burst, DEFAULT_PROM_RATE_LIMIT_BURST);
 }
 
 #[test]
 fn no_recovery_flags_yields_none() {
-    let cfg =
-        Config::from_args(args(&["--socket", "/s", "--threshold-ms", "100"])).expect("parse");
+    let cfg = Config::from_args(args(&["--socket", "/s", "--threshold-ms", "100"])).expect("parse");
     let mode = cfg.resolve_recovery_mode().expect("resolve");
     assert!(mode.is_none());
 }
@@ -1074,8 +1065,7 @@ fn parses_recovery_env_repeatable() {
 
 #[test]
 fn recovery_env_defaults_to_empty() {
-    let cfg =
-        Config::from_args(args(&["--socket", "/s", "--threshold-ms", "100"])).expect("parse");
+    let cfg = Config::from_args(args(&["--socket", "/s", "--threshold-ms", "100"])).expect("parse");
     assert!(cfg.recovery_env.is_empty());
 }
 
@@ -1095,8 +1085,7 @@ fn parses_heartbeat_file() {
 
 #[test]
 fn heartbeat_file_omitted_is_none() {
-    let cfg =
-        Config::from_args(args(&["--socket", "/s", "--threshold-ms", "100"])).expect("parse");
+    let cfg = Config::from_args(args(&["--socket", "/s", "--threshold-ms", "100"])).expect("parse");
     assert!(cfg.heartbeat_file.is_none());
 }
 
@@ -1117,8 +1106,7 @@ fn mk_tmpdir(tag: &str) -> PathBuf {
     // A parallel `UnixDatagram::bind` in another test installs a
     // 0o177 umask that strips the `x` bit from new directories,
     // breaking subsequent open() inside this dir. Restore explicitly.
-    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755))
-        .expect("chmod tempdir");
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).expect("chmod tempdir");
     dir
 }
 

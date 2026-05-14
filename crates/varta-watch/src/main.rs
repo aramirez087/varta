@@ -1022,6 +1022,7 @@ fn run(cfg: Config) -> std::io::Result<()> {
             .with_audit_sink(recovery_audit_sink)
             .with_allow_cross_namespace(cfg.allow_cross_namespace_agents)
             .with_reap_scratch_capacity(cfg.tracker_capacity)
+            .with_outstanding_capacity(cfg.tracker_capacity)
     });
     let mut file_export: Option<FileExporter> = match cfg.file_export.as_ref() {
         Some(path) => Some(FileExporter::create(
@@ -1298,6 +1299,20 @@ fn run(cfg: Config) -> std::io::Result<()> {
                                  at capacity (M8 fail-closed guard)."
                             );
                         }
+                        RecoveryOutcome::RefusedOutstandingCapacity { pid } => {
+                            #[cfg(not(feature = "compile-time-config"))]
+                            varta_warn!(
+                                "recovery for pid {pid} REFUSED: outstanding-child \
+                                 table at capacity (tracker_capacity worth of \
+                                 recoveries already in flight). Alert on \
+                                 rate(varta_recovery_refused_total{{reason=\"outstanding_capacity\"}}[5m]) > 0."
+                            );
+                            #[cfg(feature = "compile-time-config")]
+                            varta_warn!(
+                                "recovery for pid {pid} REFUSED: outstanding-child \
+                                 table at capacity."
+                            );
+                        }
                         RecoveryOutcome::Reaped { .. }
                         | RecoveryOutcome::Killed { .. }
                         | RecoveryOutcome::ReapFailed(_) => {
@@ -1504,6 +1519,7 @@ fn run(cfg: Config) -> std::io::Result<()> {
         if let Some(rec) = recovery.as_mut() {
             let evictions = rec.take_last_fired_evictions();
             let invariants = rec.take_last_fired_invariant_violations();
+            let outstanding_probe_exhausted = rec.take_outstanding_probe_exhausted();
             #[cfg(feature = "prometheus-exporter")]
             if let Some(pe) = prom_export.as_mut() {
                 if evictions > 0 {
@@ -1511,6 +1527,9 @@ fn run(cfg: Config) -> std::io::Result<()> {
                 }
                 if invariants > 0 {
                     pe.record_recovery_invariant_violations(invariants);
+                }
+                if outstanding_probe_exhausted > 0 {
+                    pe.record_recovery_outstanding_probe_exhausted(outstanding_probe_exhausted);
                 }
             }
             #[cfg(not(feature = "prometheus-exporter"))]
@@ -1520,6 +1539,7 @@ fn run(cfg: Config) -> std::io::Result<()> {
                 // `LastFiredTable`'s internal accumulators stay bounded.
                 let _ = evictions;
                 let _ = invariants;
+                let _ = outstanding_probe_exhausted;
             }
         }
 

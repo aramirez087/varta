@@ -10,7 +10,7 @@ cargo-fuzz = true
 [dependencies]
 libfuzzer-sys = "0.4"
 varta-vlp = { path = "../crates/varta-vlp", features = ["crypto"] }
-varta-watch = { path = "../crates/varta-watch" }
+varta-watch = { path = "../crates/varta-watch", features = ["fuzzing"] }
 
 [[bin]]
 name = "frame_decode"
@@ -64,6 +64,34 @@ bench = false
 [[bin]]
 name = "peer_cred_cmsg"
 path = "fuzz_targets/peer_cred_cmsg.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "bounded_index_u32"
+path = "fuzz_targets/bounded_index_u32.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "bounded_index_ip"
+path = "fuzz_targets/bounded_index_ip.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "outstanding_table"
+path = "fuzz_targets/outstanding_table.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ip_state_table"
+path = "fuzz_targets/ip_state_table.rs"
 test = false
 doc = false
 bench = false

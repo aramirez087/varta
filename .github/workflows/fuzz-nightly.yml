@@ -1,0 +1,89 @@
+name: fuzz-nightly
+
+# Long-form fuzzing: each declared target runs for 30 minutes per night.
+# The 30-second `fuzz-smoke` job in `ci.yml` gates merges; this workflow
+# accumulates coverage between runs via the corpus cache, surfaces deep
+# convergence bugs that fall outside the smoke budget, and auto-opens an
+# issue on any crash.
+
+on:
+  schedule:
+    - cron: "17 4 * * *"   # 04:17 UTC daily
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  long-form:
+    name: fuzz-nightly (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - frame_decode
+          - frame_roundtrip
+          - aead_roundtrip
+          - tracker_record
+          - config_from_args
+          - kdf_derive
+          - peer_cred_cmsg
+          - flag_catalogue_lookup
+          - bounded_index_u32
+          - bounded_index_ip
+          - outstanding_table
+          - ip_state_table
+
+    steps:
+      - name: checkout
+        uses: actions/checkout@v4
+
+      - name: rust toolchain (nightly — cargo-fuzz requires nightly)
+        uses: dtolnay/rust-toolchain@nightly
+
+      - name: install cargo-fuzz
+        run: cargo install --locked cargo-fuzz
+
+      - name: restore corpus cache
+        uses: actions/cache@v4
+        with:
+          path: fuzz/corpus/${{ matrix.target }}
+          key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}
+          restore-keys: |
+            fuzz-corpus-${{ matrix.target }}-
+
+      - name: ensure corpus directory exists
+        run: mkdir -p fuzz/corpus/${{ matrix.target }}
+
+      - name: fuzz ${{ matrix.target }} (30 min)
+        run: cargo fuzz run ${{ matrix.target }} fuzz/corpus/${{ matrix.target }} -- -max_total_time=1800
+
+      - name: upload artifacts (on crash)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-artifacts-${{ matrix.target }}
+          path: fuzz/artifacts/${{ matrix.target }}
+
+      - name: open issue on crash
+        if: failure()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const target = '${{ matrix.target }}';
+            const runId = context.runId;
+            const runUrl = `${context.payload.repository.html_url}/actions/runs/${runId}`;
+            await github.rest.issues.create({
+              ...context.repo,
+              title: `fuzz-nightly: ${target} crashed (run ${runId})`,
+              labels: ['fuzz-crash', 'bug'],
+              body: `Nightly fuzz run produced a reproducer for **${target}**.\n\n` +
+                    `* Run: ${runUrl}\n` +
+                    `* Artifacts: download \`fuzz-artifacts-${target}\` from the run page.\n\n` +
+                    `Reproduce locally:\n\n` +
+                    "```\n" +
+                    `cargo fuzz run ${target} fuzz/artifacts/${target}/<crash-input>\n` +
+                    "```\n"
+            });

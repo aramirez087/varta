@@ -83,6 +83,12 @@ prometheus-exporter = ["varta-vlp/crypto"]
 # with `prometheus-exporter` (the HTTP exporter has no opt-in path
 # without argv).  See book/src/architecture/compile-time-config.md.
 compile-time-config = []
+# Test-only: expose normally-private bounded-collection modules (`probe_table`,
+# `outstanding_table`, `ip_state_table`) under a stable `__fuzz_internals`
+# path so the `fuzz/` crate can drive them directly. Not enabled in any
+# production build; the CI `zero-dep audit` is not affected because no new
+# registry dependencies are introduced.
+fuzzing = ["prometheus-exporter"]
 
 [dependencies.varta-vlp]
 path = "../varta-vlp"

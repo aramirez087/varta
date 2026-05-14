@@ -33,6 +33,8 @@ use varta_vlp::DecodeError;
 use varta_vlp::Status;
 
 #[cfg(feature = "prometheus-exporter")]
+use crate::ip_state_table::{IpStateTable, LastSeen};
+#[cfg(feature = "prometheus-exporter")]
 use crate::log_ratelimit::{LogKind, LOG_RATE_LIMITER};
 
 use crate::observer::Event;
@@ -629,6 +631,13 @@ struct PromIpState {
     last_seen: Instant,
 }
 
+#[cfg(feature = "prometheus-exporter")]
+impl LastSeen for PromIpState {
+    fn last_seen(&self) -> Instant {
+        self.last_seen
+    }
+}
+
 /// Reasons a `/metrics` connection can be dropped before serving.  Indexed by
 /// [`drop_reason_index`]; the array doubles as the canonical ordering for
 /// the exposition output, so series remain stable across scrapes.
@@ -639,7 +648,7 @@ const DROP_REASON_LABELS: [&str; 3] = ["drain", "rate_limit", "ip_table_full"];
 /// [`recovery_outcome_index`]; emitted unconditionally (every value, even
 /// at zero) so `absent()` alert rules stay green.
 #[cfg(feature = "prometheus-exporter")]
-const RECOVERY_OUTCOME_LABELS: [&str; 9] = [
+const RECOVERY_OUTCOME_LABELS: [&str; 10] = [
     "spawned",
     "debounced",
     "reaped_zero",
@@ -649,16 +658,18 @@ const RECOVERY_OUTCOME_LABELS: [&str; 9] = [
     "refused_unauthenticated_transport",
     "refused_cross_namespace",
     "refused_debounce_capacity",
+    "refused_outstanding_capacity",
 ];
 
 /// Reason label values for `varta_recovery_refused_total`. Indexed by
 /// [`refused_reason_index`]; emitted unconditionally so `absent()` rules
 /// stay green.
 #[cfg(feature = "prometheus-exporter")]
-const RECOVERY_REFUSED_REASON_LABELS: [&str; 3] = [
+const RECOVERY_REFUSED_REASON_LABELS: [&str; 4] = [
     "unauthenticated_transport",
     "cross_namespace_agent",
     "debounce_capacity",
+    "outstanding_capacity",
 ];
 
 /// Map a [`crate::recovery::RecoveryOutcome`] to a stable index for the
@@ -681,6 +692,7 @@ fn recovery_outcome_index(outcome: &crate::recovery::RecoveryOutcome) -> usize {
         RecoveryOutcome::RefusedUnauthenticatedSource { .. } => 6,
         RecoveryOutcome::RefusedCrossNamespace { .. } => 7,
         RecoveryOutcome::RefusedDebounceCapacity { .. } => 8,
+        RecoveryOutcome::RefusedOutstandingCapacity { .. } => 9,
         // ReapFailed is not user-facing here — treat as a reap-nonzero
         // (it implies the child terminated abnormally from our POV).
         RecoveryOutcome::ReapFailed(_) => 3,
@@ -697,6 +709,7 @@ enum RefusedReason {
     UnauthenticatedTransport,
     CrossNamespaceAgent,
     DebounceCapacity,
+    OutstandingCapacity,
 }
 
 #[cfg(feature = "prometheus-exporter")]
@@ -705,6 +718,7 @@ fn refused_reason_index(r: RefusedReason) -> usize {
         RefusedReason::UnauthenticatedTransport => 0,
         RefusedReason::CrossNamespaceAgent => 1,
         RefusedReason::DebounceCapacity => 2,
+        RefusedReason::OutstandingCapacity => 3,
     }
 }
 
@@ -845,6 +859,13 @@ pub struct PromExporter {
     /// without resolving. Surfaced as
     /// `varta_tracker_pid_index_probe_exhausted_total`.
     tracker_pid_index_probe_exhausted_total: u64,
+    /// `OutstandingTable` pid-index probe-exhaustion events. Surfaced as
+    /// `varta_recovery_outstanding_probe_exhausted_total`.  Mirrors the
+    /// tracker's counter for the cold recovery path.
+    recovery_outstanding_probe_exhausted_total: u64,
+    /// `IpStateTable` ip-index probe-exhaustion events. Surfaced as
+    /// `varta_prom_ip_state_probe_exhausted_total`.
+    prom_ip_state_probe_exhausted_total: u64,
     /// Sum of recovery child wall-clock durations in ns. Used together with
     /// `recovery_duration_count_total` to compute an average runtime.
     recovery_duration_ns_sum: u64,
@@ -904,7 +925,7 @@ pub struct PromExporter {
     /// Per-source-IP token bucket state.  Bounded by
     /// [`MAX_PROM_IP_STATES`]; entries older than [`PROM_IP_STATE_TTL`] are
     /// evicted lazily when the table reaches capacity.
-    ip_state: HashMap<IpAddr, PromIpState>,
+    ip_state: IpStateTable<PromIpState>,
     /// Per-source-IP refill rate (connections per second). Set from
     /// `Config::prom_rate_limit_per_sec` at construction time.
     rate_per_sec: u32,
@@ -996,6 +1017,8 @@ impl PromExporter {
             tracker_namespace_conflict_total: 0,
             tracker_invariant_violations_total: 0,
             tracker_pid_index_probe_exhausted_total: 0,
+            recovery_outstanding_probe_exhausted_total: 0,
+            prom_ip_state_probe_exhausted_total: 0,
             recovery_duration_ns_sum: 0,
             recovery_duration_count_total: 0,
             scrape_skipped_total: 0,
@@ -1010,7 +1033,7 @@ impl PromExporter {
             serve_pending_count_total: 0,
             scrape_budget_exceeded_total: 0,
             scrape_budget: DEFAULT_SCRAPE_BUDGET,
-            ip_state: HashMap::new(),
+            ip_state: IpStateTable::with_capacity(MAX_PROM_IP_STATES),
             rate_per_sec,
             rate_burst,
             last_ip_sweep: now,
@@ -1037,11 +1060,10 @@ impl PromExporter {
         // by MAX_PROM_IP_STATES iterations when it isn't.
         if now.duration_since(self.last_ip_sweep) >= PROM_IP_STATE_SWEEP_INTERVAL {
             self.last_ip_sweep = now;
-            self.ip_state
-                .retain(|_, st| now.duration_since(st.last_seen) < PROM_IP_STATE_TTL);
+            self.ip_state.evict_older_than(now, PROM_IP_STATE_TTL);
         }
 
-        match self.ip_state.get_mut(&ip) {
+        match self.ip_state.get_mut(ip) {
             Some(st) => {
                 let elapsed_ms = now.duration_since(st.last_refill).as_millis() as u64;
                 if elapsed_ms > 0 {
@@ -1064,19 +1086,14 @@ impl PromExporter {
             None => {
                 if self.ip_state.len() >= MAX_PROM_IP_STATES {
                     // Try to make room by evicting stale entries first.
-                    self.ip_state
-                        .retain(|_, st| now.duration_since(st.last_seen) < PROM_IP_STATE_TTL);
+                    self.ip_state.evict_older_than(now, PROM_IP_STATE_TTL);
                 }
                 if self.ip_state.len() >= MAX_PROM_IP_STATES {
-                    // Still full — force-evict the oldest entry.  Count the
-                    // event so a sustained horizontal flood is observable.
-                    if let Some(oldest_ip) = self
-                        .ip_state
-                        .iter()
-                        .min_by_key(|(_, s)| s.last_seen)
-                        .map(|(k, _)| *k)
-                    {
-                        self.ip_state.remove(&oldest_ip);
+                    // Still full — force-evict the oldest entry.  Count
+                    // the event so a sustained horizontal flood is
+                    // observable.
+                    if let Some(oldest_ip) = self.ip_state.oldest_ip() {
+                        self.ip_state.remove(oldest_ip);
                     }
                     self.connections_dropped_total[drop_reason_index(DropReason::IpTableFull)] =
                         self.connections_dropped_total[drop_reason_index(DropReason::IpTableFull)]
@@ -1085,7 +1102,7 @@ impl PromExporter {
                 // New entry starts with a full bucket minus the one token
                 // consumed by this connection.
                 let tokens_milli = cap_milli.saturating_sub(1000);
-                self.ip_state.insert(
+                let _ = self.ip_state.insert(
                     ip,
                     PromIpState {
                         tokens_milli,
@@ -1216,6 +1233,11 @@ impl PromExporter {
                 self.recovery_refused_total[r_idx] =
                     self.recovery_refused_total[r_idx].saturating_add(1);
             }
+            crate::recovery::RecoveryOutcome::RefusedOutstandingCapacity { .. } => {
+                let r_idx = refused_reason_index(RefusedReason::OutstandingCapacity);
+                self.recovery_refused_total[r_idx] =
+                    self.recovery_refused_total[r_idx].saturating_add(1);
+            }
             _ => {}
         }
         if let Some(d) = duration_ns {
@@ -1297,6 +1319,14 @@ impl PromExporter {
     pub fn record_tracker_pid_index_probe_exhausted(&mut self, count: u64) {
         self.tracker_pid_index_probe_exhausted_total = self
             .tracker_pid_index_probe_exhausted_total
+            .saturating_add(count);
+    }
+
+    /// Record one or more `OutstandingTable` probe-exhaustion events. See
+    /// [`crate::recovery::Recovery::take_outstanding_probe_exhausted`].
+    pub fn record_recovery_outstanding_probe_exhausted(&mut self, count: u64) {
+        self.recovery_outstanding_probe_exhausted_total = self
+            .recovery_outstanding_probe_exhausted_total
             .saturating_add(count);
     }
 
@@ -1563,6 +1593,18 @@ impl PromExporter {
         const BODY_BUF_MAX_CAPACITY: usize = 65_536;
         if self.body_buf.capacity() > BODY_BUF_MAX_CAPACITY {
             self.body_buf = String::with_capacity(BODY_BUF_MAX_CAPACITY);
+        }
+
+        // Drain the IpStateTable probe-exhausted counter into the
+        // exporter's own accumulator so exposition has a coherent value
+        // to print.  Recovery and Tracker counters are drained in the
+        // observer loop via dedicated `record_*` calls; the IP-state
+        // table is owned by the exporter, so it drains itself.
+        let prom_ip_probes = self.ip_state.take_probe_exhausted();
+        if prom_ip_probes > 0 {
+            self.prom_ip_state_probe_exhausted_total = self
+                .prom_ip_state_probe_exhausted_total
+                .saturating_add(prom_ip_probes);
         }
 
         let mut pids: Vec<u32> = self.rows.keys().copied().collect();
@@ -1870,6 +1912,29 @@ impl PromExporter {
             self.body_buf,
             "varta_tracker_pid_index_probe_exhausted_total {}",
             self.tracker_pid_index_probe_exhausted_total
+        );
+        // OutstandingTable probe-exhaustion — cold recovery path. Mirrors
+        // the tracker counter; same load-factor argument applies.
+        self.body_buf.push_str(
+            "# HELP varta_recovery_outstanding_probe_exhausted_total OutstandingTable pid-index lookups/inserts that ran the full MAX_PROBE budget.\n",
+        );
+        self.body_buf
+            .push_str("# TYPE varta_recovery_outstanding_probe_exhausted_total counter\n");
+        let _ = writeln!(
+            self.body_buf,
+            "varta_recovery_outstanding_probe_exhausted_total {}",
+            self.recovery_outstanding_probe_exhausted_total
+        );
+        // IpStateTable probe-exhaustion — /metrics accept path.
+        self.body_buf.push_str(
+            "# HELP varta_prom_ip_state_probe_exhausted_total IpStateTable lookups/inserts that ran the full MAX_PROBE budget.\n",
+        );
+        self.body_buf
+            .push_str("# TYPE varta_prom_ip_state_probe_exhausted_total counter\n");
+        let _ = writeln!(
+            self.body_buf,
+            "varta_prom_ip_state_probe_exhausted_total {}",
+            self.prom_ip_state_probe_exhausted_total
         );
         self.body_buf.push_str(
             "# HELP varta_frame_decrypt_failures_total Total AEAD decryption/tag-verification failures.\n",

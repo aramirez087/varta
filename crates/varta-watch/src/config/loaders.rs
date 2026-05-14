@@ -1,9 +1,9 @@
 use super::types::Config;
+#[cfg(feature = "secure-udp")]
+use super::validate::read_secret_file;
 use super::validate::validate_recovery_file;
 #[cfg(any(feature = "secure-udp", feature = "prometheus-exporter"))]
 use super::validate::validate_secret_file;
-#[cfg(feature = "secure-udp")]
-use super::validate::read_secret_file;
 
 impl Config {
     /// Resolve recovery mode from CLI flags, enforcing mutual exclusion

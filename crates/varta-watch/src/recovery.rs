@@ -30,13 +30,13 @@
 //! context). Use `--recovery-cmd-file` / `--recovery-exec-file` with
 //! restrictive file permissions for an additional trust check.
 
-use std::collections::HashMap;
 use std::io::Read;
 use std::os::unix::io::AsRawFd;
 use std::process::{Child, ChildStderr, ChildStdout, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use crate::audit::{CompleteOutcome, CompleteRecord, RecoveryAuditLog, RefusedRecord, SpawnRecord};
+use crate::outstanding_table::{InsertError as OutstandingInsertError, OutstandingTable};
 use crate::peer_cred::BeatOrigin;
 
 // fcntl(2) flags. Hand-rolled to avoid pulling `libc` into a production crate.
@@ -211,6 +211,17 @@ pub enum RecoveryOutcome {
     /// can detect both legitimate scale-out and the M8 adversarial
     /// stall-burst pattern.
     RefusedDebounceCapacity {
+        /// Agent pid whose stall was refused.
+        pid: u32,
+    },
+    /// Recovery was structurally declined because the
+    /// [`crate::outstanding_table::OutstandingTable`] was at capacity —
+    /// one outstanding child per tracked agent already in flight.  This
+    /// only fires when the operator's `--tracker-capacity` worth of
+    /// agents are simultaneously in mid-recovery, which is itself an
+    /// emergency condition.  The refusal is logged to the audit sink and
+    /// counted in Prometheus.
+    RefusedOutstandingCapacity {
         /// Agent pid whose stall was refused.
         pid: u32,
     },
@@ -494,7 +505,12 @@ pub struct Recovery {
     debounce: Duration,
     last_fired: LastFiredTable,
     timeout: Option<Duration>,
-    outstanding: HashMap<u32, Outstanding>,
+    outstanding: OutstandingTable<Outstanding>,
+    /// Count of recoveries refused because [`OutstandingTable`] was at
+    /// capacity (one outstanding child per tracked agent already in
+    /// flight). Surfaced as
+    /// `varta_recovery_refused_total{reason="outstanding_capacity"}`.
+    refused_outstanding_capacity: u64,
     pending_outcomes: Vec<RecoveryOutcome>,
     /// Explicit environment variables for child processes in `KEY=VALUE`
     /// format. When non-empty, the child's environment is cleared to
@@ -586,7 +602,8 @@ impl Recovery {
             debounce,
             last_fired: LastFiredTable::new(),
             timeout,
-            outstanding: HashMap::new(),
+            outstanding: OutstandingTable::with_capacity(crate::tracker::MAX_CAPACITY),
+            refused_outstanding_capacity: 0,
             pending_outcomes: Vec::new(),
             recovery_env: Vec::new(),
             shutdown_grace: Duration::from_millis(crate::config::DEFAULT_SHUTDOWN_GRACE_MS),
@@ -608,6 +625,37 @@ impl Recovery {
     pub fn with_reap_scratch_capacity(mut self, capacity: usize) -> Self {
         self.reap_scratch.reserve_exact(capacity);
         self
+    }
+
+    /// Bound the outstanding-child table to `capacity` slots. By default
+    /// the table is sized at [`crate::tracker::MAX_CAPACITY`]; threading
+    /// the observer's actual `tracker_capacity` through tightens the
+    /// bound so a capacity-exhaustion attempt against `Recovery` fails
+    /// closed at the same threshold the tracker itself enforces.
+    pub fn with_outstanding_capacity(mut self, capacity: usize) -> Self {
+        let cap = capacity.max(1);
+        self.outstanding = OutstandingTable::with_capacity(cap);
+        self
+    }
+
+    /// Take and reset the count of recoveries refused because the
+    /// outstanding-child table was at capacity.  Distinct from
+    /// [`Self::take_refused_debounce_capacity`]: a debounce-capacity
+    /// refusal means we cannot record that recovery fired; an
+    /// outstanding-capacity refusal means we cannot track the child
+    /// process after it spawns. Both are surfaced under
+    /// `varta_recovery_refused_total` with distinct `reason` labels.
+    pub fn take_refused_outstanding_capacity(&mut self) -> u64 {
+        let n = self.refused_outstanding_capacity;
+        self.refused_outstanding_capacity = 0;
+        n
+    }
+
+    /// Take and reset the [`OutstandingTable`] probe-exhausted counter.
+    ///
+    /// Surfaced as `varta_recovery_outstanding_probe_exhausted_total`.
+    pub fn take_outstanding_probe_exhausted(&mut self) -> u64 {
+        self.outstanding.take_probe_exhausted()
     }
 
     /// Permit recovery to fire for agents whose kernel-attested PID namespace
@@ -760,27 +808,32 @@ impl Recovery {
         // constructed at all — the unreachable branch is gone, not just
         // better-annotated. Mirrors the DO-178C "no unproven panics" stance
         // already enforced in tracker.rs (cerebrum 2026-05-13).
-        use std::collections::hash_map::Entry;
         let cap = self.capture_cap;
-        let mut occupied = match self.outstanding.entry(pid) {
-            Entry::Occupied(o) => o,
-            Entry::Vacant(_) => return None,
+        // Step 1: drain capture and call `try_wait` while holding the
+        // mutable borrow.  The borrow ends with the inner scope so the
+        // ownership-taking arms below can call `&mut self` methods
+        // without conflict.
+        let try_wait_result = {
+            let entry_mut = self.outstanding.get_mut(pid)?;
+            // Drain piped stdio (if any) before checking exit; the child
+            // may have written its last bytes after our previous tick's
+            // drain.
+            Self::drain_outstanding_capture(entry_mut, cap);
+            let child_pid = entry_mut.child.id();
+            let wait = entry_mut.child.try_wait();
+            (child_pid, wait)
         };
+        let (child_pid, try_wait_result) = try_wait_result;
 
-        // Drain piped stdio (if any) before checking exit; the child may
-        // have written its last bytes after our previous tick's drain.
-        Self::drain_outstanding_capture(occupied.get_mut(), cap);
-
-        match occupied.get_mut().child.try_wait() {
+        match try_wait_result {
             Ok(Some(status)) => {
-                let child_pid = occupied.get().child.id();
-                let killed = occupied.get().killed;
-                let spawned_at = occupied.get().spawned_at;
-                let wallclock_ms = occupied.get().wallclock_at_spawn_ms;
                 // Final drain pass after exit: the child may have flushed
                 // its tail buffer between our last drain and try_wait.
-                Self::drain_outstanding_capture(occupied.get_mut(), cap);
-                let entry = occupied.remove();
+                if let Some(entry_mut) = self.outstanding.get_mut(pid) {
+                    Self::drain_outstanding_capture(entry_mut, cap);
+                }
+                let entry = self.outstanding.remove(pid)?;
+                let killed = entry.killed;
                 self.emit_complete_audit(
                     pid,
                     child_pid,
@@ -790,8 +843,8 @@ impl Recovery {
                         CompleteOutcome::Reaped
                     },
                     Some(&status),
-                    spawned_at,
-                    wallclock_ms,
+                    entry.spawned_at,
+                    entry.wallclock_at_spawn_ms,
                     entry.stdout_len,
                     entry.stderr_len,
                     entry.truncated,
@@ -800,17 +853,14 @@ impl Recovery {
             }
             Ok(None) => None,
             Err(e) => {
-                let child_pid = occupied.get().child.id();
-                let spawned_at = occupied.get().spawned_at;
-                let wallclock_ms = occupied.get().wallclock_at_spawn_ms;
-                let entry = occupied.remove();
+                let entry = self.outstanding.remove(pid)?;
                 self.emit_complete_audit(
                     pid,
                     child_pid,
                     CompleteOutcome::ReapFailed,
                     None,
-                    spawned_at,
-                    wallclock_ms,
+                    entry.spawned_at,
+                    entry.wallclock_at_spawn_ms,
                     entry.stdout_len,
                     entry.stderr_len,
                     entry.truncated,
@@ -1005,12 +1055,29 @@ impl Recovery {
             }
         }
 
-        if self.outstanding.contains_key(&pid) {
+        if self.outstanding.contains(pid) {
             if let Some(outcome) = self.reap_finished_child(pid) {
                 self.pending_outcomes.push(outcome);
             } else {
                 return RecoveryOutcome::Debounced;
             }
+        }
+
+        // Pre-spawn capacity check.  If every tracked-agent slot already
+        // has an outstanding recovery in flight, fail closed before
+        // burning a LastFiredTable slot so the debounce window for this
+        // pid is preserved for the next attempt.
+        if self.outstanding.len() >= self.outstanding.capacity() {
+            self.refused_outstanding_capacity = self.refused_outstanding_capacity.saturating_add(1);
+            if let Some(sink) = self.audit_sink.as_mut() {
+                sink.record_refused(&RefusedRecord {
+                    wallclock_ms: RecoveryAuditLog::wallclock_ms_now(),
+                    observer_ns: 0,
+                    agent_pid: pid,
+                    reason: "outstanding_capacity",
+                });
+            }
+            return RecoveryOutcome::RefusedOutstandingCapacity { pid };
         }
 
         // Capacity-aware insertion.  Three outcomes:
@@ -1068,7 +1135,7 @@ impl Recovery {
                             "/bin/sh",
                             template_len,
                         );
-                        self.outstanding.insert(
+                        match self.outstanding.try_insert(
                             pid,
                             Outstanding {
                                 child,
@@ -1081,8 +1148,27 @@ impl Recovery {
                                 stderr_len: 0,
                                 truncated: false,
                             },
-                        );
-                        RecoveryOutcome::Spawned { child_pid }
+                        ) {
+                            Ok(()) => RecoveryOutcome::Spawned { child_pid },
+                            Err(OutstandingInsertError::AlreadyPresent) => {
+                                debug_assert!(
+                                    false,
+                                    "OutstandingTable::try_insert returned AlreadyPresent \
+                                     after the `contains` guard above",
+                                );
+                                RecoveryOutcome::Spawned { child_pid }
+                            }
+                            Err(OutstandingInsertError::Full) => {
+                                // The pre-spawn capacity check should make
+                                // this unreachable, but probe-budget
+                                // exhaustion is a theoretical residual.
+                                // Fail closed: surface the refusal and let
+                                // the kernel reap the orphaned child.
+                                self.refused_outstanding_capacity =
+                                    self.refused_outstanding_capacity.saturating_add(1);
+                                RecoveryOutcome::RefusedOutstandingCapacity { pid }
+                            }
+                        }
                     }
                     Err(e) => RecoveryOutcome::SpawnFailed(e),
                 }
@@ -1117,7 +1203,7 @@ impl Recovery {
                             substituted[0].as_str(),
                             template_len,
                         );
-                        self.outstanding.insert(
+                        match self.outstanding.try_insert(
                             pid,
                             Outstanding {
                                 child,
@@ -1130,8 +1216,22 @@ impl Recovery {
                                 stderr_len: 0,
                                 truncated: false,
                             },
-                        );
-                        RecoveryOutcome::Spawned { child_pid }
+                        ) {
+                            Ok(()) => RecoveryOutcome::Spawned { child_pid },
+                            Err(OutstandingInsertError::AlreadyPresent) => {
+                                debug_assert!(
+                                    false,
+                                    "OutstandingTable::try_insert returned AlreadyPresent \
+                                     after the `contains` guard above",
+                                );
+                                RecoveryOutcome::Spawned { child_pid }
+                            }
+                            Err(OutstandingInsertError::Full) => {
+                                self.refused_outstanding_capacity =
+                                    self.refused_outstanding_capacity.saturating_add(1);
+                                RecoveryOutcome::RefusedOutstandingCapacity { pid }
+                            }
+                        }
                     }
                     Err(e) => RecoveryOutcome::SpawnFailed(e),
                 }
@@ -1199,7 +1299,7 @@ impl Recovery {
         // Bounded by `outstanding.len()`, which is itself bounded by
         // `tracker_capacity` — there is no silent cap.
         self.reap_scratch.clear();
-        self.reap_scratch.extend(self.outstanding.keys().copied());
+        self.reap_scratch.extend(self.outstanding.iter_pids());
         debug_assert!(
             self.reap_scratch.len() == self.outstanding.len(),
             "reap_scratch must mirror outstanding exactly"
@@ -1216,63 +1316,63 @@ impl Recovery {
                 continue;
             }
 
-            // Acquire the entry once via the Entry API. `OccupiedEntry::remove`
-            // returns owned ownership in the `kill()` error arm without a
-            // second map lookup, so the formerly-unreachable
-            // `remove(&pid).unwrap()` cannot be constructed.
-            use std::collections::hash_map::Entry;
-            let mut occupied = match self.outstanding.entry(pid) {
-                Entry::Occupied(o) => o,
-                Entry::Vacant(_) => continue,
+            // Capture metadata and run `kill` inside a borrow scope so
+            // the mutable borrow ends before the `Err(e)` arm needs to
+            // call back into `&mut self` to take ownership.  The pattern
+            // is the same one used by `reap_finished_child`.
+            let kill_step = {
+                let Some(entry_mut) = self.outstanding.get_mut(pid) else {
+                    continue;
+                };
+                let Some(to) = self.timeout else { continue };
+                if entry_mut.spawned_at.elapsed() < to {
+                    // No timeout exceeded — leave in place.
+                    continue;
+                }
+                if entry_mut.killed {
+                    continue;
+                }
+                let child_pid = entry_mut.child.id();
+                let kill_result = entry_mut.child.kill();
+                (child_pid, kill_result)
             };
+            let (child_pid, kill_result) = kill_step;
 
-            // Still running — check timeout.
-            let Some(to) = self.timeout else { continue };
-            if occupied.get().spawned_at.elapsed() < to {
-                // No timeout exceeded — leave in place.
-                continue;
-            }
-            if occupied.get().killed {
-                continue;
-            }
-
-            let child_pid = occupied.get().child.id();
-            // Defer the post-borrow retry so the `OccupiedEntry` lifetime
-            // ends naturally before we re-enter `&mut self` methods.
             let mut needs_reap_retry = false;
-            match occupied.get_mut().child.kill() {
+            match kill_result {
                 Ok(()) => {
-                    // Do not wait here; the observer poll loop must remain
-                    // non-blocking. A later try_wait call will reap the child.
-                    occupied.get_mut().killed = true;
+                    // Do not wait here; the observer poll loop must
+                    // remain non-blocking. A later try_wait call will
+                    // reap the child.
+                    if let Some(entry_mut) = self.outstanding.get_mut(pid) {
+                        entry_mut.killed = true;
+                    }
                     outcomes.push(RecoveryOutcome::Killed { child_pid });
                 }
 
                 Err(e) if e.kind() == std::io::ErrorKind::InvalidInput => {
                     // Child already exited between our try_wait and kill.
-                    // Retry try_wait once to reap, but only after this
-                    // borrow on `self.outstanding` ends.
+                    // Retry try_wait once.
                     needs_reap_retry = true;
                 }
 
                 Err(e) => {
-                    let entry = occupied.remove();
-                    self.emit_complete_audit(
-                        pid,
-                        child_pid,
-                        CompleteOutcome::ReapFailed,
-                        None,
-                        entry.spawned_at,
-                        entry.wallclock_at_spawn_ms,
-                        entry.stdout_len,
-                        entry.stderr_len,
-                        entry.truncated,
-                    );
+                    if let Some(entry) = self.outstanding.remove(pid) {
+                        self.emit_complete_audit(
+                            pid,
+                            child_pid,
+                            CompleteOutcome::ReapFailed,
+                            None,
+                            entry.spawned_at,
+                            entry.wallclock_at_spawn_ms,
+                            entry.stdout_len,
+                            entry.stderr_len,
+                            entry.truncated,
+                        );
+                    }
                     outcomes.push(RecoveryOutcome::ReapFailed(e));
                 }
             }
-            // `occupied` borrow on `self.outstanding` ends here. Safe to
-            // re-enter `&mut self` methods for the deferred retry.
             if needs_reap_retry {
                 if let Some(outcome) = self.reap_finished_child(pid) {
                     outcomes.push(outcome);
@@ -1292,7 +1392,7 @@ impl Drop for Recovery {
         let mut children: Vec<std::process::Child> = self
             .outstanding
             .drain()
-            .map(|(_, mut entry)| {
+            .map(|mut entry| {
                 let _ = entry.child.kill();
                 entry.child
             })

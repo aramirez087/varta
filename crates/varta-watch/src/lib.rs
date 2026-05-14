@@ -41,7 +41,35 @@ pub mod notify;
 pub mod observer;
 pub mod peer_cred;
 pub mod pid_max;
+// When `fuzzing` is on, bounded-collection modules are exposed as
+// public so the `fuzz/` crate can drive them directly through
+// `varta_watch::__fuzz_internals::*`. The names stay namespaced under
+// `__fuzz_internals` so accidental external use is loud.
+#[cfg(all(feature = "prometheus-exporter", not(feature = "fuzzing")))]
+mod ip_state_table;
+#[cfg(not(feature = "fuzzing"))]
+mod outstanding_table;
+#[cfg(not(feature = "fuzzing"))]
+mod probe_table;
 pub mod recovery;
+
+#[cfg(feature = "fuzzing")]
+#[path = "ip_state_table.rs"]
+pub mod ip_state_table;
+#[cfg(feature = "fuzzing")]
+#[path = "outstanding_table.rs"]
+pub mod outstanding_table;
+#[cfg(feature = "fuzzing")]
+#[path = "probe_table.rs"]
+pub mod probe_table;
+
+/// Test-only: stable namespace for the fuzz-only re-exports.
+#[cfg(feature = "fuzzing")]
+pub mod __fuzz_internals {
+    pub use crate::ip_state_table;
+    pub use crate::outstanding_table;
+    pub use crate::probe_table;
+}
 pub mod tracker;
 
 #[cfg(feature = "secure-udp")]

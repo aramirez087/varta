@@ -16,6 +16,8 @@
 - [Audit Logging](architecture/audit-log.md)
 - [Compile-Time Configuration](architecture/compile-time-config.md)
 - [Safety Profiles](architecture/safety-profiles.md)
+- [Supply-Chain Posture](architecture/supply-chain.md)
+- [Bounded Collections](architecture/bounded-collections.md)
 
 ---
 

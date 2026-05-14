@@ -30,7 +30,7 @@ jobs:
       # the SRE and Class-A profiles.
       - name: clippy (SRE — argv parser + HTTP exporter)
         run: |
-          cargo clippy --workspace --all-targets \
+          cargo clippy --locked --workspace --all-targets \
             --features 'varta-watch/secure-udp varta-watch/unsafe-plaintext-udp varta-watch/unsafe-shell-recovery varta-watch/json-log varta-watch/audit-chain varta-watch/test-hooks varta-watch/prometheus-exporter varta-vlp/crypto varta-vlp/std varta-client/panic-handler varta-client/udp varta-client/secure-udp varta-client/test-hooks varta-tests/udp varta-tests/secure-udp varta-tests/shell-recovery varta-tests/test-hooks varta-tests/prometheus-exporter' \
             -- -D warnings
 
@@ -38,23 +38,23 @@ jobs:
         env:
           VARTA_CONFIG_FILE: ${{ github.workspace }}/crates/varta-watch/tests/fixtures/safety_critical.varta.conf
         run: |
-          cargo clippy -p varta-watch --all-targets \
+          cargo clippy --locked -p varta-watch --all-targets \
             --no-default-features --features secure-udp,compile-time-config \
             -- -D warnings
 
       - name: clippy (no-default-features)
-        run: cargo clippy --workspace --all-targets --no-default-features -- -D warnings
+        run: cargo clippy --locked --workspace --all-targets --no-default-features -- -D warnings
 
       - name: varta-vlp no_std build (default features)
         # Default-feature build of the protocol crate must compile as
         # `#![no_std]` for avionics targets (FreeRTOS, Zephyr) without libstd.
-        run: cargo build -p varta-vlp --no-default-features
+        run: cargo build --locked -p varta-vlp --no-default-features
 
       - name: varta-vlp no_std build (crypto only)
         # `crypto` must stay no_std-clean — chacha20poly1305 / hkdf / sha2 /
         # zeroize are all `default-features = false`. This step trips if any
         # of them inadvertently re-enables `std` in a point release.
-        run: cargo build -p varta-vlp --no-default-features --features crypto
+        run: cargo build --locked -p varta-vlp --no-default-features --features crypto
 
       - name: install no_std target (thumbv7m-none-eabi)
         if: runner.os == 'Linux'
@@ -66,8 +66,8 @@ jobs:
         # sufficient for a library crate.
         if: runner.os == 'Linux'
         run: |
-          cargo build -p varta-vlp --no-default-features --target thumbv7m-none-eabi
-          cargo build -p varta-vlp --no-default-features --features crypto --target thumbv7m-none-eabi
+          cargo build --locked -p varta-vlp --no-default-features --target thumbv7m-none-eabi
+          cargo build --locked -p varta-vlp --no-default-features --features crypto --target thumbv7m-none-eabi
 
       # `--all-features` is forbidden by the `prometheus-exporter` +
       # `compile-time-config` compile_error guard.  Run SRE-profile tests
@@ -77,20 +77,20 @@ jobs:
         env:
           RUSTFLAGS: -D warnings
         run: |
-          cargo test --workspace \
+          cargo test --locked --workspace \
             --features 'varta-watch/secure-udp varta-watch/unsafe-plaintext-udp varta-watch/unsafe-shell-recovery varta-watch/json-log varta-watch/audit-chain varta-watch/test-hooks varta-watch/prometheus-exporter varta-vlp/crypto varta-vlp/std varta-client/panic-handler varta-client/udp varta-client/secure-udp varta-client/test-hooks varta-tests/udp varta-tests/secure-udp varta-tests/shell-recovery varta-tests/test-hooks varta-tests/prometheus-exporter'
 
       - name: doc-tests (SRE profile)
         run: |
-          cargo test --doc --workspace \
+          cargo test --locked --doc --workspace \
             --features 'varta-watch/secure-udp varta-watch/unsafe-plaintext-udp varta-watch/unsafe-shell-recovery varta-watch/json-log varta-watch/audit-chain varta-watch/test-hooks varta-watch/prometheus-exporter varta-vlp/crypto varta-vlp/std varta-client/panic-handler varta-client/udp varta-client/secure-udp varta-client/test-hooks varta-tests/udp varta-tests/secure-udp varta-tests/shell-recovery varta-tests/test-hooks varta-tests/prometheus-exporter'
 
       - name: release build
-        run: cargo build --workspace --release
+        run: cargo build --locked --workspace --release
 
       - name: examples build (SRE profile)
         run: |
-          cargo build --workspace --examples \
+          cargo build --locked --workspace --examples \
             --features 'varta-watch/secure-udp varta-watch/unsafe-plaintext-udp varta-watch/unsafe-shell-recovery varta-watch/json-log varta-watch/audit-chain varta-watch/test-hooks varta-watch/prometheus-exporter varta-vlp/crypto varta-vlp/std varta-client/panic-handler varta-client/udp varta-client/secure-udp varta-client/test-hooks varta-tests/udp varta-tests/secure-udp varta-tests/shell-recovery varta-tests/test-hooks varta-tests/prometheus-exporter'
 
       - name: zero-dep audit (varta-vlp)
@@ -171,7 +171,7 @@ jobs:
           done
 
       - name: bench latency (record only — never fails CI)
-        run: cargo run -p varta-bench --release -- latency || true
+        run: cargo run --locked -p varta-bench --release -- latency || true
 
   fuzz-smoke:
     name: fuzz-smoke
@@ -185,7 +185,12 @@ jobs:
         uses: dtolnay/rust-toolchain@nightly
 
       - name: install cargo-fuzz
-        run: cargo install cargo-fuzz
+        # Pin the installer step itself — `cargo install --locked` consumes
+        # the cargo-fuzz `Cargo.lock`, not ours.  Keeps the tool's
+        # transitive deps reproducible.  `cargo fuzz run` subcommands below
+        # do not accept `--locked`; the fuzz harness manages its own
+        # workspace under `fuzz/`.
+        run: cargo install --locked cargo-fuzz
 
       - name: fuzz frame_decode (30 s)
         run: cargo fuzz run frame_decode fuzz/corpus/frame_decode -- -max_total_time=30
@@ -208,6 +213,21 @@ jobs:
       - name: fuzz peer_cred_cmsg (30 s)
         run: cargo fuzz run peer_cred_cmsg fuzz/corpus/peer_cred_cmsg -- -max_total_time=30
 
+      - name: fuzz flag_catalogue_lookup (30 s)
+        run: cargo fuzz run flag_catalogue_lookup -- -max_total_time=30
+
+      - name: fuzz bounded_index_u32 (30 s)
+        run: cargo fuzz run bounded_index_u32 fuzz/corpus/bounded_index_u32 -- -max_total_time=30
+
+      - name: fuzz bounded_index_ip (30 s)
+        run: cargo fuzz run bounded_index_ip fuzz/corpus/bounded_index_ip -- -max_total_time=30
+
+      - name: fuzz outstanding_table (30 s)
+        run: cargo fuzz run outstanding_table fuzz/corpus/outstanding_table -- -max_total_time=30
+
+      - name: fuzz ip_state_table (30 s)
+        run: cargo fuzz run ip_state_table fuzz/corpus/ip_state_table -- -max_total_time=30
+
       - name: assert no fuzz artifacts (reproducer = CI failure)
         run: test -z "$(find fuzz/artifacts -type f 2>/dev/null)"
 
@@ -223,19 +243,19 @@ jobs:
       - name: cargo miri setup
         run: cargo miri setup
       - name: miri varta-vlp (pure no_std + crypto compute)
-        run: cargo miri test -p varta-vlp --all-features
+        run: cargo miri test --locked -p varta-vlp --all-features
         env: { MIRIFLAGS: "-Zmiri-strict-provenance" }
       - name: miri varta-vlp crypto boundary tests
-        run: cargo miri test -p varta-vlp --features crypto --test crypto_boundary
+        run: cargo miri test --locked -p varta-vlp --features crypto --test crypto_boundary
         env: { MIRIFLAGS: "-Zmiri-strict-provenance" }
       - name: miri peer_cred cmsg parsing
-        run: cargo miri test -p varta-watch --lib peer_cred -- --test-threads=1
+        run: cargo miri test --locked -p varta-watch --lib peer_cred -- --test-threads=1
         env: { MIRIFLAGS: "-Zmiri-strict-provenance" }
       - name: miri tracker (pure-compute, no FFI)
-        run: cargo miri test -p varta-watch --lib tracker -- --test-threads=1
+        run: cargo miri test --locked -p varta-watch --lib tracker -- --test-threads=1
         env: { MIRIFLAGS: "-Zmiri-strict-provenance" }
       - name: miri client classifier (pure-compute)
-        run: cargo miri test -p varta-client --test classifier
+        run: cargo miri test --locked -p varta-client --test classifier
         env: { MIRIFLAGS: "-Zmiri-strict-provenance" }
 
   safety-profiles:
@@ -249,7 +269,7 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: production-safe build (default features)
-        run: cargo build -p varta-watch --release
+        run: cargo build --locked -p varta-watch --release
 
       - name: verify no /bin/sh in production binary
         run: |
@@ -258,23 +278,23 @@ jobs:
             || echo "OK: no /bin/sh in production-safe binary"
 
       - name: unsafe-shell-recovery feature compiles
-        run: cargo build -p varta-watch --release --features unsafe-shell-recovery
+        run: cargo build --locked -p varta-watch --release --features unsafe-shell-recovery
 
       - name: unsafe-shell-recovery unit tests
-        run: cargo test -p varta-watch --features unsafe-shell-recovery
+        run: cargo test --locked -p varta-watch --features unsafe-shell-recovery
 
       - name: unsafe-shell-recovery integration tests
-        run: cargo test -p varta-tests --features shell-recovery
+        run: cargo test --locked -p varta-tests --features shell-recovery
 
       - name: observer-liveness integration tests (L1 self-watchdog, L2 sd_notify, L3 hw_watchdog)
-        run: cargo test -p varta-watch --features test-hooks --test notify --test cli_smoke --test self_watchdog
+        run: cargo test --locked -p varta-watch --features test-hooks --test notify --test cli_smoke --test self_watchdog
 
       # --- SRE profile (M3 — Prometheus HTTP exporter compiled in) ----------
       - name: SRE profile — build
-        run: cargo build -p varta-watch --release --features prometheus-exporter
+        run: cargo build --locked -p varta-watch --release --features prometheus-exporter
 
       - name: SRE profile — tests
-        run: cargo test -p varta-watch --features prometheus-exporter
+        run: cargo test --locked -p varta-watch --features prometheus-exporter
 
       # --- Class-A profile (M3 + M4 — no HTTP, no argv parser) --------------
       # Build with the canonical safety-critical recipe.  The CI fixture
@@ -284,7 +304,7 @@ jobs:
         env:
           VARTA_CONFIG_FILE: ${{ github.workspace }}/crates/varta-watch/tests/fixtures/safety_critical.varta.conf
         run: |
-          cargo build -p varta-watch --release \
+          cargo build --locked -p varta-watch --release \
             --no-default-features --features secure-udp,compile-time-config
 
       - name: Class-A profile — strings audit
@@ -317,7 +337,7 @@ jobs:
         env:
           VARTA_CONFIG_FILE: ${{ github.workspace }}/crates/varta-watch/tests/fixtures/safety_critical.varta.conf
         run: |
-          cargo test -p varta-watch --release \
+          cargo test --locked -p varta-watch --release \
             --no-default-features --features secure-udp,compile-time-config \
             --test compile_time_config_smoke --test strings_audit
 
@@ -328,7 +348,7 @@ jobs:
         env:
           VARTA_CONFIG_FILE: ${{ github.workspace }}/crates/varta-watch/tests/fixtures/safety_critical.varta.conf
         run: |
-          if cargo build -p varta-watch --release \
+          if cargo build --locked -p varta-watch --release \
             --no-default-features --features prometheus-exporter,compile-time-config 2>&1 \
             | tee /tmp/feature-combo.log \
             | grep -qF "cannot be combined with"
@@ -373,11 +393,40 @@ jobs:
 
       - name: cargo kani -p varta-vlp
         if: steps.changes.outputs.vlp == 'true' || github.event_name == 'push'
+        # `cargo kani` does not forward `--locked` to its inner `cargo
+        # build`; the kani harness lives outside the workspace lockfile
+        # contract.  Tracked as a follow-up.
         run: cargo kani -p varta-vlp
 
       - name: skip notice
         if: steps.changes.outputs.vlp != 'true' && github.event_name != 'push'
         run: echo "no varta-vlp changes — Kani proofs skipped"
+
+  supply-chain:
+    name: supply-chain (cargo-deny — advisories, bans, sources, licenses)
+    # Audits the resolved dep graph against `deny.toml` at repo root.
+    # The four optional crypto deps in `crates/varta-vlp/Cargo.toml` are
+    # pinned to exact patch versions (`=X.Y.Z`); this job extends the
+    # same posture to every transitive dep (yanked crates, RUSTSEC
+    # advisories, license drift, unknown registries / git sources).
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: rust toolchain (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: install cargo-deny (pinned)
+        # Pin the tool itself — cargo-deny is part of the trusted compute
+        # base.  Bumping this version is a reviewable PR via the dep-bump
+        # procedure in `book/src/architecture/supply-chain.md`.
+        # 0.19.6 is the minimum that parses CVSS:4.0 entries in the
+        # RUSTSEC advisory db (libcrux-poly1305 RUSTSEC-2026-0073 trips
+        # 0.16.x with `unsupported CVSS version: 4.0`).
+        run: cargo install --locked --version 0.19.6 cargo-deny
+
+      - name: cargo deny check
+        run: cargo deny --all-features check advisories bans sources licenses
 
   book:
     name: build-book

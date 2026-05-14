@@ -31,7 +31,14 @@ workspace = true
 # Optional: only present when --features crypto is active.
 # Zero impact on the default UDS build — cargo tree shows no registry deps
 # unless the feature is enabled.
-chacha20poly1305 = { version = "0.10", default-features = false, optional = true }
-hkdf             = { version = "0.12", default-features = false, optional = true }
-sha2             = { version = "0.10", default-features = false, optional = true }
-zeroize          = { version = "1.7",  default-features = false, optional = true, features = ["derive"] }
+#
+# Exact-version pins (`=X.Y.Z`).  See `book/src/architecture/supply-chain.md`
+# for the bump procedure.  Rationale: a compromised minor/patch release on
+# crates.io must not flow through silently; every dep bump is a reviewable
+# `Cargo.toml` edit that lands together with the matching `Cargo.lock` row.
+# `deny.toml` enforces the same posture for transitive deps via
+# `cargo deny check`.
+chacha20poly1305 = { version = "=0.10.1", default-features = false, optional = true }
+hkdf             = { version = "=0.12.4", default-features = false, optional = true }
+sha2             = { version = "=0.10.9", default-features = false, optional = true }
+zeroize          = { version = "=1.8.2",  default-features = false, optional = true, features = ["derive"] }
