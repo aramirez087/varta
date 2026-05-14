@@ -230,39 +230,66 @@ impl SecureUdpTransport {
     pub fn iv_prefix_index_for_test(&self) -> u32 {
         self.iv_prefix_index
     }
+
+    /// Test-only setter to fast-forward the prefix index, exercising the
+    /// doubly-exhausted (counter + prefix-index wrap → reconnect) path.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn set_iv_prefix_index_for_test(&mut self, value: u32) {
+        self.iv_prefix_index = value;
+    }
+
+    /// Advance the AEAD nonce state and return the `iv_counter` value the
+    /// next frame should use. Three branches, in order:
+    ///
+    /// 1. **Common case** — `iv_counter.checked_add(1)` succeeds; return it.
+    /// 2. **Counter wrap** — `iv_counter` exhausted but `iv_prefix_index`
+    ///    can still advance. Bump the index, re-derive `iv_prefix` via
+    ///    HKDF (no entropy syscall — see module docs), return `1`.
+    /// 3. **Doubly-exhausted** — both `u32`s exhausted (`2^64` nonces,
+    ///    ~584M years at 1 kHz). Fall back to [`Self::reconnect`] — the
+    ///    documented manual escape hatch — which refreshes the salt and
+    ///    zeroes both counters; return `1` for the first beat under the
+    ///    fresh session.
+    ///
+    /// Linear control flow — no recursion into `send`. The `debug_assert`s
+    /// guard against a future regression that breaks `reconnect()`'s
+    /// reset contract.
+    fn advance_nonce(&mut self) -> io::Result<u32> {
+        if let Some(n) = self.iv_counter.checked_add(1) {
+            return Ok(n);
+        }
+        // AEAD counter exhausted — rotate the per-session IV prefix via
+        // HKDF derivation. No OS entropy syscall: the session salt was
+        // sampled once at connect() and the KDF gives us cryptographically
+        // independent prefixes.
+        if let Some(next_index) = self.iv_prefix_index.checked_add(1) {
+            self.iv_prefix_index = next_index;
+            self.iv_prefix = varta_vlp::crypto::kdf::derive_iv_prefix(
+                &self.iv_session_salt,
+                self.iv_prefix_index,
+            );
+            return Ok(1);
+        }
+        // Prefix index also exhausted (2^64 nonces — ~584M years at 1
+        // kHz). Fall back to the documented manual escape hatch: refresh
+        // the salt via the entropy chain. Linear control flow — replaces
+        // the prior `return self.send(buf)` recursion.
+        self.reconnect()?;
+        debug_assert_eq!(
+            self.iv_counter, 0,
+            "reconnect() must zero iv_counter — see secure_transport module docs"
+        );
+        debug_assert_eq!(
+            self.iv_prefix_index, 0,
+            "reconnect() must zero iv_prefix_index — see secure_transport module docs"
+        );
+        Ok(1)
+    }
 }
 
 impl BeatTransport for SecureUdpTransport {
     fn send(&mut self, buf: &[u8; 32]) -> io::Result<usize> {
-        self.iv_counter = match self.iv_counter.checked_add(1) {
-            Some(n) => n,
-            None => {
-                // AEAD counter exhausted — rotate the per-session IV prefix
-                // via HKDF derivation.  No OS entropy syscall: the session
-                // salt was sampled once at connect() and the KDF gives us
-                // cryptographically independent prefixes.
-                match self.iv_prefix_index.checked_add(1) {
-                    Some(next_index) => {
-                        self.iv_prefix_index = next_index;
-                        self.iv_prefix = varta_vlp::crypto::kdf::derive_iv_prefix(
-                            &self.iv_session_salt,
-                            self.iv_prefix_index,
-                        );
-                        // First beat in the rotated prefix's counter space.
-                        1
-                    }
-                    None => {
-                        // Prefix index also exhausted (2^64 nonces — ~584M
-                        // years at 1 kHz). Fall back to the documented
-                        // manual escape hatch: refresh the salt via the
-                        // entropy chain. Retry the beat against the fresh
-                        // session.
-                        self.reconnect()?;
-                        return self.send(buf);
-                    }
-                }
-            }
-        };
+        self.iv_counter = self.advance_nonce()?;
 
         // Build 12-byte nonce: iv_prefix (8) || iv_counter (4) LE
         let mut nonce = [0u8; NONCE_BYTES];
@@ -672,6 +699,40 @@ mod tests {
             );
             assert_eq!(tx.iv_prefix_index_for_test(), expected_index);
         }
+    }
+
+    /// Both `iv_counter` AND `iv_prefix_index` exhausted — `send()` must
+    /// fall back to `reconnect()`, refresh the salt, and resume from
+    /// `iv_prefix_index = 0`, `iv_counter = 1`. This exercises the path
+    /// that previously recursed into `self.send(buf)`; it must now run
+    /// linearly without stack growth and still produce identical state.
+    #[test]
+    fn doubly_exhausted_nonce_falls_back_to_reconnect() {
+        let addr = SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::LOCALHOST, 9876, 0, 0));
+        let key = Key::from_bytes([0u8; 32]);
+        let mut tx = SecureUdpTransport::connect(addr, key).expect("connect");
+
+        let salt_before = tx.iv_session_salt;
+        let prefix_before = tx.iv_prefix_for_test();
+
+        // Force both u32s to the brink of exhaustion.
+        tx.set_iv_counter_for_test(u32::MAX);
+        tx.set_iv_prefix_index_for_test(u32::MAX);
+
+        let buf = [0u8; 32];
+        let _ = <SecureUdpTransport as BeatTransport>::send(&mut tx, &buf);
+
+        // Salt MUST have rotated — reconnect() is the only way out of
+        // doubly-exhausted state.
+        assert_ne!(
+            tx.iv_session_salt, salt_before,
+            "reconnect should refresh the session salt on double exhaustion"
+        );
+        // Both counters reset to a fresh session, then bumped by one beat.
+        assert_eq!(tx.iv_prefix_index_for_test(), 0);
+        assert_eq!(tx.iv_counter, 1);
+        // Prefix-0 of the new salt is overwhelmingly likely to differ.
+        assert_ne!(tx.iv_prefix_for_test(), prefix_before);
     }
 
     /// `reconnect()` IS allowed to re-read entropy — it's the documented
