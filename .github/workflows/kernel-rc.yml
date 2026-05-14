@@ -1,0 +1,194 @@
+name: kernel-rc
+
+# Boots the latest mainline / -rc Linux kernel inside virtme-ng and runs
+# the signal-restorer trampoline regression test (`tests/signal_trampoline.rs`)
+# against that kernel. The trampoline at `crates/varta-watch/src/main.rs`
+# is ABI-pinned to today's `rt_sigreturn` / `SA_RESTORER` semantics; any
+# future kernel that breaks those semantics would SIGSEGV the observer on
+# first signal delivery. This workflow surfaces that breakage one -rc
+# ahead of the affected stable release.
+#
+# Modeled on `.github/workflows/fuzz-nightly.yml`: weekly cron, manual
+# dispatch, auto-issue-on-failure with a reproduction command.
+
+on:
+  schedule:
+    - cron: "23 5 * * 1"   # Monday 05:23 UTC
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  vm-signal:
+    name: kernel-rc (${{ matrix.kernel }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        kernel:
+          # Latest stable kernel from the Ubuntu mainline archive. Catches
+          # any regression that already shipped — early-warning sanity check.
+          - mainline-stable
+          # Latest -rc tag. The lead-time lever: a failure here lands an
+          # issue before the kernel hits a stable distro release.
+          - mainline-rc
+
+    steps:
+      - name: checkout
+        uses: actions/checkout@v4
+
+      - name: rust toolchain (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: install KVM + qemu
+        # `ubuntu-latest` GitHub-hosted runners expose nested KVM since
+        # early 2023, so the VM boot stays fast.  `qemu-system-x86` is
+        # virtme-ng's underlying hypervisor.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            qemu-kvm qemu-system-x86 python3-pip
+          # Allow the unprivileged runner to use /dev/kvm.
+          sudo chmod 666 /dev/kvm || true
+
+      - name: install virtme-ng
+        # Pin to a known-good minor: virtme-ng's CLI is stable but the
+        # `--rwdir` semantics changed in early releases.  >=1.30 is safe.
+        run: |
+          python3 -m pip install --user --upgrade pip
+          python3 -m pip install --user 'virtme-ng>=1.30,<2'
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: resolve kernel URL
+        id: kernel
+        run: |
+          set -euo pipefail
+          # Ubuntu's mainline archive publishes per-tag debs at
+          #   https://kernel.ubuntu.com/mainline/<tag>/amd64/
+          # The HTML index lists every released kernel.  Parse it,
+          # filter for the latest stable or rc tag, and pick the
+          # `linux-image-unsigned-…-generic_…_amd64.deb`.
+          INDEX=https://kernel.ubuntu.com/mainline/
+          curl -fsSL "$INDEX" -o index.html
+          case "${{ matrix.kernel }}" in
+            mainline-stable)
+              # Latest tag without `-rc`.
+              TAG=$(grep -oE 'href="v[0-9][^/"]*"' index.html \
+                | sed -E 's/href="(v[^"/]+)"/\1/' \
+                | grep -v -- '-rc' \
+                | sort -V | tail -n1)
+              ;;
+            mainline-rc)
+              # Latest -rc tag.
+              TAG=$(grep -oE 'href="v[0-9][^/"]*-rc[0-9]+"' index.html \
+                | sed -E 's/href="([^"]+)"/\1/' \
+                | sort -V | tail -n1)
+              ;;
+          esac
+          if [ -z "${TAG:-}" ]; then
+            echo "could not resolve kernel tag for ${{ matrix.kernel }}" >&2
+            exit 1
+          fi
+          DIR_URL="${INDEX}${TAG}/amd64/"
+          curl -fsSL "$DIR_URL" -o tag-index.html
+          # Prefer the unsigned, generic image (no signature check; smaller).
+          DEB=$(grep -oE 'href="linux-image-unsigned-[^"]+-generic_[^"]+_amd64\.deb"' tag-index.html \
+            | head -n1 | sed -E 's/href="([^"]+)"/\1/')
+          if [ -z "${DEB:-}" ]; then
+            # Fall back to the signed image if unsigned is absent.
+            DEB=$(grep -oE 'href="linux-image-[^"]+-generic_[^"]+_amd64\.deb"' tag-index.html \
+              | head -n1 | sed -E 's/href="([^"]+)"/\1/')
+          fi
+          if [ -z "${DEB:-}" ]; then
+            echo "could not resolve kernel deb for $TAG" >&2
+            exit 1
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "url=${DIR_URL}${DEB}" >> "$GITHUB_OUTPUT"
+          echo "resolved $TAG -> ${DIR_URL}${DEB}"
+
+      - name: fetch kernel image
+        run: |
+          set -euo pipefail
+          curl -fsSL -o kernel.deb "${{ steps.kernel.outputs.url }}"
+          mkdir -p kernel-extract
+          dpkg-deb -x kernel.deb kernel-extract
+          # The vmlinuz lives under boot/.  Take the first match.
+          VMLINUZ=$(find kernel-extract/boot -maxdepth 1 -name 'vmlinuz-*' | head -n1)
+          if [ -z "${VMLINUZ:-}" ]; then
+            echo "no vmlinuz in extracted deb" >&2
+            ls -R kernel-extract >&2
+            exit 1
+          fi
+          cp "$VMLINUZ" ./vmlinuz
+          ls -lh ./vmlinuz
+
+      - name: build varta workspace (release)
+        # Release matches the production posture; trampoline + readback
+        # must work in release as much as in debug.
+        run: |
+          cargo build --locked --workspace --release
+          cargo test --locked --workspace --release --no-run
+
+      - name: run signal_trampoline test inside VM
+        id: vm-test
+        # virtme-ng mounts the host root r/w inside the VM, boots the
+        # downloaded kernel, runs the command, and exits with its exit
+        # code.  `--test-threads=1` keeps the three trampoline tests
+        # serial so socket-path / signal-target races stay obvious.
+        run: |
+          vng --kernel ./vmlinuz --rwdir . -- \
+              cargo test --locked -p varta-tests --release \
+                  --test signal_trampoline -- --test-threads=1 --nocapture
+
+      - name: capture dmesg on failure
+        if: failure()
+        run: |
+          vng --kernel ./vmlinuz --rwdir . -- \
+              dmesg > dmesg.log 2>&1 || true
+
+      - name: upload artifacts (on failure)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernel-rc-${{ matrix.kernel }}-artifacts
+          path: |
+            dmesg.log
+            vmlinuz
+          if-no-files-found: warn
+
+      - name: open issue on failure
+        if: failure()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const kernel = '${{ matrix.kernel }}';
+            const tag = '${{ steps.kernel.outputs.tag }}' || '(unresolved)';
+            const runId = context.runId;
+            const runUrl = `${context.payload.repository.html_url}/actions/runs/${runId}`;
+            await github.rest.issues.create({
+              ...context.repo,
+              title: `kernel-rc: signal_trampoline regression on ${kernel} (${tag})`,
+              labels: ['kernel-rc', 'bug'],
+              body: `The weekly kernel-rc job failed on **${kernel}** (\`${tag}\`).\n\n` +
+                    `* Run: ${runUrl}\n` +
+                    `* Artifacts: download \`kernel-rc-${kernel}-artifacts\` from the run page \` (\`dmesg.log\`).\n\n` +
+                    `Most likely failure mode: the signal-restorer trampoline in ` +
+                    `\`crates/varta-watch/src/main.rs\` (lines 169–185 / KernelSigAction layout) ` +
+                    `is no longer ABI-compatible with this kernel, OR the readback at ` +
+                    `\`install_signal_handlers\` now disagrees with the kernel.\n\n` +
+                    `Reproduce locally:\n\n` +
+                    "```bash\n" +
+                    `# from a Linux host with KVM + python3 available:\n` +
+                    `python3 -m pip install --user 'virtme-ng>=1.30,<2'\n` +
+                    `# fetch the kernel manually from\n` +
+                    `#   https://kernel.ubuntu.com/mainline/${tag}/amd64/\n` +
+                    `cargo build --locked --workspace --release\n` +
+                    `cargo test --locked --workspace --release --no-run\n` +
+                    `vng --kernel ./vmlinuz --rwdir . -- \\\n` +
+                    `    cargo test --locked -p varta-tests --release \\\n` +
+                    `        --test signal_trampoline -- --test-threads=1 --nocapture\n` +
+                    "```\n"
+            });
