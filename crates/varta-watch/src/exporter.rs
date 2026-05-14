@@ -2668,4 +2668,56 @@ mod tests {
             "ip_table_full drop counter must increment on force-eviction"
         );
     }
+
+    /// M8: every refusal-reason label must be emitted on the first
+    /// scrape (even at zero) so `absent()` alert rules stay green.
+    /// Confirms the `debounce_capacity` label joins the
+    /// pre-existing `unauthenticated_transport` and `cross_namespace_agent`
+    /// labels with no gaps.
+    #[test]
+    fn recovery_refused_debounce_capacity_label_emitted_at_zero() {
+        let mut prom =
+            PromExporter::bind("127.0.0.1:0".parse().unwrap(), TEST_TOKEN).expect("bind");
+        prom.render_body();
+        let body = &prom.body_buf;
+        for reason in RECOVERY_REFUSED_REASON_LABELS.iter() {
+            let needle = format!("varta_recovery_refused_total{{reason=\"{reason}\"}} 0");
+            assert!(
+                body.contains(&needle),
+                "missing first-scrape zero line for reason {reason:?}; body:\n{body}"
+            );
+        }
+        // The new evictions + invariant-violations counters must also
+        // emit at zero, mirroring the tracker self-health pattern.
+        assert!(
+            body.contains("varta_recovery_last_fired_evictions_total 0"),
+            "evictions counter missing zero line in first scrape"
+        );
+        assert!(
+            body.contains("varta_recovery_invariant_violations_total 0"),
+            "invariant-violations counter missing zero line in first scrape"
+        );
+    }
+
+    /// M8: bumping the `RefusedDebounceCapacity` outcome counter must
+    /// drive both the outcome-label and the refused-reason-label
+    /// arrays.  Confirms `record_recovery_outcome` is the single
+    /// entry point for the new variant.
+    #[test]
+    fn recovery_refused_debounce_capacity_outcome_drives_counters() {
+        let mut prom =
+            PromExporter::bind("127.0.0.1:0".parse().unwrap(), TEST_TOKEN).expect("bind");
+        let outcome = crate::recovery::RecoveryOutcome::RefusedDebounceCapacity { pid: 42 };
+        prom.record_recovery_outcome(&outcome, None);
+        prom.render_body();
+        let body = &prom.body_buf;
+        assert!(
+            body.contains("varta_recovery_outcomes_total{outcome=\"refused_debounce_capacity\"} 1"),
+            "outcome counter must increment under refused_debounce_capacity; body:\n{body}"
+        );
+        assert!(
+            body.contains("varta_recovery_refused_total{reason=\"debounce_capacity\"} 1"),
+            "refused-reason counter must increment under debounce_capacity; body:\n{body}"
+        );
+    }
 }

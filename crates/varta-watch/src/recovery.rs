@@ -382,12 +382,10 @@ impl LastFiredTable {
                     existing_slot = Some(idx);
                     break;
                 }
-                Some(s) => {
-                    match oldest {
-                        Some((_, oldest_at)) if s.fired_at >= oldest_at => {}
-                        _ => oldest = Some((idx, s.fired_at)),
-                    }
-                }
+                Some(s) => match oldest {
+                    Some((_, oldest_at)) if s.fired_at >= oldest_at => {}
+                    _ => oldest = Some((idx, s.fired_at)),
+                },
                 None => {
                     if first_empty.is_none() {
                         first_empty = Some(idx);

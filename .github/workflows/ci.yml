@@ -388,5 +388,12 @@ jobs:
           curl -L "https://github.com/rust-lang/mdBook/releases/download/${tag}/mdbook-${tag}-x86_64-unknown-linux-gnu.tar.gz" | tar xz
           mv mdbook /usr/local/bin/
 
+      - name: sync governance docs into book
+        run: |
+          mkdir -p book/src/governance
+          cp CONTRIBUTING.md book/src/governance/contributing.md
+          cp SECURITY.md     book/src/governance/security.md
+          cp ROADMAP.md      book/src/governance/roadmap.md
+
       - name: build book
         run: mdbook build book

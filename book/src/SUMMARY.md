@@ -27,6 +27,6 @@
 
 # Governance
 
-- [Contributing](../../CONTRIBUTING.md)
-- [Security](../../SECURITY.md)
-- [Roadmap](../../ROADMAP.md)
+- [Contributing](governance/contributing.md)
+- [Security](governance/security.md)
+- [Roadmap](governance/roadmap.md)

@@ -467,9 +467,98 @@ holds even when the truncation counter is non-zero.
 
 ---
 
+## Debounce table semantics under load
+
+The `Recovery` runner keeps a per-pid ledger of the most recent recovery
+fire (`LastFiredTable`).  Each subsequent stall for the same pid is
+gated on `now - last_fired[pid] >= debounce`; closer-than-debounce
+stalls return `RecoveryOutcome::Debounced` and never spawn a child.
+
+### Capacity and eviction policy
+
+The ledger is a fixed-size, array-backed table with capacity
+`MAX_LAST_FIRED_CAPACITY = 4096`.  Capacity is sized to make the M8
+adversarial-burst pattern costly: 4096 distinct pids would have to
+stall faster than `debounce` cadence before the eviction policy is
+engaged.  Per-slot cost is `Option<LastFiredSlot>` ≈ 24 bytes →
+~96 KiB total — within budget for the observer.
+
+When the table is full and a stall arrives for a new pid, the policy
+is **fail-closed**:
+
+1. The oldest slot is identified by a single bounded linear scan.
+2. If that slot's age is at least `debounce`, it is evicted and the
+   new pid takes its place.  Per-pid debounce semantics are preserved
+   because the evicted pid's window has already elapsed.  The
+   eviction is counted in
+   `varta_recovery_last_fired_evictions_total` (operators tune
+   capacity on this signal).
+3. If the oldest slot's age is below `debounce`, the recovery is
+   **refused**.  The runner returns
+   `RecoveryOutcome::RefusedDebounceCapacity { pid }`, emits a
+   `RefusedRecord { reason: "debounce_capacity" }` to the audit log,
+   and bumps both
+   `varta_recovery_outcomes_total{outcome="refused_debounce_capacity"}`
+   and
+   `varta_recovery_refused_total{reason="debounce_capacity"}`.
+
+Eviction is debounce-respecting churn; refusal is suppression.
+Operators tune capacity on the first signal and alert on the second.
+
+### Clock-regression defense
+
+All age comparisons use `Instant::saturating_duration_since`, which
+returns `Duration::ZERO` on regression.  ZERO-duration entries are
+treated as "not eligible for eviction" — preventing a backwards
+clock blip from auto-evicting the whole table.
+
+### Recommended alerts
+
+```promql
+# Alert immediately on any debounce-capacity refusal — this is either
+# legitimate scale-out past 4096 concurrent stalls or the M8
+# adversarial stall-burst pattern.  Either case warrants paging.
+rate(varta_recovery_refused_total{reason="debounce_capacity"}[5m]) > 0
+```
+
+```promql
+# Warn on sustained eviction churn — debounce semantics are still
+# intact, but capacity is becoming a bottleneck under steady-state
+# load.  Tune MAX_LAST_FIRED_CAPACITY or audit which pids are
+# stalling.
+rate(varta_recovery_last_fired_evictions_total[5m]) > 0.1
+```
+
+```promql
+# Page on any non-zero invariant-violation count — the defensive
+# fall-throughs in LastFiredTable should never fire in correct
+# operation.  Non-zero values indicate a code bug, not load.
+varta_recovery_invariant_violations_total > 0
+```
+
+### Bounded-WCET guarantee
+
+Every `LastFiredTable` operation is a linear scan over a fixed-size
+backing store.  The unit test `last_fired_table_prune_bounded_wcet`
+asserts the prune sweep completes in under 5 ms in debug builds at
+full capacity (a future refactor that reintroduces O(n²) behaviour
+disguised as "cleanup" is caught by this test).
+
+The pre-M8 `HashMap`-based implementation was the source of the
+debounce-bypass bug closed by this section: reactive pruning at the
+top of `on_stall` (`prune_threshold = debounce * 10`) left the map
+full of fresh entries under adversarial load, and the `at_capacity`
+branch skipped the debounce check entirely.  The new table never
+skips the check; capacity pressure surfaces as a refusal or an
+audited eviction.
+
+---
+
 ## Cross-references
 
 - [Safety profiles](safety-profiles.md) — compile-time vs. runtime feature
   gating for production-safe builds
 - [VLP transports](vlp-transports.md) — transport-level trust classification
 - [Peer authentication](peer-authentication.md) — kernel-level PID attestation
+- [Verification](verification.md) — symbolic verification of `Frame::decode`
+  (M7) and the LastFiredTable invariants on the verification roadmap
