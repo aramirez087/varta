@@ -400,37 +400,47 @@ unsafe fn install_signal_handlers() -> io::Result<()> {
             return Err(io::Error::from_raw_os_error(-rc as i32));
         }
 
-        // Defensive readback (debug builds only). Prove the kernel
-        // stored exactly what we sent — proves the syscall path bypasses
-        // libc and (on x86_64) our trampoline is the installed restorer.
-        // Zero release-build cost.
-        #[cfg(debug_assertions)]
+        // Production-grade readback. Runs in every build (debug + release)
+        // and refuses to start the binary if the kernel did not store
+        // exactly what we sent. This is the runtime check that the
+        // trampoline ABI is still valid on the kernel we're running on:
+        // if a future kernel silently changes `rt_sigreturn` / `SA_RESTORER`
+        // semantics in a way that would SIGSEGV us on first signal
+        // delivery, that change is overwhelmingly likely to also cause one
+        // of the field comparisons below to disagree, so we surface a
+        // typed `io::Error` at startup instead of crashing at SIGTERM.
+        // Cost: one extra syscall per signal install (two total at startup).
+        let mut old = std::mem::MaybeUninit::<KernelSigAction>::zeroed();
+        // SAFETY: `oact` is a writable, correctly-sized stack slot.
+        let rc2 = unsafe { rt_sigaction_raw(sig, std::ptr::null(), old.as_mut_ptr()) };
+        if rc2 < 0 {
+            return Err(io::Error::from_raw_os_error(-rc2 as i32));
+        }
+        // SAFETY: a successful readback fully initialises the slot.
+        let old = unsafe { old.assume_init() };
+        if old.sa_handler != handle as *const () {
+            return Err(io::Error::other(
+                "rt_sigaction readback: kernel reports a different sa_handler than we installed",
+            ));
+        }
+        if old.sa_flags & SA_RESTART == 0 {
+            return Err(io::Error::other(
+                "rt_sigaction readback: kernel did not preserve SA_RESTART",
+            ));
+        }
+        #[cfg(target_arch = "x86_64")]
         {
-            let mut old = std::mem::MaybeUninit::<KernelSigAction>::zeroed();
-            // SAFETY: `oact` is a writable, correctly-sized stack slot.
-            let rc2 = unsafe { rt_sigaction_raw(sig, std::ptr::null(), old.as_mut_ptr()) };
-            debug_assert!(rc2 >= 0, "rt_sigaction readback failed: {rc2}");
-            // SAFETY: a successful readback fully initialises the slot.
-            let old = unsafe { old.assume_init() };
-            debug_assert_eq!(
-                old.sa_handler, handle as *const (),
-                "kernel reports a different sa_handler than we installed",
-            );
-            debug_assert!(
-                old.sa_flags & SA_RESTART != 0,
-                "kernel did not preserve SA_RESTART",
-            );
-            #[cfg(target_arch = "x86_64")]
-            {
-                debug_assert!(
-                    old.sa_flags & SA_RESTORER != 0,
-                    "SA_RESTORER not set in installed action — \
-                     libc wrapper hijacked the syscall?",
-                );
-                debug_assert_eq!(
-                    old.sa_restorer, varta_signal_restorer as *const (),
-                    "kernel did not install our trampoline (libc override?)",
-                );
+            if old.sa_flags & SA_RESTORER == 0 {
+                return Err(io::Error::other(
+                    "rt_sigaction readback: SA_RESTORER not set in installed action \
+                     (libc wrapper hijacked the syscall?)",
+                ));
+            }
+            if old.sa_restorer != varta_signal_restorer as *const () {
+                return Err(io::Error::other(
+                    "rt_sigaction readback: kernel did not install our trampoline \
+                     (libc override, or kernel rt_sigreturn ABI changed?)",
+                ));
             }
         }
         Ok(())
