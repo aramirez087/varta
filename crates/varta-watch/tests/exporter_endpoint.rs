@@ -275,3 +275,94 @@ fn file_exporter_appends_one_line_per_event() {
         "file exporter line count mismatch:\n{body}"
     );
 }
+
+#[test]
+fn file_exporter_sync_every_one_durable_without_flush() {
+    // sync_every = 1 forces fdatasync on every record. Reading the file
+    // back through a fresh open (no shared BufWriter state) must see the
+    // line on disk before the exporter is dropped or flushed.
+    let path = unique_tmp("export-sync");
+    let mut fe = FileExporter::create(path.as_path(), None, 1).expect("create file exporter");
+    let ev = Event::Beat {
+        pid: 1,
+        status: Status::Ok,
+        payload: 0,
+        nonce: 1,
+        observer_ns: 0,
+        origin: varta_watch::BeatOrigin::KernelAttested,
+        pid_ns_inode: None,
+    };
+    fe.record(&ev).unwrap();
+    // Crucially: NO `fe.flush()` and NO `drop(fe)` before reading. The
+    // fdatasync inside `after_write` is what proves durability.
+    let body = std::fs::read_to_string(path.as_path()).expect("read export file");
+    assert_eq!(
+        body.lines().count(),
+        1,
+        "sync_every=1 must persist every record on disk:\n{body}"
+    );
+}
+
+#[test]
+fn file_exporter_sync_every_zero_is_buffered_until_flush() {
+    // sync_every = 0 (default) keeps the old behavior — writes stay in
+    // the BufWriter until flush()/drop. Reading the file mid-stream sees
+    // an empty file even though `record()` returned Ok.
+    let path = unique_tmp("export-buffered");
+    let mut fe = FileExporter::create(path.as_path(), None, 0).expect("create file exporter");
+    let ev = Event::Beat {
+        pid: 1,
+        status: Status::Ok,
+        payload: 0,
+        nonce: 1,
+        observer_ns: 0,
+        origin: varta_watch::BeatOrigin::KernelAttested,
+        pid_ns_inode: None,
+    };
+    fe.record(&ev).unwrap();
+    let mid = std::fs::read_to_string(path.as_path()).expect("read export file");
+    assert!(
+        mid.is_empty(),
+        "without sync_every, a one-event write must still be buffered:\n{mid}"
+    );
+    fe.flush().expect("flush");
+    let after = std::fs::read_to_string(path.as_path()).expect("read export file");
+    assert_eq!(
+        after.lines().count(),
+        1,
+        "after flush the buffered event must be on disk:\n{after}"
+    );
+}
+
+#[test]
+fn file_exporter_sync_every_n_batches_durability() {
+    // sync_every = 3 — first two records stay buffered, the third
+    // triggers an fdatasync that brings all three on disk together.
+    let path = unique_tmp("export-batched");
+    let mut fe = FileExporter::create(path.as_path(), None, 3).expect("create file exporter");
+    let make = |nonce: u64| Event::Beat {
+        pid: 1,
+        status: Status::Ok,
+        payload: 0,
+        nonce,
+        observer_ns: 0,
+        origin: varta_watch::BeatOrigin::KernelAttested,
+        pid_ns_inode: None,
+    };
+
+    fe.record(&make(1)).unwrap();
+    fe.record(&make(2)).unwrap();
+    let after_two = std::fs::read_to_string(path.as_path()).expect("read export file");
+    assert!(
+        after_two.is_empty(),
+        "below the sync threshold the file should still be empty:\n{after_two}"
+    );
+
+    fe.record(&make(3)).unwrap();
+    let after_three = std::fs::read_to_string(path.as_path()).expect("read export file");
+    assert_eq!(
+        after_three.lines().count(),
+        3,
+        "the Nth record must flush every preceding buffered record too:\n{after_three}"
+    );
+}

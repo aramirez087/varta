@@ -1167,7 +1167,7 @@ OPTIONAL:
                     if parsed > u32::MAX as u64 {
                         return Err(ConfigError::BadValue {
                             flag: "--export-file-sync-every",
-                            value: v,
+                            raw: v,
                         });
                     }
                     export_file_sync_every = parsed as u32;

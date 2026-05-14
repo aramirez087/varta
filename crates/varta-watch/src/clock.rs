@@ -501,8 +501,8 @@ mod tests {
     #[cfg(any(target_os = "macos", target_os = "ios"))]
     #[test]
     fn monotonic_raw_forward_only_on_macos() {
-        let clk = Clock::new(ClockSource::MonotonicRaw)
-            .expect("CLOCK_MONOTONIC_RAW must work on macOS");
+        let clk =
+            Clock::new(ClockSource::MonotonicRaw).expect("CLOCK_MONOTONIC_RAW must work on macOS");
         let a = clk.now_ns();
         let b = clk.now_ns();
         assert!(b >= a, "monotonic-raw clock regressed: {a} -> {b}");
