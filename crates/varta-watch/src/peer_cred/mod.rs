@@ -24,6 +24,7 @@
 //!   `enable_credential_passing` / `recv_authenticated` currently live in this
 //!   file; later commits split them out.
 
+mod macos_fallback;
 mod ns_inode;
 mod recv;
 mod types;

@@ -26,6 +26,14 @@ pub(crate) fn enable_credential_passing(fd: i32) -> io::Result<()> {
     {
         let (level, optname) = (plat::SOL_SOCKET, plat::SO_PASSCRED);
         let one: i32 = 1;
+        // SAFETY: `setsockopt(2)` with `SO_PASSCRED` (see `socket(7)` and
+        // `unix(7)`) reads `optlen` bytes from `optval`.
+        // - `fd` is the observer's UDS receive socket (freshly bound by the
+        //   listener immediately before this call).
+        // - `addr_of!(one)` produces a valid pointer to a stack-local i32
+        //   that outlives the call.
+        // - `optlen == size_of::<i32>()` matches what the kernel reads.
+        // - The return value is checked; on error we surface the errno.
         let ret = unsafe {
             plat::setsockopt(
                 fd,
@@ -45,6 +53,10 @@ pub(crate) fn enable_credential_passing(fd: i32) -> io::Result<()> {
     {
         let (level, optname) = (plat::SOL_SOCKET, plat::LOCAL_CREDS);
         let one: i32 = 1;
+        // SAFETY: `setsockopt(2)` with `LOCAL_CREDS` (see `unix(4)`) reads
+        // `optlen` bytes from `optval`. Same invariants as the Linux branch
+        // above: `fd` is the freshly bound UDS receive socket, `addr_of!`
+        // yields a valid pointer to a stack-local i32, `optlen` matches.
         let ret = unsafe {
             plat::setsockopt(
                 fd,
@@ -136,6 +148,18 @@ pub(crate) fn recv_authenticated(fd: i32) -> RecvResult {
     };
 
     let n = loop {
+        // SAFETY: `recvmsg(2)` reads from `fd` and writes:
+        //   - up to `iov.iov_len` (= 32) bytes into the `data` stack array
+        //     via `iov.iov_base`;
+        //   - up to `mhdr.msg_controllen` bytes of ancillary data into the
+        //     `anc` stack array via `mhdr.msg_control`;
+        //   - the actual control length into `mhdr.msg_controllen` and the
+        //     flags into `mhdr.msg_flags`.
+        // All pointed-to buffers are stack-allocated for the duration of
+        // this function. The `Msghdr` field layout is verified at compile
+        // time by `offset_of!` assertions in `plat`. `&mut mhdr` is the
+        // single exclusive borrow for the duration of the call. The return
+        // value is checked below: `< 0` is errno, `>= 0` is byte count.
         let ret = unsafe { plat::recvmsg(fd, &mut mhdr, 0) };
         if ret < 0 {
             let err = io::Error::last_os_error();

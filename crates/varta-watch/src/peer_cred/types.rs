@@ -19,6 +19,11 @@ extern "C" {
 /// musl), caching avoids per-datagram syscall overhead and portability issues.
 pub(crate) fn observer_uid() -> u32 {
     static UID: OnceLock<u32> = OnceLock::new();
+    // SAFETY: `getuid(2)` is async-signal-safe per POSIX and always
+    // succeeds: it takes no arguments and cannot fail. The return value is
+    // the calling process's real UID. No pointers, no allocation, no
+    // mutable shared state — the only "unsafe" aspect is the FFI boundary
+    // itself.
     *UID.get_or_init(|| unsafe { getuid() })
 }
 

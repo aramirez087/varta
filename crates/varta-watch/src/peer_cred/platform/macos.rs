@@ -84,19 +84,38 @@ pub(crate) const ANCILLARY_BUFFER_SIZE: usize = 16;
 
 /// Extract peer PID and UID after a successful `recvmsg` on macOS.
 ///
-/// Attempts `getsockopt(LOCAL_PEERTOKEN)` which returns an `audit_token_t`
-/// containing the sender's identity. Because the observer is
-/// single-threaded and this is called immediately after `recvmsg(2)`, no
-/// other datagram can arrive between the two syscalls.
+/// Attempts `getsockopt(LOCAL_PEERTOKEN)` first; on failure or short return
+/// falls back to `LOCAL_PEERPID` + `LOCAL_PEERCRED`. The single-threaded
+/// observer guarantees no other datagram can arrive between `recvmsg(2)`
+/// and these syscalls. Always returns `Some` on macOS — even when all three
+/// mechanisms fail, the sentinel `(0, 0)` is returned so the caller can
+/// distinguish "no kernel attestation" from "I/O error".
 ///
-/// If `LOCAL_PEERTOKEN` fails (e.g. on older macOS versions or
-/// unconnected `SOCK_DGRAM` where the kernel doesn't expose per-datagram
-/// credentials), falls back to `LOCAL_PEERPID` and `LOCAL_PEERCRED`
-/// individually. Only returns the sentinel (0, 0) when all three
-/// mechanisms fail.
+/// The syscall outcomes are produced by three small unsafe shims and then
+/// combined by [`super::super::macos_fallback::pid_uid_from_results`],
+/// which is pure logic and independently tested.
 pub(crate) fn peer_pid_after_recv(fd: i32, _mhdr: &Msghdr) -> Option<(u32, u32)> {
+    let token = get_token(fd);
+    let pid = get_peer_pid(fd);
+    let cred = get_peer_cred(fd);
+    Some(super::super::macos_fallback::pid_uid_from_results(
+        token, pid, cred,
+    ))
+}
+
+fn get_token(fd: i32) -> super::super::macos_fallback::TokenResult {
     let mut token = AuditToken { val: [0u32; 8] };
     let mut optlen: u32 = mem::size_of::<AuditToken>() as u32;
+    // SAFETY: `getsockopt(2)` with `LOCAL_PEERTOKEN` (see `unix(4)`) writes
+    // an `audit_token_t` of `optlen` bytes into `token` on success.
+    // - `fd` is the observer's UDS receive socket (opened by the listener).
+    // - `&mut token as *mut AuditToken as *mut c_void` is properly aligned
+    //   (`#[repr(C)]`, 4-byte alignment of `u32`) and points to a stack
+    //   buffer of `size_of::<AuditToken>() == 32` bytes (compile-time
+    //   asserted below).
+    // - `optlen` is initialised to the buffer's size before the call and
+    //   updated in-place; the decision function checks
+    //   `optlen >= size_of::<AuditToken>()` before trusting the result.
     let ret = unsafe {
         getsockopt(
             fd,
@@ -106,22 +125,25 @@ pub(crate) fn peer_pid_after_recv(fd: i32, _mhdr: &Msghdr) -> Option<(u32, u32)>
             &mut optlen,
         )
     };
-    if ret == 0 && (optlen as usize) >= mem::size_of::<AuditToken>() {
-        // at_pid is at index 5, at_euid is at index 1
-        return Some((token.val[5], token.val[1]));
+    // `val[5]` is `at_pid`, `val[1]` is `at_euid`; index positions are
+    // documented at the `AuditToken` definition above.
+    super::super::macos_fallback::TokenResult {
+        ret,
+        optlen,
+        at_pid: token.val[5],
+        at_euid: token.val[1],
     }
-
-    // LOCAL_PEERTOKEN failed — try older LOCAL_PEERPID + LOCAL_PEERCRED.
-    // On unconnected SOCK_DGRAM the kernel may succeed here even when
-    // the newer audit token API is unavailable.
-    let pid = get_peer_pid_fallback(fd);
-    let uid = get_peer_uid_fallback(fd);
-    Some((pid, uid))
 }
 
-fn get_peer_pid_fallback(fd: i32) -> u32 {
+fn get_peer_pid(fd: i32) -> super::super::macos_fallback::PidResult {
     let mut pid: i32 = 0;
     let mut optlen: u32 = mem::size_of::<i32>() as u32;
+    // SAFETY: `getsockopt(2)` with `LOCAL_PEERPID` writes an `i32` of
+    // `optlen` bytes into `pid` on success.
+    // - `&mut pid as *mut i32 as *mut c_void` is properly aligned (i32,
+    //   4-byte alignment) and points to a stack buffer of 4 bytes.
+    // - `optlen` is initialised to 4 bytes and updated in-place; the
+    //   decision function checks `optlen >= 4` before trusting the result.
     let ret = unsafe {
         getsockopt(
             fd,
@@ -131,14 +153,10 @@ fn get_peer_pid_fallback(fd: i32) -> u32 {
             &mut optlen,
         )
     };
-    if ret == 0 && (optlen as usize) >= mem::size_of::<i32>() && pid > 0 {
-        pid as u32
-    } else {
-        0
-    }
+    super::super::macos_fallback::PidResult { ret, optlen, pid }
 }
 
-fn get_peer_uid_fallback(fd: i32) -> u32 {
+fn get_peer_cred(fd: i32) -> super::super::macos_fallback::CredResult {
     let mut cred = Xucred {
         cr_version: 0,
         cr_uid: 0,
@@ -146,6 +164,14 @@ fn get_peer_uid_fallback(fd: i32) -> u32 {
         cr_groups: [0u32; 16],
     };
     let mut optlen: u32 = mem::size_of::<Xucred>() as u32;
+    // SAFETY: `getsockopt(2)` with `LOCAL_PEERCRED` writes an
+    // `xucred` of `optlen` bytes into `cred` on success.
+    // - `&mut cred as *mut Xucred as *mut c_void` is properly aligned
+    //   (`#[repr(C)]`, 4-byte alignment) and points to a stack buffer of
+    //   `size_of::<Xucred>() == 76` bytes (compile-time asserted below).
+    // - `optlen` is initialised to the buffer's size and updated in-place;
+    //   the decision function checks `optlen >= 8` (enough to cover
+    //   `cr_version` + `cr_uid`) before trusting `cr_uid`.
     let ret = unsafe {
         getsockopt(
             fd,
@@ -155,10 +181,10 @@ fn get_peer_uid_fallback(fd: i32) -> u32 {
             &mut optlen,
         )
     };
-    if ret == 0 && (optlen as usize) >= 8 {
-        cred.cr_uid
-    } else {
-        0
+    super::super::macos_fallback::CredResult {
+        ret,
+        optlen,
+        cr_uid: cred.cr_uid,
     }
 }
 
