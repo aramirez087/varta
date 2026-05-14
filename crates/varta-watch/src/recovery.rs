@@ -337,8 +337,12 @@ struct LastFiredTable {
 
 impl LastFiredTable {
     fn new() -> Self {
+        Self::with_capacity(MAX_LAST_FIRED_CAPACITY)
+    }
+
+    fn with_capacity(cap: usize) -> Self {
         LastFiredTable {
-            slots: vec![None; MAX_LAST_FIRED_CAPACITY].into_boxed_slice(),
+            slots: vec![None; cap].into_boxed_slice(),
             occupied: 0,
             evictions: 0,
             invariant_violations: 0,
@@ -645,6 +649,16 @@ impl Recovery {
     /// Operators alert on any non-zero value.
     pub fn take_last_fired_invariant_violations(&mut self) -> u64 {
         self.last_fired.take_invariant_violations()
+    }
+
+    /// Test-only: shrink the [`LastFiredTable`] to `cap` slots so unit
+    /// tests can exercise the capacity-pressure branches without
+    /// spawning [`MAX_LAST_FIRED_CAPACITY`] child processes.  The
+    /// production code path constructs the table at full capacity via
+    /// [`LastFiredTable::new`].
+    #[cfg(test)]
+    pub(crate) fn shrink_last_fired_for_test(&mut self, cap: usize) {
+        self.last_fired = LastFiredTable::with_capacity(cap);
     }
 
     /// Attach a recovery audit sink. Every spawn and completion will be
@@ -2066,5 +2080,160 @@ mod tests {
         assert_eq!(rec.take_refused_cross_namespace(), 1);
         // The unauth counter must NOT have been bumped — cross-namespace is checked first.
         assert_eq!(rec.take_refused_unauthenticated_source(), 0);
+    }
+
+    // ----------------------------------------------------------------
+    // M8 — `LastFiredTable` capacity-pressure semantics
+    //
+    // These tests prove that the fail-closed eviction policy preserves
+    // the per-pid debounce invariant under adversarial stall bursts,
+    // closing the silent-bypass gap documented in the M8 finding.
+    // The first four tests exercise `LastFiredTable` directly so they
+    // run in microseconds; the fifth wires through `Recovery::on_stall`
+    // to confirm the audit + counter + outcome plumbing.
+    // ----------------------------------------------------------------
+
+    #[test]
+    fn last_fired_table_at_capacity_with_fresh_entries_refuses() {
+        // Capacity=4 keeps the test trivially exhaustive.  The
+        // production table uses MAX_LAST_FIRED_CAPACITY=4096 but the
+        // logic under test is identical.
+        let mut table = LastFiredTable::with_capacity(4);
+        let debounce = Duration::from_secs(10);
+        let t0 = Instant::now();
+        for pid in 10..14 {
+            assert_eq!(
+                table.try_insert(pid, t0, debounce),
+                InsertOutcome::Inserted,
+                "pid {pid} should fill an empty slot"
+            );
+        }
+        assert_eq!(table.len(), 4);
+
+        // Table is full and every entry is fresh (age 0 < debounce).
+        // The insert MUST be refused — preserving the debounce window
+        // of all four existing entries.
+        let result = table.try_insert(99, t0 + Duration::from_millis(1), debounce);
+        assert_eq!(result, InsertOutcome::RefusedCapacity);
+        // Refusal does not insert: pid 99 is absent and the table is
+        // still full of the original four pids.
+        assert!(table.get(99).is_none());
+        assert_eq!(table.len(), 4);
+    }
+
+    #[test]
+    fn last_fired_table_at_capacity_evicts_oldest_past_debounce() {
+        let mut table = LastFiredTable::with_capacity(4);
+        let debounce = Duration::from_millis(100);
+        let t0 = Instant::now();
+        // pid 10 is the oldest entry.
+        table.try_insert(10, t0, debounce);
+        table.try_insert(11, t0 + Duration::from_millis(10), debounce);
+        table.try_insert(12, t0 + Duration::from_millis(20), debounce);
+        table.try_insert(13, t0 + Duration::from_millis(30), debounce);
+
+        // 200 ms later, pid 10's debounce window (100 ms) has elapsed —
+        // it is safe to evict.  pids 11/12/13 must remain in the table.
+        let now = t0 + Duration::from_millis(200);
+        let outcome = table.try_insert(99, now, debounce);
+        assert_eq!(outcome, InsertOutcome::EvictedOldest { evicted_pid: 10 });
+        assert!(table.get(10).is_none());
+        assert_eq!(table.get(99), Some(now));
+        assert_eq!(table.get(11), Some(t0 + Duration::from_millis(10)));
+        assert_eq!(table.get(12), Some(t0 + Duration::from_millis(20)));
+        assert_eq!(table.get(13), Some(t0 + Duration::from_millis(30)));
+    }
+
+    #[test]
+    fn last_fired_table_refusal_does_not_burn_debounce_window() {
+        // A capacity-refused pid must remain *absent* from the table
+        // so that, once capacity drains, the next legitimate stall for
+        // that pid fires immediately rather than being held back by a
+        // stale entry that was never actually granted.
+        let mut table = LastFiredTable::with_capacity(2);
+        let debounce = Duration::from_millis(100);
+        let t0 = Instant::now();
+        table.try_insert(1, t0, debounce);
+        table.try_insert(2, t0, debounce);
+
+        let refused = table.try_insert(99, t0 + Duration::from_millis(50), debounce);
+        assert_eq!(refused, InsertOutcome::RefusedCapacity);
+        assert!(table.get(99).is_none(), "refusal must not leave a record");
+
+        // Capacity drains: both slots age past debounce.  pid 99 now
+        // inserts cleanly (evicting one of the older entries).
+        let later = t0 + Duration::from_millis(200);
+        let outcome = table.try_insert(99, later, debounce);
+        assert!(matches!(
+            outcome,
+            InsertOutcome::EvictedOldest { .. } | InsertOutcome::Inserted
+        ));
+        assert_eq!(table.get(99), Some(later));
+    }
+
+    #[test]
+    fn last_fired_table_prune_bounded_wcet() {
+        // Fill the production-sized table with entries older than the
+        // prune threshold; the prune must complete in well under 5 ms
+        // in debug builds.  Detects a future refactor that
+        // reintroduces O(n²) behaviour disguised as "cleanup."
+        let mut table = LastFiredTable::with_capacity(MAX_LAST_FIRED_CAPACITY);
+        let t0 = Instant::now();
+        for pid in 0..MAX_LAST_FIRED_CAPACITY as u32 {
+            // pid 0/1 are normally rejected at the wire by
+            // Frame::decode, but LastFiredTable itself accepts any u32.
+            table.try_insert(pid.saturating_add(2), t0, Duration::ZERO);
+        }
+        assert_eq!(table.len(), MAX_LAST_FIRED_CAPACITY);
+
+        let later = t0 + Duration::from_secs(60);
+        let start = Instant::now();
+        table.prune_expired(later, Duration::from_secs(1));
+        let elapsed = start.elapsed();
+        assert_eq!(table.len(), 0, "every entry exceeded the prune threshold");
+        assert!(
+            elapsed < Duration::from_millis(5),
+            "prune_expired took {elapsed:?} — expected < 5 ms; \
+             O(n) linear scan over {MAX_LAST_FIRED_CAPACITY} slots"
+        );
+    }
+
+    #[test]
+    fn on_stall_refuses_when_debounce_table_at_capacity_with_fresh_entries() {
+        // E2E wiring check: shrink the table to a tiny capacity, fill
+        // it via real `on_stall` calls (each spawning `/bin/true`),
+        // then assert that the next distinct pid surfaces as
+        // `RefusedDebounceCapacity` AND increments the dedicated
+        // refusal counter.  The audit path is exercised structurally
+        // (no sink attached — the call itself must not panic).
+        let mut rec = Recovery::with_mode(
+            RecoveryMode::Exec {
+                program: "true".to_string(),
+                args: vec![],
+            },
+            Duration::from_secs(10),
+        );
+        rec.shrink_last_fired_for_test(2);
+
+        // Slot 1, slot 2 — both spawn and fill the table.
+        for pid in 10..12u32 {
+            match rec.on_stall(pid, BeatOrigin::KernelAttested, false) {
+                RecoveryOutcome::Spawned { .. } => {}
+                other => panic!("expected Spawned for pid {pid}, got {other:?}"),
+            }
+        }
+
+        // Third distinct pid arrives while both slots are still fresh
+        // (debounce = 10 s).  Must be refused with the new outcome
+        // variant + dedicated counter bump.
+        match rec.on_stall(99, BeatOrigin::KernelAttested, false) {
+            RecoveryOutcome::RefusedDebounceCapacity { pid } => assert_eq!(pid, 99),
+            other => panic!("expected RefusedDebounceCapacity, got {other:?}"),
+        }
+        assert_eq!(rec.take_refused_debounce_capacity(), 1);
+        // Other refusal counters must be untouched — this is a
+        // distinct refusal class.
+        assert_eq!(rec.take_refused_unauthenticated_source(), 0);
+        assert_eq!(rec.take_refused_cross_namespace(), 0);
     }
 }

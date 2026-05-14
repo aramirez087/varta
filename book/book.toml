@@ -1,7 +1,6 @@
 [book]
 authors = ["Alexander Ramirez"]
 language = "en"
-multilingual = false
 src = "src"
 title = "The Varta Book"
 
