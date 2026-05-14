@@ -37,13 +37,36 @@
 //!
 //! # Fork-safety
 //!
-//! After `fork(2)` the child inherits the parent's `iv_session_salt` and
-//! `iv_prefix_index` — both would derive identical prefixes and conflict
-//! on counter values, causing catastrophic nonce reuse under the same
-//! AEAD key. **The application MUST call [`crate::Varta::reconnect`] in
-//! the child** (or construct a fresh `Varta` instance there) before the
-//! first beat. The library does not auto-detect fork (cerebrum
-//! 2026-05-13: `last_pid` was deliberately removed).
+//! After `fork(2)` the child inherits the parent's `iv_session_salt`,
+//! `iv_prefix_index`, and `iv_counter` — three nominally-independent
+//! fields whose product defines the AEAD nonce. Without intervention,
+//! the child's first beat would reuse a 12-byte ChaCha20-Poly1305 nonce
+//! the parent has already emitted under the same key — a catastrophic
+//! confidentiality and integrity failure.
+//!
+//! [`crate::Varta`] enforces fork-safety **structurally** by snapshotting
+//! [`std::process::id`] at [`crate::Varta::connect`] time and comparing on
+//! every [`crate::Varta::beat`]. On mismatch, the wrapper calls
+//! [`BeatTransport::reconnect`] *before* the frame is built — re-reading
+//! OS entropy into a fresh 16-byte session salt and resetting
+//! `iv_prefix_index`/`iv_counter` to zero. The forked child therefore
+//! emits frames keyed by an IV prefix derived from independent entropy,
+//! making nonce collision across the fork boundary impossible. The
+//! recovery is silent to the caller and observable via
+//! [`crate::Varta::fork_recoveries`].
+//!
+//! **Advanced callers using `SecureUdpTransport` directly** (without the
+//! `Varta` wrapper) do not get this auto-detection — they must call
+//! [`SecureUdpTransport::reconnect`] in the child themselves. The
+//! [`BeatTransport`] trait is intentionally low-level; the safety policy
+//! lives one layer up.
+//!
+//! Historical note (cerebrum 2026-05-13): a prior `last_pid` field in
+//! `Varta` was removed because it detected fork but only reset clock
+//! state — the IV state was still inherited, so the "fix" was theatre.
+//! The current design is structurally different in that the PID-mismatch
+//! response is `transport.reconnect()`, which is precisely where the IV
+//! salt rotates.
 //!
 //! **This transport is designed for trusted local networks.**
 
@@ -289,9 +312,13 @@ impl BeatTransport for SecureUdpTransport {
     /// state. This is the **only** path after `connect()` that touches OS
     /// entropy.
     ///
-    /// Call after `fork(2)` in the child (the inherited `iv_session_salt`
-    /// would otherwise cause catastrophic nonce reuse), or when an
-    /// operator wants a fresh AEAD session for forward-secrecy hygiene.
+    /// Called automatically by [`crate::Varta::beat`] when a `fork(2)`
+    /// transition is detected (PID mismatch against the connect-time
+    /// snapshot). Advanced callers using `SecureUdpTransport` directly
+    /// must invoke this themselves in the forked child — the inherited
+    /// `iv_session_salt` would otherwise cause catastrophic AEAD nonce
+    /// reuse. Also called by operators wanting a fresh session for
+    /// forward-secrecy hygiene.
     fn reconnect(&mut self) -> io::Result<()> {
         use varta_vlp::crypto::kdf;
 

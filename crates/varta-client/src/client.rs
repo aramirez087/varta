@@ -217,10 +217,17 @@ impl fmt::Display for BeatOutcome {
 /// ordering. To share across threads, wrap in a [`std::sync::Mutex`] or move
 /// the handle into a dedicated emitter thread or channel.
 ///
-/// After `fork(2)` the child inherits this handle. For correctness —
-/// especially on secure-UDP transports where nonce reuse is a cryptographic
-/// failure — create a fresh [`Varta`] in the child (or call
-/// [`reconnect`](Self::reconnect)) before the first beat.
+/// After `fork(2)` the child inherits this handle. Fork is **auto-detected**
+/// on the next [`beat`](Self::beat): if `std::process::id()` differs from the
+/// PID captured at [`connect`](Self::connect) time, the underlying transport's
+/// [`reconnect`](crate::transport::BeatTransport::reconnect) is invoked
+/// **before** the frame is built. On secure-UDP this re-reads OS entropy and
+/// rotates the AEAD session salt, making catastrophic nonce reuse across the
+/// fork boundary structurally impossible. The recovery is silent — the caller
+/// sees [`BeatOutcome::Sent`] — and is observable via
+/// [`fork_recoveries`](Self::fork_recoveries). Calling
+/// [`reconnect`](Self::reconnect) explicitly in the child is still supported
+/// and idempotent.
 pub struct Varta<T: BeatTransport = UdsTransport> {
     transport: T,
     buf: [u8; 32],
@@ -230,6 +237,14 @@ pub struct Varta<T: BeatTransport = UdsTransport> {
     reconnect_after: u32,
     last_timestamp: u64,
     clock_regressions: u64,
+    /// PID captured at `connect` / `reconnect` time. Compared against
+    /// `std::process::id()` on every [`beat`](Self::beat) to detect `fork(2)`
+    /// and trigger transport refresh before any frame leaves the process.
+    /// See the struct-level docstring for the safety contract.
+    connect_pid: u32,
+    /// Saturating count of fork-recovery events surfaced via
+    /// [`fork_recoveries`](Self::fork_recoveries).
+    fork_recoveries: u64,
 }
 
 // Static assertion: Varta<UdsTransport> is Send and must remain so.
@@ -262,6 +277,8 @@ impl Varta<UdsTransport> {
             reconnect_after: 0,
             last_timestamp: 0,
             clock_regressions: 0,
+            connect_pid: std::process::id(),
+            fork_recoveries: 0,
         })
     }
 }
@@ -296,6 +313,8 @@ impl Varta<UdpTransport> {
             reconnect_after: 0,
             last_timestamp: 0,
             clock_regressions: 0,
+            connect_pid: std::process::id(),
+            fork_recoveries: 0,
         })
     }
 }
@@ -328,6 +347,8 @@ impl Varta<SecureUdpTransport> {
             reconnect_after: 0,
             last_timestamp: 0,
             clock_regressions: 0,
+            connect_pid: std::process::id(),
+            fork_recoveries: 0,
         })
     }
 
@@ -360,6 +381,8 @@ impl Varta<SecureUdpTransport> {
             reconnect_after: 0,
             last_timestamp: 0,
             clock_regressions: 0,
+            connect_pid: std::process::id(),
+            fork_recoveries: 0,
         })
     }
 
@@ -381,6 +404,17 @@ impl Varta<SecureUdpTransport> {
     #[cfg(any(test, feature = "test-hooks"))]
     pub fn iv_prefix_index_for_test(&self) -> u32 {
         self.transport.iv_prefix_index_for_test()
+    }
+}
+
+impl<T: BeatTransport> Varta<T> {
+    /// Test-only: spoof the connect-time PID snapshot so the next
+    /// [`beat`](Self::beat) trips the fork-detection branch without an
+    /// actual `fork(2)` syscall. Pair with the transport-level
+    /// `iv_prefix_for_test()` accessor to assert that the IV salt rotated.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn set_connect_pid_for_test(&mut self, pid: u32) {
+        self.connect_pid = pid;
     }
 }
 
@@ -419,13 +453,37 @@ impl<T: BeatTransport> Varta<T> {
     /// path allocates a fresh socket; this is acceptable because observer
     /// restarts are rare and the steady-state path remains allocation-free.
     pub fn beat(&mut self, status: Status, payload: u32) -> BeatOutcome {
+        let pid = std::process::id();
+        if pid != self.connect_pid {
+            // Fork detected. Refresh the underlying transport so any
+            // session-keyed state (e.g. secure-UDP iv_session_salt /
+            // iv_prefix_index / iv_counter) is re-seeded from OS entropy
+            // before the next frame is built. This is the only correct
+            // response to a fork on the secure path — without it, the
+            // child would derive the same 12-byte AEAD nonce its parent
+            // has already used under the same ChaCha20-Poly1305 key.
+            //
+            // Reset the local epoch and frame counters so the child's
+            // wire stream looks like a fresh session to the observer
+            // (per-pid tracker keying makes this safe).
+            match self.transport.reconnect() {
+                Ok(()) => {
+                    self.connect_pid = pid;
+                    self.fork_recoveries = self.fork_recoveries.saturating_add(1);
+                    self.nonce = 0;
+                    self.start = Instant::now();
+                    self.last_timestamp = 0;
+                    self.consecutive_dropped = 0;
+                }
+                Err(e) => return BeatOutcome::Failed(BeatError::from_io(&e)),
+            }
+        }
         if self.nonce < NONCE_TERMINAL - 1 {
             self.nonce += 1;
         } else {
             warn_nonce_wrapping();
             self.nonce = 0;
         }
-        let pid = std::process::id();
         // Saturate the nanosecond timestamp at `u64::MAX as u128` so the cast
         // never wraps. `u64::MAX` itself is reserved as a wire-level sentinel
         // (`DecodeError::BadTimestamp`); reaching it would require ~584.5
@@ -482,11 +540,18 @@ impl<T: BeatTransport> Varta<T> {
     /// a fresh connection to the target stored at [`connect`](Self::connect)
     /// time. Agent identity (`nonce`, `start` clock) is preserved.
     ///
+    /// Also refreshes the internal fork-detection snapshot so an explicit
+    /// reconnect issued from a forked child (the documented manual escape
+    /// hatch) cannot leave a stale parent PID behind that would re-trigger
+    /// auto-recovery on the next beat.
+    ///
     /// This is the only post-[`connect`](Self::connect) allocation site and
     /// should only be called when recovery is needed, not on the steady-state
     /// beat path.
     pub fn reconnect(&mut self) -> io::Result<()> {
-        self.transport.reconnect()
+        self.transport.reconnect()?;
+        self.connect_pid = std::process::id();
+        Ok(())
     }
 
     /// Enable automatic reconnect after `n` consecutive
@@ -522,6 +587,22 @@ impl<T: BeatTransport> Varta<T> {
     /// counter named `varta_client_clock_regression_total`.
     pub fn clock_regressions(&self) -> u64 {
         self.clock_regressions
+    }
+
+    /// Number of times [`beat`](Self::beat) has observed a `fork(2)`
+    /// transition (i.e. `std::process::id()` differing from the PID captured
+    /// at [`connect`](Self::connect) time) and refreshed the underlying
+    /// transport in response. Saturating; never wraps.
+    ///
+    /// A non-zero value is the operational signal that auto-recovery has
+    /// fired. On the secure-UDP transport, each event corresponds to one
+    /// AEAD session-salt rotation in the forked child — the structural
+    /// guarantee against nonce reuse across the fork boundary.
+    ///
+    /// Consumers wiring a Prometheus exporter SHOULD publish this as a
+    /// counter named `varta_client_fork_recoveries_total`.
+    pub fn fork_recoveries(&self) -> u64 {
+        self.fork_recoveries
     }
 }
 
@@ -600,5 +681,165 @@ mod tests {
 
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_dir(path.parent().unwrap());
+    }
+
+    /// Steady-state (no fork): the recovery counter must stay at zero
+    /// across many beats. This guards against accidental triggering of
+    /// the fork-detection branch on a forward-only PID.
+    #[test]
+    fn same_pid_does_not_trigger_fork_recovery() {
+        let (_listener, path) = bind_listener();
+        let mut agent = Varta::connect(&path).expect("connect");
+        for _ in 0..64 {
+            let _ = agent.beat(Status::Ok, 0);
+        }
+        assert_eq!(
+            agent.fork_recoveries(),
+            0,
+            "no fork-recovery should fire in a single-process beat loop"
+        );
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir(path.parent().unwrap());
+    }
+
+    /// Spoof a PID change via the test hook. The next `beat()` must
+    /// detect the mismatch, refresh the UDS transport, and increment
+    /// the fork-recovery counter. The frame counter (`nonce`) resets so
+    /// the post-recovery beat carries `nonce == 1`.
+    #[test]
+    fn spoofed_fork_triggers_uds_transport_reconnect() {
+        let (_listener, path) = bind_listener();
+        let mut agent = Varta::connect(&path).expect("connect");
+
+        // Emit a few beats so the counters are non-trivial pre-fork.
+        let _ = agent.beat(Status::Ok, 0);
+        let _ = agent.beat(Status::Ok, 0);
+        assert_eq!(agent.fork_recoveries(), 0);
+        assert_eq!(agent.nonce, 2);
+
+        // Spoof: pretend a fork happened. The actual pid is unchanged;
+        // the snapshot we lie about is `connect_pid`.
+        let real_pid = std::process::id();
+        agent.set_connect_pid_for_test(real_pid.wrapping_add(1));
+
+        // The next beat must observe the mismatch and recover.
+        let _ = agent.beat(Status::Ok, 0);
+        assert_eq!(
+            agent.fork_recoveries(),
+            1,
+            "fork-recovery counter must increment exactly once"
+        );
+        assert_eq!(
+            agent.connect_pid, real_pid,
+            "connect_pid must be refreshed to the current pid"
+        );
+        assert_eq!(
+            agent.nonce, 1,
+            "nonce must reset to 0 on recovery, then increment to 1 for the beat"
+        );
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir(path.parent().unwrap());
+    }
+
+    /// A `BeatTransport` whose `reconnect()` always fails. Used to assert
+    /// that a fork-recovery whose transport refresh fails surfaces as
+    /// `BeatOutcome::Failed` *and* does not increment the counter.
+    struct AlwaysFailReconnect {
+        sent: u32,
+    }
+
+    impl BeatTransport for AlwaysFailReconnect {
+        fn send(&mut self, _buf: &[u8; 32]) -> io::Result<usize> {
+            self.sent = self.sent.saturating_add(1);
+            Ok(32)
+        }
+
+        fn reconnect(&mut self) -> io::Result<()> {
+            Err(io::Error::from(io::ErrorKind::PermissionDenied))
+        }
+    }
+
+    fn varta_with_transport<T: BeatTransport>(transport: T) -> Varta<T> {
+        Varta {
+            transport,
+            buf: [0u8; 32],
+            start: Instant::now(),
+            nonce: 0,
+            consecutive_dropped: 0,
+            reconnect_after: 0,
+            last_timestamp: 0,
+            clock_regressions: 0,
+            connect_pid: std::process::id(),
+            fork_recoveries: 0,
+        }
+    }
+
+    #[test]
+    fn fork_recovery_with_failing_reconnect_returns_failed() {
+        let mut agent = varta_with_transport(AlwaysFailReconnect { sent: 0 });
+
+        // Spoof a fork.
+        agent.set_connect_pid_for_test(std::process::id().wrapping_add(1));
+
+        let outcome = agent.beat(Status::Ok, 0);
+        match outcome {
+            BeatOutcome::Failed(e) => {
+                assert_eq!(e.kind, io::ErrorKind::PermissionDenied);
+            }
+            other => panic!("expected Failed on reconnect failure, got {other:?}"),
+        }
+        assert_eq!(
+            agent.fork_recoveries(),
+            0,
+            "counter must NOT increment when the recovery transport refresh fails"
+        );
+        assert_eq!(
+            agent.transport.sent, 0,
+            "no frame should be sent when fork-recovery fails"
+        );
+    }
+
+    /// Secure-UDP path: spoofing a fork must rotate the AEAD session salt
+    /// and IV prefix. This is the load-bearing test — without salt
+    /// rotation, the child would derive the parent's nonce stream under
+    /// the same key.
+    #[cfg(feature = "secure-udp")]
+    #[test]
+    fn spoofed_fork_rotates_secure_udp_session_salt() {
+        use std::net::{Ipv6Addr, SocketAddr, SocketAddrV6};
+        use varta_vlp::crypto::Key;
+
+        let addr = SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::LOCALHOST, 9876, 0, 0));
+        let key = Key::from_bytes([0x42; 32]);
+        let mut agent = Varta::connect_secure_udp(addr, key).expect("connect");
+
+        // Snapshot pre-fork crypto state.
+        let prefix_before = agent.iv_prefix_for_test();
+
+        // Spoof: pretend a fork happened.
+        agent.set_connect_pid_for_test(std::process::id().wrapping_add(1));
+
+        // The destination is a closed ephemeral address so the send may
+        // fail at the network layer, but the fork-recovery + reconnect
+        // logic runs before the syscall. The recovery and the IV
+        // rotation are what we are asserting on.
+        let _ = agent.beat(Status::Ok, 0);
+
+        assert_eq!(
+            agent.fork_recoveries(),
+            1,
+            "secure-UDP fork-recovery counter must increment"
+        );
+        let prefix_after = agent.iv_prefix_for_test();
+        assert_ne!(
+            prefix_before, prefix_after,
+            "IV prefix must rotate on fork-recovery (defeats nonce reuse)"
+        );
+        assert_eq!(
+            agent.iv_prefix_index_for_test(),
+            0,
+            "prefix_index must reset to 0 on transport.reconnect()"
+        );
     }
 }

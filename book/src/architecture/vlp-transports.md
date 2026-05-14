@@ -282,6 +282,69 @@ separate
 `--secure-udp-i-accept-recovery-on-unauthenticated-transport`
 acknowledgement.
 
+## Fork-safety on secure-UDP
+
+After `fork(2)`, a child process inherits its parent's
+`SecureUdpTransport` state — the 16-byte `iv_session_salt`, the
+`iv_prefix_index`, and the `iv_counter`. Three nominally-independent
+fields whose product defines the AEAD nonce. If the child ever calls
+`Varta::beat()` without intervention, it derives the same 12-byte
+ChaCha20-Poly1305 nonce its parent has already emitted under the same
+key — a *catastrophic* confidentiality and integrity failure (Poly1305
+key recovery, plaintext XOR leak).
+
+### How `Varta` enforces fork-safety structurally
+
+`Varta::connect` snapshots `std::process::id()` into a private
+`connect_pid` field. Every `Varta::beat` reads the current PID and
+compares — on mismatch (i.e. the handle is now in a forked child), the
+wrapper invokes `transport.reconnect()` **before** building the frame.
+`SecureUdpTransport::reconnect()` re-reads OS entropy into a fresh
+16-byte session salt, recomputes the IV prefix, and resets the prefix
+index and counter to zero. The child's first emitted frame therefore
+uses an IV prefix derived from independent entropy — nonce collision
+across the fork boundary is impossible.
+
+Auto-recovery is silent: the caller observes `BeatOutcome::Sent`. The
+event is observable via `Varta::fork_recoveries() -> u64` (suggested
+Prometheus name: `varta_client_fork_recoveries_total`). The local
+session epoch resets too — `nonce → 0`, `start → Instant::now()`,
+`last_timestamp → 0`, `consecutive_dropped → 0` — so the child's
+wire stream looks like a fresh session to the observer.
+
+### Observer view
+
+The observer's per-sender state in `SecureUdpListener` is keyed by
+`(SocketAddr, iv_prefix)` with a 1-deep replay history (see
+[H4 replay shadow](#secure-udp--replay-shadow-threat-boundary-h4) above).
+When the forked child sends frames from the same source port with a
+new IV prefix, the observer transitions its current state into the
+`prev_*` slots and accepts the new prefix as a fresh session — no
+replay error, no protocol-level signal required. Fork-recovery is
+*entirely transparent* to the wire format.
+
+### Advanced callers
+
+Callers using `SecureUdpTransport` directly (without the `Varta`
+wrapper) do **not** get auto-detection. The `BeatTransport` trait is
+intentionally low-level; the safety policy lives one layer up.
+Direct-transport users must call `SecureUdpTransport::reconnect()`
+themselves in the forked child before the first beat.
+
+### Panic-hook parallel
+
+`install_panic_handler_secure_udp` caches an 8-byte IV at install time
+to avoid the (non-async-signal-safe) entropy read inside the panic
+hook itself. The same fork hazard applies: a child that panics would
+otherwise emit `(cached_iv, iv_counter=1)` — colliding with the
+parent's identical pair if the parent panicked too. The installer
+snapshots `install_pid` and, inside the hook, re-runs the entropy
+chain (`getrandom`/`getentropy` → `/dev/urandom`) when the PID has
+changed. The strict variant fails closed (skips the secure frame) when
+no entropy source is reachable; the `accept-degraded-entropy` variant
+falls back to `fallback_iv_random()` per the documented degraded-entropy
+policy.
+
 ## Cross-references
 
 - [Observer liveness](observer-liveness.md) — the watcher's own liveness story: in-process self-watchdog, systemd `sd_notify`, hardware watchdog, and paired-observer pattern

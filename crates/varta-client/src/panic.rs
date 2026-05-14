@@ -161,45 +161,63 @@ pub fn install_panic_handler_udp(addr: std::net::SocketAddr) {
 /// `provider` is called once at install time to obtain the 8-byte IV random
 /// prefix. If it returns `Err`, installation is aborted and the error is
 /// returned to the caller; the panic hook is NOT registered.
+///
+/// `refresh` is called inside the panic hook when [`std::process::id`] differs
+/// from the PID at install time — i.e. the process has `fork(2)`-ed since.
+/// Without this refresh, the child's panic frame would use the same cached
+/// `iv_random` + `iv_counter = 1` pair as the parent under the same AEAD key,
+/// which is **catastrophic nonce reuse**. A `None` return from `refresh`
+/// signals that no usable IV is available; the secure frame is then skipped
+/// entirely and the previous panic hook still fires.
 #[cfg(all(feature = "panic-handler", feature = "secure-udp"))]
-pub(crate) fn install_with_entropy_provider<F>(
+pub(crate) fn install_with_entropy_provider<F, G>(
     addr: std::net::SocketAddr,
     key: Key,
     provider: F,
+    refresh: G,
 ) -> Result<(), PanicInstallError>
 where
     F: FnOnce() -> std::io::Result<[u8; 8]>,
+    G: Fn() -> Option<[u8; 8]> + Send + Sync + 'static,
 {
     use varta_vlp::crypto::{self, NONCE_BYTES};
 
     let start = Instant::now();
     // Pre-compute the IV random prefix at install time — /dev/urandom
     // reads are not async-signal-safe and must not happen inside the
-    // panic hook.
+    // panic hook on the steady-state (non-forked) path.
     let iv_random: [u8; 8] = provider().map_err(PanicInstallError::EntropyUnavailable)?;
+    // Snapshot the PID at install time. If a forked child later panics,
+    // it would otherwise re-use the parent's cached `iv_random` under the
+    // same key — a catastrophic AEAD nonce collision. We detect the fork
+    // by PID mismatch and re-run the entropy chain via `refresh`.
+    let install_pid = std::process::id();
     let prev = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         let _ = (|| {
+            let panic_pid = std::process::id();
+            let nonce_prefix: [u8; 8] = if panic_pid != install_pid {
+                // Forked since install. Refresh entropy at panic time.
+                // `refresh()` returning `None` means no usable source is
+                // reachable; bail out of the inner closure so we do NOT
+                // emit a nonce-reusing frame.
+                refresh()?
+            } else {
+                iv_random
+            };
+
             let sock = bind_ephemeral(&addr).ok()?;
             sock.connect(addr).ok()?;
             sock.set_nonblocking(true).ok()?;
             let timestamp = start.elapsed().as_nanos().min(u64::MAX as u128) as u64;
-            let frame = Frame::new(
-                Status::Critical,
-                std::process::id(),
-                timestamp,
-                NONCE_TERMINAL,
-                0,
-            );
+            let frame = Frame::new(Status::Critical, panic_pid, timestamp, NONCE_TERMINAL, 0);
             let mut buf = [0u8; 32];
             frame.encode(&mut buf);
 
-            // Use the pre-computed IV from install time.
-            // File I/O inside a panic hook is not async-signal-safe.
             let iv_counter = 1u32;
 
             let mut nonce = [0u8; NONCE_BYTES];
-            nonce[..8].copy_from_slice(&iv_random);
+            nonce[..8].copy_from_slice(&nonce_prefix);
             nonce[8..12].copy_from_slice(&iv_counter.to_le_bytes());
 
             // Shared-key panic frame: AAD is empty (matches the
@@ -207,7 +225,7 @@ where
             let (ciphertext, tag) = crypto::seal(key.as_bytes(), &nonce, b"", &buf);
 
             let mut secure_frame = [0u8; crypto::SECURE_FRAME_BYTES];
-            secure_frame[..8].copy_from_slice(&iv_random);
+            secure_frame[..8].copy_from_slice(&nonce_prefix);
             secure_frame[8..12].copy_from_slice(&iv_counter.to_le_bytes());
             secure_frame[12..44].copy_from_slice(&ciphertext);
             secure_frame[44..60].copy_from_slice(&tag);
@@ -249,7 +267,11 @@ pub fn install_panic_handler_secure_udp(
     key: Key,
 ) -> Result<(), PanicInstallError> {
     use crate::secure_transport::read_iv_random;
-    install_with_entropy_provider(addr, key, read_iv_random)
+    // Fork-time refresh uses the same entropy chain as the install-time
+    // read. On failure (e.g. no `/dev` in a stripped container) we return
+    // `None` to fail closed — the child's panic frame is skipped rather
+    // than emitted with the parent's cached IV.
+    install_with_entropy_provider(addr, key, read_iv_random, || read_iv_random().ok())
 }
 
 /// Install a UDP panic handler with ChaCha20-Poly1305 encryption, accepting
@@ -280,9 +302,16 @@ pub fn install_panic_handler_secure_udp_accept_degraded_entropy(
     key: Key,
 ) {
     use crate::secure_transport::{fallback_iv_random, read_iv_random};
-    let _ = install_with_entropy_provider(addr, key, || {
-        Ok(read_iv_random().unwrap_or_else(|_| fallback_iv_random()))
-    });
+    // Both install-time and fork-time refresh fall through to the
+    // non-cryptographic `fallback_iv_random` when OS entropy is
+    // unreachable. This always returns `Some`, so the panic frame
+    // is always emitted — at the documented degraded-entropy risk.
+    let _ = install_with_entropy_provider(
+        addr,
+        key,
+        || Ok(read_iv_random().unwrap_or_else(|_| fallback_iv_random())),
+        || Some(read_iv_random().unwrap_or_else(|_| fallback_iv_random())),
+    );
 }
 
 #[cfg(all(test, feature = "panic-handler", feature = "secure-udp"))]
@@ -301,7 +330,12 @@ mod tests {
 
     #[test]
     fn install_with_entropy_provider_happy_path_returns_ok() {
-        let result = install_with_entropy_provider(dummy_addr(), dummy_key(), || Ok([1u8; 8]));
+        let result = install_with_entropy_provider(
+            dummy_addr(),
+            dummy_key(),
+            || Ok([1u8; 8]),
+            || Some([2u8; 8]),
+        );
         assert!(result.is_ok());
         // Restore default hook so other tests are not affected.
         let _ = std::panic::take_hook();
@@ -310,7 +344,12 @@ mod tests {
     #[test]
     fn install_with_entropy_provider_failure_returns_err_and_does_not_install() {
         let err = io::Error::new(io::ErrorKind::NotFound, "no /dev in chroot");
-        let result = install_with_entropy_provider(dummy_addr(), dummy_key(), || Err(err));
+        let result = install_with_entropy_provider(
+            dummy_addr(),
+            dummy_key(),
+            || Err(err),
+            || Some([2u8; 8]),
+        );
         match result {
             Err(PanicInstallError::EntropyUnavailable(inner)) => {
                 assert_eq!(inner.kind(), io::ErrorKind::NotFound);
