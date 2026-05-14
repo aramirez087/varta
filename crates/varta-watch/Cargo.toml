@@ -6,6 +6,11 @@ license = "MIT OR Apache-2.0"
 description = "Varta observer — receives VLP frames and surfaces stalls."
 authors = ["Alexander Ramirez"]
 repository = "https://github.com/aramirez087/Varta"
+documentation = "https://docs.rs/varta-watch"
+readme = "README.md"
+categories = ["command-line-utilities", "network-programming", "os"]
+keywords = ["monitoring", "watchdog", "healthcheck", "prometheus", "safety-critical"]
+rust-version = "1.70.0"
 # Std-only build script.  When `compile-time-config` is active it parses
 # $VARTA_CONFIG_FILE (KEY=VALUE) and emits constants into $OUT_DIR; when
 # the feature is absent it writes an empty stub so config.rs's `include!`

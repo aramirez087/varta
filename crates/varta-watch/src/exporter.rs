@@ -30,6 +30,9 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use varta_vlp::DecodeError;
 use varta_vlp::Status;
 
+#[cfg(feature = "prometheus-exporter")]
+use crate::log_ratelimit::{LogKind, LOG_RATE_LIMITER};
+
 use crate::observer::Event;
 
 /// Sink for an [`Event`] stream.
@@ -390,6 +393,14 @@ fn status_label(s: Status) -> &'static str {
         Status::Stall => "stall",
     }
 }
+
+/// Prometheus `kind` label values for `varta_log_suppressed_total`. Indexed
+/// by [`LogKind::index`]; the array doubles as the canonical ordering for
+/// the exposition output so series remain stable across scrapes.  Must stay
+/// in sync with the `LogKind` enum in `log_ratelimit.rs` — same order, same count.
+#[cfg(feature = "prometheus-exporter")]
+const LOG_KIND_LABELS: [&str; LogKind::COUNT] =
+    ["file_export_io", "audit_io", "prom_serve", "heartbeat_io"];
 
 /// Prometheus `kind` label values for `varta_decode_errors_total`. Indexed
 /// by [`decode_kind_index`]; the array doubles as the canonical ordering
@@ -1564,6 +1575,29 @@ impl PromExporter {
                 "varta_recovery_refused_total{{reason=\"{reason}\"}} {}",
                 self.recovery_refused_total[idx]
             );
+        }
+        // varta_log_suppressed_total — messages suppressed by the per-kind
+        // 1-second cooldown rate limiter.  Non-zero values indicate a
+        // sustained error flood on that path (e.g. a broken file-export
+        // sink).  Always emitted in full so `absent()` alert rules stay
+        // green-on-green.
+        {
+            let suppressed = LOG_RATE_LIMITER
+                .lock()
+                .map(|g| g.snapshot_totals())
+                .unwrap_or([0; LogKind::COUNT]);
+            self.body_buf.push_str(
+                "# HELP varta_log_suppressed_total Log messages suppressed by the per-kind cooldown rate limiter.\n",
+            );
+            self.body_buf
+                .push_str("# TYPE varta_log_suppressed_total counter\n");
+            for (idx, kind) in LOG_KIND_LABELS.iter().enumerate() {
+                let _ = writeln!(
+                    self.body_buf,
+                    "varta_log_suppressed_total{{kind=\"{kind}\"}} {}",
+                    suppressed[idx]
+                );
+            }
         }
         // varta_origin_conflict_total — beats dropped because the slot's
         // pinned transport origin disagreed with the beat's origin

@@ -23,12 +23,13 @@ use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::time::{Duration, Instant};
 
+use varta_watch::log_ratelimit::LogKind;
 #[cfg(feature = "prometheus-exporter")]
 use varta_watch::PromExporter;
 use varta_watch::{
-    varta_error, varta_error_err, varta_error_pid, varta_info_pid_child, varta_warn,
-    varta_warn_child, Config, ConfigError, Event, Exporter, FileExporter, Observer, Recovery,
-    RecoveryOutcome,
+    varta_error, varta_error_err, varta_error_pid, varta_error_rl, varta_info_pid_child,
+    varta_warn, varta_warn_child, varta_warn_rl, Config, ConfigError, Event, Exporter,
+    FileExporter, Observer, Recovery, RecoveryOutcome,
 };
 
 /// Shutdown latch flipped by [`install_signal_handlers`] on SIGINT/SIGTERM
@@ -898,7 +899,7 @@ fn run(cfg: Config) -> std::io::Result<()> {
         while let Some(ev) = observer.poll_pending() {
             if let Some(fe) = file_export.as_mut() {
                 if let Err(e) = fe.record(&ev) {
-                    varta_error!("file export error: {e}");
+                    varta_error_rl!(LogKind::FileExportIo, "file export error: {e}");
                 }
             }
             #[cfg(feature = "prometheus-exporter")]
@@ -993,7 +994,7 @@ fn run(cfg: Config) -> std::io::Result<()> {
         let had_io = if let Some(ev) = observer.poll() {
             if let Some(fe) = file_export.as_mut() {
                 if let Err(e) = fe.record(&ev) {
-                    varta_error!("file export error: {e}");
+                    varta_error_rl!(LogKind::FileExportIo, "file export error: {e}");
                 }
             }
             #[cfg(feature = "prometheus-exporter")]
@@ -1162,7 +1163,7 @@ fn run(cfg: Config) -> std::io::Result<()> {
         // surface them once per tick.
         if let Some(rec) = recovery.as_mut() {
             if let Some(err) = rec.drain_audit_err() {
-                varta_warn!("recovery audit IO error: {err}");
+                varta_warn_rl!(LogKind::AuditIo, "recovery audit IO error: {err}");
             }
         }
 
@@ -1210,7 +1211,7 @@ fn run(cfg: Config) -> std::io::Result<()> {
             // without polluting beat-path alarms.
             let serve_start = Instant::now();
             if let Err(e) = pe.serve_pending() {
-                varta_error!("/metrics serve error: {e}");
+                varta_error_rl!(LogKind::PromServe, "/metrics serve error: {e}");
             }
             pe.record_loop_tick();
             pe.record_serve_pending_duration(serve_start.elapsed());
@@ -1225,7 +1226,7 @@ fn run(cfg: Config) -> std::io::Result<()> {
             let ts = observer.now_ns();
             let line = format!("{loop_count} {ts}\n");
             if let Err(e) = write_heartbeat_atomic(hb_path, line.as_bytes()) {
-                varta_error!("heartbeat file write error: {e}");
+                varta_error_rl!(LogKind::HeartbeatIo, "heartbeat file write error: {e}");
             }
         }
         // Update the self-watchdog liveness timestamp.  Uses wall-clock so the

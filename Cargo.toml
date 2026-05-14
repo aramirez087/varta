@@ -9,6 +9,14 @@ members = [
     "crates/varta-bench",
 ]
 
+[workspace.package]
+authors = ["Alexander Ramirez"]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/aramirez087/Varta"
+homepage = "https://varta.io"
+rust-version = "1.70.0"
+edition = "2021"
+
 # Every crate must explicitly opt out of unsafe_code with #![allow(unsafe_code)]
 # where FFI or kernel interfaces require it.  This creates a grep-able audit
 # trail: search for `allow(unsafe_code)` to find all permitted unsafe sites.

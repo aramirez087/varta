@@ -6,6 +6,11 @@ license = "MIT OR Apache-2.0"
 description = "Varta Lifeline Protocol — 32-byte fixed-layout health frame."
 authors = ["Alexander Ramirez"]
 repository = "https://github.com/aramirez087/Varta"
+documentation = "https://docs.rs/varta-vlp"
+readme = "README.md"
+categories = ["network-programming", "embedded", "no-std"]
+keywords = ["protocol", "heartbeat", "monitoring", "no-std", "cryptography"]
+rust-version = "1.70.0"
 
 [features]
 default = []

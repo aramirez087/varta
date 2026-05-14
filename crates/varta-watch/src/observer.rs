@@ -287,7 +287,16 @@ impl Observer {
     /// Poll every listener once round-robin and return the first
     /// non-`WouldBlock` [`Event`] found. Each listener is tried exactly
     /// once per call — a busy listener cannot starve others because the
-    /// round-robin advances past it on every successful receive.
+    /// round-robin cursor (`next_listener_start`) advances past each
+    /// non-`WouldBlock` listener on every call.
+    ///
+    /// **Latency bound:** worst-case per-call work is
+    /// `N_listeners × per-listener-recv-cost + eviction_scan_window`.
+    /// Under the canonical stress profile (3 listeners, 4096 tracker
+    /// capacity, 256-slot eviction window) the p99 iteration time is
+    /// ≤ 5 ms — see `docs/architecture/observer-liveness.md` and the
+    /// `tick-distribution` bench (`cargo run -p varta-bench --release --
+    /// tick-distribution`) which asserts this bound under sustained load.
     ///
     /// This method never returns [`Event::Stall`] — queued stall events must
     /// be retrieved via [`Observer::poll_pending`].

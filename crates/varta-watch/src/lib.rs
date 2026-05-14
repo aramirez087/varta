@@ -36,6 +36,7 @@ pub mod exporter;
 pub mod hw_watchdog;
 pub mod listener;
 pub mod log;
+pub mod log_ratelimit;
 pub mod notify;
 pub mod observer;
 pub mod peer_cred;

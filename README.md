@@ -4,6 +4,15 @@
   <img src="assets/varta-animation.svg" alt="Varta Animation" width="100%">
 </p>
 
+<p align="center">
+  <a href="https://github.com/aramirez087/Varta/actions/workflows/ci.yml">
+    <img src="https://github.com/aramirez087/Varta/actions/workflows/ci.yml/badge.svg" alt="CI Status">
+  </a>
+  <img src="https://img.shields.io/badge/license-MIT%2FApache--2.0-blue.svg" alt="License">
+  <img src="https://img.shields.io/badge/fuzzing-active-success" alt="Fuzzing">
+  <img src="https://img.shields.io/badge/miri-passing-success" alt="Miri">
+</p>
+
 **Zero dependencies. Zero allocations. Agents that never go dark.**
 
 A 32-byte heartbeat protocol for distributed local agents and networked clusters. Your processes talk; Varta listens.
@@ -79,13 +88,17 @@ Then inspect the metrics:
 curl -s http://127.0.0.1:9100/metrics
 ```
 
-## Crates
-
-| Crate | README | Description |
-|-------|--------|-------------|
-| `varta-vlp` | [README](crates/varta-vlp/README.md) | 32-byte wire protocol — `Frame`, `Status`, encode/decode. |
-| `varta-client` | [README](crates/varta-client/README.md) | Agent API — `Varta::connect`, `beat`, optional panic hook. |
 | `varta-watch` | [README](crates/varta-watch/README.md) | Observer binary — stall detection, file export, Prometheus. |
+
+## Examples
+
+| Example | Feature | Description |
+|---------|---------|-------------|
+| [`basic`](crates/varta-client/examples/basic.rs) | - | Minimal UDS heartbeat loop. |
+| [`with_payload`](crates/varta-client/examples/with_payload.rs) | - | Heartbeat with 16-byte custom payload. |
+| [`udp`](crates/varta-client/examples/udp.rs) | `udp` | Heartbeat over network (UDP). |
+| [`secure_udp`](crates/varta-client/examples/secure_udp.rs) | `secure-udp` | Encrypted heartbeats (ChaCha20-Poly1305). |
+| [`with_panic_handler`](crates/varta-client/examples/with_panic_handler.rs) | `panic-handler` | Automatic `Critical` beat on Rust panic. |
 
 ## Performance
 
@@ -99,4 +112,5 @@ stack encode, one `send(2)`, no allocations.
 - **No heap allocation** after `Varta::connect` in the steady-state beat path.
 - **No blocking** — `WouldBlock` is treated as `Dropped`, never as an error
   that stalls the caller.
+- **MSRV** — Minimum Supported Rust Version is **1.70.0**.
 - **Edition 2021**, pinned toolchain via `rust-toolchain.toml`.

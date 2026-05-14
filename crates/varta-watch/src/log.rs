@@ -15,7 +15,7 @@
 //!
 //! # JSON string escaping
 //!
-//! Messages are run through a minimal JSOn string escaper that handles
+//! Messages are run through a minimal JSON string escaper that handles
 //! `"`, `\`, and ASCII control characters (0x00–0x1F).  No other
 //! characters are escaped.  This is safe because the only variable parts
 //! of log messages are integer PIDs, `io::Error` Display impls (which
@@ -23,6 +23,14 @@
 //!
 //! There is no `serde` dependency — the JSON is hand-written to satisfy
 //! the zero-dependency constraint on production crates.
+//!
+//! # Allocation policy
+//!
+//! All `varta_*` macros format into a [`StackFmt`] buffer on the stack.
+//! No heap allocation occurs on the log emit path.  The only remaining
+//! allocation in the macros is the `eprintln!` / `write_fmt` call itself,
+//! which flushes a fixed-size stack buffer to stderr without any
+//! intermediate `String`.
 
 #[cfg(feature = "json-log")]
 use std::io::{self, Write};
@@ -100,100 +108,301 @@ pub fn emit_json(
 }
 
 // ---------------------------------------------------------------------------
+// StackFmt — allocation-free message buffer
+// ---------------------------------------------------------------------------
+
+/// Stack-allocated, fixed-capacity formatter for heap-free log message assembly.
+///
+/// Used internally by the `varta_*` logging macros.  The buffer is sized at
+/// compile time; content exceeding `N` bytes is silently truncated at the
+/// nearest UTF-8 codepoint boundary so the result is always valid UTF-8.
+///
+/// This type is an implementation detail.  It is `pub` only because
+/// `#[macro_export]` macros expand at the call site and must reference it
+/// via `$crate::log::StackFmt`.
+#[doc(hidden)]
+pub struct StackFmt<const N: usize> {
+    buf: [u8; N],
+    len: usize,
+}
+
+impl<const N: usize> StackFmt<N> {
+    /// Create an empty buffer.
+    #[inline]
+    pub fn new() -> Self {
+        Self {
+            buf: [0u8; N],
+            len: 0,
+        }
+    }
+
+    /// Return the formatted content as a `&str`.
+    #[inline]
+    pub fn as_str(&self) -> &str {
+        // SAFETY: `write_str` only copies from `&str` slices (which are
+        // valid UTF-8) and, when the slice would overflow the buffer, backs
+        // off from any partial multibyte codepoint before committing the
+        // copy.  Therefore `buf[..len]` is always well-formed UTF-8.
+        unsafe { core::str::from_utf8_unchecked(&self.buf[..self.len]) }
+    }
+}
+
+impl<const N: usize> core::fmt::Write for StackFmt<N> {
+    #[inline]
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        let remaining = N.saturating_sub(self.len);
+        if remaining == 0 {
+            return Ok(());
+        }
+        let bytes = s.as_bytes();
+        if bytes.len() <= remaining {
+            self.buf[self.len..self.len + bytes.len()].copy_from_slice(bytes);
+            self.len += bytes.len();
+        } else {
+            // Back off from `remaining` past any UTF-8 continuation bytes
+            // (0x80..=0xBF) so we never split a multibyte codepoint.
+            let mut cut = remaining;
+            while cut > 0 && (bytes[cut] & 0xC0) == 0x80 {
+                cut -= 1;
+            }
+            self.buf[self.len..self.len + cut].copy_from_slice(&bytes[..cut]);
+            self.len += cut;
+        }
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Public logging macros
 // ---------------------------------------------------------------------------
 
 /// Emit an info-level message.  Produces a JSON line (`json-log`) or a
-/// `eprintln!("varta-watch: ...")` call (default).
+/// `eprintln!("varta-watch: ...")` call (default).  No heap allocation.
 #[macro_export]
 macro_rules! varta_info {
     ($($arg:tt)*) => {{
+        let mut _buf = $crate::log::StackFmt::<320>::new();
+        let _ = ::core::fmt::Write::write_fmt(&mut _buf, ::core::format_args!($($arg)*));
         #[cfg(feature = "json-log")]
-        $crate::log::emit_json("info", &::std::format!($($arg)*), None, None, None);
+        $crate::log::emit_json("info", _buf.as_str(), None, None, None);
         #[cfg(not(feature = "json-log"))]
-        ::std::eprintln!("varta-watch: {}", ::std::format!($($arg)*));
+        {
+            let _ = ::std::io::Write::write_fmt(
+                &mut ::std::io::stderr().lock(),
+                ::core::format_args!("varta-watch: {}\n", _buf.as_str()),
+            );
+        }
     }};
 }
 
-/// Emit a warn-level message.
+/// Emit a warn-level message.  No heap allocation.
 #[macro_export]
 macro_rules! varta_warn {
     ($($arg:tt)*) => {{
+        let mut _buf = $crate::log::StackFmt::<320>::new();
+        let _ = ::core::fmt::Write::write_fmt(&mut _buf, ::core::format_args!($($arg)*));
         #[cfg(feature = "json-log")]
-        $crate::log::emit_json("warn", &::std::format!($($arg)*), None, None, None);
+        $crate::log::emit_json("warn", _buf.as_str(), None, None, None);
         #[cfg(not(feature = "json-log"))]
-        ::std::eprintln!("varta-watch: {}", ::std::format!($($arg)*));
+        {
+            let _ = ::std::io::Write::write_fmt(
+                &mut ::std::io::stderr().lock(),
+                ::core::format_args!("varta-watch: {}\n", _buf.as_str()),
+            );
+        }
     }};
 }
 
-/// Emit an error-level message.
+/// Emit an error-level message.  No heap allocation.
 #[macro_export]
 macro_rules! varta_error {
     ($($arg:tt)*) => {{
+        let mut _buf = $crate::log::StackFmt::<320>::new();
+        let _ = ::core::fmt::Write::write_fmt(&mut _buf, ::core::format_args!($($arg)*));
         #[cfg(feature = "json-log")]
-        $crate::log::emit_json("error", &::std::format!($($arg)*), None, None, None);
+        $crate::log::emit_json("error", _buf.as_str(), None, None, None);
         #[cfg(not(feature = "json-log"))]
-        ::std::eprintln!("varta-watch: {}", ::std::format!($($arg)*));
+        {
+            let _ = ::std::io::Write::write_fmt(
+                &mut ::std::io::stderr().lock(),
+                ::core::format_args!("varta-watch: {}\n", _buf.as_str()),
+            );
+        }
     }};
 }
 
 /// Emit an info-level message with an associated PID in the structured output.
+/// No heap allocation.
 #[macro_export]
 macro_rules! varta_info_pid {
     ($pid:expr, $($arg:tt)*) => {{
+        let mut _buf = $crate::log::StackFmt::<320>::new();
+        let _ = ::core::fmt::Write::write_fmt(&mut _buf, ::core::format_args!($($arg)*));
         #[cfg(feature = "json-log")]
-        $crate::log::emit_json("info", &::std::format!($($arg)*), Some($pid), None, None);
+        $crate::log::emit_json("info", _buf.as_str(), Some($pid), None, None);
         #[cfg(not(feature = "json-log"))]
-        ::std::eprintln!("varta-watch: {}", ::std::format!($($arg)*));
+        {
+            let _ = ::std::io::Write::write_fmt(
+                &mut ::std::io::stderr().lock(),
+                ::core::format_args!("varta-watch: {}\n", _buf.as_str()),
+            );
+        }
     }};
 }
 
 /// Emit an info-level message with an associated PID and child PID.
+/// No heap allocation.
 #[macro_export]
 macro_rules! varta_info_pid_child {
     ($pid:expr, $child_pid:expr, $($arg:tt)*) => {{
+        let mut _buf = $crate::log::StackFmt::<320>::new();
+        let _ = ::core::fmt::Write::write_fmt(&mut _buf, ::core::format_args!($($arg)*));
         #[cfg(feature = "json-log")]
-        $crate::log::emit_json("info", &::std::format!($($arg)*), Some($pid), Some($child_pid), None);
+        $crate::log::emit_json("info", _buf.as_str(), Some($pid), Some($child_pid), None);
         #[cfg(not(feature = "json-log"))]
-        ::std::eprintln!("varta-watch: {}", ::std::format!($($arg)*));
+        {
+            let _ = ::std::io::Write::write_fmt(
+                &mut ::std::io::stderr().lock(),
+                ::core::format_args!("varta-watch: {}\n", _buf.as_str()),
+            );
+        }
     }};
 }
 
-/// Emit a warn-level message with an associated child PID.
+/// Emit a warn-level message with an associated child PID.  No heap allocation.
 #[macro_export]
 macro_rules! varta_warn_child {
     ($child_pid:expr, $($arg:tt)*) => {{
+        let mut _buf = $crate::log::StackFmt::<320>::new();
+        let _ = ::core::fmt::Write::write_fmt(&mut _buf, ::core::format_args!($($arg)*));
         #[cfg(feature = "json-log")]
-        $crate::log::emit_json("warn", &::std::format!($($arg)*), None, Some($child_pid), None);
+        $crate::log::emit_json("warn", _buf.as_str(), None, Some($child_pid), None);
         #[cfg(not(feature = "json-log"))]
-        ::std::eprintln!("varta-watch: {}", ::std::format!($($arg)*));
+        {
+            let _ = ::std::io::Write::write_fmt(
+                &mut ::std::io::stderr().lock(),
+                ::core::format_args!("varta-watch: {}\n", _buf.as_str()),
+            );
+        }
     }};
 }
 
 /// Emit an error-level message with an associated PID and error Display.
+/// No heap allocation.
 #[macro_export]
 macro_rules! varta_error_pid {
     ($pid:expr, $error:expr, $($arg:tt)*) => {{
+        let mut _buf = $crate::log::StackFmt::<320>::new();
+        let mut _err = $crate::log::StackFmt::<128>::new();
+        let _ = ::core::fmt::Write::write_fmt(&mut _buf, ::core::format_args!($($arg)*));
+        let _ = ::core::fmt::Write::write_fmt(&mut _err, ::core::format_args!("{}", $error));
         #[cfg(feature = "json-log")]
-        $crate::log::emit_json("error", &::std::format!($($arg)*), Some($pid), None, Some(&::std::format!("{}", $error)));
+        $crate::log::emit_json("error", _buf.as_str(), Some($pid), None, Some(_err.as_str()));
         #[cfg(not(feature = "json-log"))]
-        ::std::eprintln!("varta-watch: {}", ::std::format!($($arg)*));
+        {
+            let _ = ::std::io::Write::write_fmt(
+                &mut ::std::io::stderr().lock(),
+                ::core::format_args!("varta-watch: {}\n", _buf.as_str()),
+            );
+        }
     }};
 }
 
 /// Emit an error-level message with an associated error Display value.
+/// No heap allocation.
 #[macro_export]
 macro_rules! varta_error_err {
     ($error:expr, $($arg:tt)*) => {{
+        let mut _buf = $crate::log::StackFmt::<320>::new();
+        let mut _err = $crate::log::StackFmt::<128>::new();
+        let _ = ::core::fmt::Write::write_fmt(&mut _buf, ::core::format_args!($($arg)*));
+        let _ = ::core::fmt::Write::write_fmt(&mut _err, ::core::format_args!("{}", $error));
         #[cfg(feature = "json-log")]
-        $crate::log::emit_json("error", &::std::format!($($arg)*), None, None, Some(&::std::format!("{}", $error)));
+        $crate::log::emit_json("error", _buf.as_str(), None, None, Some(_err.as_str()));
         #[cfg(not(feature = "json-log"))]
-        ::std::eprintln!("varta-watch: {}", ::std::format!($($arg)*));
+        {
+            let _ = ::std::io::Write::write_fmt(
+                &mut ::std::io::stderr().lock(),
+                ::core::format_args!("varta-watch: {}\n", _buf.as_str()),
+            );
+        }
     }};
 }
 
 #[cfg(test)]
 mod tests {
+    use super::StackFmt;
+    use core::fmt::Write as _;
+
+    #[test]
+    fn stack_fmt_basic() {
+        let mut buf = StackFmt::<64>::new();
+        write!(buf, "hello {}", 42).unwrap();
+        assert_eq!(buf.as_str(), "hello 42");
+    }
+
+    #[test]
+    fn stack_fmt_truncates_at_capacity() {
+        let mut buf = StackFmt::<8>::new();
+        write!(buf, "hello world").unwrap();
+        // Truncated at 8 bytes, still valid UTF-8.
+        assert_eq!(buf.as_str(), "hello wo");
+        assert_eq!(buf.as_str().len(), 8);
+    }
+
+    #[test]
+    fn stack_fmt_truncates_at_utf8_boundary() {
+        // "€" is 3 bytes (0xE2 0x82 0xAC). Buffer of 5 fits "ab" + incomplete
+        // "€" — we must not include the partial codepoint.
+        let mut buf = StackFmt::<5>::new();
+        write!(buf, "ab€").unwrap();
+        // "ab" (2 bytes) fits; the 3-byte "€" is too wide for the remaining 3
+        // bytes — wait, 2 + 3 = 5 which fits exactly.
+        assert_eq!(buf.as_str(), "ab€");
+
+        let mut buf2 = StackFmt::<4>::new();
+        write!(buf2, "ab€").unwrap();
+        // Only 2 bytes remaining after "ab"; "€" (3 bytes) won't fit without
+        // splitting. Should truncate after "ab".
+        assert_eq!(buf2.as_str(), "ab");
+    }
+
+    #[test]
+    fn stack_fmt_overflow_does_not_panic() {
+        let mut buf = StackFmt::<4>::new();
+        // Writing 100 bytes into a 4-byte buffer must not panic.
+        write!(buf, "{:0>100}", 0).unwrap();
+        assert_eq!(buf.as_str().len(), 4);
+    }
+
+    #[test]
+    fn stack_fmt_empty() {
+        let buf = StackFmt::<16>::new();
+        assert_eq!(buf.as_str(), "");
+    }
+
+    #[test]
+    fn varta_info_non_json() {
+        varta_info!("test {}", 42);
+        varta_warn!("test {}", "warn");
+        varta_error!("test {}", "err");
+        varta_info_pid!(1234, "pid {}", 1234);
+        varta_info_pid_child!(1234, 5678, "pid {} child {}", 1234, 5678);
+        varta_warn_child!(5678, "child {}", 5678);
+        varta_error_pid!(
+            1234,
+            std::io::Error::from(std::io::ErrorKind::Other),
+            "pid {} err {}",
+            1234,
+            "oops"
+        );
+        varta_error_err!(
+            std::io::Error::from(std::io::ErrorKind::Other),
+            "err {}",
+            "oops"
+        );
+    }
+
     #[cfg(feature = "json-log")]
     mod json_tests {
         use super::super::write_json_str;
@@ -232,27 +441,5 @@ mod tests {
             write_json_str(&mut buf, "a\x01b").unwrap();
             assert_eq!(buf, b"\"a\\u0001b\"");
         }
-    }
-
-    #[test]
-    fn varta_info_non_json() {
-        varta_info!("test {}", 42);
-        varta_warn!("test {}", "warn");
-        varta_error!("test {}", "err");
-        varta_info_pid!(1234, "pid {}", 1234);
-        varta_info_pid_child!(1234, 5678, "pid {} child {}", 1234, 5678);
-        varta_warn_child!(5678, "child {}", 5678);
-        varta_error_pid!(
-            1234,
-            std::io::Error::from(std::io::ErrorKind::Other),
-            "pid {} err {}",
-            1234,
-            "oops"
-        );
-        varta_error_err!(
-            std::io::Error::from(std::io::ErrorKind::Other),
-            "err {}",
-            "oops"
-        );
     }
 }
