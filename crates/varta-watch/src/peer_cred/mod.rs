@@ -29,6 +29,10 @@ mod ns_inode;
 mod recv;
 mod types;
 
+#[cfg(any(fuzzing, test))]
+#[cfg(target_os = "linux")]
+pub mod fuzz_entry;
+
 pub(crate) use ns_inode::{observer_pid_namespace_inode, read_pid_namespace_inode};
 pub(crate) use recv::{enable_credential_passing, recv_authenticated};
 pub(crate) use types::observer_uid;

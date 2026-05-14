@@ -205,6 +205,9 @@ jobs:
       - name: fuzz kdf_derive (30 s)
         run: cargo fuzz run kdf_derive -- -max_total_time=30
 
+      - name: fuzz peer_cred_cmsg (30 s)
+        run: cargo fuzz run peer_cred_cmsg fuzz/corpus/peer_cred_cmsg -- -max_total_time=30
+
       - name: assert no fuzz artifacts (reproducer = CI failure)
         run: test -z "$(find fuzz/artifacts -type f 2>/dev/null)"
 

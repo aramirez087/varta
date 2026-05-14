@@ -26,7 +26,11 @@ unsafe_code = "deny"
 # `crates/varta-vlp/src/lib.rs` and `proofs.rs` does not trip the
 # `unexpected_cfgs` lint under normal `cargo build` / `cargo clippy`.
 # See `book/src/architecture/verification.md` for the verification strategy.
-unexpected_cfgs = { level = "warn", check-cfg = ["cfg(kani)"] }
+#
+# Register `cfg(fuzzing)` so the `cargo fuzz`-set cfg used by the
+# `varta-watch::peer_cred::fuzz_entry` test/fuzz helper does not trip
+# `unexpected_cfgs` under normal builds.
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(kani)", "cfg(fuzzing)"] }
 
 [profile.release]
 overflow-checks = true

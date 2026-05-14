@@ -61,3 +61,10 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "peer_cred_cmsg"
+path = "fuzz_targets/peer_cred_cmsg.rs"
+test = false
+doc = false
+bench = false
+
