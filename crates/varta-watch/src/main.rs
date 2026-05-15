@@ -21,7 +21,7 @@ use std::fs::OpenOptions;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicU64, AtomicU8, Ordering};
 use std::time::{Duration, Instant};
 
 #[cfg(feature = "prometheus-exporter")]
@@ -37,23 +37,35 @@ use varta_watch::{
 
 /// Shutdown latch flipped by [`handle_shutdown`] on SIGINT/SIGTERM
 /// and by the `--shutdown-after-secs` deadline path. The poll loop exits
-/// when this becomes `true`.
+/// when this becomes non-zero.
 ///
 /// # Async-signal-safety
 ///
-/// The signal handler writes `true` with `Ordering::Release` to this
-/// `AtomicBool`.  On all Tier-1 targets the operation compiles to a single
-/// aligned atomic instruction (e.g. `lock or $1,mem` on x86_64; `stlr` on
-/// aarch64) and cannot be interrupted mid-store.  POSIX `sig_atomic_t` is
-/// the minimum guarantee, but lock-free atomics are explicitly supported in
-/// signal handlers by Linux `signal-safety(7)` and Apple `sigaction(2)`.
+/// The signal handler writes `1` with `Ordering::Release` to this
+/// `AtomicI32`.  `AtomicI32` is an integer atomic — the same primitive
+/// as POSIX `volatile sig_atomic_t` (`int` on every conformant platform).
+/// The `const _` assertion below proves at compile time that the type is
+/// always lock-free, guaranteeing the store compiles to a single aligned
+/// atomic instruction (e.g. `lock or $1,mem` on x86_64; `stlr` on
+/// aarch64) and cannot be interrupted mid-store.
 /// `SA_RESTART` is set so the observer's `recvmsg(2)` never returns `EINTR`.
 /// On Linux the handler is installed via a direct `rt_sigaction(2)` syscall
 /// (not the libc wrapper, which would strip our `sa_restorer`); on x86_64
 /// the kernel returns through our own [`varta_signal_restorer`] trampoline.
 /// On aarch64 the kernel-side `<asm-generic/signal.h>` struct has no
 /// `sa_restorer` field, and signal-return goes through the vDSO.
-static SHUTDOWN: AtomicBool = AtomicBool::new(false);
+static SHUTDOWN: AtomicI32 = AtomicI32::new(0);
+
+/// Compile-time proof that [`SHUTDOWN`] lowers to a single uninterruptible
+/// instruction: `AtomicI32` is only available when `target_has_atomic = "32"`,
+/// i.e. when 32-bit atomic ops are lock-free on the target — the structural
+/// requirement for async-signal-safety per POSIX (equivalent to
+/// `volatile sig_atomic_t`).
+#[cfg(not(target_has_atomic = "32"))]
+compile_error!(
+    "varta-watch requires lock-free 32-bit atomics (target_has_atomic = \"32\") \
+     for the async-signal-safe SHUTDOWN latch"
+);
 
 /// Nanosecond timestamp of the most recent poll loop iteration, written by
 /// the main thread each tick and read by the self-watchdog thread.
@@ -114,10 +126,11 @@ static CLOCK_SOURCE: AtomicU8 = AtomicU8::new(0);
 
 /// Shutdown handler — flips [`SHUTDOWN`] on SIGINT / SIGTERM delivery.
 ///
-/// Async-signal-safe: a single `Release` store to an `AtomicBool` compiles
-/// to one aligned atomic instruction on all Tier-1 targets.
+/// Async-signal-safe by POSIX construction: `AtomicI32` is the integer
+/// primitive equivalent to `volatile sig_atomic_t`, proven lock-free at
+/// compile time (see the `const _` assertion after [`SHUTDOWN`]).
 extern "C" fn handle_shutdown(_sig: i32) {
-    SHUTDOWN.store(true, Ordering::Release);
+    SHUTDOWN.store(1, Ordering::Release);
 }
 
 /// Write `contents` to `path` atomically via a same-directory tempfile + rename.
@@ -738,7 +751,7 @@ fn run(cfg: Config) -> std::io::Result<()> {
             .name("varta-watchdog".into())
             .spawn(move || loop {
                 std::thread::sleep(tick_sleep);
-                if SHUTDOWN.load(Ordering::Acquire) {
+                if SHUTDOWN.load(Ordering::Acquire) != 0 {
                     return;
                 }
                 let now = observer_now_ns();
@@ -825,7 +838,7 @@ fn run(cfg: Config) -> std::io::Result<()> {
     #[cfg(feature = "test-hooks")]
     let mut wedge_once = cfg.inject_wedge_ms;
     loop {
-        if SHUTDOWN.load(Ordering::Acquire) {
+        if SHUTDOWN.load(Ordering::Acquire) != 0 {
             break;
         }
         if let Some(deadline) = cfg.shutdown_after {
@@ -1597,7 +1610,7 @@ mod tests {
     fn signal_handler_real_sigint_flips_shutdown() {
         let _guard = SIGNAL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
-        SHUTDOWN.store(false, Ordering::Release);
+        SHUTDOWN.store(0, Ordering::Release);
 
         // SAFETY: single-threaded test process; handler does one atomic store.
         unsafe { varta_watch::signal_install::install(SignalHandlerMode::Direct, handle_shutdown) }
@@ -1605,8 +1618,8 @@ mod tests {
 
         // Confirm the handler hasn't already fired from some stray signal.
         assert!(
-            !SHUTDOWN.load(Ordering::Acquire),
-            "SHUTDOWN was already true before signal delivery"
+            SHUTDOWN.load(Ordering::Acquire) == 0,
+            "SHUTDOWN was already non-zero before signal delivery"
         );
 
         // Deliver SIGINT to ourselves via raw FFI — no `libc` crate dep.
@@ -1631,14 +1644,14 @@ mod tests {
         // 50 ms is several orders of magnitude longer than typical kernel
         // signal delivery latency (single-digit microseconds).
         let deadline = std::time::Instant::now() + Duration::from_millis(50);
-        while std::time::Instant::now() < deadline && !SHUTDOWN.load(Ordering::Acquire) {
+        while std::time::Instant::now() < deadline && SHUTDOWN.load(Ordering::Acquire) == 0 {
             std::thread::yield_now();
         }
 
-        let fired = SHUTDOWN.load(Ordering::Acquire);
+        let fired = SHUTDOWN.load(Ordering::Acquire) != 0;
 
         // Reset so subsequent tests in this binary see a clean slate.
-        SHUTDOWN.store(false, Ordering::Release);
+        SHUTDOWN.store(0, Ordering::Release);
 
         assert!(
             fired,

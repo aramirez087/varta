@@ -57,7 +57,9 @@ use std::io;
 ///
 /// Must be called exactly once, before any other threads are spawned and
 /// before any competing code installs handlers for `SIGINT` or `SIGTERM`.
-/// `handler` must be async-signal-safe (store-to-atomic is always safe).
+/// `handler` must be async-signal-safe; storing to an `AtomicI32` that is
+/// `is_always_lock_free()` qualifies — richer operations (allocation, locking,
+/// non-reentrant libc) do not.
 #[allow(clippy::needless_return)] // cfg-gated returns prevent fall-through to dead branches
 pub unsafe fn install(mode: SignalHandlerMode, handler: extern "C" fn(i32)) -> io::Result<()> {
     #[cfg(target_os = "linux")]
