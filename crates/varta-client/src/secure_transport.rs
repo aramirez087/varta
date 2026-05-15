@@ -222,6 +222,14 @@ impl SecureUdpTransport {
         self.iv_counter = value;
     }
 
+    /// Test-only accessor for the current committed `iv_counter`. Used to
+    /// assert commit-on-success behaviour — that a failed `send` (e.g.
+    /// `WouldBlock`) does NOT advance the counter.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn iv_counter_for_test(&self) -> u32 {
+        self.iv_counter
+    }
+
     /// Test-only accessor for the current derived prefix.
     #[cfg(any(test, feature = "test-hooks"))]
     pub fn iv_prefix_for_test(&self) -> [u8; 8] {
@@ -293,14 +301,21 @@ impl SecureUdpTransport {
 
 impl BeatTransport for SecureUdpTransport {
     fn send(&mut self, buf: &[u8; 32]) -> io::Result<usize> {
-        self.iv_counter = self.advance_nonce()?;
+        // Speculatively compute the next counter. `advance_nonce` may still
+        // mutate `self.iv_prefix`/`self.iv_prefix_index` for the wrap path
+        // and re-bind the socket via `reconnect()` for the doubly-exhausted
+        // path — those side effects are structural and cannot be deferred.
+        // The common path (`checked_add` succeeds, > 99.999...% of real
+        // calls) is purely functional here: `pending_counter` lives as a
+        // local until the kernel confirms it accepted the datagram.
+        let pending_counter = self.advance_nonce()?;
 
-        // Build 12-byte nonce: iv_prefix (8) || iv_counter (4) LE
+        // Build 12-byte nonce: iv_prefix (8) || pending_counter (4) LE
         let mut nonce = [0u8; NONCE_BYTES];
         nonce[..8].copy_from_slice(&self.iv_prefix);
-        nonce[8..12].copy_from_slice(&self.iv_counter.to_le_bytes());
+        nonce[8..12].copy_from_slice(&pending_counter.to_le_bytes());
 
-        if self.is_master_mode {
+        let result = if self.is_master_mode {
             // Master-key wire format (64 bytes):
             // [agent_pid: 4] [iv_random: 8] [iv_counter: 4] [ciphertext: 32] [tag: 16]
             //
@@ -319,7 +334,7 @@ impl BeatTransport for SecureUdpTransport {
             let mut frame = [0u8; SECURE_FRAME_MASTER_LEN];
             frame[0..4].copy_from_slice(&agent_pid_bytes);
             frame[4..12].copy_from_slice(&self.iv_prefix);
-            frame[12..16].copy_from_slice(&self.iv_counter.to_le_bytes());
+            frame[12..16].copy_from_slice(&pending_counter.to_le_bytes());
             frame[16..48].copy_from_slice(&ciphertext);
             frame[48..64].copy_from_slice(&tag);
 
@@ -332,12 +347,23 @@ impl BeatTransport for SecureUdpTransport {
 
             let mut frame = [0u8; SECURE_FRAME_LEN];
             frame[..8].copy_from_slice(&self.iv_prefix);
-            frame[8..12].copy_from_slice(&self.iv_counter.to_le_bytes());
+            frame[8..12].copy_from_slice(&pending_counter.to_le_bytes());
             frame[12..44].copy_from_slice(&ciphertext);
             frame[44..60].copy_from_slice(&tag);
 
             self.sock.send(&frame)
+        };
+
+        // Commit the counter advance only when the kernel accepted the
+        // datagram. `WouldBlock`/`EAGAIN` means the ciphertext never escaped
+        // the process, so the next call can reuse `pending_counter` with no
+        // observable nonce reuse on the wire. UDP `send(2)` is datagram-
+        // atomic — either the full datagram is queued or nothing is — so
+        // there is no "half-sent under this nonce" state to reason about.
+        if result.is_ok() {
+            self.iv_counter = pending_counter;
         }
+        result
     }
 
     /// Manual session refresh — re-binds the ephemeral socket, re-reads OS
@@ -740,6 +766,80 @@ mod tests {
         assert_eq!(tx.iv_counter, 1);
         // Prefix-0 of the new salt is overwhelmingly likely to differ.
         assert_ne!(tx.iv_prefix_for_test(), prefix_before);
+    }
+
+    /// Commit-on-success contract: a failed `send(2)` (e.g. `WouldBlock` on
+    /// the beat path) must NOT advance `iv_counter`. The kernel never
+    /// accepted the datagram, so the speculative nonce is unobserved on
+    /// the wire and can be re-tried on the next call with no AEAD
+    /// nonce-reuse risk.
+    ///
+    /// We force a deterministic failure by `mem::replace`-ing the connected
+    /// socket with an unconnected `UdpSocket::bind`. Calling `send(2)` on
+    /// an unconnected datagram socket yields `ENOTCONN` / `EDESTADDRREQ` —
+    /// platform-portable and immediate.
+    #[test]
+    fn iv_counter_commits_only_on_successful_send() {
+        use std::mem;
+        use std::net::{Ipv4Addr, UdpSocket};
+
+        let addr = SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::LOCALHOST, 9876, 0, 0));
+        let key = Key::from_bytes([0u8; 32]);
+        let mut tx = SecureUdpTransport::connect(addr, key).expect("connect");
+
+        // Sanity baseline: a normal send on the connected socket commits
+        // the counter advance.
+        let baseline = tx.iv_counter;
+        let buf = [0u8; 32];
+        let ok = <SecureUdpTransport as BeatTransport>::send(&mut tx, &buf);
+        assert!(
+            ok.is_ok(),
+            "baseline send on connected socket failed: {ok:?}"
+        );
+        assert_eq!(
+            tx.iv_counter,
+            baseline + 1,
+            "successful send must advance iv_counter by exactly 1"
+        );
+
+        // Swap the connected socket for an unconnected one. send(2) on an
+        // unconnected UDP socket fails with ENOTCONN / EDESTADDRREQ.
+        let unconnected =
+            UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind unconnected UDP socket");
+        unconnected
+            .set_nonblocking(true)
+            .expect("set_nonblocking on unconnected");
+        let _replaced = mem::replace(&mut tx.sock, unconnected);
+
+        let counter_before = tx.iv_counter;
+        let prefix_before = tx.iv_prefix_for_test();
+        let prefix_index_before = tx.iv_prefix_index_for_test();
+
+        for attempt in 0..5 {
+            let r = <SecureUdpTransport as BeatTransport>::send(&mut tx, &buf);
+            assert!(
+                r.is_err(),
+                "send #{attempt} on unconnected socket unexpectedly succeeded: {r:?}"
+            );
+        }
+
+        // Commit-on-success: none of the five failed sends may have moved
+        // the committed AEAD state.
+        assert_eq!(
+            tx.iv_counter, counter_before,
+            "iv_counter advanced despite send() failures \
+             (commit-on-success contract violated)"
+        );
+        assert_eq!(
+            tx.iv_prefix_for_test(),
+            prefix_before,
+            "iv_prefix mutated on failed send"
+        );
+        assert_eq!(
+            tx.iv_prefix_index_for_test(),
+            prefix_index_before,
+            "iv_prefix_index mutated on failed send"
+        );
     }
 
     /// `reconnect()` IS allowed to re-read entropy — it's the documented

@@ -405,6 +405,14 @@ impl Varta<SecureUdpTransport> {
     pub fn iv_prefix_index_for_test(&self) -> u32 {
         self.transport.iv_prefix_index_for_test()
     }
+
+    /// Test-only: read the currently-committed AEAD counter. Pairs with
+    /// `set_iv_counter_for_test` to assert commit-on-success semantics on
+    /// `BeatTransport::send` — a `Dropped` beat must NOT advance this value.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn iv_counter_for_test(&self) -> u32 {
+        self.transport.iv_counter_for_test()
+    }
 }
 
 impl<T: BeatTransport> Varta<T> {
