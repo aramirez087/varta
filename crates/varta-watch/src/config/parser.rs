@@ -77,6 +77,9 @@ impl Config {
         let mut accepted_key_file: Option<PathBuf> = None;
         let mut master_key_file: Option<PathBuf> = None;
         let mut max_beat_rate: Option<u32> = None;
+        let mut global_beat_rate: Option<u32> = None;
+        let mut global_beat_burst: Option<u32> = None;
+        let mut uds_rcvbuf_bytes: Option<u32> = None;
         let mut heartbeat_file: Option<PathBuf> = None;
         let mut self_watchdog: Option<Duration> = None;
         let mut hw_watchdog: Option<PathBuf> = None;
@@ -340,6 +343,36 @@ impl Config {
                     max_beat_rate =
                         Some(v.parse::<u32>().map_err(|_| ConfigError::BadInteger {
                             flag: "--max-beat-rate",
+                            raw: v,
+                        })?);
+                }
+                "--global-beat-rate" => {
+                    let v = iter
+                        .next()
+                        .ok_or(ConfigError::MissingValue("--global-beat-rate"))?;
+                    global_beat_rate =
+                        Some(v.parse::<u32>().map_err(|_| ConfigError::BadInteger {
+                            flag: "--global-beat-rate",
+                            raw: v,
+                        })?);
+                }
+                "--global-beat-burst" => {
+                    let v = iter
+                        .next()
+                        .ok_or(ConfigError::MissingValue("--global-beat-burst"))?;
+                    global_beat_burst =
+                        Some(v.parse::<u32>().map_err(|_| ConfigError::BadInteger {
+                            flag: "--global-beat-burst",
+                            raw: v,
+                        })?);
+                }
+                "--uds-rcvbuf-bytes" => {
+                    let v = iter
+                        .next()
+                        .ok_or(ConfigError::MissingValue("--uds-rcvbuf-bytes"))?;
+                    uds_rcvbuf_bytes =
+                        Some(v.parse::<u32>().map_err(|_| ConfigError::BadInteger {
+                            flag: "--uds-rcvbuf-bytes",
                             raw: v,
                         })?);
                 }
@@ -725,7 +758,14 @@ impl Config {
             secure_key_file,
             accepted_key_file,
             master_key_file,
-            max_beat_rate,
+            max_beat_rate: match max_beat_rate {
+                None => Some(super::types::DEFAULT_MAX_BEAT_RATE),
+                Some(0) => None,
+                Some(n) => Some(n),
+            },
+            global_beat_rate: global_beat_rate.unwrap_or(super::types::DEFAULT_GLOBAL_BEAT_RATE),
+            global_beat_burst: global_beat_burst.unwrap_or(super::types::DEFAULT_GLOBAL_BEAT_BURST),
+            uds_rcvbuf_bytes: uds_rcvbuf_bytes.unwrap_or(super::types::DEFAULT_UDS_RCVBUF_BYTES),
             heartbeat_file,
             self_watchdog,
             hw_watchdog,

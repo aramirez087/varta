@@ -39,10 +39,13 @@ fn bind_succeeds_on_clean_path() {
         THRESHOLD,
         0o600,
         Duration::from_millis(100),
+        0,
         64,
         EvictionPolicy::Strict,
         DEFAULT_EVICTION_SCAN_WINDOW,
         None,
+        0,
+        0,
         ClockSource::Monotonic,
     )
     .expect("bind on clean path should succeed");
@@ -74,10 +77,13 @@ fn bind_fails_when_live_observer_present() {
         THRESHOLD,
         0o600,
         Duration::from_millis(100),
+        0,
         64,
         EvictionPolicy::Strict,
         DEFAULT_EVICTION_SCAN_WINDOW,
         None,
+        0,
+        0,
         ClockSource::Monotonic,
     )
     .expect("first bind must succeed");
@@ -87,10 +93,13 @@ fn bind_fails_when_live_observer_present() {
         THRESHOLD,
         0o600,
         Duration::from_millis(100),
+        0,
         64,
         EvictionPolicy::Strict,
         DEFAULT_EVICTION_SCAN_WINDOW,
         None,
+        0,
+        0,
         ClockSource::Monotonic,
     )
     .err()
@@ -128,10 +137,13 @@ fn bind_cleans_up_stale_socket_file() {
         THRESHOLD,
         0o600,
         Duration::from_millis(100),
+        0,
         64,
         EvictionPolicy::Strict,
         DEFAULT_EVICTION_SCAN_WINDOW,
         None,
+        0,
+        0,
         ClockSource::Monotonic,
     )
     .expect("bind over stale socket must succeed");
@@ -159,10 +171,13 @@ fn bind_preserves_non_socket_file_at_path() {
         THRESHOLD,
         0o600,
         Duration::from_millis(100),
+        0,
         64,
         EvictionPolicy::Strict,
         DEFAULT_EVICTION_SCAN_WINDOW,
         None,
+        0,
+        0,
         ClockSource::Monotonic,
     )
     .err()
@@ -192,10 +207,13 @@ fn drop_unlinks_bound_socket() {
         THRESHOLD,
         0o600,
         Duration::from_millis(100),
+        0,
         64,
         EvictionPolicy::Strict,
         DEFAULT_EVICTION_SCAN_WINDOW,
         None,
+        0,
+        0,
         ClockSource::Monotonic,
     )
     .expect("bind must succeed");
@@ -217,10 +235,13 @@ fn drop_swallows_missing_file() {
         THRESHOLD,
         0o600,
         Duration::from_millis(100),
+        0,
         64,
         EvictionPolicy::Strict,
         DEFAULT_EVICTION_SCAN_WINDOW,
         None,
+        0,
+        0,
         ClockSource::Monotonic,
     )
     .expect("bind must succeed");
@@ -242,10 +263,13 @@ fn drop_preserves_foreign_inode() {
         THRESHOLD,
         0o600,
         Duration::from_millis(100),
+        0,
         64,
         EvictionPolicy::Strict,
         DEFAULT_EVICTION_SCAN_WINDOW,
         None,
+        0,
+        0,
         ClockSource::Monotonic,
     )
     .expect("first bind must succeed");
@@ -257,10 +281,13 @@ fn drop_preserves_foreign_inode() {
         THRESHOLD,
         0o600,
         Duration::from_millis(100),
+        0,
         64,
         EvictionPolicy::Strict,
         DEFAULT_EVICTION_SCAN_WINDOW,
         None,
+        0,
+        0,
         ClockSource::Monotonic,
     )
     .expect("second bind must succeed");

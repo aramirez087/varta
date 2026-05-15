@@ -1428,12 +1428,12 @@ fn max_beat_rate_limits_and_reports_metric() {
     );
 
     // Parse the rate_limited value and assert it's > 0
-    let rl_val = last_body
+    let rl_val: u64 = last_body
         .lines()
-        .find(|l| l.starts_with("varta_rate_limited_total "))
-        .and_then(|l| l.split_whitespace().nth(1))
-        .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(0);
+        .filter(|l| l.starts_with("varta_rate_limited_total{"))
+        .filter_map(|l| l.split_whitespace().last())
+        .filter_map(|v| v.parse::<u64>().ok())
+        .sum();
     assert!(
         rl_val > 0,
         "varta_rate_limited_total should be > 0 when sending 50 beats at max 10/s"

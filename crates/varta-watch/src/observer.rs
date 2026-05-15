@@ -22,6 +22,95 @@ use crate::listener::{BeatListener, UdsListener};
 use crate::peer_cred::{BeatOrigin, RecvResult};
 use crate::tracker::{EvictionPolicy, Tracker, Update};
 
+/// Reason a beat was dropped by the rate limiter.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RateLimitReason {
+    PerPid = 0,
+    Global = 1,
+}
+
+pub(crate) const RATE_LIMIT_N: usize = 2;
+
+/// Global per-observer token bucket — one shared across all senders.
+///
+/// Guards against per-pid rotation attacks where an attacker cycles through
+/// fake pids to keep every per-pid bucket empty.
+///
+/// Disabled when `capacity_milli == 0`.  All arithmetic is integer-only
+/// (milli-tokens) to stay allocation-free on the hot path.
+pub(crate) struct GlobalRateLimit {
+    /// Current token count in milli-tokens (1000 milli-tokens = 1 frame allowed).
+    tokens_milli: u64,
+    /// Maximum token count (= burst × 1000).
+    capacity_milli: u64,
+    /// Tokens added per nanosecond × 1_000_000 to keep integer math.
+    /// Stored as (rate_per_sec * 1_000_000) to avoid float division.
+    refill_numerator: u64,
+    /// Denominator for refill: 1_000_000_000 (ns per sec).
+    refill_denominator: u64,
+    /// Nanosecond timestamp of last refill.
+    last_refill_ns: u64,
+}
+
+impl GlobalRateLimit {
+    /// Construct a new token bucket.  `rate_per_sec = 0` or `burst = 0`
+    /// produces a disabled bucket (always allows).
+    pub(crate) fn new(rate_per_sec: u32, burst: u32) -> Self {
+        if rate_per_sec == 0 || burst == 0 {
+            return GlobalRateLimit {
+                tokens_milli: 0,
+                capacity_milli: 0,
+                refill_numerator: 0,
+                refill_denominator: 1,
+                last_refill_ns: 0,
+            };
+        }
+        let capacity_milli = (burst as u64).saturating_mul(1_000);
+        GlobalRateLimit {
+            tokens_milli: capacity_milli,
+            capacity_milli,
+            refill_numerator: (rate_per_sec as u64).saturating_mul(1_000_000),
+            refill_denominator: 1_000_000_000,
+            last_refill_ns: 0,
+        }
+    }
+
+    /// Disabled when capacity is 0 — all frames pass.
+    #[inline]
+    pub(crate) fn is_disabled(&self) -> bool {
+        self.capacity_milli == 0
+    }
+
+    /// Try to consume one token.  Returns `true` if the frame is allowed,
+    /// `false` if the global bucket is exhausted.
+    #[inline]
+    pub(crate) fn try_consume(&mut self, now_ns: u64) -> bool {
+        if self.is_disabled() {
+            return true;
+        }
+        // Lazy refill: add tokens proportional to elapsed time since last refill.
+        let elapsed_ns = now_ns.saturating_sub(self.last_refill_ns);
+        if elapsed_ns > 0 {
+            let added = elapsed_ns
+                .saturating_mul(self.refill_numerator)
+                .checked_div(self.refill_denominator)
+                .unwrap_or(0);
+            self.tokens_milli = self
+                .tokens_milli
+                .saturating_add(added)
+                .min(self.capacity_milli);
+            self.last_refill_ns = now_ns;
+        }
+        // Consume 1000 milli-tokens (= 1 frame).
+        if self.tokens_milli >= 1_000 {
+            self.tokens_milli -= 1_000;
+            true
+        } else {
+            false
+        }
+    }
+}
+
 /// Event surfaced by [`Observer::poll`].
 ///
 /// Each call to `poll` returns at most one event. Unknown-pid overflow and
@@ -146,8 +235,11 @@ pub struct Observer {
     /// Minimum inter-beat interval applied per pid, in nanoseconds.
     /// `None` means no rate limiting (the default).
     rate_limit_interval_ns: Option<u64>,
-    /// Total beats dropped by the rate limiter since the last drain.
-    rate_limited_total: u64,
+    /// Beats dropped by the per-pid and global rate limiters since the last drain.
+    /// Index 0 = per-pid (`RateLimitReason::PerPid`), 1 = global (`RateLimitReason::Global`).
+    rate_limited_total: [u64; RATE_LIMIT_N],
+    /// Global per-observer token bucket for defeating per-pid rotation attacks.
+    global_rl: GlobalRateLimit,
     /// Monotonicity guard — last `now_ns()` value, clamped forward-only to
     /// survive TSC drift and VM live migration.
     last_now_ns: u64,
@@ -176,6 +268,10 @@ pub struct Observer {
     /// Count of beats dropped at ingress because `frame.pid > pid_max`.
     /// Surfaced as `varta_frame_rejected_pid_above_max_total`.
     pid_above_max_drops: u64,
+    /// Effective `SO_RCVBUF` size granted by the kernel for the observer UDS,
+    /// in bytes.  `0` if `--uds-rcvbuf-bytes 0` was used or tuning failed.
+    /// Set by [`Observer::bind`] from the [`UdsListener::rcvbuf_bytes`] accessor.
+    pub uds_rcvbuf_bytes: u32,
 }
 
 impl Observer {
@@ -197,12 +293,15 @@ impl Observer {
     /// second.  When set, beats arriving faster than this rate from the
     /// same pid are dropped and counted via [`Observer::drain_rate_limited`].
     /// `None` (the default) disables rate limiting.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         threshold: Duration,
         tracker_capacity: usize,
         eviction_policy: EvictionPolicy,
         eviction_scan_window: usize,
         max_beat_rate: Option<u32>,
+        global_beat_rate: u32,
+        global_beat_burst: u32,
         clock_source: ClockSource,
     ) -> io::Result<Self> {
         let threshold_ns = threshold.as_nanos().min(u64::MAX as u128) as u64;
@@ -226,13 +325,15 @@ impl Observer {
             stall_cursor: 0,
             next_listener_start: 0,
             rate_limit_interval_ns,
-            rate_limited_total: 0,
+            rate_limited_total: [0; RATE_LIMIT_N],
+            global_rl: GlobalRateLimit::new(global_beat_rate, global_beat_burst),
             last_now_ns: 0,
             clock_regressions: 0,
             allow_cross_namespace: false,
             cross_namespace_drops: 0,
             pid_max: crate::pid_max::read_pid_max(),
             pid_above_max_drops: 0,
+            uds_rcvbuf_bytes: 0,
         })
     }
 
@@ -245,6 +346,7 @@ impl Observer {
     }
 
     /// Create an observer from a single already-configured listener.
+    #[allow(clippy::too_many_arguments)]
     pub fn from_listener<L: BeatListener + 'static>(
         listener: L,
         threshold: Duration,
@@ -252,6 +354,8 @@ impl Observer {
         eviction_policy: EvictionPolicy,
         eviction_scan_window: usize,
         max_beat_rate: Option<u32>,
+        global_beat_rate: u32,
+        global_beat_burst: u32,
         clock_source: ClockSource,
     ) -> io::Result<Self> {
         let mut obs = Self::new(
@@ -260,6 +364,8 @@ impl Observer {
             eviction_policy,
             eviction_scan_window,
             max_beat_rate,
+            global_beat_rate,
+            global_beat_burst,
             clock_source,
         )?;
         obs.add_listener(Box::new(listener));
@@ -278,22 +384,30 @@ impl Observer {
         threshold: Duration,
         socket_mode: u32,
         read_timeout: Duration,
+        uds_rcvbuf_bytes: u32,
         tracker_capacity: usize,
         eviction_policy: EvictionPolicy,
         eviction_scan_window: usize,
         max_beat_rate: Option<u32>,
+        global_beat_rate: u32,
+        global_beat_burst: u32,
         clock_source: ClockSource,
     ) -> io::Result<Self> {
-        let listener = UdsListener::bind(path, socket_mode, read_timeout)?;
-        Self::from_listener(
+        let listener = UdsListener::bind(path, socket_mode, read_timeout, uds_rcvbuf_bytes)?;
+        let rcvbuf = listener.rcvbuf_bytes();
+        let mut obs = Self::from_listener(
             listener,
             threshold,
             tracker_capacity,
             eviction_policy,
             eviction_scan_window,
             max_beat_rate,
+            global_beat_rate,
+            global_beat_burst,
             clock_source,
-        )
+        )?;
+        obs.uds_rcvbuf_bytes = rcvbuf;
+        Ok(obs)
     }
 
     /// Add a listener to the observer. The listener is polled in round-robin
@@ -366,6 +480,15 @@ impl Observer {
                                 }
                                 continue;
                             }
+                            // Global token bucket: drop BEFORE namespace /
+                            // per-pid classification so a rotation attack
+                            // cannot exhaust classification work.
+                            if !self.global_rl.try_consume(now_ns) {
+                                self.rate_limited_total[RateLimitReason::Global as usize] =
+                                    self.rate_limited_total[RateLimitReason::Global as usize]
+                                        .saturating_add(1);
+                                continue;
+                            }
                             // Cross-namespace gate (Linux only). When the
                             // kernel-attested peer's PID namespace inode
                             // differs from the observer's, the frame.pid
@@ -399,8 +522,10 @@ impl Observer {
                             if let Some(interval_ns) = self.rate_limit_interval_ns {
                                 if let Some(last_ns) = self.tracker.last_ns_of(frame.pid) {
                                     if now_ns.saturating_sub(last_ns) < interval_ns {
-                                        self.rate_limited_total =
-                                            self.rate_limited_total.saturating_add(1);
+                                        self.rate_limited_total[RateLimitReason::PerPid as usize] =
+                                            self.rate_limited_total
+                                                [RateLimitReason::PerPid as usize]
+                                                .saturating_add(1);
                                         continue;
                                     }
                                 }
@@ -652,11 +777,23 @@ impl Observer {
         self.tracker.take_probe_exhausted()
     }
 
-    /// Drain and reset the rate-limited counter.
-    pub fn drain_rate_limited(&mut self) -> u64 {
-        let n = self.rate_limited_total;
-        self.rate_limited_total = 0;
+    /// Drain and reset the per-pid rate-limited counter.
+    pub fn drain_per_pid_rate_limited(&mut self) -> u64 {
+        let n = self.rate_limited_total[RateLimitReason::PerPid as usize];
+        self.rate_limited_total[RateLimitReason::PerPid as usize] = 0;
         n
+    }
+
+    /// Drain and reset the global rate-limited counter.
+    pub fn drain_global_rate_limited(&mut self) -> u64 {
+        let n = self.rate_limited_total[RateLimitReason::Global as usize];
+        self.rate_limited_total[RateLimitReason::Global as usize] = 0;
+        n
+    }
+
+    /// Effective `SO_RCVBUF` size granted by the kernel for the observer UDS.
+    pub fn uds_rcvbuf_bytes(&self) -> u32 {
+        self.uds_rcvbuf_bytes
     }
 
     /// Drain and reset the AEAD decryption failure counter across all
@@ -723,10 +860,13 @@ mod tests {
             Duration::from_secs(1),
             0o600,
             Duration::from_millis(100),
+            0,
             64,
             EvictionPolicy::Strict,
             DEFAULT_EVICTION_SCAN_WINDOW,
             None,
+            0,
+            0,
             ClockSource::Monotonic,
         )
         .expect("bind should succeed on a clean temp path");
@@ -746,6 +886,8 @@ mod tests {
             EvictionPolicy::Strict,
             DEFAULT_EVICTION_SCAN_WINDOW,
             None,
+            0,
+            0,
             ClockSource::Monotonic,
         )
         .expect("Observer::new should succeed");

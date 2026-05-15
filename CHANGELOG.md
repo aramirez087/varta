@@ -8,6 +8,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Security
+- **Default-on UDS rate limiting closes same-UID flood gap.** Three layered
+  defenses are now enabled by default for all out-of-the-box deployments:
+  (1) **Per-pid rate limit** (`--max-beat-rate 100`): beats arriving faster
+  than 100/s from the same pid are dropped. Previously `None` (unlimited) by
+  default; now requires `--max-beat-rate 0` to disable.
+  (2) **Global token bucket** (`--global-beat-rate 5000 --global-beat-burst 10000`):
+  a shared bucket across all senders gates frames *before* namespace /
+  per-pid classification, defeating per-pid rotation attacks where an
+  attacker cycles fake pids to keep every per-pid bucket empty. Set
+  `--global-beat-rate 0` to disable.
+  (3) **`SO_RCVBUF` tuning** (`--uds-rcvbuf-bytes 1048576`): enlarges the
+  kernel datagram queue to ~32 k frames so brief flood bursts don't drop
+  legitimate beats before the poll loop drains. The kernel-granted size is
+  surfaced as `varta_observer_uds_rcvbuf_bytes` (gauge). Set
+  `--uds-rcvbuf-bytes 0` to leave the kernel default. **Breaking default**
+  for operators relying on unbounded per-pid beat rates — use
+  `--max-beat-rate 0 --global-beat-rate 0` to restore previous behaviour.
+- **`varta_rate_limited_total` is now labelled.** The metric now emits two
+  series: `varta_rate_limited_total{reason="per_pid"}` and
+  `{reason="global"}`, both always present even at zero. Existing dashboards
+  and alerting rules that matched the bare `varta_rate_limited_total` scalar
+  should use `sum without(reason)(varta_rate_limited_total)` to recover the
+  aggregate.
+
 - **Recovery child environment is now isolated by default.** Pre-change,
   `Recovery::apply_env` short-circuited when `recovery_env` was empty, so
   recovery subprocesses inherited the observer's full process environment —

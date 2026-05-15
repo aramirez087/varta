@@ -343,6 +343,24 @@ pub const FLAGS: &[FlagSpec] = &[
         feature: "",
     },
     FlagSpec {
+        cli: "--global-beat-rate",
+        key: "global_beat_rate",
+        kind: FlagKind::U32,
+        feature: "",
+    },
+    FlagSpec {
+        cli: "--global-beat-burst",
+        key: "global_beat_burst",
+        kind: FlagKind::U32,
+        feature: "",
+    },
+    FlagSpec {
+        cli: "--uds-rcvbuf-bytes",
+        key: "uds_rcvbuf_bytes",
+        kind: FlagKind::U32,
+        feature: "",
+    },
+    FlagSpec {
         cli: "--iteration-budget-ms",
         key: "iteration_budget_ms",
         kind: FlagKind::U64,

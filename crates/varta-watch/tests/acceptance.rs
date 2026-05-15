@@ -99,10 +99,13 @@ fn observer_emits_beat_per_received_frame() {
         Duration::from_secs(60),
         0o600,
         Duration::from_millis(100),
+        0,
         64,
         EvictionPolicy::Strict,
         DEFAULT_EVICTION_SCAN_WINDOW,
         None,
+        0,
+        0,
         ClockSource::Monotonic,
     )
     .expect("bind observer");
@@ -177,10 +180,13 @@ fn observer_emits_stall_after_threshold_elapses() {
         threshold,
         0o600,
         Duration::from_millis(100),
+        0,
         64,
         EvictionPolicy::Strict,
         DEFAULT_EVICTION_SCAN_WINDOW,
         None,
+        0,
+        0,
         ClockSource::Monotonic,
     )
     .expect("bind observer");
@@ -229,10 +235,13 @@ fn observer_reports_decode_error_for_bad_magic() {
         Duration::from_secs(60),
         0o600,
         Duration::from_millis(100),
+        0,
         64,
         EvictionPolicy::Strict,
         DEFAULT_EVICTION_SCAN_WINDOW,
         None,
+        0,
+        0,
         ClockSource::Monotonic,
     )
     .expect("bind observer");
@@ -296,10 +305,13 @@ fn observer_rejects_spoofed_pid_frame() {
         Duration::from_secs(60),
         0o600,
         Duration::from_millis(100),
+        0,
         64,
         EvictionPolicy::Strict,
         DEFAULT_EVICTION_SCAN_WINDOW,
         None,
+        0,
+        0,
         ClockSource::Monotonic,
     )
     .expect("bind observer");
@@ -352,10 +364,13 @@ fn observer_counts_truncated_datagrams() {
         Duration::from_secs(60),
         0o600,
         Duration::from_millis(100),
+        0,
         64,
         EvictionPolicy::Strict,
         DEFAULT_EVICTION_SCAN_WINDOW,
         None,
+        0,
+        0,
         ClockSource::Monotonic,
     )
     .expect("bind observer");

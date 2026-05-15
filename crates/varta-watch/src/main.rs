@@ -255,10 +255,13 @@ fn run(cfg: Config) -> std::io::Result<()> {
         cfg.threshold,
         cfg.socket_mode,
         cfg.read_timeout,
+        cfg.uds_rcvbuf_bytes,
         cfg.tracker_capacity,
         cfg.tracker_eviction_policy,
         cfg.eviction_scan_window,
         cfg.max_beat_rate,
+        cfg.global_beat_rate,
+        cfg.global_beat_burst,
         cfg.clock_source,
     )?
     .with_allow_cross_namespace(cfg.allow_cross_namespace_agents);
@@ -714,6 +717,7 @@ fn run(cfg: Config) -> std::io::Result<()> {
             .with_scrape_budget(cfg.scrape_budget);
             pe.set_tracker_config(cfg.tracker_capacity, cfg.eviction_scan_window);
             pe.set_signal_handler_mode(cfg.signal_handler_mode.as_str());
+            pe.set_uds_rcvbuf_bytes(observer.uds_rcvbuf_bytes());
             if let Ok(bound_addr) = pe.local_addr() {
                 let line = format!("{bound_addr}\n");
                 let _ = std::io::stdout().lock().write_all(line.as_bytes());
@@ -1157,11 +1161,19 @@ fn run(cfg: Config) -> std::io::Result<()> {
             }
         }
 
-        let rate_limited = observer.drain_rate_limited();
-        if rate_limited > 0 {
+        let per_pid_rate_limited = observer.drain_per_pid_rate_limited();
+        if per_pid_rate_limited > 0 {
             #[cfg(feature = "prometheus-exporter")]
             if let Some(pe) = prom_export.as_mut() {
-                pe.record_rate_limited(rate_limited);
+                pe.record_per_pid_rate_limited(per_pid_rate_limited);
+            }
+        }
+
+        let global_rate_limited = observer.drain_global_rate_limited();
+        if global_rate_limited > 0 {
+            #[cfg(feature = "prometheus-exporter")]
+            if let Some(pe) = prom_export.as_mut() {
+                pe.record_global_rate_limited(global_rate_limited);
             }
         }
 

@@ -17,6 +17,36 @@ extern "C" {
     fn umask(mode: u32) -> u32;
 }
 
+// POSIX setsockopt / getsockopt for SO_RCVBUF tuning.
+extern "C" {
+    fn setsockopt(
+        fd: i32,
+        level: i32,
+        optname: i32,
+        optval: *const core::ffi::c_void,
+        optlen: u32,
+    ) -> i32;
+    fn getsockopt(
+        fd: i32,
+        level: i32,
+        optname: i32,
+        optval: *mut core::ffi::c_void,
+        optlen: *mut u32,
+    ) -> i32;
+}
+
+// SOL_SOCKET level constant (POSIX — same value across Linux, macOS, BSDs, illumos).
+#[cfg(target_os = "linux")]
+const SOL_SOCKET: i32 = 1;
+#[cfg(not(target_os = "linux"))]
+const SOL_SOCKET: i32 = 0xffff_u32 as i32;
+
+// SO_RCVBUF socket option.
+#[cfg(target_os = "linux")]
+const SO_RCVBUF: i32 = 8;
+#[cfg(not(target_os = "linux"))]
+const SO_RCVBUF: i32 = 0x1002;
+
 /// RAII guard that restores the process umask on drop, even if a panic
 /// unwinds through the bind path.
 struct UmaskGuard(u32);
@@ -109,6 +139,10 @@ pub struct UdsListener {
     bound_dev: u64,
     bound_ino: u64,
     truncated_count: u64,
+    /// Effective `SO_RCVBUF` granted by the kernel (may be less than
+    /// requested due to `net.core.rmem_max`).  `0` means no tuning was
+    /// attempted (`--uds-rcvbuf-bytes 0`).
+    rcvbuf_bytes: u32,
 }
 
 impl UdsListener {
@@ -130,6 +164,7 @@ impl UdsListener {
         path: impl AsRef<Path>,
         socket_mode: u32,
         read_timeout: Duration,
+        uds_rcvbuf_bytes: u32,
     ) -> io::Result<Self> {
         let path = path.as_ref();
         let owned_path: PathBuf = path.to_path_buf();
@@ -191,7 +226,7 @@ impl UdsListener {
                             path,
                             std::fs::Permissions::from_mode(socket_mode),
                         )?;
-                        return Self::finish_bind(sock, owned_path, read_timeout);
+                        return Self::finish_bind(sock, owned_path, read_timeout, uds_rcvbuf_bytes);
                     }
                     Err(e) => {
                         return Err(io::Error::new(
@@ -205,10 +240,15 @@ impl UdsListener {
         };
 
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(socket_mode))?;
-        Self::finish_bind(sock, owned_path, read_timeout)
+        Self::finish_bind(sock, owned_path, read_timeout, uds_rcvbuf_bytes)
     }
 
-    fn finish_bind(sock: UnixDatagram, path: PathBuf, read_timeout: Duration) -> io::Result<Self> {
+    fn finish_bind(
+        sock: UnixDatagram,
+        path: PathBuf,
+        read_timeout: Duration,
+        uds_rcvbuf_bytes: u32,
+    ) -> io::Result<Self> {
         use std::os::unix::fs::MetadataExt;
 
         sock.set_read_timeout(Some(read_timeout))?;
@@ -219,12 +259,19 @@ impl UdsListener {
         let bound_dev = meta.dev();
         let bound_ino = meta.ino();
 
+        let granted_rcvbuf = if uds_rcvbuf_bytes > 0 {
+            set_rcvbuf(raw_fd, uds_rcvbuf_bytes).unwrap_or(0)
+        } else {
+            0
+        };
+
         Ok(UdsListener {
             sock,
             path,
             bound_dev,
             bound_ino,
             truncated_count: 0,
+            rcvbuf_bytes: granted_rcvbuf,
         })
     }
 }
@@ -256,6 +303,52 @@ impl Drop for UdsListener {
             }
         }
     }
+}
+
+impl UdsListener {
+    /// Effective `SO_RCVBUF` size granted by the kernel for this socket,
+    /// in bytes.  `0` if `--uds-rcvbuf-bytes 0` was used or tuning failed.
+    pub fn rcvbuf_bytes(&self) -> u32 {
+        self.rcvbuf_bytes
+    }
+}
+
+/// Set and read back `SO_RCVBUF` on `fd`.  Returns the kernel-granted size
+/// (which Linux doubles then clamps to `net.core.rmem_max`).  Fails soft on
+/// `EPERM` (unprivileged observer, low `rmem_max`).
+fn set_rcvbuf(fd: i32, bytes: u32) -> io::Result<u32> {
+    use core::ffi::c_void;
+    use core::mem;
+
+    let val = bytes as i32;
+    let ret = unsafe {
+        setsockopt(
+            fd,
+            SOL_SOCKET,
+            SO_RCVBUF,
+            &val as *const i32 as *const c_void,
+            mem::size_of::<i32>() as u32,
+        )
+    };
+    if ret != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // Read back the effective value (kernel may grant double the requested).
+    let mut granted: i32 = 0;
+    let mut optlen = mem::size_of::<i32>() as u32;
+    let ret = unsafe {
+        getsockopt(
+            fd,
+            SOL_SOCKET,
+            SO_RCVBUF,
+            &mut granted as *mut i32 as *mut c_void,
+            &mut optlen,
+        )
+    };
+    if ret != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(granted.max(0) as u32)
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]

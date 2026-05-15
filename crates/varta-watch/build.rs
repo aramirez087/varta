@@ -363,7 +363,28 @@ fn render_constructor(parsed: &ParsedConfig, test_hooks_active: bool) -> String 
     emit_option_path(&mut s, parsed, "secure_key_file");
     emit_option_path(&mut s, parsed, "accepted_key_file");
     emit_option_path(&mut s, parsed, "master_key_file");
-    emit_option_u32(&mut s, parsed, "max_beat_rate");
+    // max_beat_rate: absent in config means default 100; 0 means disabled (None).
+    match parsed.singletons.get("max_beat_rate") {
+        Some(v) => {
+            let n: u32 = v
+                .parse()
+                .unwrap_or_else(|_| panic!("max_beat_rate: not a u32"));
+            if n == 0 {
+                s.push_str("        max_beat_rate: None,\n");
+            } else {
+                s.push_str(&format!("        max_beat_rate: Some({n}),\n"));
+            }
+        }
+        None => s.push_str("        max_beat_rate: Some(100),\n"),
+    }
+    let global_beat_rate: u32 = singleton_u32(parsed, "global_beat_rate", 5_000);
+    s.push_str(&format!("        global_beat_rate: {global_beat_rate},\n"));
+    let global_beat_burst: u32 = singleton_u32(parsed, "global_beat_burst", 10_000);
+    s.push_str(&format!(
+        "        global_beat_burst: {global_beat_burst},\n"
+    ));
+    let uds_rcvbuf_bytes: u32 = singleton_u32(parsed, "uds_rcvbuf_bytes", 1_048_576);
+    s.push_str(&format!("        uds_rcvbuf_bytes: {uds_rcvbuf_bytes},\n"));
     emit_option_path(&mut s, parsed, "heartbeat_file");
     // self_watchdog
     match parsed.singletons.get("self_watchdog_secs") {
@@ -483,6 +504,7 @@ fn emit_option_u64(s: &mut String, parsed: &ParsedConfig, key: &str) {
     };
 }
 
+#[allow(dead_code)]
 fn emit_option_u32(s: &mut String, parsed: &ParsedConfig, key: &str) {
     match parsed.singletons.get(key) {
         Some(v) => {

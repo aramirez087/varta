@@ -179,8 +179,23 @@ OPTIONAL:
                                      (requires --features secure-udp).
     --max-beat-rate <N>            Per-pid maximum beat rate in beats/sec.
                                      Beats arriving faster than this rate
-                                     from the same pid are dropped.
-                                     Default: unlimited.
+                                     from the same pid are dropped and
+                                     counted via varta_rate_limited_total
+                                     {reason=\"per_pid\"}.  Default: 100.
+                                     Set to 0 to disable.
+    --global-beat-rate <N>         Global beat rate cap across all senders
+                                     (beats/sec).  Defends against per-pid
+                                     rotation attacks.  Default: 5000.
+                                     Set to 0 to disable.
+    --global-beat-burst <N>        Global token-bucket burst capacity.
+                                     Default: 10000.
+    --uds-rcvbuf-bytes <N>         SO_RCVBUF size requested for the
+                                     observer UDS socket (bytes).  Linux
+                                     doubles and clamps to rmem_max;
+                                     the granted size is surfaced as
+                                     varta_observer_uds_rcvbuf_bytes.
+                                     Default: 1048576.  Set to 0 to
+                                     leave the kernel default.
     --heartbeat-file <PATH>        Write a timestamp + loop-counter line to
                                      this file on every poll iteration.
                                      External watchdogs can monitor the file

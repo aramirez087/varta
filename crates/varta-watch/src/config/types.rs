@@ -36,6 +36,28 @@ pub const DEFAULT_PROM_RATE_LIMIT_PER_SEC: u32 = 5;
 /// shutting down a sustained flood within a few seconds.
 pub const DEFAULT_PROM_RATE_LIMIT_BURST: u32 = 10;
 
+/// Default per-pid maximum beat rate in beats per second.
+/// Enabled by default to provide a baseline DoS ceiling.
+/// Set `--max-beat-rate 0` to disable.
+pub const DEFAULT_MAX_BEAT_RATE: u32 = 100;
+
+/// Default global beat rate cap across all senders combined, in beats per
+/// second.  Provides a hard ceiling that defeats per-pid rotation attacks.
+/// Set `--global-beat-rate 0` to disable.  Sized for 50 concurrent agents
+/// × 100 bps.
+pub const DEFAULT_GLOBAL_BEAT_RATE: u32 = 5_000;
+
+/// Default global burst capacity (token-bucket capacity).  2× the refill
+/// rate so 50 agents can co-restart within a 1 s window.
+pub const DEFAULT_GLOBAL_BEAT_BURST: u32 = 10_000;
+
+/// Default receive-buffer size requested via `SO_RCVBUF` on the observer
+/// UDS.  1 MiB ≈ 32 768 × 32 B frames ≈ 6 s of full-burst headroom at the
+/// default global rate.  Linux doubles the value then clamps to
+/// `net.core.rmem_max` (~208 KiB stock); the gauge surfaces the actual
+/// granted value.  Set `--uds-rcvbuf-bytes 0` to leave the kernel default.
+pub const DEFAULT_UDS_RCVBUF_BYTES: u32 = 1_048_576;
+
 /// Default wall-clock budget (in milliseconds) [`crate::recovery::Recovery`]
 /// blocks in its [`Drop`] impl waiting for outstanding recovery children to
 /// exit after a `kill(2)`. Five seconds preserves the v0.1 hard-coded
@@ -212,10 +234,26 @@ pub struct Config {
     /// frame's `iv_random` prefix.
     pub master_key_file: Option<PathBuf>,
     /// Optional per-pid maximum beat rate in beats per second.
-    /// `None` (the default) means no rate limiting. Beats arriving
-    /// faster than this rate from the same pid are dropped and counted
-    /// via `varta_rate_limited_total`.
+    /// `None` disables per-pid limiting (pass `--max-beat-rate 0`).
+    /// Defaults to `Some(DEFAULT_MAX_BEAT_RATE)` — beats arriving faster
+    /// than this rate from the same pid are dropped and counted via
+    /// `varta_rate_limited_total{reason="per_pid"}`.
     pub max_beat_rate: Option<u32>,
+    /// Global beat rate cap across all senders combined, in beats per
+    /// second.  Provides a ceiling that defeats per-pid rotation attacks.
+    /// `0` disables (`--global-beat-rate 0`).  Defaults to
+    /// [`DEFAULT_GLOBAL_BEAT_RATE`].
+    pub global_beat_rate: u32,
+    /// Global token-bucket burst capacity.  Defaults to
+    /// [`DEFAULT_GLOBAL_BEAT_BURST`].  `0` along with `global_beat_rate`
+    /// effectively disables the global bucket.
+    pub global_beat_burst: u32,
+    /// Requested `SO_RCVBUF` size in bytes for the observer UDS.  `0`
+    /// leaves the kernel default unchanged.  Defaults to
+    /// [`DEFAULT_UDS_RCVBUF_BYTES`].  The actual granted size (which Linux
+    /// clamps to `net.core.rmem_max`) is surfaced as
+    /// `varta_observer_uds_rcvbuf_bytes`.
+    pub uds_rcvbuf_bytes: u32,
     /// Optional path for a heartbeat file. When set, the observer
     /// writes a timestamp + loop-counter line on every poll iteration,
     /// allowing external watchdogs to detect observer stalls.

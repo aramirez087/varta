@@ -835,7 +835,11 @@ pub struct PromExporter {
     /// measuring RTT. In steady state this equals
     /// `frames_received * (keys.len() + master_key_configured as u64)`.
     secure_aead_attempts_total: u64,
-    rate_limited_total: u64,
+    /// Beats dropped per rate-limit reason since last scrape.
+    /// Index 0 = per_pid, 1 = global.
+    rate_limited_total: [u64; 2],
+    /// Effective SO_RCVBUF size in bytes for the observer UDS, set at startup.
+    uds_rcvbuf_bytes: u32,
     /// Times the observer's monotonic clock returned a value strictly less
     /// than the previously observed one and the forward clamp absorbed the
     /// regression. Surfaced as `varta_observer_clock_regression_total`;
@@ -1100,7 +1104,8 @@ impl PromExporter {
             truncated_total: 0,
             sender_state_full_total: 0,
             secure_aead_attempts_total: 0,
-            rate_limited_total: 0,
+            rate_limited_total: [0; 2],
+            uds_rcvbuf_bytes: 0,
             clock_regressions_total: 0,
             nonce_wrap_total: 0,
             eviction_scan_truncated_total: 0,
@@ -1276,8 +1281,18 @@ impl PromExporter {
     }
 
     /// Record one or more beats dropped by per-pid rate limiting.
-    pub fn record_rate_limited(&mut self, count: u64) {
-        self.rate_limited_total = self.rate_limited_total.saturating_add(count);
+    pub fn record_per_pid_rate_limited(&mut self, count: u64) {
+        self.rate_limited_total[0] = self.rate_limited_total[0].saturating_add(count);
+    }
+
+    /// Record one or more beats dropped by the global rate limiter.
+    pub fn record_global_rate_limited(&mut self, count: u64) {
+        self.rate_limited_total[1] = self.rate_limited_total[1].saturating_add(count);
+    }
+
+    /// Record the effective SO_RCVBUF size granted by the kernel at startup.
+    pub fn set_uds_rcvbuf_bytes(&mut self, bytes: u32) {
+        self.uds_rcvbuf_bytes = bytes;
     }
 
     /// Record one or more observer clock-regression events drained from
@@ -2315,15 +2330,29 @@ impl PromExporter {
             "varta_secure_aead_attempts_total {}",
             self.secure_aead_attempts_total
         );
-        self.body_buf.push_str(
-            "# HELP varta_rate_limited_total Total beats dropped by per-pid rate limiting.\n",
-        );
+        self.body_buf
+            .push_str("# HELP varta_rate_limited_total Frames dropped due to rate limiting.\n");
         self.body_buf
             .push_str("# TYPE varta_rate_limited_total counter\n");
         let _ = writeln!(
             self.body_buf,
-            "varta_rate_limited_total {}",
-            self.rate_limited_total
+            "varta_rate_limited_total{{reason=\"per_pid\"}} {}",
+            self.rate_limited_total[0]
+        );
+        let _ = writeln!(
+            self.body_buf,
+            "varta_rate_limited_total{{reason=\"global\"}} {}",
+            self.rate_limited_total[1]
+        );
+        self.body_buf.push_str(
+            "# HELP varta_observer_uds_rcvbuf_bytes Effective SO_RCVBUF size on the observer UDS, in bytes.\n",
+        );
+        self.body_buf
+            .push_str("# TYPE varta_observer_uds_rcvbuf_bytes gauge\n");
+        let _ = writeln!(
+            self.body_buf,
+            "varta_observer_uds_rcvbuf_bytes {}",
+            self.uds_rcvbuf_bytes
         );
         self.body_buf.push_str(
             "# HELP varta_observer_clock_regression_total Times the observer monotonic clock returned a value strictly less than the previously observed one and the forward clamp absorbed the regression. Non-zero values indicate TSC drift, VM live migration, or another clock anomaly.\n",
