@@ -846,6 +846,10 @@ pub struct PromExporter {
     /// non-zero values mean TSC drift, VM live migration, or another
     /// clock anomaly the operator should investigate.
     clock_regressions_total: u64,
+    /// Times the observer clock advanced by more than the forward-jump
+    /// sentinel between adjacent poll ticks. Surfaced as
+    /// `varta_observer_clock_jump_forward_total`.
+    clock_jumps_forward_total: u64,
     nonce_wrap_total: u64,
     /// Count of bounded eviction-scan calls that ran the full
     /// `eviction_scan_window` without finding a victim. Surfaced as
@@ -1111,6 +1115,7 @@ impl PromExporter {
             rate_limited_total: [0; 2],
             uds_rcvbuf_bytes: 0,
             clock_regressions_total: 0,
+            clock_jumps_forward_total: 0,
             nonce_wrap_total: 0,
             eviction_scan_truncated_total: 0,
             tracker_capacity_cfg: 0,
@@ -1305,6 +1310,13 @@ impl PromExporter {
     /// `varta_observer_clock_regression_total`.
     pub fn record_clock_regressions(&mut self, count: u64) {
         self.clock_regressions_total = self.clock_regressions_total.saturating_add(count);
+    }
+
+    /// Record one or more forward-jump events drained from
+    /// [`crate::observer::Observer::drain_clock_jumps_forward`]. Surfaced as
+    /// `varta_observer_clock_jump_forward_total`.
+    pub fn record_clock_jumps_forward(&mut self, count: u64) {
+        self.clock_jumps_forward_total = self.clock_jumps_forward_total.saturating_add(count);
     }
 
     /// Record one or more nonce-space wrap events (agent exhausted u64 nonce
@@ -2385,6 +2397,16 @@ impl PromExporter {
             self.body_buf,
             "varta_observer_clock_regression_total {}",
             self.clock_regressions_total
+        );
+        self.body_buf.push_str(
+            "# HELP varta_observer_clock_jump_forward_total Times the observer monotonic clock advanced by more than 5 s between adjacent poll ticks. Non-zero values indicate sleep/wake on monotonic-raw/boottime, VM live migration, or a hypervisor pause.\n",
+        );
+        self.body_buf
+            .push_str("# TYPE varta_observer_clock_jump_forward_total counter\n");
+        let _ = writeln!(
+            self.body_buf,
+            "varta_observer_clock_jump_forward_total {}",
+            self.clock_jumps_forward_total
         );
         self.body_buf.push_str(
             "# HELP varta_scrape_skipped_total Number of /metrics scrapes served from cache (rate-limited).\n",

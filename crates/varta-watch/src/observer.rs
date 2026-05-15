@@ -31,6 +31,12 @@ pub(crate) enum RateLimitReason {
 
 pub(crate) const RATE_LIMIT_N: usize = 2;
 
+/// Forward-jump sentinel: a single poll-tick advance exceeding this threshold
+/// is counted as an anomalous forward jump (sleep/wake, VM live migration,
+/// hypervisor pause). 5 s is far above worst-case poll-tick latency on a
+/// loaded host and far below any plausible sleep or migration interval.
+const CLOCK_JUMP_FORWARD_THRESHOLD_NS: u64 = 5_000_000_000;
+
 /// Global per-observer token bucket — one shared across all senders.
 ///
 /// Guards against per-pid rotation attacks where an attacker cycles through
@@ -250,6 +256,13 @@ pub struct Observer {
     /// would otherwise be invisible. Drained via
     /// [`Observer::drain_clock_regressions`].
     clock_regressions: u64,
+    /// Count of times consecutive `now_ns()` readings advanced by more than
+    /// [`CLOCK_JUMP_FORWARD_THRESHOLD_NS`] in a single poll tick. This
+    /// captures sleep/wake on `monotonic-raw`/`boottime`, VM live migration,
+    /// and hypervisor pauses that are invisible to the regression counter.
+    /// Surfaced as `varta_observer_clock_jump_forward_total`. Drained via
+    /// [`Observer::drain_clock_jumps_forward`].
+    clock_jumps_forward: u64,
     /// When true, beats from agents whose kernel-attested PID namespace
     /// differs from the observer's are admitted into the tracker (and may
     /// later be passed to recovery). Set by `--allow-cross-namespace-agents`.
@@ -329,6 +342,7 @@ impl Observer {
             global_rl: GlobalRateLimit::new(global_beat_rate, global_beat_burst),
             last_now_ns: 0,
             clock_regressions: 0,
+            clock_jumps_forward: 0,
             allow_cross_namespace: false,
             cross_namespace_drops: 0,
             pid_max: crate::pid_max::read_pid_max(),
@@ -637,11 +651,27 @@ impl Observer {
     /// deployment matrix.
     pub fn now_ns(&mut self) -> u64 {
         let raw = self.clock.now_ns();
+        self.apply_raw_clock(raw)
+    }
+
+    fn apply_raw_clock(&mut self, raw: u64) -> u64 {
         if raw < self.last_now_ns {
             self.clock_regressions = self.clock_regressions.saturating_add(1);
+        } else if self.last_now_ns > 0
+            && raw.saturating_sub(self.last_now_ns) > CLOCK_JUMP_FORWARD_THRESHOLD_NS
+        {
+            self.clock_jumps_forward = self.clock_jumps_forward.saturating_add(1);
         }
         self.last_now_ns = self.last_now_ns.max(raw);
         self.last_now_ns
+    }
+
+    /// Feed a synthetic raw clock value directly, bypassing `self.clock`.
+    /// Only available in tests; allows forward-jump and regression scenarios
+    /// without waiting for real time to advance.
+    #[cfg(test)]
+    pub(crate) fn apply_raw_clock_test(&mut self, raw: u64) -> u64 {
+        self.apply_raw_clock(raw)
     }
 
     /// Drain and reset the clock-regression counter — number of times the
@@ -653,6 +683,17 @@ impl Observer {
     pub fn drain_clock_regressions(&mut self) -> u64 {
         let n = self.clock_regressions;
         self.clock_regressions = 0;
+        n
+    }
+
+    /// Drain and reset the forward-jump counter — number of times the kernel
+    /// monotonic clock advanced by more than [`CLOCK_JUMP_FORWARD_THRESHOLD_NS`]
+    /// between adjacent poll ticks. Non-zero values indicate sleep/wake on
+    /// `monotonic-raw`/`boottime`, VM live migration, or a hypervisor pause.
+    /// Surfaced as `varta_observer_clock_jump_forward_total`.
+    pub fn drain_clock_jumps_forward(&mut self) -> u64 {
+        let n = self.clock_jumps_forward;
+        self.clock_jumps_forward = 0;
         n
     }
 
@@ -949,6 +990,60 @@ mod tests {
             obs.drain_clock_regressions(),
             2,
             "counter is saturating-add cumulative until drained"
+        );
+    }
+
+    #[test]
+    fn clock_jump_forward_counter_increments_on_large_advance() {
+        let mut obs = Observer::new(
+            Duration::from_secs(1),
+            64,
+            EvictionPolicy::Strict,
+            DEFAULT_EVICTION_SCAN_WINDOW,
+            None,
+            0,
+            0,
+            ClockSource::Monotonic,
+        )
+        .expect("Observer::new should succeed");
+
+        // Feed synthetic timestamps via apply_raw_clock_test so we don't need
+        // to wait real time. Simulate a baseline reading then a 10 s jump.
+        let _ = obs.apply_raw_clock_test(1_000_000); // prime: 1 ms from baseline
+        let _ = obs.apply_raw_clock_test(11_000_000_000); // +10 s jump
+        assert_eq!(
+            obs.drain_clock_jumps_forward(),
+            1,
+            "forward jump exceeding threshold must increment the counter"
+        );
+        assert_eq!(
+            obs.drain_clock_regressions(),
+            0,
+            "a forward jump must not also count as a regression"
+        );
+
+        // Drain resets — second drain reads zero.
+        assert_eq!(
+            obs.drain_clock_jumps_forward(),
+            0,
+            "drain must reset the forward-jump counter"
+        );
+
+        // A sub-threshold advance (2 s) must not be counted.
+        let _ = obs.apply_raw_clock_test(13_000_000_000); // +2 s — below 5 s sentinel
+        assert_eq!(
+            obs.drain_clock_jumps_forward(),
+            0,
+            "advance below threshold must not be counted as a jump"
+        );
+
+        // Bootstrap case: last_now_ns == 0 must not trigger a jump (startup).
+        obs.last_now_ns = 0;
+        let _ = obs.apply_raw_clock_test(10_000_000_000); // 10 s from zero
+        assert_eq!(
+            obs.drain_clock_jumps_forward(),
+            0,
+            "initial read from last_now_ns==0 must not count as a forward jump"
         );
     }
 }

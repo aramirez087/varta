@@ -1199,6 +1199,14 @@ fn run(cfg: Config) -> std::io::Result<()> {
             }
         }
 
+        let clock_jumps_forward = observer.drain_clock_jumps_forward();
+        if clock_jumps_forward > 0 {
+            #[cfg(feature = "prometheus-exporter")]
+            if let Some(pe) = prom_export.as_mut() {
+                pe.record_clock_jumps_forward(clock_jumps_forward);
+            }
+        }
+
         let nonce_wraps = observer.drain_nonce_wraps();
         if nonce_wraps > 0 {
             #[cfg(feature = "prometheus-exporter")]
