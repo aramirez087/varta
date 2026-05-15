@@ -1003,6 +1003,10 @@ pub struct PromExporter {
     /// Count of `fdatasync` observations.  Companion to
     /// `varta_audit_fsync_seconds_count`.
     audit_fsync_count_total: u64,
+    /// `fsync(2)` calls on the UDS socket's parent directory during bind that
+    /// returned an error (soft durability degradation).  Surfaced as
+    /// `varta_socket_bind_dir_fsync_failed_total`.
+    bind_dir_fsync_failed_total: u64,
     /// `fdatasync(2)` calls on the audit log that exceeded
     /// `--audit-fsync-budget-ms`.  Surfaced as
     /// `varta_audit_fsync_budget_exceeded_total`.
@@ -1145,6 +1149,7 @@ impl PromExporter {
             audit_fsync_buckets: [0; ITERATION_BUCKET_BOUNDS_S.len() + 1],
             audit_fsync_duration_ns_sum: 0,
             audit_fsync_count_total: 0,
+            bind_dir_fsync_failed_total: 0,
             audit_fsync_budget_exceeded_total: 0,
             audit_rotation_budget_exceeded_total: 0,
             audit_ring_watermark_total: [0; 2],
@@ -1514,6 +1519,13 @@ impl PromExporter {
             let inf_idx = ITERATION_BUCKET_BOUNDS_S.len();
             self.audit_fsync_buckets[inf_idx] = self.audit_fsync_buckets[inf_idx].saturating_add(1);
         }
+    }
+
+    /// Record `fsync(2)` calls on the UDS socket's parent directory that
+    /// returned an error during bind.  See
+    /// [`crate::listener::drain_bind_dir_fsync_failures`].
+    pub fn record_bind_dir_fsync_failed(&mut self, count: u64) {
+        self.bind_dir_fsync_failed_total = self.bind_dir_fsync_failed_total.saturating_add(count);
     }
 
     /// Record `fdatasync(2)` calls that exceeded
@@ -2240,6 +2252,16 @@ impl PromExporter {
             self.body_buf,
             "varta_audit_fsync_seconds_count {}",
             self.audit_fsync_count_total
+        );
+        self.body_buf.push_str(
+            "# HELP varta_socket_bind_dir_fsync_failed_total fsync(2) calls on the UDS socket parent directory during observer bind that returned an error. Non-zero indicates a durability degradation — the unlink+bind sequence may not survive a power-loss journal replay.\n",
+        );
+        self.body_buf
+            .push_str("# TYPE varta_socket_bind_dir_fsync_failed_total counter\n");
+        let _ = writeln!(
+            self.body_buf,
+            "varta_socket_bind_dir_fsync_failed_total {}",
+            self.bind_dir_fsync_failed_total
         );
         self.body_buf.push_str(
             "# HELP varta_audit_fsync_budget_exceeded_total fdatasync(2) calls on the recovery audit log whose wall time exceeded --audit-fsync-budget-ms. Remaining records in the affected drain are written-to-BufWriter only; the next maintenance tick reattempts the sync.\n",

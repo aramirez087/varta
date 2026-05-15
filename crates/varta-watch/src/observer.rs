@@ -829,6 +829,14 @@ impl Observer {
             .map(|l| l.drain_aead_attempts())
             .sum()
     }
+
+    /// Drain and reset the parent-directory fsync failure counter for UDS
+    /// bind.  Non-zero only when the OS returned an error from `fsync(2)` on
+    /// the socket's parent directory during startup.  Surfaced as
+    /// `varta_socket_bind_dir_fsync_failed_total`.
+    pub fn drain_bind_dir_fsync_failures() -> u64 {
+        crate::listener::drain_bind_dir_fsync_failures()
+    }
 }
 
 #[cfg(test)]

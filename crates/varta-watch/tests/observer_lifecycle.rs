@@ -11,6 +11,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
+use varta_watch::listener::drain_bind_dir_fsync_failures;
 use varta_watch::tracker::DEFAULT_EVICTION_SCAN_WINDOW;
 use varta_watch::{ClockSource, EvictionPolicy, Observer};
 
@@ -250,6 +251,72 @@ fn drop_swallows_missing_file() {
     assert!(!path.exists());
 
     drop(obs);
+}
+
+/// Bind on a tempdir path must not increment the dir-fsync failure counter.
+/// Asserts that fsync_parent_dir runs and succeeds on a normal filesystem.
+#[test]
+fn bind_fsyncs_parent_directory_without_error() {
+    let path = unique_path("dirfsync");
+    let pre = drain_bind_dir_fsync_failures();
+
+    let _obs = Observer::bind(
+        &path,
+        THRESHOLD,
+        0o600,
+        Duration::from_millis(100),
+        0,
+        64,
+        EvictionPolicy::Strict,
+        DEFAULT_EVICTION_SCAN_WINDOW,
+        None,
+        0,
+        0,
+        ClockSource::Monotonic,
+    )
+    .expect("bind must succeed and dir-fsync must not error");
+
+    let post = drain_bind_dir_fsync_failures();
+    assert_eq!(
+        post, pre,
+        "dir-fsync must not have failed on a normal tempdir"
+    );
+    drop(_obs);
+}
+
+/// Stale-recovery bind path must also fsync the parent directory without error.
+#[test]
+fn bind_fsyncs_parent_directory_after_stale_recovery() {
+    let path = unique_path("dirfsync-stale");
+
+    let stale = UnixDatagram::bind(&path).expect("create stale socket");
+    drop(stale);
+
+    let pre = drain_bind_dir_fsync_failures();
+
+    let _obs = Observer::bind(
+        &path,
+        THRESHOLD,
+        0o600,
+        Duration::from_millis(100),
+        0,
+        64,
+        EvictionPolicy::Strict,
+        DEFAULT_EVICTION_SCAN_WINDOW,
+        None,
+        0,
+        0,
+        ClockSource::Monotonic,
+    )
+    .expect("stale-recovery bind must succeed and dir-fsync must not error");
+
+    let post = drain_bind_dir_fsync_failures();
+    assert_eq!(
+        post, pre,
+        "dir-fsync must not have failed on a normal tempdir (stale-recovery path)"
+    );
+    drop(_obs);
+    let _ = std::fs::remove_file(&path);
 }
 
 /// M7 constraint #6 — if another Observer has won the path (different inode),

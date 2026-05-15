@@ -1129,6 +1129,14 @@ fn run(cfg: Config) -> std::io::Result<()> {
             }
         }
 
+        let bind_dir_fsync_failed = Observer::drain_bind_dir_fsync_failures();
+        if bind_dir_fsync_failed > 0 {
+            #[cfg(feature = "prometheus-exporter")]
+            if let Some(pe) = prom_export.as_mut() {
+                pe.record_bind_dir_fsync_failed(bind_dir_fsync_failed);
+            }
+        }
+
         let decrypt_failures = observer.drain_decrypt_failures();
         if decrypt_failures > 0 {
             #[cfg(feature = "prometheus-exporter")]

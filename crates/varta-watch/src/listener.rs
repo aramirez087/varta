@@ -11,7 +11,24 @@ use std::os::unix::fs::PermissionsExt;
 use std::os::unix::io::AsRawFd;
 use std::os::unix::net::UnixDatagram;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
+
+/// Count of `fsync_parent_dir` failures since process start.  Incremented on
+/// every bind where the parent-directory fsync succeeds at the OS level but
+/// returns an error (e.g. `EINVAL` on platforms that do not support directory
+/// fsync).  Drained by [`drain_bind_dir_fsync_failures`].
+static DIR_FSYNC_FAILED: AtomicU64 = AtomicU64::new(0);
+
+/// Drain and reset the parent-directory fsync failure counter.
+///
+/// Returns the number of `fsync_parent_dir` calls that failed since the last
+/// drain (typically since process start, because bind runs once).  Called by
+/// the observer poll loop to surface `varta_socket_bind_dir_fsync_failed_total`
+/// via the Prometheus exporter.
+pub fn drain_bind_dir_fsync_failures() -> u64 {
+    DIR_FSYNC_FAILED.swap(0, Ordering::Relaxed)
+}
 
 extern "C" {
     fn umask(mode: u32) -> u32;
@@ -259,6 +276,18 @@ impl UdsListener {
         let bound_dev = meta.dev();
         let bound_ino = meta.ino();
 
+        // Fsync the parent directory so the unlink+bind+chmod sequence is
+        // durable across power loss or an unclean shutdown.  The bind has
+        // already succeeded — a directory-fsync failure is treated as a soft
+        // durability degradation rather than a startup failure (some exotic
+        // platforms return EINVAL for directory fsync).
+        if let Err(e) = fsync_parent_dir(&path) {
+            crate::varta_warn!(
+                "uds bind: parent-directory fsync failed (durability degraded): {e}"
+            );
+            DIR_FSYNC_FAILED.fetch_add(1, Ordering::Relaxed);
+        }
+
         let granted_rcvbuf = if uds_rcvbuf_bytes > 0 {
             set_rcvbuf(raw_fd, uds_rcvbuf_bytes).unwrap_or(0)
         } else {
@@ -311,6 +340,16 @@ impl UdsListener {
     pub fn rcvbuf_bytes(&self) -> u32 {
         self.rcvbuf_bytes
     }
+}
+
+/// Fsync the directory containing `path` so the unlink+bind+chmod sequence
+/// is durable across power loss.  Uses `sync_all` (`fsync(2)`) rather than
+/// `sync_data` (`fdatasync(2)`) because directory entries are metadata and
+/// `fdatasync` is not guaranteed to flush them.
+fn fsync_parent_dir(path: &Path) -> io::Result<()> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let dir = std::fs::File::open(parent)?;
+    dir.sync_all()
 }
 
 /// Set and read back `SO_RCVBUF` on `fd`.  Returns the kernel-granted size
