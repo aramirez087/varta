@@ -91,8 +91,11 @@ pub(super) unsafe fn install(handler: extern "C" fn(i32)) -> io::Result<()> {
                      (libc wrapper hijacked the syscall?)",
                 ));
             }
-            // SAFETY: varta_signal_restorer is a function item.
-            if old.sa_restorer != unsafe { varta_signal_restorer as *const () } {
+            // `varta_signal_restorer` is a function item; the cast to
+            // `*const ()` is a safe operation (taking the address of a
+            // function does not require `unsafe`; only *calling* an
+            // `unsafe extern "C"` function does).
+            if old.sa_restorer != varta_signal_restorer as *const () {
                 return Err(io::Error::other(
                     "rt_sigaction readback: kernel did not install our trampoline \
                      (libc override, or kernel rt_sigreturn ABI changed?)",

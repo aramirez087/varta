@@ -23,7 +23,7 @@
 
 use core::marker::Copy;
 use core::mem::MaybeUninit;
-use core::net::IpAddr;
+use core::net::{IpAddr, SocketAddr};
 
 /// 32-bit hash trait used by [`BoundedIndex`]. Implementations must be pure
 /// functions of `self` — deterministic across processes and free of any
@@ -295,10 +295,36 @@ impl Hash32 for IpAddr {
     }
 }
 
+impl Hash32 for SocketAddr {
+    #[inline]
+    fn hash32(&self) -> u32 {
+        // Same folding chain as Hash32 for IpAddr with the port mixed in
+        // via an independent rotation so that addr:portA and addr:portB hit
+        // different buckets. Deterministic, no allocation, no SipHash.
+        let port = u32::from(self.port());
+        match self.ip() {
+            IpAddr::V4(v) => mix32(u32::from_be_bytes(v.octets()) ^ port.rotate_left(11)),
+            IpAddr::V6(v) => {
+                let b = v.octets();
+                let c0 = u32::from_be_bytes([b[0], b[1], b[2], b[3]]);
+                let c1 = u32::from_be_bytes([b[4], b[5], b[6], b[7]]);
+                let c2 = u32::from_be_bytes([b[8], b[9], b[10], b[11]]);
+                let c3 = u32::from_be_bytes([b[12], b[13], b[14], b[15]]);
+                mix32(
+                    c0 ^ c1.rotate_left(7)
+                        ^ c2.rotate_left(13)
+                        ^ c3.rotate_left(19)
+                        ^ port.rotate_left(23),
+                )
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use core::net::{Ipv4Addr, Ipv6Addr};
+    use core::net::{Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6};
 
     #[test]
     fn entry_u32_is_8_bytes() {
@@ -448,5 +474,68 @@ mod tests {
         assert_eq!(k.hash32(), k.hash32());
         let ip = IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4));
         assert_eq!(ip.hash32(), ip.hash32());
+        let sa = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(1, 2, 3, 4), 4242));
+        assert_eq!(sa.hash32(), sa.hash32());
+    }
+
+    #[test]
+    fn roundtrip_socketaddr_v4() {
+        let mut t: BoundedIndex<SocketAddr> = BoundedIndex::new(8);
+        let a = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 1), 4242));
+        let b = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(192, 168, 1, 1), 9000));
+        t.insert(a, 0).unwrap();
+        t.insert(b, 1).unwrap();
+        assert_eq!(t.get(a), Some(0));
+        assert_eq!(t.get(b), Some(1));
+        assert_eq!(
+            t.get(SocketAddr::V4(SocketAddrV4::new(
+                Ipv4Addr::new(10, 0, 0, 1),
+                4243
+            ))),
+            None,
+            "different port on same IP must miss"
+        );
+    }
+
+    #[test]
+    fn roundtrip_socketaddr_v6() {
+        let mut t: BoundedIndex<SocketAddr> = BoundedIndex::new(8);
+        let a = SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::LOCALHOST, 4242, 0, 0));
+        let b = SocketAddr::V6(SocketAddrV6::new(
+            Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1),
+            9000,
+            0,
+            0,
+        ));
+        t.insert(a, 0).unwrap();
+        t.insert(b, 1).unwrap();
+        assert_eq!(t.get(a), Some(0));
+        assert_eq!(t.get(b), Some(1));
+        assert_eq!(
+            t.get(SocketAddr::V6(SocketAddrV6::new(
+                Ipv6Addr::LOCALHOST,
+                4243,
+                0,
+                0
+            ))),
+            None,
+            "different port on same IPv6 must miss"
+        );
+    }
+
+    #[test]
+    fn socketaddr_hash_distinguishes_port_changes() {
+        // The port mix must change the hash; otherwise an attacker pumping
+        // many ports from one IP could collapse to one bucket and waste
+        // sender-table capacity unnecessarily.
+        let ip4 = Ipv4Addr::new(10, 0, 0, 1);
+        let h1 = SocketAddr::V4(SocketAddrV4::new(ip4, 1)).hash32();
+        let h2 = SocketAddr::V4(SocketAddrV4::new(ip4, 2)).hash32();
+        assert_ne!(h1, h2);
+
+        let ip6 = Ipv6Addr::LOCALHOST;
+        let h3 = SocketAddr::V6(SocketAddrV6::new(ip6, 1, 0, 0)).hash32();
+        let h4 = SocketAddr::V6(SocketAddrV6::new(ip6, 2, 0, 0)).hash32();
+        assert_ne!(h3, h4);
     }
 }

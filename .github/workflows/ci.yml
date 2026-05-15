@@ -259,10 +259,11 @@ jobs:
         env: { MIRIFLAGS: "-Zmiri-strict-provenance" }
 
   cross-compile-checks:
-    name: cross-compile-checks (illumos + OpenBSD + riscv64)
+    name: cross-compile-checks (illumos + OpenBSD + riscv64 + musl)
     # Verify that varta-watch compiles cleanly on Tier-2/Tier-3 targets:
     # illumos (per-datagram SO_RECVUCRED attestation), OpenBSD (SocketModeOnly
-    # fallback), and riscv64 (new signal-install architecture support).
+    # fallback), riscv64 (signal-install architecture support), and musl libc
+    # (different struct sigaction layout, SCM_CREDENTIALS encoding).
     # Type-check only — no linking, no test execution — because we have no
     # runners for those platforms.
     runs-on: ubuntu-latest
@@ -290,6 +291,16 @@ jobs:
         # exercises the illumos module, IllumosCmsg CmsgPlatform impl, and the
         # validate.rs O_NOFOLLOW / ELOOP constants.
         run: cargo check --locked -p varta-watch --target x86_64-unknown-illumos
+
+      - name: install musl target
+        run: rustup target add x86_64-unknown-linux-musl
+
+      - name: cargo check — x86_64-unknown-linux-musl
+        # musl libc differs from glibc in struct sigaction layout (no
+        # sa_restorer on musl x86_64) and SCM_CREDENTIALS struct encoding;
+        # this catches compile-time regressions on signal_install/linux/*.rs
+        # and peer_cred/platform/linux.rs without paying for an Alpine runner.
+        run: cargo check --locked -p varta-watch --target x86_64-unknown-linux-musl
 
       - name: rust toolchain (nightly — OpenBSD needs -Zbuild-std)
         uses: dtolnay/rust-toolchain@nightly

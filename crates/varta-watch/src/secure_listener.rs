@@ -14,8 +14,6 @@
 //! 3. The observer's [`Tracker`] enforces per-pid nonce monotonicity on
 //!    the decrypted frame.
 
-use std::collections::hash_map::Entry;
-use std::collections::HashMap;
 use std::io;
 use std::net::{SocketAddr, UdpSocket};
 use std::time::{Duration, Instant};
@@ -24,6 +22,7 @@ use varta_vlp::crypto::{self, Key, NONCE_BYTES, SECURE_FRAME_MASTER_BYTES, TAG_B
 
 use crate::listener::{BeatListener, TransportTrust};
 use crate::peer_cred::{BeatOrigin, RecvResult};
+use crate::probe_table::BoundedIndex;
 
 /// Wire size of a shared-key VLP frame.
 const SECURE_FRAME_LEN: usize = crypto::SECURE_FRAME_BYTES;
@@ -45,9 +44,13 @@ const EVICTION_INTERVAL: Duration = Duration::from_secs(60);
 ///
 /// Tracks the current IV prefix and its last counter, plus a 1-deep history
 /// of the previous IV prefix/counter so that frames from a recently-rotated
-/// IV are still checked for replay.
+/// IV are still checked for replay. The originating `addr` is stored
+/// alongside the IV/counter pair so that a linear walk over the slab can
+/// recover the index key (matches the `OutstandingTable` pattern, which
+/// stores pid-keyed values keyed by their own value).
 #[derive(Clone, Debug)]
 struct SenderState {
+    addr: SocketAddr,
     iv_random: [u8; 8],
     last_counter: u32,
     prev_iv_random: [u8; 8],
@@ -56,8 +59,9 @@ struct SenderState {
 }
 
 impl SenderState {
-    fn new(iv_random: [u8; 8], counter: u32) -> Self {
+    fn new(addr: SocketAddr, iv_random: [u8; 8], counter: u32) -> Self {
         SenderState {
+            addr,
             iv_random,
             last_counter: counter,
             prev_iv_random: [0u8; 8],
@@ -87,7 +91,19 @@ pub struct SecureUdpListener {
     sock: UdpSocket,
     keys: Vec<Key>,
     master_key: Option<Key>,
-    sender_state: HashMap<SocketAddr, SenderState>,
+    /// One slot per tracked sender. `Some(state)` for occupied; `None` for
+    /// free. Length is fixed at construction at `MAX_SENDER_STATES` and never
+    /// reallocates.
+    sender_slab: Vec<Option<SenderState>>,
+    /// LIFO of available slab indices. Pre-populated with
+    /// `(0..MAX_SENDER_STATES).rev()` so the first insert lands at slot 0.
+    sender_free_list: Vec<u32>,
+    /// `SocketAddr → slab index` mapping with bounded WCET (no SipHash, no
+    /// rehash). Sized identically to the slab so the load-factor invariant
+    /// for `BoundedIndex` holds. Replaces the previous
+    /// `HashMap<SocketAddr, SenderState>` per the project-wide DNR rule
+    /// (see cerebrum 2026-05-14 "Generic `BoundedIndex<K>`").
+    sender_index: BoundedIndex<SocketAddr>,
     next_eviction_check: Instant,
     decrypt_failures: u64,
     truncated_count: u64,
@@ -102,6 +118,21 @@ pub struct SecureUdpListener {
     aead_attempts: u64,
     last_evicted: Option<(SocketAddr, SenderState)>,
     recovery_trust: TransportTrust,
+}
+
+/// Build the pre-allocated `(slab, free_list, index)` triple used by both
+/// `bind` and `bind_with_master`. Keeps the capacity invariant in one place.
+fn new_sender_state_store() -> (Vec<Option<SenderState>>, Vec<u32>, BoundedIndex<SocketAddr>) {
+    let mut slab = Vec::with_capacity(MAX_SENDER_STATES);
+    for _ in 0..MAX_SENDER_STATES {
+        slab.push(None);
+    }
+    let mut free_list = Vec::with_capacity(MAX_SENDER_STATES);
+    for i in (0..MAX_SENDER_STATES as u32).rev() {
+        free_list.push(i);
+    }
+    let index = BoundedIndex::new(MAX_SENDER_STATES);
+    (slab, free_list, index)
 }
 
 impl SecureUdpListener {
@@ -124,11 +155,14 @@ impl SecureUdpListener {
         }
         let sock = UdpSocket::bind(addr)?;
         sock.set_nonblocking(true)?;
+        let (sender_slab, sender_free_list, sender_index) = new_sender_state_store();
         Ok(SecureUdpListener {
             sock,
             keys,
             master_key: None,
-            sender_state: HashMap::with_capacity(64),
+            sender_slab,
+            sender_free_list,
+            sender_index,
             next_eviction_check: Instant::now() + EVICTION_INTERVAL,
             decrypt_failures: 0,
             truncated_count: 0,
@@ -155,11 +189,14 @@ impl SecureUdpListener {
     pub fn bind_with_master(addr: SocketAddr, keys: Vec<Key>, master_key: Key) -> io::Result<Self> {
         let sock = UdpSocket::bind(addr)?;
         sock.set_nonblocking(true)?;
+        let (sender_slab, sender_free_list, sender_index) = new_sender_state_store();
         Ok(SecureUdpListener {
             sock,
             keys,
             master_key: Some(master_key),
-            sender_state: HashMap::with_capacity(64),
+            sender_slab,
+            sender_free_list,
+            sender_index,
             next_eviction_check: Instant::now() + EVICTION_INTERVAL,
             decrypt_failures: 0,
             truncated_count: 0,
@@ -183,27 +220,45 @@ impl SecureUdpListener {
 
     /// Remove senders that haven't been seen in [`EVICTION_TTL`].
     /// Called periodically from [`recv`] to prevent unbounded growth from
-    /// short-lived agents (cron jobs, CI runners).
+    /// short-lived agents (cron jobs, CI runners). Linear scan over the
+    /// fixed-size slab so the WCET is bounded at `MAX_SENDER_STATES`.
     fn evict_stale_senders(&mut self) {
         let cutoff = Instant::now() - EVICTION_TTL;
-        self.sender_state
-            .retain(|_, state| state.last_seen > cutoff);
+        for slot in 0..self.sender_slab.len() {
+            let stale = self
+                .sender_slab
+                .get(slot)
+                .and_then(|opt| opt.as_ref())
+                .is_some_and(|s| s.last_seen <= cutoff);
+            if stale {
+                if let Some(state) = self.sender_slab[slot].take() {
+                    self.sender_index.remove(state.addr);
+                    self.sender_free_list.push(slot as u32);
+                }
+            }
+        }
     }
 
-    /// When the sender-state map is full after a stale-sender sweep, evict
+    /// When the sender-state slab is full after a stale-sender sweep, evict
     /// the single entry with the oldest `last_seen` to make room for a new
     /// sender. The evicted sender's replay state is preserved in
     /// `last_evicted` so that a replayed frame from the evicted sender is
     /// still rejected.
     fn force_evict_oldest_sender(&mut self) {
-        let oldest = self
-            .sender_state
+        let oldest_slot = self
+            .sender_slab
             .iter()
-            .min_by_key(|(_, s)| s.last_seen)
-            .map(|(addr, state)| (*addr, state.clone()));
-        if let Some((addr, state)) = oldest {
-            self.sender_state.remove(&addr);
-            self.last_evicted = Some((addr, state));
+            .enumerate()
+            .filter_map(|(i, opt)| opt.as_ref().map(|s| (i, s.last_seen)))
+            .min_by_key(|(_, ls)| *ls)
+            .map(|(i, _)| i);
+        if let Some(slot) = oldest_slot {
+            if let Some(state) = self.sender_slab[slot].take() {
+                self.sender_index.remove(state.addr);
+                self.sender_free_list.push(slot as u32);
+                let addr = state.addr;
+                self.last_evicted = Some((addr, state));
+            }
         }
     }
 
@@ -293,77 +348,132 @@ impl SecureUdpListener {
         iv_random: [u8; 8],
         counter: u32,
     ) -> bool {
-        match self.sender_state.entry(sender) {
-            Entry::Vacant(e) => {
-                if let Some((evicted_addr, ref evicted_state)) = self.last_evicted {
-                    if evicted_addr == *e.key() {
-                        let valid = Self::validate_replay(evicted_state, iv_random, counter);
-                        if valid {
-                            let mut new_state = evicted_state.clone();
-                            Self::apply_replay_update(&mut new_state, iv_random, counter);
-                            e.insert(new_state);
-                        }
-                        self.last_evicted = None;
-                        return valid;
-                    }
-                }
-                e.insert(SenderState::new(iv_random, counter));
-                true
-            }
-            Entry::Occupied(mut e) => {
-                let state = e.get_mut();
-
-                if state.iv_random == iv_random {
-                    if counter > state.last_counter {
-                        state.last_counter = counter;
-                        state.last_seen = Instant::now();
-                        return true;
-                    }
+        if let Some(slot) = self.sender_index.get(sender) {
+            let state = match self.sender_slab.get_mut(slot).and_then(Option::as_mut) {
+                Some(s) => s,
+                None => {
+                    // Invariant violation: index pointed to an empty slab
+                    // slot. Surface as a soft refusal rather than panicking
+                    // — same fail-graceful discipline as `OutstandingTable`.
+                    debug_assert!(false, "BoundedIndex slot points to vacant slab entry");
                     return false;
                 }
+            };
 
-                if state.prev_iv_random == iv_random {
-                    if counter > state.prev_last_counter {
-                        state.prev_last_counter = counter;
-                        state.last_seen = Instant::now();
-                        return true;
-                    }
+            if state.iv_random == iv_random {
+                if counter > state.last_counter {
+                    state.last_counter = counter;
+                    state.last_seen = Instant::now();
+                    return true;
+                }
+                return false;
+            }
+
+            if state.prev_iv_random == iv_random {
+                if counter > state.prev_last_counter {
+                    state.prev_last_counter = counter;
+                    state.last_seen = Instant::now();
+                    return true;
+                }
+                return false;
+            }
+
+            state.prev_iv_random = state.iv_random;
+            state.prev_last_counter = state.last_counter;
+            state.iv_random = iv_random;
+            state.last_counter = counter;
+            state.last_seen = Instant::now();
+            return true;
+        }
+
+        // Vacant in the index — check the force-evict shadow before falling
+        // through to a fresh insert. Matching the shadow consumes it
+        // (`take()`) so a single replayed frame from the evicted sender is
+        // checked exactly once.
+        let shadow_matches = self
+            .last_evicted
+            .as_ref()
+            .is_some_and(|(addr, _)| *addr == sender);
+        if shadow_matches {
+            let (_, evicted_state) = self
+                .last_evicted
+                .take()
+                .expect("shadow_matches implies Some");
+            let valid = Self::validate_replay(&evicted_state, iv_random, counter);
+            if valid {
+                let mut new_state = evicted_state;
+                new_state.addr = sender;
+                Self::apply_replay_update(&mut new_state, iv_random, counter);
+                if !self.allocate_sender_slot(sender, new_state) {
                     return false;
                 }
-
-                state.prev_iv_random = state.iv_random;
-                state.prev_last_counter = state.last_counter;
-                state.iv_random = iv_random;
-                state.last_counter = counter;
-                state.last_seen = Instant::now();
-                true
             }
+            return valid;
+        }
+
+        let new_state = SenderState::new(sender, iv_random, counter);
+        self.allocate_sender_slot(sender, new_state)
+    }
+
+    /// Pop a free slab slot, register `addr → slot` in the index, and write
+    /// `state` to the slab. Returns `false` (rolling back the pop) when no
+    /// free slot is available or the index probe budget is exhausted; the
+    /// caller treats this as a soft refusal. In production the outer
+    /// capacity guard in `recv` ensures a free slot exists before calling
+    /// `try_record_replay_state`, so this only matters for direct unit
+    /// tests and as defense-in-depth.
+    fn allocate_sender_slot(&mut self, addr: SocketAddr, state: SenderState) -> bool {
+        let Some(slot_u32) = self.sender_free_list.pop() else {
+            return false;
+        };
+        let slot = slot_u32 as usize;
+        if self.sender_index.insert(addr, slot).is_err() {
+            self.sender_free_list.push(slot_u32);
+            return false;
+        }
+        if let Some(cell) = self.sender_slab.get_mut(slot) {
+            *cell = Some(state);
+            true
+        } else {
+            // free_list yielded an out-of-bounds index — structural bug.
+            // Roll back the index insert and return false rather than
+            // panicking on the recv path.
+            self.sender_index.remove(addr);
+            debug_assert!(false, "free_list yielded slot ≥ sender_slab.len()");
+            false
         }
     }
 
     #[cfg(test)]
+    fn sender_state_for(&self, addr: &SocketAddr) -> Option<&SenderState> {
+        self.sender_index
+            .get(*addr)
+            .and_then(|slot| self.sender_slab.get(slot)?.as_ref())
+    }
+
+    #[cfg(test)]
     fn sender_iv_random(&self, addr: &SocketAddr) -> Option<[u8; 8]> {
-        self.sender_state.get(addr).map(|s| s.iv_random)
+        self.sender_state_for(addr).map(|s| s.iv_random)
     }
 
     #[cfg(test)]
     fn sender_last_counter(&self, addr: &SocketAddr) -> Option<u32> {
-        self.sender_state.get(addr).map(|s| s.last_counter)
+        self.sender_state_for(addr).map(|s| s.last_counter)
     }
 
     #[cfg(test)]
     fn sender_prev_iv_random(&self, addr: &SocketAddr) -> Option<[u8; 8]> {
-        self.sender_state.get(addr).map(|s| s.prev_iv_random)
+        self.sender_state_for(addr).map(|s| s.prev_iv_random)
     }
 
     #[cfg(test)]
     fn sender_prev_last_counter(&self, addr: &SocketAddr) -> Option<u32> {
-        self.sender_state.get(addr).map(|s| s.prev_last_counter)
+        self.sender_state_for(addr).map(|s| s.prev_last_counter)
     }
 
     #[cfg(test)]
     fn sender_state_len(&self) -> usize {
-        self.sender_state.len()
+        self.sender_index.len()
     }
 
     #[cfg(test)]
@@ -482,16 +592,16 @@ impl BeatListener for SecureUdpListener {
             };
 
             // Capacity guard: sweep stale senders before trying to insert
-            if self.sender_state.len() >= MAX_SENDER_STATES {
+            if self.sender_index.len() >= MAX_SENDER_STATES {
                 self.evict_stale_senders();
             }
-            if self.sender_state.len() >= MAX_SENDER_STATES {
-                // Map is still full after stale-sender sweep — force-evict
+            if self.sender_index.len() >= MAX_SENDER_STATES {
+                // Slab is still full after stale-sender sweep — force-evict
                 // the oldest entry to maintain replay protection.
                 self.force_evict_oldest_sender();
                 self.sender_state_full = self.sender_state_full.saturating_add(1);
                 debug_assert!(
-                    self.sender_state.len() < MAX_SENDER_STATES,
+                    self.sender_index.len() < MAX_SENDER_STATES,
                     "force_evict_oldest_sender should have freed a slot"
                 );
             }

@@ -5,6 +5,8 @@
 //! installed hook via [`std::panic::take_hook`], so multiple installations are
 //! safe — the most-recently registered socket path wins.
 
+#![forbid(unsafe_code)]
+
 use std::os::unix::net::UnixDatagram;
 use std::path::PathBuf;
 use std::time::Instant;

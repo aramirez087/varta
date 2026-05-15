@@ -83,6 +83,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "bounded_index_socketaddr"
+path = "fuzz_targets/bounded_index_socketaddr.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "outstanding_table"
 path = "fuzz_targets/outstanding_table.rs"
 test = false
