@@ -14,7 +14,7 @@ signal handler dependency.
 varta-watch \
   --socket /tmp/varta.sock \
   --threshold-ms 2000 \
-  --recovery-cmd "systemctl restart myapp-\$1" \
+  --recovery-exec /usr/local/bin/restart-myapp \
   --recovery-debounce-ms 5000 \
   --recovery-timeout-ms 3000 \
   --export-file /var/log/varta/events.tsv \
@@ -27,8 +27,8 @@ varta-watch \
 |------|------|---------|-------------|
 | `--socket <PATH>` | path | **required** | Bind the observer's UDS at this path. |
 | `--threshold-ms <MS>` | u64 ms | **required** | Per-pid silence window before a stall is surfaced. |
-| `--recovery-cmd <TEMPLATE>` | string | — | Shell fragment run via `/bin/sh -c` on each unique stall. The stalled pid is available as `$1`. |
-| `--recovery-debounce-ms <MS>` | u64 ms | `1000` | Per-pid debounce window for `recovery-cmd` invocations. |
+| `--recovery-exec <CMD>` | string | — | Command (with optional arguments) executed directly on each unique stall. The stalled pid is appended as the final argument. |
+| `--recovery-debounce-ms <MS>` | u64 ms | `1000` | Per-pid debounce window for recovery invocations. |
 | `--recovery-timeout-ms <MS>` | u64 ms | — | Kill-after deadline for recovery children; if a child runs longer than this it is killed via kill(2). Without this flag the child is allowed to run until completion. |
 | `--socket-mode <OCTAL>` | octal | `0600` | File mode for the observer socket (default 0600 — owner-only r/w). |
 | `--read-timeout-ms <MS>` | u64 ms | `100` | UDS read timeout per poll call. Bounded so a stalled peer cannot hold the observer loop indefinitely. |
@@ -79,18 +79,19 @@ Example:
 3456789\tdecode\t-\t-\t-\tBadMagic
 ```
 
-## `recovery_cmd` template syntax
+## Recovery exec mode
 
-The `--recovery-cmd` value is a shell fragment executed via `/bin/sh -c`.
-The stalled pid is passed as positional argument `$1` — it is never
-string-interpolated into the script body.
+The `--recovery-exec` value is executed directly via `execve(2)` — no shell
+is involved. The stalled pid is appended as the final argument. This means
+the program receives the pid as a clean integer, with no shell-injection
+surface.
 
 ```sh
-# Restart a systemd unit whose name includes the pid:
---recovery-cmd "systemctl restart myapp-\$1"
+# Restart a systemd unit (the observer appends the pid as $1):
+--recovery-exec /usr/local/bin/restart-myapp
 
-# Log the stall and attempt a graceful kill:
---recovery-cmd "echo stall \$1 >> /var/log/varta.log && kill -TERM \$1"
+# Or pass a fixed prefix followed by the pid:
+--recovery-exec-file /etc/varta/recovery-cmd.txt
 ```
 
 Recovery invocations are debounced per pid. A second stall for the same pid
@@ -98,7 +99,7 @@ within the debounce window is silently skipped; distinct pids are independent.
 The debounce window resets after each successful or failed spawn.
 
 Each recovery child is spawned asynchronously (non-blocking). The observer
-never blocks on a slow template. Completed children are reaped automatically
+never blocks on a slow command. Completed children are reaped automatically
 each poll tick. If `--recovery-timeout-ms` is set, any child that exceeds the
 deadline is killed via kill(2) and then reaped.
 

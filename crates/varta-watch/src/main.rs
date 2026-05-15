@@ -238,6 +238,12 @@ fn main() -> ExitCode {
 }
 
 fn run(cfg: Config) -> std::io::Result<()> {
+    // Attest single-threadedness before the first umask(2) call in
+    // UdsListener::bind.  The token is constructed here — the first
+    // executable statement in run() — before signal handlers, before the
+    // observer bind, and before the self-watchdog thread spawn.
+    let pre_thread = varta_watch::listener::PreThreadAttestation::new()?;
+
     // SAFETY: sole entry point of a single-threaded binary with no competing
     // SIGINT/SIGTERM installers; called before any thread is spawned.
     unsafe {
@@ -268,6 +274,7 @@ fn run(cfg: Config) -> std::io::Result<()> {
         cfg.global_beat_rate,
         cfg.global_beat_burst,
         cfg.clock_source,
+        &pre_thread,
     )?
     .with_allow_cross_namespace(cfg.allow_cross_namespace_agents);
 
@@ -506,20 +513,6 @@ fn run(cfg: Config) -> std::io::Result<()> {
 
     let recovery_mode = cfg.resolve_recovery_mode()?;
 
-    // Audit-trail warning when the operator explicitly opts into shell-mode
-    // recovery.  resolve_recovery_mode() already hard-errors when shell mode
-    // is configured without the flag, so reaching here with the flag set
-    // means the choice was deliberate — log it once so it appears in any
-    // SIEM / syslog ingest alongside the other startup banners.
-    #[cfg(feature = "unsafe-shell-recovery")]
-    if cfg.i_accept_shell_risk && (cfg.recovery_cmd.is_some() || cfg.recovery_cmd_file.is_some()) {
-        varta_warn!(
-            "shell-mode recovery is active (--i-accept-shell-risk). The system shell \
-             will be spawned with root-equivalent process authority on each unique \
-             stall. NOT for production / safety-critical use — prefer --recovery-exec."
-        );
-    }
-
     // Audit-trail warning when the operator opts into legacy env inheritance
     // for recovery child processes.  The default is to clear the child env
     // (see `Recovery::apply_env`); the opt-in flag pulls in the observer's
@@ -620,9 +613,7 @@ fn run(cfg: Config) -> std::io::Result<()> {
         }
         None => None,
     };
-    let recovery_source = if let Some(p) = cfg.recovery_cmd_file.as_ref() {
-        p.display().to_string()
-    } else if let Some(p) = cfg.recovery_exec_file.as_ref() {
+    let recovery_source = if let Some(p) = cfg.recovery_exec_file.as_ref() {
         p.display().to_string()
     } else {
         "inline".to_string()

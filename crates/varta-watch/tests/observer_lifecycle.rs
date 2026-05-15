@@ -11,9 +11,25 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use varta_watch::listener::drain_bind_dir_fsync_failures;
+use varta_watch::listener::{drain_bind_dir_fsync_failures, PreThreadAttestation};
 use varta_watch::tracker::DEFAULT_EVICTION_SCAN_WINDOW;
 use varta_watch::{ClockSource, EvictionPolicy, Observer};
+
+/// Return a token that skips the single-thread probe.
+///
+/// Tests run inside a multi-threaded test runner; the umask window is benign
+/// because each test uses a unique socket path and no concurrent thread in
+/// the test process creates files at those paths.
+///
+/// # Safety
+/// Callers must ensure no concurrent thread creates filesystem objects at the
+/// socket path during the `Observer::bind` window, which is true by
+/// construction in this isolated test module.
+#[allow(unsafe_code)]
+fn pre_thread() -> PreThreadAttestation {
+    // SAFETY: documented above.
+    unsafe { PreThreadAttestation::new_unchecked() }
+}
 
 static COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -48,6 +64,7 @@ fn bind_succeeds_on_clean_path() {
         0,
         0,
         ClockSource::Monotonic,
+        &pre_thread(),
     )
     .expect("bind on clean path should succeed");
 
@@ -86,6 +103,7 @@ fn bind_fails_when_live_observer_present() {
         0,
         0,
         ClockSource::Monotonic,
+        &pre_thread(),
     )
     .expect("first bind must succeed");
 
@@ -102,6 +120,7 @@ fn bind_fails_when_live_observer_present() {
         0,
         0,
         ClockSource::Monotonic,
+        &pre_thread(),
     )
     .err()
     .expect("second bind on live socket must fail");
@@ -146,6 +165,7 @@ fn bind_cleans_up_stale_socket_file() {
         0,
         0,
         ClockSource::Monotonic,
+        &pre_thread(),
     )
     .expect("bind over stale socket must succeed");
 
@@ -180,6 +200,7 @@ fn bind_preserves_non_socket_file_at_path() {
         0,
         0,
         ClockSource::Monotonic,
+        &pre_thread(),
     )
     .err()
     .expect("bind over regular file must fail");
@@ -216,6 +237,7 @@ fn drop_unlinks_bound_socket() {
         0,
         0,
         ClockSource::Monotonic,
+        &pre_thread(),
     )
     .expect("bind must succeed");
 
@@ -244,6 +266,7 @@ fn drop_swallows_missing_file() {
         0,
         0,
         ClockSource::Monotonic,
+        &pre_thread(),
     )
     .expect("bind must succeed");
 
@@ -273,6 +296,7 @@ fn bind_fsyncs_parent_directory_without_error() {
         0,
         0,
         ClockSource::Monotonic,
+        &pre_thread(),
     )
     .expect("bind must succeed and dir-fsync must not error");
 
@@ -307,6 +331,7 @@ fn bind_fsyncs_parent_directory_after_stale_recovery() {
         0,
         0,
         ClockSource::Monotonic,
+        &pre_thread(),
     )
     .expect("stale-recovery bind must succeed and dir-fsync must not error");
 
@@ -317,6 +342,52 @@ fn bind_fsyncs_parent_directory_after_stale_recovery() {
     );
     drop(_obs);
     let _ = std::fs::remove_file(&path);
+}
+
+/// PreThreadAttestation — the happy path (single-threaded process) is validated
+/// by the production binary itself: `main.rs` calls `PreThreadAttestation::new()?`
+/// as its very first statement. If that call returned an error, the binary would
+/// refuse to start.  No integration-test can replicate a truly single-threaded
+/// process because the test harness spawns infrastructure threads before the
+/// first test function runs; any probe here would falsely detect multi-threadedness.
+#[test]
+#[ignore = "probe always fails in the multi-threaded test harness; \
+            the success case is validated by the production binary startup"]
+fn pre_thread_attestation_succeeds_when_single_threaded() {
+    let _tok = PreThreadAttestation::new()
+        .expect("single-threaded probe must succeed");
+}
+
+/// PreThreadAttestation — the probe must reject a multi-threaded process.
+#[test]
+fn pre_thread_attestation_rejects_multi_threaded_process() {
+    // Park a background thread so the process has ≥ 2 threads.
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+    let b2 = std::sync::Arc::clone(&barrier);
+    let handle = std::thread::spawn(move || {
+        b2.wait(); // signal that we are running
+        std::thread::park();
+    });
+    barrier.wait(); // wait until the spawned thread is alive
+
+    let result = PreThreadAttestation::new();
+
+    handle.thread().unpark();
+    let _ = handle.join();
+
+    // On Linux and macOS the probe must hard-error.
+    // On other platforms it is best-effort (no probe), so we skip the assertion.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        let err = result.expect_err("multi-threaded process must be rejected");
+        assert!(
+            err.to_string().contains("multi-threaded"),
+            "error message must mention multi-threaded, got: {err}"
+        );
+    }
+    // On platforms without a probe, result is Ok — no assertion needed.
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    let _ = result;
 }
 
 /// M7 constraint #6 — if another Observer has won the path (different inode),
@@ -338,6 +409,7 @@ fn drop_preserves_foreign_inode() {
         0,
         0,
         ClockSource::Monotonic,
+        &pre_thread(),
     )
     .expect("first bind must succeed");
 
@@ -356,6 +428,7 @@ fn drop_preserves_foreign_inode() {
         0,
         0,
         ClockSource::Monotonic,
+        &pre_thread(),
     )
     .expect("second bind must succeed");
 

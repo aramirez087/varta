@@ -56,6 +56,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Fork-safety is now structurally enforced on `Varta::beat`.** Previously, a `fork(2)` followed by `beat()` in the child would cause catastrophic AEAD nonce reuse on the secure-UDP transport (the child inherited `iv_session_salt` / `iv_prefix_index` / `iv_counter` from its parent). `Varta` now snapshots `std::process::id()` at `connect()` time and, on PID mismatch, invokes `BeatTransport::reconnect()` *before* the frame is built — re-reading OS entropy into a fresh session salt and resetting the prefix/counter state. The recovery is silent (the caller sees `BeatOutcome::Sent`) and observable via `Varta::fork_recoveries() -> u64` (suggested Prometheus name: `varta_client_fork_recoveries_total`). The observer's existing `(SocketAddr, iv_prefix)` per-sender state machine accepts the new prefix as a fresh session transparently — no wire-format change required.
 - **`install_panic_handler_secure_udp` is now fork-safe.** The cached 8-byte `iv_random` would, under fork, collide with the parent's panic-frame nonce under the same key. The installer now snapshots `install_pid` and, inside the panic hook, re-runs the entropy chain (`getrandom`/`getentropy` → `/dev/urandom`) when the PID has changed. The strict variant fails closed (skips the secure frame, still chains to the previous hook) when no entropy source is reachable; the `accept-degraded-entropy` variant falls back to `fallback_iv_random` per the documented degraded-entropy policy.
 
+### Removed (BREAKING)
+
+- **Shell-mode recovery permanently removed.** The `unsafe-shell-recovery`
+  Cargo feature, `RecoveryMode::Shell`, `--recovery-cmd`, `--recovery-cmd-file`,
+  and `--i-accept-shell-risk` have been removed from all build profiles. No
+  build of `varta-watch` will ever invoke `/bin/sh` for recovery; the
+  `/bin/sh` literal no longer appears in any binary. **Migration:** replace
+  `--recovery-cmd "<template>"` with `--recovery-exec /path/to/program` (the
+  observer appends the stalled pid as the final argument). Replace
+  `--recovery-cmd-file <path>` with `--recovery-exec-file <path>`. Shell
+  logic can be moved into a thin wrapper script invoked via `--recovery-exec`.
+  Passing the removed flags at startup now produces an immediate hard error
+  with a migration hint. See
+  `book/src/architecture/recovery-shell-removal.md` for the full migration
+  guide.
+
 ### Added
 - Comprehensive community governance documentation (`CONTRIBUTING.md`, `SECURITY.md`, `CODE_OF_CONDUCT.md`).
 - Dual-licensing (MIT OR Apache-2.0).

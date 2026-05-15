@@ -40,9 +40,7 @@ cargo build -p varta-watch --release \
 
 `secure-udp` is the recommended companion feature — Class-A almost
 always wants authenticated transport.  Other features that combine
-cleanly with `compile-time-config`: `audit-chain`, `json-log`,
-`unsafe-shell-recovery` (only when the operator's signed config
-explicitly opts in via `i_accept_shell_risk = true`).
+cleanly with `compile-time-config`: `audit-chain`, `json-log`.
 
 The `prometheus-exporter` feature is **forbidden** in combination with
 `compile-time-config`; `cargo build` fails with a clear `compile_error!`
@@ -98,9 +96,7 @@ strict_namespace_check = true
 | `secure_key_file` | path | none | 64-hex-char primary key (secure-udp). |
 | `accepted_key_file` | path | none | One key per line for rotation. |
 | `master_key_file` | path | none | 64-hex-char master for per-agent derivation. |
-| `recovery_cmd` | string | none | Shell template (requires `unsafe-shell-recovery`). |
 | `recovery_exec_cmd` | string | none | `program args …` invoked via execvp. |
-| `recovery_cmd_file` | path | none | Read recovery_cmd from a hardened file. |
 | `recovery_exec_file` | path | none | Read recovery_exec_cmd from a hardened file. |
 | `recovery_debounce_ms` | u64 | `1000` | Per-pid debounce window. |
 | `recovery_env` | list-of-string | empty | `KEY=VALUE`; repeatable. Layered on top of the base env chosen by `recovery_inherit_env`. |
@@ -126,7 +122,6 @@ strict_namespace_check = true
 | `self_watchdog_secs` | u64 | none | Self-watchdog deadline (auto-enables under systemd). |
 | `hw_watchdog` | path | none | Hardware watchdog device (`/dev/watchdog`). |
 | `i_accept_plaintext_udp` | bool | `false` | Runtime acknowledgement. |
-| `i_accept_shell_risk` | bool | `false` | Runtime acknowledgement. |
 | `i_accept_recovery_on_secure_udp` | bool | `false` | Recovery on secure-UDP transport. |
 | `i_accept_recovery_on_plaintext_udp` | bool | `false` | Recovery on plaintext UDP. |
 | `i_accept_secure_udp_non_loopback` | bool | `false` | Non-loopback secure-UDP bind. |

@@ -12,8 +12,8 @@ a binary before deploying it to a safety-critical environment.
 
 | Profile | Features | argv | /metrics | Recovery |
 |---|---|---|---|---|
-| SRE / cloud | `prometheus-exporter` (+ optional `unsafe-*`) | full GNU-style parser | HTTP `/metrics` + Bearer-token | shell or exec |
-| Class-A safety-critical | `secure-udp,compile-time-config` | none (build-time fixed) | absent | exec only (or `unsafe-shell-recovery` + signed acknowledgement) |
+| SRE / cloud | `prometheus-exporter` (+ optional `unsafe-*`) | full GNU-style parser | HTTP `/metrics` + Bearer-token | exec only |
+| Class-A safety-critical | `secure-udp,compile-time-config` | none (build-time fixed) | absent | exec only |
 
 The two profiles are mutually exclusive: `prometheus-exporter` cannot
 combine with `compile-time-config` (a `compile_error!` in
@@ -38,7 +38,11 @@ No `--features` argument is needed or wanted.  Default features are empty.
 | Dangerous capability | Cargo feature | Runtime flag |
 |---|---|---|
 | Plaintext (unauthenticated) UDP listener | `unsafe-plaintext-udp` | `--i-accept-plaintext-udp` |
-| Shell-mode recovery (`/bin/sh -c`) | `unsafe-shell-recovery` | `--i-accept-shell-risk` |
+
+Shell-mode recovery (`/bin/sh -c`) has been **permanently removed** from all
+build profiles.  `/bin/sh` does not appear in any `varta-watch` binary,
+regardless of feature flags.  Use `--recovery-exec` for all recovery
+configurations.
 
 Without the compile-time feature, the code path is **not linked** into the
 binary.  A misconfigured deployment cannot accidentally enable the dangerous
@@ -51,9 +55,8 @@ cargo build -p varta-watch --release
 strings target/release/varta-watch | grep -F "/bin/sh" && echo "FAIL" || echo "OK"
 ```
 
-The `strings` check is belt-and-suspenders: because the dangerous code is
-`#[cfg(feature = ...)]`-gated at the source level, the literal string is never
-even parsed by the compiler, so it cannot appear in the binary.
+The `strings` check is belt-and-suspenders: because `/bin/sh` is structurally
+absent, the literal cannot appear in any binary regardless of features.
 
 ---
 
@@ -73,20 +76,6 @@ unsafe-plaintext-udp = ["udp-core"]
 
 Even with this feature, the listener **will not bind** unless
 `--i-accept-plaintext-udp` is also passed at runtime.
-
-### `unsafe-shell-recovery`
-
-Compiles in the `RecoveryMode::Shell` variant, which passes the recovery
-template to the system shell (`sh -c`).  A template-injection vector can
-execute arbitrary commands with the observer's authority.
-
-```toml
-[features]
-unsafe-shell-recovery = []
-```
-
-Even with this feature, shell-mode recovery **will not activate** unless
-`--i-accept-shell-risk` is also passed at runtime.
 
 ---
 
@@ -149,9 +138,9 @@ KEY=VALUE grammar and key catalogue.
 
 ## Recommended transport for recovery
 
-Always use `--recovery-exec` instead of `--recovery-cmd` for production
-deployments.  `--recovery-exec` invokes the program directly via `execvp(2)`
-with no shell involved; shell metacharacters have no effect.
+Use `--recovery-exec` for all recovery deployments.  It invokes the program
+directly via `execvp(2)` with no shell involved; shell metacharacters have no
+effect and `/bin/sh` is never spawned.
 
 ---
 

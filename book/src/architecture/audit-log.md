@@ -54,11 +54,11 @@ seq    wallclock_ms    observer_ns    spawn    agent_pid    child_pid    mode   
 ```
 
 Emitted at the moment a recovery child is `fork(2)` + `execvp(2)`'d.
-`mode` ∈ {`exec`, `shell`}; `program` is the path actually invoked
-(`/bin/sh` for shell mode, `argv[0]` for exec mode); `source` is either
-the literal `"inline"` or the path-string for `--recovery-cmd-file` /
-`--recovery-exec-file`. The command template itself is **not** logged —
-it may contain secrets, and the source path is already auditable.
+`mode` is always `"exec"` (shell mode was permanently removed); `program`
+is `argv[0]`; `source` is either the literal `"inline"` (for
+`--recovery-exec`) or the path-string for `--recovery-exec-file`.
+The full argv is **not** logged — it may contain secrets, and the source
+path is already auditable.
 
 ### `complete`
 

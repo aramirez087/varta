@@ -35,9 +35,7 @@ fn compile_time_config_matches_fixture() {
     assert_eq!(cfg.iteration_budget, Duration::from_millis(250));
     assert_eq!(cfg.scrape_budget, Duration::from_millis(250));
     assert!(!cfg.i_accept_plaintext_udp);
-    assert!(!cfg.i_accept_shell_risk);
     assert!(cfg.strict_namespace_check);
-    assert!(cfg.recovery_cmd.is_none());
     assert!(cfg.recovery_exec_cmd.is_none());
     assert!(cfg.prom_addr.is_none());
     assert_eq!(

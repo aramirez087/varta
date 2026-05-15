@@ -72,7 +72,7 @@ fn cli_help_lists_every_documented_flag() {
     for flag in [
         "--socket",
         "--threshold-ms",
-        "--recovery-cmd",
+        "--recovery-exec",
         "--recovery-debounce-ms",
         "--recovery-env",
         "--recovery-timeout-ms",
@@ -290,16 +290,14 @@ fn cli_plaintext_udp_not_compiled_in_is_rejected() {
 }
 
 // ---------------------------------------------------------------------------
-// Shell-mode recovery (--recovery-cmd / --recovery-cmd-file) must require
-// --i-accept-shell-risk (when feature is compiled in) or produce a
-// "not compiled in" error (when feature is absent).
+// Removed flags: --recovery-cmd, --recovery-cmd-file, --i-accept-shell-risk
+// must all hard-error with a migration hint pointing at --recovery-exec.
 // ---------------------------------------------------------------------------
 
-#[cfg(feature = "unsafe-shell-recovery")]
 #[cfg_attr(miri, ignore)] // JUSTIFY: miri cannot model process spawning (Command::new)
 #[test]
-fn cli_recovery_cmd_without_accept_flag_is_rejected() {
-    let path = unique_uds_path("shell-no-accept");
+fn recovery_cmd_flag_is_removed() {
+    let path = unique_uds_path("removed-recovery-cmd");
     let out = Command::new(env!("CARGO_BIN_EXE_varta-watch"))
         .args([
             "--socket",
@@ -308,60 +306,46 @@ fn cli_recovery_cmd_without_accept_flag_is_rejected() {
             "100",
             "--recovery-cmd",
             "true",
-            "--shutdown-after-secs",
-            "0",
         ])
         .output()
-        .expect("spawn varta-watch with --recovery-cmd and no accept flag");
+        .expect("spawn varta-watch with removed --recovery-cmd");
 
     assert!(
         !out.status.success(),
-        "shell-mode recovery without --i-accept-shell-risk must hard-error; \
-         got {:?} (stderr: {})",
-        out.status,
-        String::from_utf8_lossy(&out.stderr)
+        "--recovery-cmd must hard-error after removal; got {:?}",
+        out.status
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("--recovery-cmd") && stderr.contains("--recovery-exec"),
+        "error must reference --recovery-cmd and the --recovery-exec replacement; got: {stderr}"
+    );
+}
+
+#[cfg_attr(miri, ignore)] // JUSTIFY: miri cannot model process spawning (Command::new)
+#[test]
+fn i_accept_shell_risk_flag_is_removed() {
+    let path = unique_uds_path("removed-shell-risk");
+    let out = Command::new(env!("CARGO_BIN_EXE_varta-watch"))
+        .args([
+            "--socket",
+            path.as_str(),
+            "--threshold-ms",
+            "100",
+            "--i-accept-shell-risk",
+        ])
+        .output()
+        .expect("spawn varta-watch with removed --i-accept-shell-risk");
+
+    assert!(
+        !out.status.success(),
+        "--i-accept-shell-risk must hard-error after removal; got {:?}",
+        out.status
     );
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
         stderr.contains("--i-accept-shell-risk") && stderr.contains("--recovery-exec"),
-        "error must name both --i-accept-shell-risk and the safer --recovery-exec, got: {stderr}"
-    );
-}
-
-/// When compiled without `unsafe-shell-recovery`, the binary must refuse
-/// `--recovery-cmd` even with `--i-accept-shell-risk`, directing the operator
-/// to rebuild with the feature or switch to `--recovery-exec`.
-#[cfg(not(feature = "unsafe-shell-recovery"))]
-#[cfg_attr(miri, ignore)] // JUSTIFY: miri cannot model process spawning (Command::new)
-#[test]
-fn cli_recovery_cmd_without_feature_is_rejected() {
-    let path = unique_uds_path("shell-no-feature");
-    let out = Command::new(env!("CARGO_BIN_EXE_varta-watch"))
-        .args([
-            "--socket",
-            path.as_str(),
-            "--threshold-ms",
-            "100",
-            "--recovery-cmd",
-            "true",
-            "--i-accept-shell-risk",
-            "--shutdown-after-secs",
-            "0",
-        ])
-        .output()
-        .expect("spawn varta-watch with --recovery-cmd + accept but no feature");
-
-    assert!(
-        !out.status.success(),
-        "shell-mode recovery without unsafe-shell-recovery feature must hard-error; \
-         got {:?} (stderr: {})",
-        out.status,
-        String::from_utf8_lossy(&out.stderr)
-    );
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        stderr.contains("unsafe-shell-recovery"),
-        "error must name the feature, got: {stderr}"
+        "error must reference --i-accept-shell-risk and --recovery-exec; got: {stderr}"
     );
 }
 

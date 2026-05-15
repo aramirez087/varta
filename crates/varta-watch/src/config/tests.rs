@@ -23,8 +23,46 @@ fn parses_minimal_required_flags() {
     assert_eq!(cfg.threshold, Duration::from_millis(250));
     assert_eq!(cfg.recovery_debounce, Duration::from_millis(1000));
     assert_eq!(cfg.socket_mode, 0o600);
-    assert!(cfg.recovery_cmd.is_none());
+    assert!(cfg.recovery_exec_cmd.is_none());
     assert!(cfg.prom_addr.is_none());
+}
+
+/// `--recovery-cmd` is a removed flag; the parser must reject it with
+/// `RemovedFlag` and point the operator to `--recovery-exec`.
+#[test]
+fn recovery_cmd_flag_is_rejected_as_removed() {
+    match Config::from_args(args(&[
+        "--socket",
+        "/tmp/x.sock",
+        "--threshold-ms",
+        "100",
+        "--recovery-cmd",
+        "foo",
+    ])) {
+        Err(ConfigError::RemovedFlag { flag, replacement }) => {
+            assert_eq!(flag, "--recovery-cmd");
+            assert!(
+                replacement.contains("--recovery-exec"),
+                "replacement hint must mention --recovery-exec, got: {replacement}"
+            );
+        }
+        other => panic!("expected RemovedFlag for --recovery-cmd, got {other:?}"),
+    }
+}
+
+/// `--i-accept-shell-risk` is a removed flag; the parser must reject it.
+#[test]
+fn i_accept_shell_risk_flag_is_rejected_as_removed() {
+    match Config::from_args(args(&[
+        "--socket",
+        "/tmp/x.sock",
+        "--threshold-ms",
+        "100",
+        "--i-accept-shell-risk",
+    ])) {
+        Err(ConfigError::RemovedFlag { .. }) => {}
+        other => panic!("expected RemovedFlag for --i-accept-shell-risk, got {other:?}"),
+    }
 }
 
 #[cfg(feature = "prometheus-exporter")]
@@ -38,9 +76,8 @@ fn parses_full_flag_surface() {
         "/s",
         "--threshold-ms",
         "100",
-        "--recovery-cmd",
-        "echo $1",
-        "--i-accept-shell-risk",
+        "--recovery-exec",
+        "echo {pid}",
         "--recovery-debounce-ms",
         "750",
         "--export-file",
@@ -53,8 +90,7 @@ fn parses_full_flag_surface() {
         "3",
     ]))
     .expect("parse");
-    assert_eq!(cfg.recovery_cmd.as_deref(), Some("echo $1"));
-    assert!(cfg.i_accept_shell_risk);
+    assert_eq!(cfg.recovery_exec_cmd.as_deref(), Some("echo {pid}"));
     assert_eq!(cfg.recovery_debounce, Duration::from_millis(750));
     assert_eq!(cfg.file_export, Some(PathBuf::from("/tmp/e.log")));
     assert_eq!(
@@ -120,7 +156,6 @@ fn catalogue_covers_help_text() {
         // so we enumerate the known gates explicitly.
         let skip = match spec.feature {
             "prometheus-exporter" => !cfg!(feature = "prometheus-exporter"),
-            "unsafe-shell-recovery" => !cfg!(feature = "unsafe-shell-recovery"),
             "unsafe-plaintext-udp" => !cfg!(feature = "unsafe-plaintext-udp"),
             "secure-udp" => !cfg!(feature = "secure-udp"),
             "test-hooks" => true, // always skip test-only flags
@@ -468,7 +503,6 @@ fn parses_recovery_exec_cmd() {
     ]))
     .expect("parse");
     assert!(cfg.recovery_exec_cmd.is_some());
-    assert!(cfg.recovery_cmd.is_none());
     let mode = cfg.resolve_recovery_mode().expect("resolve").expect("some");
     #[allow(unreachable_patterns)]
     match mode {
@@ -480,86 +514,23 @@ fn parses_recovery_exec_cmd() {
     }
 }
 
+/// Regression: removed flags must be rejected at parse time with a helpful message
+/// pointing to the replacement flag.
 #[test]
-fn recovery_exec_and_recovery_cmd_are_mutually_exclusive() {
-    let cfg = Config::from_args(args(&[
+fn recovery_cmd_flag_is_removed() {
+    let err = Config::from_args(args(&[
         "--socket",
         "/s",
         "--threshold-ms",
         "100",
         "--recovery-cmd",
         "echo $1",
-        "--i-accept-shell-risk",
-        "--recovery-exec",
-        "true",
     ]))
-    .expect("parse");
-    let err = cfg.resolve_recovery_mode().unwrap_err();
-    assert!(
-        err.to_string().contains("mutually exclusive"),
-        "expected mutual exclusion error, got: {err}"
-    );
-}
-
-#[test]
-fn recovery_cmd_and_cmd_file_are_mutually_exclusive() {
-    let cfg = Config::from_args(args(&[
-        "--socket",
-        "/s",
-        "--threshold-ms",
-        "100",
-        "--recovery-cmd",
-        "echo $1",
-        "--i-accept-shell-risk",
-        "--recovery-cmd-file",
-        "/nonexistent",
-    ]))
-    .expect("parse");
-    let err = cfg.resolve_recovery_mode().unwrap_err();
-    assert!(
-        err.to_string().contains("mutually exclusive"),
-        "expected mutual exclusion error, got: {err}"
-    );
-}
-
-#[cfg(feature = "unsafe-shell-recovery")]
-#[test]
-fn resolve_shell_mode_from_cmd_flag() {
-    let cfg = Config::from_args(args(&[
-        "--socket",
-        "/s",
-        "--threshold-ms",
-        "100",
-        "--recovery-cmd",
-        "echo $1",
-        "--i-accept-shell-risk",
-    ]))
-    .expect("parse");
-    let mode = cfg.resolve_recovery_mode().expect("resolve").expect("some");
-    match mode {
-        crate::recovery::RecoveryMode::Shell(tpl) => assert_eq!(tpl, "echo $1"),
-        other => panic!("expected Shell mode, got {other:?}"),
-    }
-}
-
-#[cfg(not(feature = "unsafe-shell-recovery"))]
-#[test]
-fn shell_recovery_not_compiled_in_is_rejected() {
-    let cfg = Config::from_args(args(&[
-        "--socket",
-        "/s",
-        "--threshold-ms",
-        "100",
-        "--recovery-cmd",
-        "echo $1",
-        "--i-accept-shell-risk",
-    ]))
-    .expect("parse");
-    let err = cfg.resolve_recovery_mode().expect_err("must reject");
+    .expect_err("--recovery-cmd must be rejected");
     let msg = err.to_string();
     assert!(
-        msg.contains("unsafe-shell-recovery"),
-        "error must name the feature, got: {msg}"
+        msg.contains("--recovery-cmd"),
+        "error must name the removed flag, got: {msg}"
     );
     assert!(
         msg.contains("--recovery-exec"),
@@ -567,37 +538,9 @@ fn shell_recovery_not_compiled_in_is_rejected() {
     );
 }
 
-#[cfg(feature = "unsafe-shell-recovery")]
 #[test]
-fn shell_mode_inline_without_accept_flag_is_rejected() {
-    let cfg = Config::from_args(args(&[
-        "--socket",
-        "/s",
-        "--threshold-ms",
-        "100",
-        "--recovery-cmd",
-        "echo $1",
-    ]))
-    .expect("parse");
-    let err = cfg.resolve_recovery_mode().expect_err("must reject");
-    assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
-    let msg = err.to_string();
-    assert!(
-        msg.contains("--i-accept-shell-risk"),
-        "expected error to name the accept flag, got: {msg}"
-    );
-    assert!(
-        msg.contains("--recovery-exec"),
-        "expected error to recommend --recovery-exec, got: {msg}"
-    );
-}
-
-#[cfg(feature = "unsafe-shell-recovery")]
-#[test]
-fn shell_mode_file_without_accept_flag_is_rejected() {
-    // The file does not need to exist — the accept-flag check runs
-    // before the file-permission validation, so we never read it.
-    let cfg = Config::from_args(args(&[
+fn recovery_cmd_file_flag_is_removed() {
+    let err = Config::from_args(args(&[
         "--socket",
         "/s",
         "--threshold-ms",
@@ -605,10 +548,33 @@ fn shell_mode_file_without_accept_flag_is_rejected() {
         "--recovery-cmd-file",
         "/nonexistent",
     ]))
-    .expect("parse");
-    let err = cfg.resolve_recovery_mode().expect_err("must reject");
-    assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
-    assert!(err.to_string().contains("--i-accept-shell-risk"));
+    .expect_err("--recovery-cmd-file must be rejected");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("--recovery-cmd-file"),
+        "error must name the removed flag, got: {msg}"
+    );
+    assert!(
+        msg.contains("--recovery-exec"),
+        "error must recommend --recovery-exec, got: {msg}"
+    );
+}
+
+#[test]
+fn i_accept_shell_risk_flag_is_removed() {
+    let err = Config::from_args(args(&[
+        "--socket",
+        "/s",
+        "--threshold-ms",
+        "100",
+        "--i-accept-shell-risk",
+    ]))
+    .expect_err("--i-accept-shell-risk must be rejected");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("--i-accept-shell-risk"),
+        "error must name the removed flag, got: {msg}"
+    );
 }
 
 #[test]

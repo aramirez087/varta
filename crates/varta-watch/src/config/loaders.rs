@@ -7,12 +7,11 @@ use super::validate::validate_secret_file;
 
 impl Config {
     /// Resolve recovery mode from CLI flags, enforcing mutual exclusion
-    /// and loading/validating any file-based templates.
+    /// and loading/validating any file-based command sources.
     ///
     /// Returns `Ok(None)` when no recovery is configured. Returns
-    /// `Ok(Some(RecoveryMode::Shell(_)))` when `--recovery-cmd` or
-    /// `--recovery-cmd-file` is set. Returns `Ok(Some(RecoveryMode::Exec{..}))`
-    /// when `--recovery-exec` or `--recovery-exec-file` is set.
+    /// `Ok(Some(RecoveryMode::Exec{..}))` when `--recovery-exec` or
+    /// `--recovery-exec-file` is set.
     ///
     /// # Errors
     ///
@@ -22,85 +21,8 @@ impl Config {
         use crate::recovery::RecoveryMode;
 
         // Collect which sources are configured
-        let has_cmd = self.recovery_cmd.is_some();
         let has_exec = self.recovery_exec_cmd.is_some();
-        let has_cmd_file = self.recovery_cmd_file.is_some();
         let has_exec_file = self.recovery_exec_file.is_some();
-
-        let shell_any = has_cmd || has_cmd_file;
-        let exec_any = has_exec || has_exec_file;
-
-        // Shell mode — inline OR file-based — spawns the system shell with
-        // root-equivalent process authority.  A template-injection vector
-        // can terminate any process the observer can reach.  Refuse to
-        // proceed unless the operator has explicitly acknowledged the
-        // risk; recommend the safer --recovery-exec path.  The check sits
-        // before mutual-exclusion enforcement so the more actionable
-        // diagnostic wins when both forms of misconfiguration are present.
-        // Only compiled in when the feature is present; without it the
-        // cfg(not) branch below fires first.
-        #[cfg(feature = "unsafe-shell-recovery")]
-        if shell_any && !self.i_accept_shell_risk {
-            #[cfg(not(feature = "compile-time-config"))]
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "shell-mode recovery (--recovery-cmd / --recovery-cmd-file) runs \
-                 the system shell with root-equivalent process authority. For production, \
-                 use --recovery-exec (no shell, no injection surface). To proceed \
-                 with shell mode anyway, pass --i-accept-shell-risk.",
-            ));
-            #[cfg(feature = "compile-time-config")]
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "shell-mode recovery requires the shell-risk acknowledgement to \
-                 be set in the compile-time configuration",
-            ));
-        }
-
-        // Shell and exec are mutually exclusive.  Class-A builds receive a
-        // neutral message that does not embed argv flag names — those would
-        // be linked into the binary's `strings` output even when this code
-        // path is dead (`pub const &str` is always linked; the same rule
-        // applies to format-string literals).  SRE builds keep the verbose
-        // remediation that points at the specific flag pair the operator
-        // wrote.
-        if shell_any && exec_any {
-            #[cfg(not(feature = "compile-time-config"))]
-            {
-                let shell_flag = if has_cmd {
-                    "--recovery-cmd"
-                } else {
-                    "--recovery-cmd-file"
-                };
-                let exec_flag = if has_exec {
-                    "--recovery-exec"
-                } else {
-                    "--recovery-exec-file"
-                };
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    format!("{shell_flag} and {exec_flag} are mutually exclusive"),
-                ));
-            }
-            #[cfg(feature = "compile-time-config")]
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "shell-mode and exec-mode recovery are mutually exclusive",
-            ));
-        }
-
-        if has_cmd && has_cmd_file {
-            #[cfg(not(feature = "compile-time-config"))]
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "--recovery-cmd and --recovery-cmd-file are mutually exclusive",
-            ));
-            #[cfg(feature = "compile-time-config")]
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "inline shell-recovery template and shell-recovery file are mutually exclusive",
-            ));
-        }
 
         if has_exec && has_exec_file {
             #[cfg(not(feature = "compile-time-config"))]
@@ -112,27 +34,6 @@ impl Config {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 "inline exec-recovery command and exec-recovery file are mutually exclusive",
-            ));
-        }
-
-        // Shell mode — only reachable when the feature is compiled in.
-        // Without the feature, the variant doesn't exist; error here so
-        // the operator gets a clear message pointing to --recovery-exec.
-        #[cfg(feature = "unsafe-shell-recovery")]
-        {
-            if let Some(ref tpl) = self.recovery_cmd {
-                return Ok(Some(RecoveryMode::Shell(tpl.clone())));
-            }
-            if let Some(ref path) = self.recovery_cmd_file {
-                let template = validate_recovery_file(path)?;
-                return Ok(Some(RecoveryMode::Shell(template)));
-            }
-        }
-        #[cfg(not(feature = "unsafe-shell-recovery"))]
-        if shell_any {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                super::types::ConfigError::ShellRecoveryNotCompiledIn,
             ));
         }
 

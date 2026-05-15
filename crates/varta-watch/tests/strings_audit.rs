@@ -64,7 +64,6 @@ const ARGV_FLAG_LITERALS: &[&str] = &[
     "--features audit-chain",
     "--features secure-udp",
     "--features unsafe-plaintext-udp",
-    "--features unsafe-shell-recovery",
 ];
 
 #[test]
@@ -73,9 +72,8 @@ fn binary_contains_no_shell_literal_in_production_safe_builds() {
         eprintln!("strings(1) not available; skipping audit");
         return;
     };
-    // `unsafe-shell-recovery` is the only profile that legitimately
-    // links the `/bin/sh` literal; tolerate it there, reject elsewhere.
-    #[cfg(not(feature = "unsafe-shell-recovery"))]
+    // Shell-mode recovery was permanently removed; `/bin/sh` must never
+    // appear in any build profile.
     assert_absent(&blob, SHELL_LITERAL);
 }
 

@@ -18,7 +18,7 @@ use std::time::Duration;
 use varta_vlp::{DecodeError, Frame, Status};
 
 use crate::clock::{Clock, ClockSource};
-use crate::listener::{BeatListener, UdsListener};
+use crate::listener::{BeatListener, PreThreadAttestation, UdsListener};
 use crate::peer_cred::{BeatOrigin, RecvResult};
 use crate::tracker::{EvictionPolicy, Tracker, Update};
 
@@ -392,8 +392,9 @@ impl Observer {
         global_beat_rate: u32,
         global_beat_burst: u32,
         clock_source: ClockSource,
+        pre_thread: &PreThreadAttestation,
     ) -> io::Result<Self> {
-        let listener = UdsListener::bind(path, socket_mode, read_timeout, uds_rcvbuf_bytes)?;
+        let listener = UdsListener::bind(path, socket_mode, read_timeout, uds_rcvbuf_bytes, pre_thread)?;
         let rcvbuf = listener.rcvbuf_bytes();
         let mut obs = Self::from_listener(
             listener,
@@ -861,7 +862,11 @@ mod tests {
     }
 
     #[test]
+    #[allow(unsafe_code)]
     fn drop_unlinks_bound_socket() {
+        // SAFETY: unit-test runner may be multi-threaded; the umask window is
+        // benign since no concurrent thread creates files at our temp path.
+        let pre = unsafe { PreThreadAttestation::new_unchecked() };
         let path = unique_sock_path();
         let obs = Observer::bind(
             &path,
@@ -876,6 +881,7 @@ mod tests {
             0,
             0,
             ClockSource::Monotonic,
+            &pre,
         )
         .expect("bind should succeed on a clean temp path");
         assert!(path.exists(), "socket file must exist after bind");

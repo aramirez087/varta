@@ -11,6 +11,7 @@
 - [Transports](architecture/vlp-transports.md)
 - [Stall Detection & Liveness](architecture/observer-liveness.md)
 - [Recovery & Async Spawning](architecture/recovery-async-spawn.md)
+- [Shell-Mode Recovery Removal](architecture/recovery-shell-removal.md)
 - [Peer Authentication](architecture/peer-authentication.md)
 - [Namespacing](architecture/namespaces.md)
 - [Audit Logging](architecture/audit-log.md)

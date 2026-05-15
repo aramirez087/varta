@@ -1,12 +1,8 @@
 //! Per-pid debounced recovery command runner (non-blocking).
 //!
 //! Recovery is the daemon's cold path: it fires only when an agent has
-//! crossed its silence threshold. Two execution modes are available:
+//! crossed its silence threshold. One execution mode is available:
 //!
-//! * **Shell mode** ([`RecoveryMode::Shell`]) — `/bin/sh -c <template>`
-//!   with the pid passed as positional argument `$1`. The template
-//!   body is under full operator control; treat it as a trusted shell
-//!   fragment.
 //! * **Exec mode** ([`RecoveryMode::Exec`]) — `execvp(argv[0], argv[1..])`
 //!   with `{pid}` replaced by the numeric PID in each argument. No shell
 //!   is involved, eliminating shell injection risk entirely.
@@ -19,15 +15,14 @@
 //!
 //! # Security
 //!
-//! In shell mode the pid is always numeric and never string-interpolated
-//! into the script body. In exec mode no shell is spawned — arguments are
-//! passed directly to `execvp(2)`, so metacharacters have no effect.
+//! No shell is spawned — arguments are passed directly to `execvp(2)`,
+//! so shell metacharacters have no effect.
 //! **The recovery command source is under full operator control** — anyone
-//! who can pass `--recovery-cmd` / `--recovery-exec` to `varta-watch`
-//! already has arbitrary code execution capability. Treat the template
-//! as a trusted fragment and never derive it from an untrusted source
+//! who can pass `--recovery-exec` to `varta-watch`
+//! already has arbitrary code execution capability. Treat the command
+//! as a trusted invocation and never derive it from an untrusted source
 //! (e.g. a network request or environment variable from a less-privileged
-//! context). Use `--recovery-cmd-file` / `--recovery-exec-file` with
+//! context). Use `--recovery-exec-file` with
 //! restrictive file permissions for an additional trust check.
 
 use std::io::Read;
@@ -71,26 +66,14 @@ fn take_capture_handles(
 
 /// How the recovery command is executed when an agent stalls.
 ///
-/// Two modes are available:
+/// One mode is available:
 ///
-/// * [`RecoveryMode::Shell`] — `/bin/sh -c <template>` with the pid
-///   passed as `$1`. Backward compatible; the template body is under
-///   full operator control. Requires the `unsafe-shell-recovery` Cargo
-///   feature.
 /// * [`RecoveryMode::Exec`] — `execvp(argv[0], argv[1..])`. `{pid}` in
 ///   any argument is replaced with the numeric PID. No shell is
 ///   involved, so shell metacharacters have no effect.
+#[non_exhaustive]
 #[derive(Clone, Debug)]
 pub enum RecoveryMode {
-    /// Execute via `/bin/sh -c <template>`. The stalled pid is passed
-    /// as positional argument `$1` (appended after the template and
-    /// the `$0` sentinel `"varta-recovery"`).
-    ///
-    /// Requires the `unsafe-shell-recovery` Cargo feature. Even with
-    /// the feature enabled, `--i-accept-shell-risk` is required at
-    /// runtime.
-    #[cfg(feature = "unsafe-shell-recovery")]
-    Shell(String),
     /// Execute a command directly via `execvp(2)` — no shell is spawned,
     /// so shell injection is structurally impossible. Any argument
     /// containing the literal `{pid}` is substituted with the decimal
@@ -558,17 +541,6 @@ pub struct Recovery {
 }
 
 impl Recovery {
-    /// Create a new runner in shell mode with the given `template` and
-    /// `debounce` window.
-    ///
-    /// Equivalent to [`Recovery::with_timeout(template, debounce, None)`].
-    ///
-    /// Requires the `unsafe-shell-recovery` Cargo feature.
-    #[cfg(feature = "unsafe-shell-recovery")]
-    pub fn new(template: String, debounce: Duration) -> Self {
-        Self::with_timeout(RecoveryMode::Shell(template), debounce, None)
-    }
-
     /// Create a new runner in exec mode.
     ///
     /// `program` is the executable to invoke (`argv[0]`). `args` are
@@ -890,9 +862,9 @@ impl Recovery {
     }
 
     /// Set the audit-row `source` field. Use `"inline"` (default) for
-    /// `--recovery-cmd` / `--recovery-exec`, or the path string for the
-    /// `*-file` variants — provides operator visibility into which
-    /// template body was loaded into memory.
+    /// `--recovery-exec`, or the path string for `--recovery-exec-file` —
+    /// provides operator visibility into which command was loaded into
+    /// memory.
     pub fn with_source(mut self, source: String) -> Self {
         self.source = source;
         self
@@ -934,22 +906,6 @@ impl Recovery {
     pub fn with_recovery_inherit_env(mut self, inherit: bool) -> Self {
         self.recovery_inherit_env = inherit;
         self
-    }
-
-    /// Create a legacy runner from a shell template string.
-    ///
-    /// Kept for backward compatibility with callers that hold a
-    /// `template: String`.
-    ///
-    /// Requires the `unsafe-shell-recovery` Cargo feature.
-    #[cfg(feature = "unsafe-shell-recovery")]
-    #[doc(hidden)]
-    pub fn with_template_and_timeout(
-        template: String,
-        debounce: Duration,
-        timeout: Option<Duration>,
-    ) -> Self {
-        Self::with_timeout(RecoveryMode::Shell(template), debounce, timeout)
     }
 
     fn reap_finished_child(&mut self, pid: u32) -> Option<RecoveryOutcome> {
@@ -1118,11 +1074,10 @@ impl Recovery {
         });
     }
 
-    /// Spawn `/bin/sh -c <template> varta-recovery <pid>` (shell mode) or
-    /// `execvp <program> <args...>` (exec mode), both non-blockingly.
+    /// Spawn `execvp <program> <args...> <pid>` non-blockingly.
     ///
-    /// In shell mode the template receives the stalling pid as `$1`. In exec
-    /// mode `{pid}` in any argument is replaced with the numeric PID.
+    /// `{pid}` in any argument is replaced with the numeric PID, and the
+    /// numeric PID is also appended as the final argument.
     /// A per-pid debounce window suppresses repeat invocations.
     ///
     /// `origin` is the transport-class classification of the slot whose
@@ -1275,68 +1230,6 @@ impl Recovery {
         let wallclock_ms = RecoveryAuditLog::wallclock_ms_now();
 
         match &self.mode {
-            #[cfg(feature = "unsafe-shell-recovery")]
-            RecoveryMode::Shell(template) => {
-                let template_len = template.len() as u32;
-                let mut cmd = Command::new("/bin/sh");
-                self.apply_env(&mut cmd);
-                cmd.arg("-c")
-                    .arg(template)
-                    .arg("varta-recovery")
-                    .arg(pid.to_string());
-                if capture_on {
-                    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
-                }
-                match cmd.spawn() {
-                    Ok(mut child) => {
-                        let child_pid = child.id();
-                        let (out_handle, err_handle) = take_capture_handles(&mut child, capture_on);
-                        self.emit_spawn_audit(
-                            wallclock_ms,
-                            pid,
-                            child_pid,
-                            "shell",
-                            "/bin/sh",
-                            template_len,
-                        );
-                        match self.outstanding.try_insert(
-                            pid,
-                            Outstanding {
-                                child,
-                                spawned_at: now,
-                                killed: false,
-                                wallclock_at_spawn_ms: wallclock_ms,
-                                stdout_handle: out_handle,
-                                stderr_handle: err_handle,
-                                stdout_len: 0,
-                                stderr_len: 0,
-                                truncated: false,
-                            },
-                        ) {
-                            Ok(()) => RecoveryOutcome::Spawned { child_pid },
-                            Err(OutstandingInsertError::AlreadyPresent) => {
-                                debug_assert!(
-                                    false,
-                                    "OutstandingTable::try_insert returned AlreadyPresent \
-                                     after the `contains` guard above",
-                                );
-                                RecoveryOutcome::Spawned { child_pid }
-                            }
-                            Err(OutstandingInsertError::Full) => {
-                                // The pre-spawn capacity check should make
-                                // this unreachable, but probe-budget
-                                // exhaustion is a theoretical residual.
-                                // Fail closed: surface the refusal and let
-                                // the kernel reap the orphaned child.
-                                self.refused_outstanding_capacity =
-                                    self.refused_outstanding_capacity.saturating_add(1);
-                                RecoveryOutcome::RefusedOutstandingCapacity { pid }
-                            }
-                        }
-                    }
-                    Err(e) => RecoveryOutcome::SpawnFailed(e),
-                }
-            }
             RecoveryMode::Exec { program, args } => {
                 let pid_str = pid.to_string();
                 let substituted: Vec<String> = std::iter::once(program.clone())
@@ -1618,246 +1511,6 @@ mod tests {
     use super::*;
     use std::time::Instant;
 
-    #[cfg(feature = "unsafe-shell-recovery")]
-    #[test]
-    fn debounces_repeat_calls_for_same_pid() {
-        let mut rec = Recovery::new("true".to_string(), Duration::from_secs(10));
-        let first = rec.on_stall(1, BeatOrigin::KernelAttested, false);
-        let second = rec.on_stall(1, BeatOrigin::KernelAttested, false);
-        assert!(matches!(first, RecoveryOutcome::Spawned { .. }));
-        assert!(matches!(second, RecoveryOutcome::Debounced));
-    }
-
-    /// The configurable Drop grace must bound wall-clock shutdown time
-    /// even when outstanding children are still running.  We spawn a child
-    /// that sleeps far longer than the grace, then drop the Recovery and
-    /// time the unwind.  The deadline gives SIGKILL ample headroom over
-    /// the grace itself; the test fails if Drop blocked for the full
-    /// 30-second sleep.
-    #[cfg(feature = "unsafe-shell-recovery")]
-    #[test]
-    fn drop_returns_within_configured_grace() {
-        let mut rec = Recovery::new("sleep 30".to_string(), Duration::ZERO)
-            .with_shutdown_grace(Duration::from_millis(200));
-        match rec.on_stall(99, BeatOrigin::KernelAttested, false) {
-            RecoveryOutcome::Spawned { .. } => {}
-            other => panic!("expected first stall to spawn, got {other:?}"),
-        }
-        let start = Instant::now();
-        drop(rec);
-        let elapsed = start.elapsed();
-        assert!(
-            elapsed < Duration::from_millis(1_500),
-            "Drop took {elapsed:?}; must respect --shutdown-grace-ms (~200 ms here)"
-        );
-    }
-
-    #[cfg(feature = "unsafe-shell-recovery")]
-    #[test]
-    fn debounce_is_per_pid() {
-        let mut rec = Recovery::new("true".to_string(), Duration::from_secs(10));
-        let a = rec.on_stall(1, BeatOrigin::KernelAttested, false);
-        let b = rec.on_stall(2, BeatOrigin::KernelAttested, false);
-        assert!(matches!(a, RecoveryOutcome::Spawned { .. }));
-        assert!(matches!(b, RecoveryOutcome::Spawned { .. }));
-    }
-
-    #[cfg(feature = "unsafe-shell-recovery")]
-    #[test]
-    fn does_not_replace_outstanding_child_for_same_pid() {
-        let mut rec = Recovery::with_template_and_timeout(
-            "sleep 5".to_string(),
-            Duration::ZERO,
-            Some(Duration::from_millis(50)),
-        );
-        let first_child_pid = match rec.on_stall(7, BeatOrigin::KernelAttested, false) {
-            RecoveryOutcome::Spawned { child_pid } => child_pid,
-            other => panic!("expected first stall to spawn, got {other:?}"),
-        };
-
-        let second = rec.on_stall(7, BeatOrigin::KernelAttested, false);
-        assert!(
-            matches!(second, RecoveryOutcome::Debounced),
-            "same-pid recovery must not replace outstanding child; got {second:?}"
-        );
-
-        let deadline = Instant::now() + Duration::from_millis(1_000);
-        loop {
-            if Instant::now() >= deadline {
-                panic!("timed out waiting for original child to be killed");
-            }
-            let outcomes = rec.try_reap();
-            if outcomes.iter().any(
-                |o| matches!(o, RecoveryOutcome::Killed { child_pid } if *child_pid == first_child_pid),
-            ) {
-                return;
-            }
-            std::thread::sleep(Duration::from_millis(20));
-        }
-    }
-
-    #[cfg(feature = "unsafe-shell-recovery")]
-    #[test]
-    fn template_receives_pid_as_dollar_one() {
-        let mut rec = Recovery::new(
-            "test \"$1-$1\" = \"7-7\"".to_string(),
-            Duration::from_secs(0),
-        );
-        match rec.on_stall(7, BeatOrigin::KernelAttested, false) {
-            RecoveryOutcome::Spawned { child_pid: _ } => {
-                // Child should exit quickly; reap it.
-                std::thread::sleep(Duration::from_millis(50));
-                let outcomes = rec.try_reap();
-                let reaped = outcomes.into_iter().find_map(|o| match o {
-                    RecoveryOutcome::Reaped { status, .. } => Some(status),
-                    _ => None,
-                });
-                assert!(
-                    matches!(reaped, Some(s) if s.success()),
-                    "expected Reaped(success) for pid 7; got {:?}",
-                    reaped
-                );
-            }
-            other => panic!("expected Spawned, got {other:?}"),
-        }
-    }
-
-    #[cfg(feature = "unsafe-shell-recovery")]
-    #[test]
-    fn spawn_returns_immediately_for_slow_template() {
-        let mut rec = Recovery::new("sleep 1".to_string(), Duration::ZERO);
-        let start = Instant::now();
-        match rec.on_stall(42, BeatOrigin::KernelAttested, false) {
-            RecoveryOutcome::Spawned { .. } => {}
-            other => panic!("expected Spawned, got {other:?}"),
-        }
-        let elapsed = start.elapsed();
-        assert!(
-            elapsed < Duration::from_millis(50),
-            "spawn blocked for {elapsed:?}; expected non-blocking"
-        );
-    }
-
-    #[cfg(feature = "unsafe-shell-recovery")]
-    #[test]
-    fn try_reap_surfaces_reaped_for_fast_child() {
-        let mut rec = Recovery::new("true".to_string(), Duration::ZERO);
-        match rec.on_stall(99, BeatOrigin::KernelAttested, false) {
-            RecoveryOutcome::Spawned { .. } => {}
-            other => panic!("expected Spawned, got {other:?}"),
-        }
-
-        // Poll try_reap until we see Reaped.
-        let deadline = Instant::now() + Duration::from_millis(500);
-        loop {
-            if Instant::now() >= deadline {
-                panic!("timed out waiting for Reaped");
-            }
-            let outcomes = rec.try_reap();
-            if let Some(o) = outcomes.into_iter().find_map(|o| match o {
-                RecoveryOutcome::Reaped { status, .. } => Some(status),
-                _ => None,
-            }) {
-                assert!(o.success(), "expected success from 'true'");
-                return;
-            }
-            std::thread::sleep(Duration::from_millis(20));
-        }
-    }
-
-    #[cfg(feature = "unsafe-shell-recovery")]
-    #[test]
-    fn try_reap_kills_after_timeout() {
-        let mut rec = Recovery::with_template_and_timeout(
-            "sleep 5".to_string(),
-            Duration::ZERO,
-            Some(Duration::from_millis(100)),
-        );
-        match rec.on_stall(7, BeatOrigin::KernelAttested, false) {
-            RecoveryOutcome::Spawned { .. } => {}
-            other => panic!("expected Spawned, got {other:?}"),
-        }
-
-        let deadline = Instant::now() + Duration::from_millis(1_000);
-        loop {
-            if Instant::now() >= deadline {
-                panic!("timed out waiting for Killed");
-            }
-            let outcomes = rec.try_reap();
-            if outcomes
-                .iter()
-                .any(|o| matches!(o, RecoveryOutcome::Killed { .. }))
-            {
-                return;
-            }
-            std::thread::sleep(Duration::from_millis(30));
-        }
-    }
-
-    #[cfg(feature = "unsafe-shell-recovery")]
-    #[test]
-    fn drop_kills_and_reaps_still_running_children() {
-        // Spawn a long-running child with no timeout — the child will
-        // still be alive when `rec` goes out of scope. Drop must kill
-        // and wait on it to prevent a zombie.
-        let start = Instant::now();
-        {
-            let mut rec = Recovery::new("sleep 5".to_string(), Duration::ZERO);
-            match rec.on_stall(999, BeatOrigin::KernelAttested, false) {
-                RecoveryOutcome::Spawned { .. } => {}
-                other => panic!("expected Spawned, got {other:?}"),
-            }
-            // Drop happens here; kill + wait must run.
-        }
-        let elapsed = start.elapsed();
-
-        // If Drop properly kills the child, this completes in well under
-        // 5 seconds. Without the fix, Drop would only call try_reap (which
-        // sees the child is still running and does nothing), and
-        // std::process::Child's Drop does not wait — so the child would
-        // outlive Recovery but this test would still pass without asserting
-        // elapsed time. The timing assert is the proof the child was killed.
-        assert!(
-            elapsed < Duration::from_secs(1),
-            "Drop hung for {elapsed:?}; expected kill+wait to complete quickly"
-        );
-    }
-
-    #[cfg(feature = "unsafe-shell-recovery")]
-    #[test]
-    fn with_timeout_constructor_accepts_optional_duration() {
-        let _none = Recovery::with_template_and_timeout("true".to_string(), Duration::ZERO, None);
-        let _some = Recovery::with_template_and_timeout(
-            "true".to_string(),
-            Duration::ZERO,
-            Some(Duration::from_millis(50)),
-        );
-    }
-
-    #[cfg(feature = "unsafe-shell-recovery")]
-    #[test]
-    fn last_fired_hashmap_is_pruned_after_debounce_times_ten() {
-        let debounce = Duration::from_millis(10);
-        let mut rec = Recovery::new("true".to_string(), debounce);
-
-        assert!(matches!(
-            rec.on_stall(1, BeatOrigin::KernelAttested, false),
-            RecoveryOutcome::Spawned { .. }
-        ));
-        assert!(matches!(
-            rec.on_stall(1, BeatOrigin::KernelAttested, false),
-            RecoveryOutcome::Debounced
-        ));
-
-        let prune_threshold = debounce.saturating_mul(10);
-        std::thread::sleep(prune_threshold + Duration::from_millis(40));
-
-        assert!(matches!(
-            rec.on_stall(1, BeatOrigin::KernelAttested, false),
-            RecoveryOutcome::Spawned { .. }
-        ));
-    }
-
     #[test]
     fn exec_mode_spawns_command_via_execvp() {
         let mut rec = Recovery::with_mode(
@@ -1936,194 +1589,6 @@ mod tests {
                 );
             }
             other => panic!("expected Spawned, got {other:?}"),
-        }
-    }
-
-    #[cfg(feature = "unsafe-shell-recovery")]
-    #[test]
-    fn env_isolation_clears_inherited_environment() {
-        let mut rec = Recovery::with_timeout(
-            RecoveryMode::Shell("test -z \"$HOME\"".to_string()),
-            Duration::ZERO,
-            None,
-        )
-        .with_recovery_env(vec!["FOO=bar".to_string()]);
-        match rec.on_stall(1, BeatOrigin::KernelAttested, false) {
-            RecoveryOutcome::Spawned { .. } => {
-                std::thread::sleep(Duration::from_millis(100));
-                let outcomes = rec.try_reap();
-                let reaped = outcomes.into_iter().find_map(|o| match o {
-                    RecoveryOutcome::Reaped { status, .. } => Some(status),
-                    _ => None,
-                });
-                assert!(
-                    matches!(reaped, Some(s) if s.success()),
-                    "HOME should not be set under default (cleared) env policy; got {reaped:?}"
-                );
-            }
-            other => panic!("expected Spawned, got {other:?}"),
-        }
-    }
-
-    #[cfg(feature = "unsafe-shell-recovery")]
-    #[test]
-    fn env_isolation_passes_explicit_variables() {
-        let mut rec = Recovery::with_timeout(
-            RecoveryMode::Shell(
-                "test \"$MYVAR\" = \"hello\" && test \"$OTHER\" = \"world\"".to_string(),
-            ),
-            Duration::ZERO,
-            None,
-        )
-        .with_recovery_env(vec!["MYVAR=hello".to_string(), "OTHER=world".to_string()]);
-        match rec.on_stall(1, BeatOrigin::KernelAttested, false) {
-            RecoveryOutcome::Spawned { .. } => {
-                std::thread::sleep(Duration::from_millis(100));
-                let outcomes = rec.try_reap();
-                let reaped = outcomes.into_iter().find_map(|o| match o {
-                    RecoveryOutcome::Reaped { status, .. } => Some(status),
-                    _ => None,
-                });
-                assert!(
-                    matches!(reaped, Some(s) if s.success()),
-                    "explicit env vars should be visible to child; got {reaped:?}"
-                );
-            }
-            other => panic!("expected Spawned, got {other:?}"),
-        }
-    }
-
-    #[cfg(feature = "unsafe-shell-recovery")]
-    #[test]
-    fn default_env_clears_inherited_env_even_without_overrides() {
-        // Secure default (post-2026-05-14): with neither --recovery-env nor
-        // --recovery-inherit-env set, the child must NOT see the observer's
-        // env. Asserts the inverse of the legacy behavior that would have
-        // leaked AWS_*/`*_TOKEN`/etc. into recovery subprocesses.
-        // SAFETY: this test mutates process env. It runs with no other env-
-        // sensitive tests in parallel because each test thread shares the
-        // same process. Using a uniquely-named var avoids cross-test races.
-        const SENTINEL: &str = "VARTA_TEST_LEAK_SENTINEL_DEFAULT";
-        // SAFETY: set_var is unsafe in 2024 edition; we accept the global
-        // mutation risk because the sentinel name is unique and we restore
-        // it on the way out.
-        unsafe {
-            std::env::set_var(SENTINEL, "must-not-leak");
-        }
-        let mut rec = Recovery::with_timeout(
-            RecoveryMode::Shell(format!("test -z \"${SENTINEL}\"")),
-            Duration::ZERO,
-            None,
-        );
-        let outcome = rec.on_stall(1, BeatOrigin::KernelAttested, false);
-        match outcome {
-            RecoveryOutcome::Spawned { .. } => {
-                std::thread::sleep(Duration::from_millis(100));
-                let outcomes = rec.try_reap();
-                let reaped = outcomes.into_iter().find_map(|o| match o {
-                    RecoveryOutcome::Reaped { status, .. } => Some(status),
-                    _ => None,
-                });
-                // SAFETY: restore env before any assertion can panic so we
-                // do not poison sibling tests.
-                unsafe {
-                    std::env::remove_var(SENTINEL);
-                }
-                assert!(
-                    matches!(reaped, Some(s) if s.success()),
-                    "sentinel env var must NOT be inherited under default env policy; got {reaped:?}"
-                );
-            }
-            other => {
-                unsafe {
-                    std::env::remove_var(SENTINEL);
-                }
-                panic!("expected Spawned, got {other:?}");
-            }
-        }
-    }
-
-    #[cfg(feature = "unsafe-shell-recovery")]
-    #[test]
-    fn inherit_env_opt_in_restores_legacy_inheritance() {
-        // With --recovery-inherit-env, the child sees the observer's env.
-        const SENTINEL: &str = "VARTA_TEST_LEAK_SENTINEL_OPTIN";
-        unsafe {
-            std::env::set_var(SENTINEL, "expected-to-be-inherited");
-        }
-        let mut rec = Recovery::with_timeout(
-            RecoveryMode::Shell(format!(
-                "test \"${SENTINEL}\" = \"expected-to-be-inherited\""
-            )),
-            Duration::ZERO,
-            None,
-        )
-        .with_recovery_inherit_env(true);
-        let outcome = rec.on_stall(1, BeatOrigin::KernelAttested, false);
-        match outcome {
-            RecoveryOutcome::Spawned { .. } => {
-                std::thread::sleep(Duration::from_millis(100));
-                let outcomes = rec.try_reap();
-                let reaped = outcomes.into_iter().find_map(|o| match o {
-                    RecoveryOutcome::Reaped { status, .. } => Some(status),
-                    _ => None,
-                });
-                unsafe {
-                    std::env::remove_var(SENTINEL);
-                }
-                assert!(
-                    matches!(reaped, Some(s) if s.success()),
-                    "sentinel env var must be inherited when --recovery-inherit-env is set; got {reaped:?}"
-                );
-            }
-            other => {
-                unsafe {
-                    std::env::remove_var(SENTINEL);
-                }
-                panic!("expected Spawned, got {other:?}");
-            }
-        }
-    }
-
-    #[cfg(feature = "unsafe-shell-recovery")]
-    #[test]
-    fn inherit_env_layered_with_explicit_overrides_takes_overrides() {
-        // With --recovery-inherit-env AND --recovery-env KEY=NEW, the
-        // override wins for that KEY even when the inherited value differs.
-        const KEY: &str = "VARTA_TEST_OVERRIDE_KEY";
-        unsafe {
-            std::env::set_var(KEY, "inherited-value");
-        }
-        let mut rec = Recovery::with_timeout(
-            RecoveryMode::Shell(format!("test \"${KEY}\" = \"override-value\"")),
-            Duration::ZERO,
-            None,
-        )
-        .with_recovery_inherit_env(true)
-        .with_recovery_env(vec![format!("{KEY}=override-value")]);
-        let outcome = rec.on_stall(1, BeatOrigin::KernelAttested, false);
-        match outcome {
-            RecoveryOutcome::Spawned { .. } => {
-                std::thread::sleep(Duration::from_millis(100));
-                let outcomes = rec.try_reap();
-                let reaped = outcomes.into_iter().find_map(|o| match o {
-                    RecoveryOutcome::Reaped { status, .. } => Some(status),
-                    _ => None,
-                });
-                unsafe {
-                    std::env::remove_var(KEY);
-                }
-                assert!(
-                    matches!(reaped, Some(s) if s.success()),
-                    "explicit --recovery-env override must beat inherited value; got {reaped:?}"
-                );
-            }
-            other => {
-                unsafe {
-                    std::env::remove_var(KEY);
-                }
-                panic!("expected Spawned, got {other:?}");
-            }
         }
     }
 

@@ -104,7 +104,7 @@ pub use config::{Config, ConfigError};
 #[cfg(feature = "prometheus-exporter")]
 pub use exporter::PromExporter;
 pub use exporter::{Exporter, FileExporter};
-pub use listener::{BeatListener, TransportTrust, UdsListener};
+pub use listener::{BeatListener, PreThreadAttestation, TransportTrust, UdsListener};
 pub use observer::{Event, Observer};
 pub use peer_cred::BeatOrigin;
 pub use recovery::{Recovery, RecoveryOutcome};

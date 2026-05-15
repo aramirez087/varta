@@ -6,7 +6,7 @@ use crate::clock::ClockSource;
 use crate::signal_install::SignalHandlerMode;
 use crate::tracker::EvictionPolicy;
 
-/// Default per-pid debounce window applied when `--recovery-cmd` is set
+/// Default per-pid debounce window applied when `--recovery-exec` is set
 /// without an explicit `--recovery-debounce-ms`.
 pub const DEFAULT_RECOVERY_DEBOUNCE_MS: u64 = 1000;
 
@@ -137,21 +137,14 @@ pub struct Config {
     pub socket: PathBuf,
     /// Per-pid silence window before the observer surfaces `Event::Stall`.
     pub threshold: Duration,
-    /// Optional shell-fragment template invoked on each unique stall. The
-    /// stalled pid is passed as `$1` (positional argument, not string-replaced).
-    pub recovery_cmd: Option<String>,
     /// Optional exec command line invoked on each unique stall. `{pid}` in
     /// any argument is replaced with the numeric PID. No shell is spawned.
     pub recovery_exec_cmd: Option<String>,
-    /// Optional path to a file containing the `--recovery-cmd` shell template.
-    /// The file must be owned by the observer's UID and have mode 0600 or
-    /// stricter. Mutually exclusive with `recovery_cmd`.
-    pub recovery_cmd_file: Option<PathBuf>,
     /// Optional path to a file containing the `--recovery-exec` command line.
-    /// Same permission requirements as `recovery_cmd_file`. Mutually
-    /// exclusive with `recovery_exec_cmd`.
+    /// The file must be owned by the observer's UID and have mode 0600 or
+    /// stricter. Mutually exclusive with `recovery_exec_cmd`.
     pub recovery_exec_file: Option<PathBuf>,
-    /// Per-pid debounce window for `recovery_cmd` invocations.
+    /// Per-pid debounce window for recovery invocations.
     pub recovery_debounce: Duration,
     /// Environment variables passed to recovery child processes. Each entry
     /// is in `KEY=VALUE` format. Applied on top of the base env chosen by
@@ -281,13 +274,6 @@ pub struct Config {
     /// include `--features unsafe-plaintext-udp` for the plaintext path
     /// to exist at all.  Set by `--i-accept-plaintext-udp`.
     pub i_accept_plaintext_udp: bool,
-    /// Operator opt-in required to run shell-mode recovery (`--recovery-cmd`
-    /// or `--recovery-cmd-file`).  Shell mode spawns `/bin/sh -c <template>`
-    /// with root-equivalent process authority — a single template-injection
-    /// vector can terminate any process the observer can reach.  For
-    /// production deployments use `--recovery-exec` (no shell, no injection
-    /// surface).  Set by `--i-accept-shell-risk`.
-    pub i_accept_shell_risk: bool,
     /// Operator opt-in to combine the **secure-UDP** listener with a recovery
     /// command.  Secure UDP authenticates wire bytes but cannot attest the
     /// sending process — a holder of a shared PSK or a derived per-agent key
@@ -474,7 +460,7 @@ pub enum ConfigError {
     },
     /// Two or more mutually exclusive recovery flags were specified.
     MutuallyExclusive {
-        /// The pair of conflicting flags (e.g. `("--recovery-cmd", "--recovery-exec")`).
+        /// The pair of conflicting flags (e.g. `("--recovery-exec", "--recovery-exec-file")`).
         a: &'static str,
         /// Second conflicting flag.
         b: &'static str,
@@ -503,9 +489,8 @@ pub enum ConfigError {
         max: u32,
     },
     /// `--recovery-capture-stdio` was passed without any recovery command
-    /// configured (`--recovery-cmd` / `--recovery-cmd-file` /
-    /// `--recovery-exec` / `--recovery-exec-file`). Capture is meaningless
-    /// without something to capture from.
+    /// configured (`--recovery-exec` / `--recovery-exec-file`). Capture is
+    /// meaningless without something to capture from.
     RecoveryCaptureRequiresRecovery,
     /// `--shutdown-grace-ms` was below [`MIN_SHUTDOWN_GRACE_MS`].
     ShutdownGraceTooLow {
@@ -514,12 +499,11 @@ pub enum ConfigError {
         /// The minimum allowed value.
         min: u64,
     },
-    /// Shell-mode recovery flags were passed but this binary was compiled
-    /// without the `unsafe-shell-recovery` Cargo feature.  Rebuild with
-    /// `--features unsafe-shell-recovery` or use `--recovery-exec` instead.
+    /// Shell-mode recovery flags were passed (removed feature).  Use
+    /// `--recovery-exec` instead.
     ShellRecoveryNotCompiledIn,
-    /// A recovery command (`--recovery-cmd` / `--recovery-cmd-file` /
-    /// `--recovery-exec` / `--recovery-exec-file`) was configured at the
+    /// A recovery command (`--recovery-exec` / `--recovery-exec-file`) was
+    /// configured at the
     /// same time as a UDP listener (`--udp-port`), without the matching
     /// per-listener operator acknowledgement.  UDP transports cannot attest
     /// the sending process — an attacker holding the AEAD key (or a derived
@@ -667,13 +651,10 @@ impl core::fmt::Display for ConfigError {
                 "--recovery-capture-bytes: {value} exceeds the maximum allowed value ({max} bytes)"
             ),
             ConfigError::RecoveryCaptureRequiresRecovery => f.write_str(
-                "--recovery-capture-stdio requires --recovery-cmd, --recovery-cmd-file, \
-                 --recovery-exec, or --recovery-exec-file",
+                "--recovery-capture-stdio requires --recovery-exec or --recovery-exec-file",
             ),
             ConfigError::ShellRecoveryNotCompiledIn => f.write_str(
-                "shell-mode recovery (--recovery-cmd / --recovery-cmd-file) is not available \
-                 in this build; rebuild with --features unsafe-shell-recovery, or use \
-                 --recovery-exec instead",
+                "shell-mode recovery has been permanently removed; use --recovery-exec instead",
             ),
             ConfigError::RecoveryRequiresAuthenticatedTransport { udp_addr } => write!(
                 f,
@@ -780,8 +761,8 @@ impl core::fmt::Display for ConfigError {
             }
             ConfigError::ShellRecoveryNotCompiledIn => write!(
                 f,
-                "shell-mode recovery is not compiled into this build; \
-                 use the exec-mode recovery key instead ({REF})"
+                "shell-mode recovery has been permanently removed; \
+                 use --recovery-exec instead ({REF})"
             ),
             ConfigError::ClockSourceUnsupported { platform, .. } => write!(
                 f,

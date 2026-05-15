@@ -151,17 +151,16 @@ pub struct SpawnRecord<'a> {
     pub agent_pid: u32,
     /// Child pid of the freshly-spawned recovery process.
     pub child_pid: u32,
-    /// "shell" or "exec".
+    /// Always `"exec"` (shell mode was permanently removed).
     pub mode: &'a str,
-    /// Program path actually invoked (`/bin/sh` for shell mode, `argv[0]`
-    /// for exec mode).
+    /// Program path actually invoked (`argv[0]`).
     pub program: &'a str,
-    /// Source of the command: `"inline"` for `--recovery-cmd` /
-    /// `--recovery-exec`, or the path-string for the `*-file` variants.
+    /// Source of the command: `"inline"` for `--recovery-exec`, or the
+    /// path-string for `--recovery-exec-file`.
     pub source: &'a str,
-    /// Length in bytes of the resolved command template (shell) or full
-    /// argv (exec). The contents themselves are not written — they may
-    /// embed secrets and the source path is already auditable.
+    /// Length in bytes of the full argv. The contents themselves are not
+    /// written — they may embed secrets and the source path is already
+    /// auditable.
     pub template_len: u32,
 }
 

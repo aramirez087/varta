@@ -11,10 +11,21 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use varta_vlp::{DecodeError, Frame, Status};
+use varta_watch::listener::PreThreadAttestation;
 use varta_watch::tracker::{DEFAULT_EVICTION_SCAN_WINDOW, MAX_CAPACITY};
 use varta_watch::ClockSource;
 use varta_watch::EvictionPolicy;
 use varta_watch::{Event, Observer, Tracker, Update};
+
+/// Return a token without the single-thread probe.
+/// Tests run inside a multi-threaded test runner; the umask window is benign
+/// because each test uses a unique socket path and no concurrent test thread
+/// creates files at those paths.
+#[allow(unsafe_code)]
+fn pre_thread() -> PreThreadAttestation {
+    // SAFETY: see above.
+    unsafe { PreThreadAttestation::new_unchecked() }
+}
 
 static UDS_COUNTER: AtomicU32 = AtomicU32::new(0);
 
@@ -107,6 +118,7 @@ fn observer_emits_beat_per_received_frame() {
         0,
         0,
         ClockSource::Monotonic,
+        &pre_thread(),
     )
     .expect("bind observer");
     let client = client_socket(path.as_path());
@@ -188,6 +200,7 @@ fn observer_emits_stall_after_threshold_elapses() {
         0,
         0,
         ClockSource::Monotonic,
+        &pre_thread(),
     )
     .expect("bind observer");
     let client = client_socket(path.as_path());
@@ -243,6 +256,7 @@ fn observer_reports_decode_error_for_bad_magic() {
         0,
         0,
         ClockSource::Monotonic,
+        &pre_thread(),
     )
     .expect("bind observer");
     let client = client_socket(path.as_path());
@@ -313,6 +327,7 @@ fn observer_rejects_spoofed_pid_frame() {
         0,
         0,
         ClockSource::Monotonic,
+        &pre_thread(),
     )
     .expect("bind observer");
     let client = client_socket(path.as_path());
@@ -372,6 +387,7 @@ fn observer_counts_truncated_datagrams() {
         0,
         0,
         ClockSource::Monotonic,
+        &pre_thread(),
     )
     .expect("bind observer");
     let client = client_socket(path.as_path());

@@ -41,11 +41,6 @@ secure-udp = ["udp-core", "varta-vlp/crypto"]
 # unless `--i-accept-plaintext-udp` is passed.  Do not enable in
 # production builds.
 unsafe-plaintext-udp = ["udp-core"]
-# UNSAFE: enable the /bin/sh -c recovery template path.  A shell template
-# is one quoting bug away from RCE under the observer's authority.  Even
-# with this feature compiled in, --i-accept-shell-risk is still required
-# at runtime.  Do not enable in production builds.
-unsafe-shell-recovery = []
 # Emit structured JSON lines to stderr instead of plain eprintln!.
 # Each line is a self-contained JSON object with ts_ns, level, msg,
 # and optional context fields (pid, child_pid, error).  Suitable for

@@ -31,7 +31,7 @@ jobs:
       - name: clippy (SRE — argv parser + HTTP exporter)
         run: |
           cargo clippy --locked --workspace --all-targets \
-            --features 'varta-watch/secure-udp varta-watch/unsafe-plaintext-udp varta-watch/unsafe-shell-recovery varta-watch/json-log varta-watch/audit-chain varta-watch/test-hooks varta-watch/prometheus-exporter varta-vlp/crypto varta-vlp/std varta-client/panic-handler varta-client/udp varta-client/secure-udp varta-client/test-hooks varta-tests/udp varta-tests/secure-udp varta-tests/shell-recovery varta-tests/test-hooks varta-tests/prometheus-exporter' \
+            --features 'varta-watch/secure-udp varta-watch/unsafe-plaintext-udp varta-watch/json-log varta-watch/audit-chain varta-watch/test-hooks varta-watch/prometheus-exporter varta-vlp/crypto varta-vlp/std varta-client/panic-handler varta-client/udp varta-client/secure-udp varta-client/test-hooks varta-tests/udp varta-tests/secure-udp varta-tests/test-hooks varta-tests/prometheus-exporter' \
             -- -D warnings
 
       - name: clippy (Class-A — compile-time config, no HTTP, no argv)
@@ -78,12 +78,12 @@ jobs:
           RUSTFLAGS: -D warnings
         run: |
           cargo test --locked --workspace \
-            --features 'varta-watch/secure-udp varta-watch/unsafe-plaintext-udp varta-watch/unsafe-shell-recovery varta-watch/json-log varta-watch/audit-chain varta-watch/test-hooks varta-watch/prometheus-exporter varta-vlp/crypto varta-vlp/std varta-client/panic-handler varta-client/udp varta-client/secure-udp varta-client/test-hooks varta-tests/udp varta-tests/secure-udp varta-tests/shell-recovery varta-tests/test-hooks varta-tests/prometheus-exporter'
+            --features 'varta-watch/secure-udp varta-watch/unsafe-plaintext-udp varta-watch/json-log varta-watch/audit-chain varta-watch/test-hooks varta-watch/prometheus-exporter varta-vlp/crypto varta-vlp/std varta-client/panic-handler varta-client/udp varta-client/secure-udp varta-client/test-hooks varta-tests/udp varta-tests/secure-udp varta-tests/test-hooks varta-tests/prometheus-exporter'
 
       - name: doc-tests (SRE profile)
         run: |
           cargo test --locked --doc --workspace \
-            --features 'varta-watch/secure-udp varta-watch/unsafe-plaintext-udp varta-watch/unsafe-shell-recovery varta-watch/json-log varta-watch/audit-chain varta-watch/test-hooks varta-watch/prometheus-exporter varta-vlp/crypto varta-vlp/std varta-client/panic-handler varta-client/udp varta-client/secure-udp varta-client/test-hooks varta-tests/udp varta-tests/secure-udp varta-tests/shell-recovery varta-tests/test-hooks varta-tests/prometheus-exporter'
+            --features 'varta-watch/secure-udp varta-watch/unsafe-plaintext-udp varta-watch/json-log varta-watch/audit-chain varta-watch/test-hooks varta-watch/prometheus-exporter varta-vlp/crypto varta-vlp/std varta-client/panic-handler varta-client/udp varta-client/secure-udp varta-client/test-hooks varta-tests/udp varta-tests/secure-udp varta-tests/test-hooks varta-tests/prometheus-exporter'
 
       - name: release build
         run: cargo build --locked --workspace --release
@@ -91,7 +91,7 @@ jobs:
       - name: examples build (SRE profile)
         run: |
           cargo build --locked --workspace --examples \
-            --features 'varta-watch/secure-udp varta-watch/unsafe-plaintext-udp varta-watch/unsafe-shell-recovery varta-watch/json-log varta-watch/audit-chain varta-watch/test-hooks varta-watch/prometheus-exporter varta-vlp/crypto varta-vlp/std varta-client/panic-handler varta-client/udp varta-client/secure-udp varta-client/test-hooks varta-tests/udp varta-tests/secure-udp varta-tests/shell-recovery varta-tests/test-hooks varta-tests/prometheus-exporter'
+            --features 'varta-watch/secure-udp varta-watch/unsafe-plaintext-udp varta-watch/json-log varta-watch/audit-chain varta-watch/test-hooks varta-watch/prometheus-exporter varta-vlp/crypto varta-vlp/std varta-client/panic-handler varta-client/udp varta-client/secure-udp varta-client/test-hooks varta-tests/udp varta-tests/secure-udp varta-tests/test-hooks varta-tests/prometheus-exporter'
 
       - name: zero-dep audit (varta-vlp)
         run: |
@@ -337,15 +337,6 @@ jobs:
             && { echo "FAIL: /bin/sh found in production-safe binary"; exit 1; } \
             || echo "OK: no /bin/sh in production-safe binary"
 
-      - name: unsafe-shell-recovery feature compiles
-        run: cargo build --locked -p varta-watch --release --features unsafe-shell-recovery
-
-      - name: unsafe-shell-recovery unit tests
-        run: cargo test --locked -p varta-watch --features unsafe-shell-recovery
-
-      - name: unsafe-shell-recovery integration tests
-        run: cargo test --locked -p varta-tests --features shell-recovery
-
       - name: observer-liveness integration tests (L1 self-watchdog, L2 sd_notify, L3 hw_watchdog)
         run: cargo test --locked -p varta-watch --features test-hooks --test notify --test cli_smoke --test self_watchdog
 
@@ -378,7 +369,7 @@ jobs:
             "--master-key-file" "--key-file" "--clock-source" "--i-accept"
             "--allow-cross-namespace" "--udp-port"
             "--features audit-chain" "--features secure-udp"
-            "--features unsafe-plaintext-udp" "--features unsafe-shell-recovery"
+            "--features unsafe-plaintext-udp"
           )
           fail=0
           for needle in "${FORBIDDEN[@]}"; do

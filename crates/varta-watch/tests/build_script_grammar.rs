@@ -132,6 +132,23 @@ threshold_ms = 5000
 }
 
 #[test]
+fn recovery_cmd_is_rejected_as_unknown_key() {
+    // `recovery_cmd` was removed; operators must use `recovery_exec_cmd`.
+    // The config-file parser must reject it so a stale config file is
+    // surfaced at build time rather than silently ignored.
+    let bad = format!("{MINIMAL}recovery_cmd = systemctl restart myapp\n");
+    let err = parse_kv(&bad).expect_err("removed key recovery_cmd must error");
+    assert!(err.contains("unknown key"), "got: {err}");
+}
+
+#[test]
+fn recovery_cmd_file_is_rejected_as_unknown_key() {
+    let bad = format!("{MINIMAL}recovery_cmd_file = /etc/varta/cmd\n");
+    let err = parse_kv(&bad).expect_err("removed key recovery_cmd_file must error");
+    assert!(err.contains("unknown key"), "got: {err}");
+}
+
+#[test]
 fn recovery_audit_sync_every_zero_is_rejected() {
     let bad = "\
 socket = /tmp/x.sock

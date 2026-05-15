@@ -157,22 +157,10 @@ pub const FLAGS: &[FlagSpec] = &[
     // Recovery — command sources
     // -------------------------------------------------------------------------
     FlagSpec {
-        cli: "--recovery-cmd",
-        key: "recovery_cmd",
-        kind: FlagKind::Str,
-        feature: "unsafe-shell-recovery",
-    },
-    FlagSpec {
         cli: "--recovery-exec",
         key: "recovery_exec_cmd",
         kind: FlagKind::Str,
         feature: "",
-    },
-    FlagSpec {
-        cli: "--recovery-cmd-file",
-        key: "recovery_cmd_file",
-        kind: FlagKind::Path,
-        feature: "unsafe-shell-recovery",
     },
     FlagSpec {
         cli: "--recovery-exec-file",
@@ -413,12 +401,6 @@ pub const FLAGS: &[FlagSpec] = &[
         key: "i_accept_plaintext_udp",
         kind: FlagKind::Bool,
         feature: "unsafe-plaintext-udp",
-    },
-    FlagSpec {
-        cli: "--i-accept-shell-risk",
-        key: "i_accept_shell_risk",
-        kind: FlagKind::Bool,
-        feature: "unsafe-shell-recovery",
     },
     FlagSpec {
         cli: "--secure-udp-i-accept-recovery-on-unauthenticated-transport",

@@ -70,7 +70,7 @@ a `UdpListener` is added alongside the UDS listener.
 | **Use case** | Local IPC, process monitoring | IoT/edge, microservices | Anything crossing untrusted networks |
 
 > **Recovery-on-UDP is structurally rejected by default.** Combining any
-> recovery flag (`--recovery-cmd` / `--recovery-exec` / `*-file`) with
+> recovery flag (`--recovery-exec` / `--recovery-exec-file`) with
 > `--udp-port` is a startup hard-error unless the operator passes
 > `--i-accept-recovery-on-unauthenticated-transport`.  Even with the flag,
 > the runtime origin gate still refuses to fire recovery for UDP-origin
@@ -160,12 +160,11 @@ varta-watch --socket /tmp/varta.sock --threshold-ms 500 \
     non-cryptographic fallback — see `book/src/architecture/peer-authentication.md`
     for the full nonce-reuse risk analysis.
 
-- **Recovery commands**: Two execution modes:
-  - `--recovery-cmd`: Shell mode — templates executed via `/bin/sh -c` with
-    the PID as `$1` (positional argument, never string-interpolated).
-  - `--recovery-exec`: Exec mode — commands executed directly via `execvp(2)`
-    with `{pid}` replaced in arguments. No shell is involved.
-  - `--recovery-cmd-file` / `--recovery-exec-file`: Read templates from files
+- **Recovery commands**: Exec mode only (shell mode was permanently removed):
+  - `--recovery-exec`: Command executed directly via `execvp(2)` with `{pid}`
+    replaced in arguments; the pid is also appended as the final argument.
+    No shell is involved.
+  - `--recovery-exec-file`: Read the program + args from a hardened file
     with mandatory ownership/permission checks (UID match, mode ≤ 0600).
 
 ## Container / PID-namespace semantics

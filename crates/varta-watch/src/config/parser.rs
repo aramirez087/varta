@@ -43,9 +43,7 @@ impl Config {
     pub fn from_args(args: impl IntoIterator<Item = String>) -> Result<Config, ConfigError> {
         let mut socket: Option<PathBuf> = None;
         let mut threshold_ms: Option<u64> = None;
-        let mut recovery_cmd: Option<String> = None;
         let mut recovery_exec_cmd: Option<String> = None;
-        let mut recovery_cmd_file: Option<PathBuf> = None;
         let mut recovery_exec_file: Option<PathBuf> = None;
         let mut recovery_debounce_ms: Option<u64> = None;
         let mut recovery_env: Vec<String> = Vec::new();
@@ -88,7 +86,6 @@ impl Config {
         #[allow(unused_mut)]
         let mut prom_rate_limit_burst: Option<u32> = None;
         let mut i_accept_plaintext_udp = false;
-        let mut i_accept_shell_risk = false;
         let mut i_accept_recovery_on_secure_udp = false;
         let mut i_accept_recovery_on_plaintext_udp = false;
         let mut i_accept_secure_udp_non_loopback = false;
@@ -123,22 +120,28 @@ impl Config {
                     threshold_ms = Some(parse_u64("--threshold-ms", &v)?);
                 }
                 "--recovery-cmd" => {
-                    let v = iter
-                        .next()
-                        .ok_or(ConfigError::MissingValue("--recovery-cmd"))?;
-                    recovery_cmd = Some(v);
+                    return Err(ConfigError::RemovedFlag {
+                        flag: "--recovery-cmd",
+                        replacement: "--recovery-exec",
+                    });
+                }
+                "--recovery-cmd-file" => {
+                    return Err(ConfigError::RemovedFlag {
+                        flag: "--recovery-cmd-file",
+                        replacement: "--recovery-exec-file",
+                    });
+                }
+                "--i-accept-shell-risk" => {
+                    return Err(ConfigError::RemovedFlag {
+                        flag: "--i-accept-shell-risk",
+                        replacement: "--recovery-exec",
+                    });
                 }
                 "--recovery-exec" => {
                     let v = iter
                         .next()
                         .ok_or(ConfigError::MissingValue("--recovery-exec"))?;
                     recovery_exec_cmd = Some(v);
-                }
-                "--recovery-cmd-file" => {
-                    let v = iter
-                        .next()
-                        .ok_or(ConfigError::MissingValue("--recovery-cmd-file"))?;
-                    recovery_cmd_file = Some(PathBuf::from(v));
                 }
                 "--recovery-exec-file" => {
                     let v = iter
@@ -434,9 +437,6 @@ impl Config {
                 "--i-accept-plaintext-udp" => {
                     i_accept_plaintext_udp = true;
                 }
-                "--i-accept-shell-risk" => {
-                    i_accept_shell_risk = true;
-                }
                 "--secure-udp-i-accept-recovery-on-unauthenticated-transport" => {
                     i_accept_recovery_on_secure_udp = true;
                 }
@@ -598,12 +598,7 @@ impl Config {
         // Capture is meaningless without a recovery command. Reject the flag
         // at parse time so a misconfiguration surfaces at startup rather than
         // hiding silently in a runbook.
-        if recovery_capture_stdio
-            && recovery_cmd.is_none()
-            && recovery_exec_cmd.is_none()
-            && recovery_cmd_file.is_none()
-            && recovery_exec_file.is_none()
-        {
+        if recovery_capture_stdio && recovery_exec_cmd.is_none() && recovery_exec_file.is_none() {
             return Err(ConfigError::RecoveryCaptureRequiresRecovery);
         }
 
@@ -619,10 +614,7 @@ impl Config {
         // unauthenticated-transport covers the secure-UDP listener only;
         // --plaintext-udp-i-accept-recovery-on-unauthenticated-transport
         // covers the plaintext-UDP listener only. They are independent.
-        let any_recovery_configured = recovery_cmd.is_some()
-            || recovery_exec_cmd.is_some()
-            || recovery_cmd_file.is_some()
-            || recovery_exec_file.is_some();
+        let any_recovery_configured = recovery_exec_cmd.is_some() || recovery_exec_file.is_some();
         if any_recovery_configured {
             if let Some(port) = udp_port {
                 let bind_ip =
@@ -733,9 +725,7 @@ impl Config {
         Ok(Config {
             socket,
             threshold: Duration::from_millis(threshold_ms),
-            recovery_cmd,
             recovery_exec_cmd,
-            recovery_cmd_file,
             recovery_exec_file,
             recovery_debounce,
             recovery_env,
@@ -773,7 +763,6 @@ impl Config {
                 .unwrap_or(DEFAULT_PROM_RATE_LIMIT_PER_SEC),
             prom_rate_limit_burst: prom_rate_limit_burst.unwrap_or(DEFAULT_PROM_RATE_LIMIT_BURST),
             i_accept_plaintext_udp,
-            i_accept_shell_risk,
             i_accept_recovery_on_secure_udp,
             i_accept_recovery_on_plaintext_udp,
             i_accept_secure_udp_non_loopback,

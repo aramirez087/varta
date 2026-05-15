@@ -235,15 +235,15 @@ fn client_to_observer_to_recovery_full_loop() {
     let tmp = TempDir::new("loop");
     let socket = tmp.path().join("varta.sock");
     let marker = tmp.path().join("recovered.marker");
-    let recovery_cmd = format!("touch {}", marker.display());
+    let recovery_exec = format!("touch {}", marker.display());
 
     let (mut child, prom_addr) = spawn_watch(&[
         "--socket",
         socket.to_str().unwrap(),
         "--threshold-ms",
         "200",
-        "--recovery-cmd",
-        &recovery_cmd,
+        "--recovery-exec",
+        &recovery_exec,
         "--recovery-debounce-ms",
         "1000",
         "--prom-addr",
@@ -603,31 +603,36 @@ fn recovery_exec_mode_touch_marker_file() {
     );
 }
 
-// ===== A2: --recovery-cmd-file E2E ==========================================
+// ===== A2: --recovery-cmd-file migration → --recovery-exec-file E2E =========
 
-/// Writes the recovery command template to a file with 0600 permissions,
-/// spawns `varta-watch` with `--recovery-cmd-file`, and asserts recovery
-/// fires on stall.
+/// Writes the recovery exec command to a file with 0600 permissions,
+/// spawns `varta-watch` with `--recovery-exec-file`, and asserts recovery
+/// fires on stall.  (Previously used `--recovery-cmd-file`; shell-mode
+/// recovery was permanently removed.  See
+/// `book/src/architecture/recovery-shell-removal.md`.)
 fn recovery_cmd_file_mode() {
     let tmp = TempDir::new("rcmd-file");
     let socket = tmp.path().join("varta.sock");
-    let cmd_file = tmp.path().join("recovery.cmd");
+    let exec_file = tmp.path().join("recovery.exec");
     let marker = tmp.path().join("rcmd-file.marker");
 
-    // Write recovery template to file with restrictive permissions
+    // Write exec command to file with restrictive permissions.
+    // The exec-file format is: first whitespace-separated token is the
+    // program; remaining tokens are fixed arguments.  The observer appends
+    // the stalled pid as the final argument.
     {
         let file = std::fs::OpenOptions::new()
             .create(true)
             .truncate(true)
             .write(true)
             .mode(0o600)
-            .open(&cmd_file)
-            .expect("create recovery cmd file");
+            .open(&exec_file)
+            .expect("create recovery exec file");
         let mut writer = std::io::BufWriter::new(file);
         writer
             .write_all(format!("touch {}", marker.display()).as_bytes())
-            .expect("write recovery cmd");
-        writer.flush().expect("flush recovery cmd");
+            .expect("write recovery exec");
+        writer.flush().expect("flush recovery exec");
     }
 
     let (mut child, _prom_addr) = spawn_watch(&[
@@ -635,8 +640,8 @@ fn recovery_cmd_file_mode() {
         socket.to_str().unwrap(),
         "--threshold-ms",
         "200",
-        "--recovery-cmd-file",
-        cmd_file.to_str().unwrap(),
+        "--recovery-exec-file",
+        exec_file.to_str().unwrap(),
         "--recovery-debounce-ms",
         "1000",
         "--prom-addr",
@@ -674,7 +679,7 @@ fn recovery_cmd_file_mode() {
     std::thread::sleep(Duration::from_millis(400));
     assert!(
         wait_until(|| marker.exists(), Duration::from_secs(3)),
-        "recovery-cmd-file marker did not appear within 3s"
+        "recovery-exec-file marker did not appear within 3s"
     );
 }
 
@@ -754,22 +759,32 @@ fn recovery_exec_file_mode() {
 
 // ===== A4: --recovery-timeout-ms (kill-after) E2E ===========================
 
-/// Spawns varta-watch with `--recovery-cmd "sleep 10" --recovery-timeout-ms 300`.
-/// After a stall, the sleep child should be killed within 300ms, leaving the
-/// observer responsive (not hung).
+/// Spawns varta-watch with `--recovery-exec <script> --recovery-timeout-ms 300`.
+/// After a stall, the script touches a marker then sleeps; the sleep child
+/// should be killed within 300 ms, leaving the observer responsive (not hung).
 fn recovery_timeout_kill_after() {
+    use std::os::unix::fs::PermissionsExt;
     let tmp = TempDir::new("rto");
     let socket = tmp.path().join("varta.sock");
     let marker = tmp.path().join("rto.marker");
-    let cmd = format!("touch {} && sleep 10", marker.display());
+
+    // Write a tiny shell wrapper that touches the marker then sleeps.
+    // Shell-mode recovery is gone; the wrapper is a named, auditable file.
+    let script = tmp.path().join("rto-recovery.sh");
+    {
+        let content = format!("#!/bin/sh\ntouch '{}'\nsleep 10\n", marker.display());
+        std::fs::write(&script, content.as_bytes()).expect("write recovery script");
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod recovery script");
+    }
 
     let (mut child, prom_addr) = spawn_watch(&[
         "--socket",
         socket.to_str().unwrap(),
         "--threshold-ms",
         "200",
-        "--recovery-cmd",
-        &cmd,
+        "--recovery-exec",
+        script.to_str().unwrap(),
         "--recovery-debounce-ms",
         "0", // no debounce so stall triggers immediately
         "--recovery-timeout-ms",
@@ -806,7 +821,7 @@ fn recovery_timeout_kill_after() {
         }
     }
 
-    // Wait for stall + recovery spawn + marker creation
+    // Wait for stall + recovery spawn + marker creation (script touches marker first).
     std::thread::sleep(Duration::from_millis(400));
     assert!(
         wait_until(|| marker.exists(), Duration::from_secs(3)),
@@ -847,6 +862,7 @@ fn recovery_timeout_kill_after() {
 /// so cross-test env races are not a concern.
 #[allow(unsafe_code)]
 fn recovery_env_isolation() {
+    use std::os::unix::fs::PermissionsExt;
     const SENTINEL_KEY: &str = "VARTA_E2E_SECRET";
     const SENTINEL_VAL: &str = "must-not-leak";
 
@@ -860,18 +876,26 @@ fn recovery_env_isolation() {
     let tmp = TempDir::new("renv");
     let socket = tmp.path().join("varta.sock");
     let marker_isolated = tmp.path().join("env-isolated.marker");
-    let cmd = format!(
-        "test \"$VARTA_E2E_ENV\" = \"works\" && touch {}",
-        marker_isolated.display()
-    );
+    // Write a wrapper script that checks the allowlisted env var and touches
+    // the marker. Shell-mode recovery is gone; this is a named wrapper.
+    let script1 = tmp.path().join("renv1.sh");
+    {
+        let content = format!(
+            "#!/bin/sh\ntest \"$VARTA_E2E_ENV\" = \"works\" && touch '{}'\n",
+            marker_isolated.display()
+        );
+        std::fs::write(&script1, content.as_bytes()).expect("write script1");
+        std::fs::set_permissions(&script1, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod script1");
+    }
 
     let (mut child, _prom_addr) = spawn_watch(&[
         "--socket",
         socket.to_str().unwrap(),
         "--threshold-ms",
         "200",
-        "--recovery-cmd",
-        &cmd,
+        "--recovery-exec",
+        script1.to_str().unwrap(),
         "--recovery-debounce-ms",
         "0",
         "--recovery-env",
@@ -906,18 +930,24 @@ fn recovery_env_isolation() {
     // Touch the marker ONLY when the sentinel is absent.  If the secret
     // leaked into the recovery child, the marker is never created and the
     // wait_until below times out, failing the test loudly.
-    let cmd2 = format!(
-        "test -z \"${SENTINEL_KEY}\" && touch {}",
-        marker_secure.display()
-    );
+    let script2 = tmp2.path().join("renv2.sh");
+    {
+        let content = format!(
+            "#!/bin/sh\ntest -z \"${SENTINEL_KEY}\" && touch '{}'\n",
+            marker_secure.display()
+        );
+        std::fs::write(&script2, content.as_bytes()).expect("write script2");
+        std::fs::set_permissions(&script2, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod script2");
+    }
 
     let (mut child2, _prom_addr2) = spawn_watch(&[
         "--socket",
         socket2.to_str().unwrap(),
         "--threshold-ms",
         "200",
-        "--recovery-cmd",
-        &cmd2,
+        "--recovery-exec",
+        script2.to_str().unwrap(),
         "--recovery-debounce-ms",
         "0",
         "--prom-addr",
@@ -954,18 +984,24 @@ fn recovery_env_isolation() {
     let tmp3 = TempDir::new("renv-inherit");
     let socket3 = tmp3.path().join("varta.sock");
     let marker_inherit = tmp3.path().join("inherit-optin.marker");
-    let cmd3 = format!(
-        "test \"${SENTINEL_KEY}\" = \"{SENTINEL_VAL}\" && touch {}",
-        marker_inherit.display()
-    );
+    let script3 = tmp3.path().join("renv3.sh");
+    {
+        let content = format!(
+            "#!/bin/sh\ntest \"${SENTINEL_KEY}\" = \"{SENTINEL_VAL}\" && touch '{}'\n",
+            marker_inherit.display()
+        );
+        std::fs::write(&script3, content.as_bytes()).expect("write script3");
+        std::fs::set_permissions(&script3, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod script3");
+    }
 
     let (mut child3, _prom_addr3) = spawn_watch(&[
         "--socket",
         socket3.to_str().unwrap(),
         "--threshold-ms",
         "200",
-        "--recovery-cmd",
-        &cmd3,
+        "--recovery-exec",
+        script3.to_str().unwrap(),
         "--recovery-debounce-ms",
         "0",
         "--recovery-inherit-env",

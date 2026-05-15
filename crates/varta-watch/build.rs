@@ -271,9 +271,7 @@ fn render_constructor(parsed: &ParsedConfig, test_hooks_active: bool) -> String 
 
     // Optionals with defaults — read each accepted key and emit either the
     // parsed value or the documented default.
-    emit_option_string(&mut s, parsed, "recovery_cmd");
     emit_option_string(&mut s, parsed, "recovery_exec_cmd");
-    emit_option_path(&mut s, parsed, "recovery_cmd_file");
     emit_option_path(&mut s, parsed, "recovery_exec_file");
     let debounce_ms: u64 = singleton_u64(parsed, "recovery_debounce_ms", 1000);
     s.push_str(&format!(
@@ -402,7 +400,6 @@ fn render_constructor(parsed: &ParsedConfig, test_hooks_active: bool) -> String 
     s.push_str("        prom_rate_limit_per_sec: 5,\n");
     s.push_str("        prom_rate_limit_burst: 10,\n");
     emit_bool(&mut s, parsed, "i_accept_plaintext_udp");
-    emit_bool(&mut s, parsed, "i_accept_shell_risk");
     emit_bool(&mut s, parsed, "i_accept_recovery_on_secure_udp");
     emit_bool(&mut s, parsed, "i_accept_recovery_on_plaintext_udp");
     emit_bool(&mut s, parsed, "i_accept_secure_udp_non_loopback");

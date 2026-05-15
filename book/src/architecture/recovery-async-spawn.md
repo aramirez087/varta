@@ -9,13 +9,11 @@ read-timeout cadence. When a stalled pid crosses its silence threshold,
 the observer surfaces `Event::Stall` and the binary calls
 `Recovery::on_stall(pid)`.
 
-Today, `Recovery::on_stall` (`crates/varta-watch/src/recovery.rs:71`)
-shells out via `Command::new("/bin/sh").arg("-c").arg(&rendered).status()`.
-`status()` blocks the calling thread until the child exits, which means
-the entire poll loop — beat decoding, exporter pumping, Prometheus
-serving, stall surfacing for *other* pids — freezes for the duration
-of the recovery template. A misbehaving template (`sleep 30`, a slow
-restart script) effectively takes the observer offline.
+Previously `Recovery::on_stall` blocked the calling thread until the child
+exited, which meant the entire poll loop — beat decoding, exporter pumping,
+Prometheus serving, stall surfacing for *other* pids — froze for the duration
+of the recovery command. A slow recovery script effectively took the observer
+offline.
 
 This is blocker **B1** for v0.1.0.
 
@@ -51,8 +49,8 @@ pub enum RecoveryOutcome {
     /// debounce window; nothing was spawned.
     Debounced,
 
-    /// `Command::spawn` failed before the shell could run (e.g. fork
-    /// failure, `/bin/sh` missing). Surfaced verbatim.
+    /// `Command::spawn` failed (e.g. fork failure, program not found).
+    /// Surfaced verbatim.
     SpawnFailed(std::io::Error),
 
     /// A previously-`Spawned` child has exited and was reaped on this
@@ -71,22 +69,20 @@ pub enum RecoveryOutcome {
 pub struct Recovery { /* private */ }
 
 impl Recovery {
-    /// Backwards-compatible constructor. Equivalent to
-    /// `with_timeout(template, debounce, None)`.
-    pub fn new(template: String, debounce: Duration) -> Self;
-
-    /// Construct a runner with an optional per-child deadline.
+    /// Construct an exec-mode runner with optional per-child deadline.
     ///
     /// `timeout = None` ⇒ children are reaped but never killed
     /// (preserves v0.1.0 semantics for users who tolerate long-running
-    /// recovery templates).
-    pub fn with_timeout(
-        template: String,
+    /// recovery commands).
+    pub fn with_exec_and_timeout(
+        program: String,
+        args: Vec<String>,
         debounce: Duration,
         timeout: Option<Duration>,
     ) -> Self;
 
-    /// Render `{pid}` and spawn `/bin/sh -c <rendered>` non-blockingly.
+    /// Spawn the configured program with the stalled pid appended as the
+    /// final argument, non-blockingly.
     /// Returns `Spawned`, `Debounced`, or `SpawnFailed` — never blocks.
     pub fn on_stall(&mut self, pid: u32) -> RecoveryOutcome;
 
@@ -213,8 +209,8 @@ two options:
    the choice is visible in SIEM/syslog audit trails alongside other
    safety banners (shell-recovery, plaintext UDP, etc.).
 
-Enforcement is centralised in `Recovery::apply_env` (`recovery.rs`); both
-shell-mode and exec-mode children flow through it.
+Enforcement is centralised in `Recovery::apply_env` (`recovery.rs`); all
+exec-mode children flow through it.
 
 ## 8. Out of scope for this epic
 

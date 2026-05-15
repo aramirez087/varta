@@ -181,8 +181,8 @@ network sockets.  AEAD is the only durable defence.
 
 ## Recovery eligibility and transport-origin gating
 
-Recovery commands (`--recovery-cmd` / `--recovery-exec` and the `*-file`
-variants) take the **stalled agent's `frame.pid`** and substitute it into
+Recovery commands (`--recovery-exec` and `--recovery-exec-file`) take the
+**stalled agent's `frame.pid`** and substitute it into
 the spawned process (`kill -9 {pid}`, `systemctl restart agent@{pid}.service`,
 etc.).  That makes recovery a privileged action that targets an arbitrary
 process by id — and means the wire-level `frame.pid` must be tied back to
@@ -209,8 +209,8 @@ a kernel-attested agent.
 
 ### Two-layer enforcement
 
-1. **Startup hard-error.**  If any `--recovery-cmd` / `--recovery-cmd-file` /
-   `--recovery-exec` / `--recovery-exec-file` is configured *and* `--udp-port`
+1. **Startup hard-error.**  If any `--recovery-exec` / `--recovery-exec-file`
+   is configured *and* `--udp-port`
    is set, the daemon refuses to start with
    `ConfigError::RecoveryRequiresAuthenticatedTransport`.  Operators must
    pass `--i-accept-recovery-on-unauthenticated-transport` to proceed.
@@ -251,23 +251,15 @@ decision.
 
 ## Recovery command authentication boundary
 
-`--recovery-cmd` (inline shell) and `--recovery-cmd-file` (file-based
-shell) both spawn `/bin/sh -c <template>` with the observer's full
-process authority.  In a safety-critical deployment a recovery template
-like `systemctl restart {service}` or `kill -9 {pid}` can terminate
-unrelated production processes if the template body is mis-edited or if
-shell metacharacters appear unexpectedly.
+`--recovery-exec` and `--recovery-exec-file` invoke the program directly
+via `execvp(2)` — no shell, no metacharacter interpretation, no injection
+surface.  The stalled pid is appended as the final argument: never
+interpolated into a command string.
 
-To prevent accidental shell-mode deployment, **shell mode requires
-`--i-accept-shell-risk` at runtime**.  Without that flag, startup
-hard-errors with a message that recommends `--recovery-exec` (which
-calls `execvp(2)` directly — no shell, no metacharacter interpretation,
-no injection surface).  This applies to both the inline and file-based
-forms; the shell-injection risk is identical regardless of where the
-template comes from.
-
-`--recovery-exec` and `--recovery-exec-file` do **not** require an
-accept flag — they are the default-safe path.
+Shell-mode recovery (`--recovery-cmd` / `--recovery-cmd-file`) was
+**permanently removed**.  All builds — SRE, Class-A, and default — use
+exec-only recovery.  No opt-in flag is required; exec-mode is the only
+available recovery mode.
 
 ## Prometheus `/metrics` endpoint exposure
 
@@ -420,24 +412,17 @@ child process runs with a sanitized environment:
 2. `PATH` is set to `/usr/bin:/bin` (sufficient to locate common tools).
 3. Only the explicitly-listed `KEY=VALUE` pairs are exported.
 
-Without `--recovery-env`, the child inherits the observer's full
-environment (backward compatible).  This flag provides defense-in-depth
-against environment-variable-based injection vectors (e.g. a malicious
-`LD_PRELOAD` or `IFS` in the observer's environment that could affect
-`/bin/sh -c` behaviour).
+Without `--recovery-env`, the child inherits `PATH=/usr/bin:/bin` only
+(secure default since 2026-05-14).  This eliminates `LD_PRELOAD`, `IFS`,
+and other environment-injection vectors from recovery children entirely.
 
-Shell-mode recovery is gated by `--i-accept-shell-risk` at startup
-(see the "Recovery command authentication boundary" section above).
-When the flag *is* set, the observer still emits a single audit-trail
-`varta_warn!` at startup so that the choice is captured in any SIEM /
-syslog ingest alongside the other startup banners.
+## Exec safety
 
-## Template safety
-
-The `{pid}` substitution in `--recovery-cmd` is safe regardless of the
-authentication outcome.  A `u32` PID formatted as a decimal string
-contains only the characters `0`–`9` and can never carry shell
-metacharacters (`;`, `|`, `&`, `$`, `` ` ``, etc.).
+The `{pid}` substitution in `--recovery-exec` args is safe: a `u32` PID
+formatted as a decimal string contains only the characters `0`–`9` and
+can never carry shell metacharacters (`;`, `|`, `&`, `$`, `` ` ``, etc.).
+Furthermore, since exec-mode never passes arguments through a shell,
+metacharacter interpretation is structurally impossible.
 
 ## Metrics
 
@@ -463,8 +448,8 @@ metacharacters (`;`, `|`, `&`, `$`, `` ` ``, etc.).
                                    │          └─ [PID MATCH + UID MATCH] →
                                    ↓
                               [SUCCESS]  Observer trusts the PID → tracks,
-                                         surfaces stalls, triggers --recovery-cmd
-                                         with {pid} substitution.
+                                         surfaces stalls, triggers --recovery-exec
+                                         with {pid} as the final argument.
 ```
 
 The trust boundary is the kernel: a frame is only accepted if the kernel

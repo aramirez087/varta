@@ -6,6 +6,7 @@
 //!
 //! [`Observer`]: crate::Observer
 
+use core::marker::PhantomData;
 use std::io::{self, ErrorKind};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::io::AsRawFd;
@@ -63,6 +64,109 @@ const SOL_SOCKET: i32 = 0xffff_u32 as i32;
 const SO_RCVBUF: i32 = 8;
 #[cfg(not(target_os = "linux"))]
 const SO_RCVBUF: i32 = 0x1002;
+
+/// Attests that the process is single-threaded at construction time.
+///
+/// [`UdsListener::bind`] calls `umask(2)`, which is process-wide; any thread
+/// creating filesystem objects during the bind window would inherit the
+/// restricted umask. Holding a `&PreThreadAttestation` encodes the
+/// single-threaded precondition in the type signature so the invariant is
+/// enforced at compile time, not just by convention.
+///
+/// Construct exactly once at the top of `fn main`, before any thread spawn:
+///
+/// ```text
+/// let pre_thread = PreThreadAttestation::new()?;
+/// // … then pass &pre_thread to Observer::bind / UdsListener::bind
+/// ```
+///
+/// The token is `!Send + !Sync` (via `PhantomData<*const ()>`) so it cannot
+/// be moved into or shared across thread boundaries after construction.
+#[derive(Debug)]
+pub struct PreThreadAttestation {
+    _no_send: PhantomData<*const ()>,
+}
+
+impl PreThreadAttestation {
+    /// Probe the OS thread count and return a token if the process is
+    /// single-threaded.
+    ///
+    /// On Linux counts `/proc/self/task/` entries. On macOS calls
+    /// `pthread_is_threaded_np(3)`. On other platforms the runtime probe is
+    /// skipped; the type-level structural guarantee still holds.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`io::ErrorKind::Other`] if the process has more than one
+    /// thread, or if the Linux `/proc/self/task` directory is unreadable.
+    pub fn new() -> io::Result<Self> {
+        Self::probe()?;
+        Ok(Self {
+            _no_send: PhantomData,
+        })
+    }
+
+    /// Create a token without a runtime probe.
+    ///
+    /// Intended for test code where the multi-threaded test runner would
+    /// incorrectly fail the probe even though the umask window is benign.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure that no concurrent thread creates filesystem
+    /// objects during the `UdsListener::bind` window, or that any such race
+    /// is acceptable in the calling context.
+    pub unsafe fn new_unchecked() -> Self {
+        Self {
+            _no_send: PhantomData,
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn probe() -> io::Result<()> {
+        let mut count: usize = 0;
+        for entry in std::fs::read_dir("/proc/self/task")? {
+            entry?;
+            count += 1;
+            if count > 1 {
+                return Err(io::Error::new(
+                    io::ErrorKind::Other,
+                    "process is multi-threaded; UdsListener::bind changes \
+                     umask(2) process-wide and would race concurrent file creation",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(target_os = "macos")]
+    fn probe() -> io::Result<()> {
+        extern "C" {
+            // Available in macOS pthread.h since 10.0.
+            // Returns 0 when single-threaded, 1 when multi-threaded.
+            fn pthread_is_threaded_np() -> i32;
+        }
+        // SAFETY: pthread_is_threaded_np is a pure read of a per-process flag
+        // with no side effects and a stable ABI across all macOS versions.
+        if unsafe { pthread_is_threaded_np() } != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::Other,
+                "process is multi-threaded; UdsListener::bind changes \
+                 umask(2) process-wide and would race concurrent file creation",
+            ));
+        }
+        Ok(())
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    fn probe() -> io::Result<()> {
+        // No per-platform thread-count probe is implemented here.
+        // The type-level guarantee — UdsListener::bind requires a
+        // &PreThreadAttestation that can only be soundly constructed before
+        // the first thread spawn — remains the primary enforcement.
+        Ok(())
+    }
+}
 
 /// RAII guard that restores the process umask on drop, even if a panic
 /// unwinds through the bind path.
@@ -182,6 +286,7 @@ impl UdsListener {
         socket_mode: u32,
         read_timeout: Duration,
         uds_rcvbuf_bytes: u32,
+        _pre_thread: &PreThreadAttestation,
     ) -> io::Result<Self> {
         let path = path.as_ref();
         let owned_path: PathBuf = path.to_path_buf();

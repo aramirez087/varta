@@ -26,28 +26,15 @@ REQUIRED:
                                     surfaced (milliseconds).
 
 OPTIONAL:
-    --recovery-cmd <TEMPLATE>      Shell fragment run on each unique stall
-                                     via the system shell with the stalled
-                                     pid passed as $1. SECURITY: the
-                                     template body is under full operator
-                                     control; never accept it from an
-                                     untrusted source. Requires --features
-                                     unsafe-shell-recovery at build time.
     --recovery-exec <CMD>          Command and arguments invoked via execvp
                                      on each unique stall. Split on
                                      whitespace into argv; {pid} in any
                                      argument is replaced with the numeric
                                      PID. No shell — metacharacters have
-                                     no effect. Mutually exclusive with
-                                     --recovery-cmd.
-    --recovery-cmd-file <PATH>     Read --recovery-cmd template from a file.
+                                     no effect.
+    --recovery-exec-file <PATH>    Read --recovery-exec command from a file.
                                      File must be owned by the observer's
                                      UID and mode 0600 or stricter.
-                                     Requires --features
-                                     unsafe-shell-recovery at build time.
-    --recovery-exec-file <PATH>    Read --recovery-exec command from a file
-                                     with the same permission requirements
-                                     as --recovery-cmd-file.
     --recovery-debounce-ms <MS>    Per-pid debounce window for recovery
                                      invocations (default 1000).
     --recovery-env <KEY=VALUE>     Repeatable. Pass an environment variable
@@ -255,17 +242,6 @@ OPTIONAL:
                                      firewall rules or a private VLAN
                                      before enabling.  See
                                      book/src/architecture/vlp-transports.md.
-    --i-accept-shell-risk          UNSAFE: explicitly accept the security
-                                     risk of shell-mode recovery
-                                     (--recovery-cmd / --recovery-cmd-file).
-                                     Required to use shell-mode at all;
-                                     without this flag, only --recovery-exec
-                                     / --recovery-exec-file are permitted.
-                                     Shell mode spawns the system shell
-                                     with root-equivalent process authority
-                                     — prefer --recovery-exec for any
-                                     production deployment. Build must also
-                                     include --features unsafe-shell-recovery.
     --secure-udp-i-accept-recovery-on-unauthenticated-transport
                                    UNSAFE: accept the security risk of
                                      running a recovery command while the
