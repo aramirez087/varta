@@ -23,9 +23,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 // Bring in the real kernel-ABI types and syscall wrapper from the production
 // signal_install module.  This eliminates the parallel-duplicate maintenance
 // hazard that existed when these were copy-pasted here.
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[cfg(all(target_os = "linux", target_arch = "x86_64", not(feature = "libc-signal-mode")))]
 use varta_watch::__test_signal_abi::varta_signal_restorer;
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", not(feature = "libc-signal-mode")))]
 use varta_watch::__test_signal_abi::{rt_sigaction_raw, KernelSigAction, SA_RESTART, SA_RESTORER};
 
 static GOT_SIGNAL: AtomicBool = AtomicBool::new(false);
@@ -136,7 +136,7 @@ extern "C" fn restorer_test_handle(_sig: i32) {
 /// emitting the `varta_signal_restorer` symbol the test binary will fail
 /// to link and this test will not even compile. As a belt-and-braces
 /// runtime check, also assert the symbol address is non-null.
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[cfg(all(target_os = "linux", target_arch = "x86_64", not(feature = "libc-signal-mode")))]
 #[test]
 fn restorer_symbol_is_addressable() {
     let p = varta_signal_restorer as *const ();
@@ -153,7 +153,7 @@ fn restorer_symbol_is_addressable() {
 ///
 /// Uses `SIGUSR2` (benign user-defined signal) to avoid interfering with
 /// the libc `SIGURG` test above.
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[cfg(all(target_os = "linux", target_arch = "x86_64", not(feature = "libc-signal-mode")))]
 #[test]
 fn linux_restorer_is_ours() {
     const SIGUSR2: i32 = 12;
@@ -222,7 +222,7 @@ fn linux_restorer_is_ours() {
 /// aarch64 counterpart: prove the direct-syscall install round-trips
 /// correctly even though there is no `sa_restorer` to verify. Catches
 /// kernel ABI struct-size / offset regressions on aarch64.
-#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+#[cfg(all(target_os = "linux", target_arch = "aarch64", not(feature = "libc-signal-mode")))]
 #[test]
 fn linux_aarch64_direct_syscall_roundtrips() {
     const SIGUSR2: i32 = 12;
@@ -273,7 +273,7 @@ fn linux_aarch64_direct_syscall_roundtrips() {
 
 /// riscv64 counterpart: same struct/syscall round-trip as aarch64 (no
 /// `sa_restorer` on riscv64 either — vDSO handles signal-return).
-#[cfg(all(target_os = "linux", target_arch = "riscv64"))]
+#[cfg(all(target_os = "linux", target_arch = "riscv64", not(feature = "libc-signal-mode")))]
 #[test]
 fn linux_riscv64_direct_syscall_roundtrips() {
     const SIGUSR2: i32 = 12;

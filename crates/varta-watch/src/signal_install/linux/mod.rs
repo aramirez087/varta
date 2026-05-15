@@ -1,42 +1,58 @@
-// Refuse to compile on Linux architectures we have not pinned the syscall
-// ABI for. To add a new architecture: implement `KernelSigAction` in
-// kernel_abi.rs, add `rt_sigaction_raw` in syscall.rs, add the trampoline in
-// trampoline.rs if `__ARCH_HAS_SA_RESTORER` is defined for that arch, and
-// update this allowlist.
-#[cfg(not(any(
-    target_arch = "x86_64",
-    target_arch = "aarch64",
-    target_arch = "riscv64"
-)))]
+// When `libc-signal-mode` is active, the direct-syscall path is excised from
+// compilation entirely (no KernelSigAction, no inline-asm trampoline, no
+// rt_sigaction_raw wrapper). The libc wrapper is always compiled and is the
+// only signal-install path in that build.
+//
+// Refuse to compile on Linux architectures we have not pinned the direct-
+// syscall ABI for — but ONLY when the direct path is included (feature off).
+// The libc `sigaction(3)` wrapper works on any Linux architecture.
+#[cfg(all(
+    not(feature = "libc-signal-mode"),
+    not(any(
+        target_arch = "x86_64",
+        target_arch = "aarch64",
+        target_arch = "riscv64"
+    ))
+))]
 compile_error!(
     "varta-watch on Linux currently supports x86_64, aarch64, and riscv64 only — \
      add KernelSigAction + rt_sigaction_raw arms for this architecture \
-     (see book/src/architecture/signal-install.md for the extension recipe)"
+     (see book/src/architecture/signal-install.md for the extension recipe). \
+     Alternatively, enable the `libc-signal-mode` Cargo feature to skip the \
+     direct-syscall path entirely."
 );
 
+#[cfg(not(feature = "libc-signal-mode"))]
 pub(super) mod direct;
+#[cfg(not(feature = "libc-signal-mode"))]
 pub(super) mod kernel_abi;
 pub(super) mod libc_wrapper;
+#[cfg(not(feature = "libc-signal-mode"))]
 pub(super) mod syscall;
+#[cfg(not(feature = "libc-signal-mode"))]
 pub(super) mod trampoline;
 
 use std::io;
-use std::sync::atomic::{AtomicBool, Ordering};
 
 use super::mode::SignalHandlerMode;
+#[cfg(not(feature = "libc-signal-mode"))]
+use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(not(feature = "libc-signal-mode"))]
 use kernel_abi::KernelSigAction;
+#[cfg(not(feature = "libc-signal-mode"))]
 use syscall::rt_sigaction_raw;
 
 /// `SA_RESTART`: restart syscalls interrupted by this signal (no `EINTR`).
 /// Verified against `<asm-generic/signal-defs.h>`.
+#[cfg(not(feature = "libc-signal-mode"))]
 pub(crate) const SA_RESTART: u64 = 0x1000_0000;
 
 /// `SA_RESTORER`: kernel uses `sa_restorer` as the signal-return trampoline.
 /// x86_64 requires this; on aarch64 / riscv64 the field is absent from the
 /// kernel struct, so we do not set this flag.
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(not(feature = "libc-signal-mode"), target_arch = "x86_64"))]
 pub(crate) const SA_RESTORER: u64 = 0x0400_0000;
-#[cfg(not(target_arch = "x86_64"))]
+#[cfg(all(not(feature = "libc-signal-mode"), not(target_arch = "x86_64")))]
 pub(crate) const SA_RESTORER: u64 = 0; // not applicable; never used
 
 /// Install SIGINT / SIGTERM handlers on Linux.
@@ -44,7 +60,8 @@ pub(crate) const SA_RESTORER: u64 = 0; // not applicable; never used
 /// `mode = Direct`: direct `rt_sigaction(2)` syscall with full kernel-ABI
 /// ownership. A startup readback verifies the kernel preserved every field we
 /// sent, followed by a live SIGUSR1 smoke test that proves signal delivery
-/// and trampoline return actually work.
+/// and trampoline return actually work. Not available when `libc-signal-mode`
+/// feature is enabled — the whole direct path is excised at compile time.
 ///
 /// `mode = Libc`: libc `sigaction(3)` wrapper. The restorer is libc's own
 /// `__restore_rt`; we accept that trade-off. No smoke test is run — libc's
@@ -58,6 +75,7 @@ pub(super) unsafe fn install(
     mode: SignalHandlerMode,
     handler: extern "C" fn(i32),
 ) -> io::Result<()> {
+    #[cfg(not(feature = "libc-signal-mode"))]
     match mode {
         SignalHandlerMode::Direct => {
             unsafe { direct::install(handler) }?;
@@ -67,11 +85,16 @@ pub(super) unsafe fn install(
             unsafe { libc_wrapper::install(handler) }?;
         }
     }
+    #[cfg(feature = "libc-signal-mode")]
+    {
+        let _ = mode; // always Libc when feature is on; rejected at argv if "direct" passed
+        unsafe { libc_wrapper::install(handler) }?;
+    }
     Ok(())
 }
 
 // ---------------------------------------------------------------------------
-// Live-delivery smoke test
+// Live-delivery smoke test (direct path only)
 // ---------------------------------------------------------------------------
 //
 // After installing the SIGINT / SIGTERM handlers via the Direct path, we
@@ -87,21 +110,27 @@ pub(super) unsafe fn install(
 //
 // Cost: one extra `rt_sigaction` + `kill` + 50 ms poll at startup.
 // Only runs in Direct mode (libc's __restore_rt is always trustworthy).
+// Excised entirely when `libc-signal-mode` feature is enabled.
 
+#[cfg(not(feature = "libc-signal-mode"))]
 static SMOKE_TEST_FIRED: AtomicBool = AtomicBool::new(false);
 
+#[cfg(not(feature = "libc-signal-mode"))]
 extern "C" fn smoke_handler(_: i32) {
     SMOKE_TEST_FIRED.store(true, Ordering::Release);
 }
 
 /// SIGUSR1 signal number on Linux (all architectures we support).
+#[cfg(not(feature = "libc-signal-mode"))]
 const SIGUSR1: i32 = 10;
 
+#[cfg(not(feature = "libc-signal-mode"))]
 extern "C" {
     fn getpid() -> i32;
     fn kill(pid: i32, sig: i32) -> i32;
 }
 
+#[cfg(not(feature = "libc-signal-mode"))]
 unsafe fn verify_live_delivery() -> io::Result<()> {
     SMOKE_TEST_FIRED.store(false, Ordering::SeqCst);
 
@@ -158,8 +187,11 @@ unsafe fn verify_live_delivery() -> io::Result<()> {
 // independently. Exposing them under `__test_signal_abi` (cf.
 // `__fuzz_internals` in lib.rs) lets the tests consume the *real*
 // definitions rather than maintaining parallel duplicates.
+//
+// Excised when `libc-signal-mode` is active — the kernel-ABI types and the
+// direct-syscall wrapper do not exist in that build.
 
-#[cfg(any(test, feature = "test-hooks"))]
+#[cfg(all(any(test, feature = "test-hooks"), not(feature = "libc-signal-mode")))]
 pub(crate) mod test_abi {
     pub use super::kernel_abi::KernelSigAction;
     pub use super::syscall::rt_sigaction_raw;

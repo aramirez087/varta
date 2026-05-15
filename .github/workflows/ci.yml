@@ -409,6 +409,36 @@ jobs:
             exit 1
           fi
 
+      # --- libc-signal-mode feature ------------------------------------------
+      # Build and test varta-watch with the libc-signal-mode feature, which
+      # excises the inline-asm trampoline and the direct-syscall path. Also
+      # verify the compile_error! fires when both libc-signal-mode and
+      # compile-time-config are enabled together.
+      - name: varta-watch libc-signal-mode build and tests
+        if: runner.os == 'Linux'
+        run: |
+          cargo test --locked -p varta-watch \
+            --no-default-features --features libc-signal-mode \
+            --test signal_handler --test signal_handler_libc_mode \
+            --test signal_handler_libc_only_build
+
+      - name: libc-signal-mode + compile-time-config rejected by compile_error!
+        if: runner.os == 'Linux'
+        env:
+          VARTA_CONFIG_FILE: ${{ github.workspace }}/crates/varta-watch/tests/fixtures/safety_critical.varta.conf
+        run: |
+          if cargo build --locked -p varta-watch --release \
+            --no-default-features --features libc-signal-mode,compile-time-config 2>&1 \
+            | tee /tmp/libc-signal-combo.log \
+            | grep -qF "cannot be combined with"
+          then
+            echo "OK: libc-signal-mode + compile-time-config rejected by compile_error!"
+          else
+            echo "FAIL: combination should have triggered compile_error!"
+            cat /tmp/libc-signal-combo.log
+            exit 1
+          fi
+
   kani-proofs:
     name: kani-proofs (symbolic verification of varta-vlp)
     # Symbolic verification of `Frame::decode` and the CRC-32C primitive.

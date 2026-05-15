@@ -29,6 +29,15 @@ compile_error!(
      feature matrix."
 );
 
+#[cfg(all(feature = "libc-signal-mode", feature = "compile-time-config"))]
+compile_error!(
+    "`libc-signal-mode` cannot be combined with `compile-time-config` \
+     — Class-A safety-critical builds intentionally retain end-to-end \
+     kernel-ABI ownership via the inline-asm signal-return trampoline. \
+     See book/src/architecture/signal-install.md for the supported \
+     feature matrix."
+);
+
 pub mod audit;
 pub mod clock;
 pub mod config;
@@ -78,7 +87,7 @@ pub mod __fuzz_internals {
 /// enables for the integration-test binary) or `test` cfg.
 ///
 /// Mirrors the `__fuzz_internals` pattern used for bounded-collection modules.
-#[cfg(any(test, feature = "test-hooks"))]
+#[cfg(all(any(test, feature = "test-hooks"), not(feature = "libc-signal-mode")))]
 #[doc(hidden)]
 pub mod __test_signal_abi {
     #[cfg(target_os = "linux")]

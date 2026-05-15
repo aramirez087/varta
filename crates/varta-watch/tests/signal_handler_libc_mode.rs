@@ -72,6 +72,7 @@ fn libc_mode_exits_cleanly_on_sigterm() {
 
 /// `--signal-handler-mode=direct` (default) must also start and exit cleanly,
 /// as a regression guard alongside the libc path.
+#[cfg(not(feature = "libc-signal-mode"))]
 #[cfg_attr(miri, ignore)] // JUSTIFY: miri cannot model process spawning
 #[test]
 fn direct_mode_exits_cleanly_on_sigterm() {

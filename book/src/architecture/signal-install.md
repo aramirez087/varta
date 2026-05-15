@@ -129,3 +129,48 @@ Follow this checklist:
 
 7. **`.github/workflows/kernel-rc.yml`**: add a matrix row if a GitHub-hosted
    runner is available for the architecture.
+
+## The `libc-signal-mode` build feature
+
+Operators who need a binary that contains **zero inline assembly** — for
+example, a security review policy that forbids `global_asm!` in shipping
+code, or a platform tool-chain that does not support inline-asm — can build
+with:
+
+```bash
+cargo build -p varta-watch --no-default-features --features libc-signal-mode
+```
+
+When this feature is enabled:
+
+- `trampoline.rs`, `direct.rs`, `syscall.rs`, and `kernel_abi.rs` are
+  **excluded from compilation entirely**. The resulting binary contains no
+  `varta_signal_restorer` symbol and no `rt_sigaction(2)` wrapper.
+- Only `libc_wrapper.rs` is compiled. Signal handlers are installed via a
+  direct `extern "C"` call to libc's `sigaction(3)` — **no `libc` crate
+  dependency** is added; the symbol is resolved at link time.
+- The runtime default flips to `SignalHandlerMode::Libc`. Passing
+  `--signal-handler-mode=direct` at argv is rejected with a `BadValue`
+  error.
+- The startup readback and SIGUSR1 live-delivery smoke test are also
+  excised (they exercise the direct-path trampoline, which no longer
+  exists).
+
+**Trade-off**: libc owns `sa_restorer` (`__restore_rt`) in this build.
+Varta cannot prove end-to-end kernel-ABI ownership — a libc update that
+changes `__restore_rt` semantics will silently affect signal-return
+behaviour. For the vast majority of operators this is the right default
+assumption (libc has tested it); for Class-A / IEC 62304 deployments,
+the direct path is the certified choice.
+
+**Class-A incompatibility**: `libc-signal-mode` and `compile-time-config`
+cannot be combined — the build fails with `compile_error!`. Class-A
+safety-critical builds must retain the direct path and the trampoline to
+satisfy the end-to-end kernel-ABI ownership requirement.
+
+To verify the trampoline is absent:
+
+```bash
+nm target/debug/varta-watch | grep varta_signal_restorer
+# must return no output
+```

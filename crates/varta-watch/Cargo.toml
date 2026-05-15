@@ -96,6 +96,15 @@ fuzzing = ["prometheus-exporter"]
 # refusal path on the CI host without requiring a platform that lacks
 # per-datagram credentials. Never enabled in production builds.
 force-socketmode-fallback = []
+# Excise the inline-asm `varta_signal_restorer` trampoline and the direct
+# `rt_sigaction(2)` syscall path from compilation entirely.  When enabled,
+# only the libc `sigaction(3)` wrapper is linked (zero registry deps — pure
+# `extern "C"`); the runtime default flips to `SignalHandlerMode::Libc`; and
+# `--signal-handler-mode=direct` is rejected at argv.  Cannot be combined
+# with `compile-time-config` (enforced by `compile_error!` in lib.rs) —
+# Class-A safety-critical builds retain end-to-end kernel-ABI ownership.
+# See book/src/architecture/signal-install.md.
+libc-signal-mode = []
 
 [dependencies.varta-vlp]
 path = "../varta-vlp"

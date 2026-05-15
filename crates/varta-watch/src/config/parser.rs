@@ -796,7 +796,7 @@ impl Config {
             inject_wedge_ms,
             clock_source: clock_source.unwrap_or(ClockSource::Monotonic),
             signal_handler_mode: signal_handler_mode
-                .unwrap_or(crate::signal_install::SignalHandlerMode::Direct),
+                .unwrap_or_default(),
         })
     }
 }
