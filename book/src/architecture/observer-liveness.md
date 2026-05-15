@@ -632,6 +632,96 @@ audited eviction.
 
 ---
 
+## Audit-log durability vs availability
+
+The recovery audit log (`crate::audit::RecoveryAuditLog`) is the last
+synchronous-disk path on the poll thread.  Three operator-controlled
+budgets keep a wedged filesystem (NFS stall, full disk, slow SSD
+garbage-collection) from blocking the poll loop:
+
+| Flag                                | Default | Meaning                                                                                                            |
+| ----------------------------------- | ------- | ------------------------------------------------------------------------------------------------------------------ |
+| `--audit-fsync-budget-ms`           | `50`    | Soft per-call budget for one `fdatasync(2)`.  Overruns defer further fsyncs in the *current* drain to next tick.   |
+| `--audit-sync-interval-ms`          | `0`     | Time-based fdatasync cadence (in addition to `--recovery-audit-sync-every`).  `0` disables the time-based rule.    |
+| `--audit-rotation-budget-ms`        | `50`    | Per-tick budget for the rotation state machine.  Overruns preserve progress and resume on the next maintenance tick. |
+
+The drain is *deferral-aware*: when one fsync exceeds
+`--audit-fsync-budget-ms`, the remaining records in the same drain
+are written to the BufWriter only — the fsync is reattempted on the
+next tick.  This bounds the worst-case poll stall on a slow disk to
+one fsync per tick, while still progressing the audit chain on disk
+(records sit in the BufWriter, durable through process restart via
+the `Drop` impl's best-effort `flush + sync_data`).
+
+Rotation is a state machine (`drive_audit_rotation`): one sub-step
+per call (one `rename`, then the fresh fd open, then the v2 header
+write, then the chain-stitching boot record + fsync).  Each call
+honours `--audit-rotation-budget-ms`; if exceeded, state is
+preserved on `self` and the next tick resumes from the same
+sub-step.  Recursion through `direct_write_line → maybe_rotate →
+emit_boot → direct_write_line` is structurally impossible because
+the hot path never drives rotation directly — it only sets a
+`needs_rotation` flag for the main loop to consume.
+
+The default configuration preserves IEC 62304 Class C durability
+byte-for-byte: `--recovery-audit-sync-every=1` +
+`--audit-sync-interval-ms=0` means every record fsyncs before the
+drain returns, and `--audit-fsync-budget-ms=50` only ever takes
+effect when a single fsync exceeds 50 ms — i.e. when the disk is
+*already* stalling the poll loop.  Operators who can accept relaxed
+durability (e.g. cloud SRE deployments, not safety-critical) set
+`--recovery-audit-sync-every=64 --audit-sync-interval-ms=100` to
+amortise fsync cost over many records while still pinning a
+worst-case sync interval.
+
+### Audit-log observability
+
+Four signals back the operator's mental model:
+
+- `varta_audit_fsync_seconds` (histogram, shares
+  `ITERATION_BUCKET_BOUNDS_S` with `iteration_seconds`) — per-call
+  wall time of each `fdatasync(2)` on the audit fd.
+- `varta_audit_fsync_budget_exceeded_total` (counter) — fsync calls
+  whose wall time exceeded `--audit-fsync-budget-ms`.
+- `varta_audit_rotation_budget_exceeded_total` (counter) — rotation
+  drive calls that ran out of budget and deferred to the next tick.
+- `varta_audit_ring_watermark_total{level="warn"|"critical"}`
+  (counter) — rising-edge transitions of the in-memory ring fill
+  across 75% and 95% of `AUDIT_RING_CAP` (= 256).  Counter increments
+  once per *excursion* above each threshold; falling-edge re-arms
+  the rising-edge trigger.  Both label values are emitted from the
+  first scrape (stable-label-set discipline).
+
+### Recommended alerts
+
+```promql
+# fsync wall-time is climbing past the budget — disk is degraded but
+# the poll loop is still bounded.  Investigate before audit records
+# start dropping.
+rate(varta_audit_fsync_budget_exceeded_total[5m]) > 0.1
+```
+
+```promql
+# Critical watermark crossed — drain has fallen far enough behind
+# that records will start dropping if the trend continues.  Pages
+# operator before audit_dropped_total increments.
+rate(varta_audit_ring_watermark_total{level="critical"}[5m]) > 0
+```
+
+```promql
+# p99 fsync wall-time exceeds 100 ms — disk is becoming a poll-loop
+# bottleneck even under the deferral.
+histogram_quantile(0.99, rate(varta_audit_fsync_seconds_bucket[5m])) > 0.1
+```
+
+The structural answer to "what happens when the disk is permanently
+slow" is *visible degradation*: every tick defers, both fsync and
+rotation budget-exceeded counters climb, ring watermarks fire, and
+operators see the regression *before* records start dropping or the
+self-watchdog aborts.  The poll loop itself stays within budget.
+
+---
+
 ## Cross-references
 
 - [Safety profiles](safety-profiles.md) — compile-time vs. runtime feature

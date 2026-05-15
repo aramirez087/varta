@@ -208,6 +208,29 @@ cat audit.log.5 audit.log.4 audit.log.3 audit.log.2 audit.log.1 audit.log \
 | `--recovery-audit-file <PATH>`      | no       | unset   | Append audit records to PATH. Created mode 0600. |
 | `--recovery-audit-max-bytes <N>`    | no       | unbounded | Rotate after a write that pushes the file past N bytes. |
 | `--recovery-audit-sync-every <N>`   | no       | 1       | fdatasync cadence. `1` is the only Class C-conforming value. |
+| `--audit-fsync-budget-ms <MS>`      | no       | 50      | Soft per-call budget for one `fdatasync(2)`. Overruns defer further fsyncs in the *current* drain to next tick; the poll loop never blocks on more than one slow fsync per tick. |
+| `--audit-sync-interval-ms <MS>`     | no       | 0       | Time-based fdatasync cadence. `0` disables; with a non-zero value the drain force-syncs after this many ms have elapsed since the last sync (in addition to `--recovery-audit-sync-every`). |
+| `--audit-rotation-budget-ms <MS>`   | no       | 50      | Per-tick budget for the rotation state machine. Overruns preserve progress and resume on the next maintenance tick. |
+
+## Durability vs availability
+
+The default configuration is unchanged from Class C semantics:
+`--recovery-audit-sync-every=1` + `--audit-sync-interval-ms=0` means
+every record fsyncs before the drain returns, and
+`--audit-fsync-budget-ms=50` only ever takes effect when a single
+fsync exceeds 50 ms — i.e. when the disk is *already* stalling the
+poll loop.  The new flag does not weaken durability for safety-critical
+operators; it provides the structural guarantee that the poll loop
+itself cannot block indefinitely on a wedged fsync.
+
+Operators who can accept relaxed durability (e.g. cloud SRE
+deployments, not safety-critical) set
+`--recovery-audit-sync-every=64 --audit-sync-interval-ms=100` to
+amortise fsync cost over many records while still pinning a
+worst-case sync interval.
+
+See [observer-liveness.md](observer-liveness.md#audit-log-durability-vs-availability)
+for the audit-log observability signals and recommended alerts.
 
 ## Threat model
 

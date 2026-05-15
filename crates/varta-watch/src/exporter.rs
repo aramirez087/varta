@@ -482,8 +482,14 @@ fn status_label(s: Status) -> &'static str {
 /// the exposition output so series remain stable across scrapes.  Must stay
 /// in sync with the `LogKind` enum in `log_ratelimit.rs` — same order, same count.
 #[cfg(feature = "prometheus-exporter")]
-const LOG_KIND_LABELS: [&str; LogKind::COUNT] =
-    ["file_export_io", "audit_io", "prom_serve", "heartbeat_io"];
+const LOG_KIND_LABELS: [&str; LogKind::COUNT] = [
+    "file_export_io",
+    "audit_io",
+    "prom_serve",
+    "heartbeat_io",
+    "audit_ring_warn",
+    "audit_ring_critical",
+];
 
 /// Prometheus `kind` label values for `varta_decode_errors_total`. Indexed
 /// by [`decode_kind_index`]; the array doubles as the canonical ordering
@@ -983,6 +989,30 @@ pub struct PromExporter {
     /// audit ring. Surfaced as
     /// `varta_recovery_audit_flush_budget_exceeded_total`.
     audit_flush_budget_exceeded_total: u64,
+    /// Per-`fdatasync(2)` wall-clock-duration histogram, same bucket
+    /// boundaries as [`Self::iteration_buckets`].  Surfaced as
+    /// `varta_audit_fsync_seconds`.  Last slot is `+Inf`.
+    audit_fsync_buckets: [u64; ITERATION_BUCKET_BOUNDS_S.len() + 1],
+    /// Sum (ns) of observed `fdatasync` durations.  Companion to
+    /// `varta_audit_fsync_seconds_sum`.
+    audit_fsync_duration_ns_sum: u64,
+    /// Count of `fdatasync` observations.  Companion to
+    /// `varta_audit_fsync_seconds_count`.
+    audit_fsync_count_total: u64,
+    /// `fdatasync(2)` calls on the audit log that exceeded
+    /// `--audit-fsync-budget-ms`.  Surfaced as
+    /// `varta_audit_fsync_budget_exceeded_total`.
+    audit_fsync_budget_exceeded_total: u64,
+    /// Rotation state-machine drive calls that exceeded
+    /// `--audit-rotation-budget-ms` and had to defer.  Surfaced as
+    /// `varta_audit_rotation_budget_exceeded_total`.
+    audit_rotation_budget_exceeded_total: u64,
+    /// Rising-edge ring-fill watermark counters: `[0]` = warn (≥75%),
+    /// `[1]` = critical (≥95%).  Surfaced as
+    /// `varta_audit_ring_watermark_total{level=...}`.  Both label
+    /// values are emitted unconditionally — even at zero — so
+    /// `absent()` alert rules stay green from the first scrape.
+    audit_ring_watermark_total: [u64; 2],
     /// Soft per-call budget for `serve_pending`. Configurable via
     /// `--scrape-budget-ms`; defaults to [`DEFAULT_SCRAPE_BUDGET`].
     scrape_budget: Duration,
@@ -1107,6 +1137,12 @@ impl PromExporter {
             stage_count_total: [0; STAGE_LABELS.len()],
             audit_dropped_total: 0,
             audit_flush_budget_exceeded_total: 0,
+            audit_fsync_buckets: [0; ITERATION_BUCKET_BOUNDS_S.len() + 1],
+            audit_fsync_duration_ns_sum: 0,
+            audit_fsync_count_total: 0,
+            audit_fsync_budget_exceeded_total: 0,
+            audit_rotation_budget_exceeded_total: 0,
+            audit_ring_watermark_total: [0; 2],
             scrape_budget: DEFAULT_SCRAPE_BUDGET,
             ip_state: IpStateTable::with_capacity(MAX_PROM_IP_STATES),
             rate_per_sec,
@@ -1439,6 +1475,63 @@ impl PromExporter {
     pub fn record_audit_flush_budget_exceeded(&mut self, count: u64) {
         self.audit_flush_budget_exceeded_total =
             self.audit_flush_budget_exceeded_total.saturating_add(count);
+    }
+
+    /// Record one `fdatasync(2)` observation on the audit log.  Folds
+    /// the duration into the `varta_audit_fsync_seconds` histogram
+    /// (shares bucket boundaries with `iteration_seconds` so operators
+    /// can compare distributions in PromQL) and updates the
+    /// `_sum`/`_count` companions.
+    pub fn record_audit_fsync_duration(&mut self, d: Duration) {
+        let secs = d.as_secs_f64();
+        let ns = u64::try_from(d.as_nanos()).unwrap_or(u64::MAX);
+        self.audit_fsync_duration_ns_sum = self.audit_fsync_duration_ns_sum.saturating_add(ns);
+        self.audit_fsync_count_total = self.audit_fsync_count_total.saturating_add(1);
+        let mut placed = false;
+        for (i, &bound) in ITERATION_BUCKET_BOUNDS_S.iter().enumerate() {
+            if secs <= bound {
+                self.audit_fsync_buckets[i] = self.audit_fsync_buckets[i].saturating_add(1);
+                placed = true;
+                break;
+            }
+        }
+        if !placed {
+            let inf_idx = ITERATION_BUCKET_BOUNDS_S.len();
+            self.audit_fsync_buckets[inf_idx] = self.audit_fsync_buckets[inf_idx].saturating_add(1);
+        }
+    }
+
+    /// Record `fdatasync(2)` calls that exceeded
+    /// `--audit-fsync-budget-ms`.  See
+    /// [`crate::recovery::Recovery::take_audit_fsync_budget_exceeded`].
+    pub fn record_audit_fsync_budget_exceeded(&mut self, count: u64) {
+        self.audit_fsync_budget_exceeded_total =
+            self.audit_fsync_budget_exceeded_total.saturating_add(count);
+    }
+
+    /// Record rotation state-machine ticks that exceeded
+    /// `--audit-rotation-budget-ms` and had to defer.  See
+    /// [`crate::recovery::Recovery::take_audit_rotation_budget_exceeded`].
+    pub fn record_audit_rotation_budget_exceeded(&mut self, count: u64) {
+        self.audit_rotation_budget_exceeded_total = self
+            .audit_rotation_budget_exceeded_total
+            .saturating_add(count);
+    }
+
+    /// Record an audit-ring high-watermark crossing.  `level` must be
+    /// `"warn"` (75% fill) or `"critical"` (95% fill); any other value
+    /// is silently dropped (stable-label-set discipline applies — only
+    /// the two known labels are ever emitted).  Edge-triggered: the
+    /// audit sink counts one crossing per excursion above the
+    /// threshold, not one per tick.
+    pub fn record_audit_ring_watermark(&mut self, level: &str, count: u64) {
+        let idx = match level {
+            "warn" => 0,
+            "critical" => 1,
+            _ => return,
+        };
+        self.audit_ring_watermark_total[idx] =
+            self.audit_ring_watermark_total[idx].saturating_add(count);
     }
 
     /// Record one or more scrapes served from cache (scrape arrived before
@@ -2101,6 +2194,75 @@ impl PromExporter {
             self.body_buf,
             "varta_recovery_audit_flush_budget_exceeded_total {}",
             self.audit_flush_budget_exceeded_total
+        );
+        // Per-fdatasync wall-clock histogram on the audit log.  Same
+        // bucket boundaries as iteration_seconds for cross-metric
+        // coherence; emits every bucket including +Inf on every scrape
+        // so absent() alert rules and histogram_quantile() work from
+        // the first scrape.
+        self.body_buf.push_str(
+            "# HELP varta_audit_fsync_seconds Wall time per fdatasync(2) on the recovery audit log. Bounded by --audit-fsync-budget-ms; overruns increment varta_audit_fsync_budget_exceeded_total.\n",
+        );
+        self.body_buf
+            .push_str("# TYPE varta_audit_fsync_seconds histogram\n");
+        let mut cum_af: u64 = 0;
+        for (idx, bound) in ITERATION_BUCKET_BOUNDS_S.iter().enumerate() {
+            cum_af = cum_af.saturating_add(self.audit_fsync_buckets[idx]);
+            let _ = writeln!(
+                self.body_buf,
+                "varta_audit_fsync_seconds_bucket{{le=\"{bound}\"}} {cum_af}",
+            );
+        }
+        let inf_idx_af = ITERATION_BUCKET_BOUNDS_S.len();
+        cum_af = cum_af.saturating_add(self.audit_fsync_buckets[inf_idx_af]);
+        let _ = writeln!(
+            self.body_buf,
+            "varta_audit_fsync_seconds_bucket{{le=\"+Inf\"}} {cum_af}"
+        );
+        let sum_s_af = (self.audit_fsync_duration_ns_sum as f64) / 1e9;
+        let _ = writeln!(self.body_buf, "varta_audit_fsync_seconds_sum {sum_s_af:.9}");
+        let _ = writeln!(
+            self.body_buf,
+            "varta_audit_fsync_seconds_count {}",
+            self.audit_fsync_count_total
+        );
+        self.body_buf.push_str(
+            "# HELP varta_audit_fsync_budget_exceeded_total fdatasync(2) calls on the recovery audit log whose wall time exceeded --audit-fsync-budget-ms. Remaining records in the affected drain are written-to-BufWriter only; the next maintenance tick reattempts the sync.\n",
+        );
+        self.body_buf
+            .push_str("# TYPE varta_audit_fsync_budget_exceeded_total counter\n");
+        let _ = writeln!(
+            self.body_buf,
+            "varta_audit_fsync_budget_exceeded_total {}",
+            self.audit_fsync_budget_exceeded_total
+        );
+        self.body_buf.push_str(
+            "# HELP varta_audit_rotation_budget_exceeded_total drive_audit_rotation calls that exceeded --audit-rotation-budget-ms. The state machine preserves progress and the next tick resumes.\n",
+        );
+        self.body_buf
+            .push_str("# TYPE varta_audit_rotation_budget_exceeded_total counter\n");
+        let _ = writeln!(
+            self.body_buf,
+            "varta_audit_rotation_budget_exceeded_total {}",
+            self.audit_rotation_budget_exceeded_total
+        );
+        // Rising-edge ring-fill watermark counters.  Both label values
+        // (warn = 75%, critical = 95%) emitted unconditionally so
+        // absent() alerts are correct from the first scrape.
+        self.body_buf.push_str(
+            "# HELP varta_audit_ring_watermark_total Rising-edge transitions of the audit-record ring fill across warning (75%) and critical (95%) thresholds. Increment indicates drain pressure that has not yet caused records to drop.\n",
+        );
+        self.body_buf
+            .push_str("# TYPE varta_audit_ring_watermark_total counter\n");
+        let _ = writeln!(
+            self.body_buf,
+            "varta_audit_ring_watermark_total{{level=\"warn\"}} {}",
+            self.audit_ring_watermark_total[0]
+        );
+        let _ = writeln!(
+            self.body_buf,
+            "varta_audit_ring_watermark_total{{level=\"critical\"}} {}",
+            self.audit_ring_watermark_total[1]
         );
         // IpStateTable probe-exhaustion — /metrics accept path.
         self.body_buf.push_str(

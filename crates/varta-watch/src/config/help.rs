@@ -302,6 +302,39 @@ OPTIONAL:
                                      Class C-conforming value. Values >1
                                      emit a startup warning. 0 is
                                      rejected at parse time.
+    --audit-fsync-budget-ms <MS>   Soft per-call budget for a single
+                                     fdatasync(2) on the audit file. If
+                                     one fsync exceeds this, the
+                                     remaining records in the current
+                                     drain are written-to-BufWriter only
+                                     and the fsync is deferred to the
+                                     next tick — bounds the worst-case
+                                     poll stall on a slow disk to one
+                                     fsync per tick. Overruns increment
+                                     varta_audit_fsync_budget_exceeded_total.
+                                     Default 50. 0 is rejected at parse
+                                     time.
+    --audit-sync-interval-ms <MS>  Time-based fdatasync cadence in
+                                     addition to --recovery-audit-sync-every.
+                                     0 (default) disables the time
+                                     cadence; with a non-zero value the
+                                     drain force-syncs after this many
+                                     ms have elapsed since the last
+                                     sync. Operators on safety-critical
+                                     profiles keep
+                                     --recovery-audit-sync-every=1 and
+                                     ignore this flag.
+    --audit-rotation-budget-ms <MS> Per-tick wall-clock budget for the
+                                     audit-log rotation state machine.
+                                     Rotation (rename × 5 + reopen +
+                                     header + boot record + fsync)
+                                     advances incrementally; if a tick
+                                     exceeds this budget the state is
+                                     preserved and the next tick
+                                     resumes. Overruns increment
+                                     varta_audit_rotation_budget_exceeded_total.
+                                     Default 50. 0 is rejected at parse
+                                     time.
     --recovery-capture-stdio       Capture child stdout/stderr non-
                                      blockingly so its length and
                                      truncation status appear in the audit

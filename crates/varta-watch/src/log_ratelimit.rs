@@ -40,11 +40,19 @@ pub enum LogKind {
     /// `varta_error!("heartbeat file write error: ...")` — fired each
     /// heartbeat-file interval on I/O failure.
     HeartbeatIo = 3,
+    /// `varta_warn!("audit ring \u{2265} 75% full: drain not keeping up")`
+    /// — fired when the audit-record ring crosses the 75% fill
+    /// threshold (rising edge only; re-arms on falling back below).
+    AuditRingWarn = 4,
+    /// `varta_error!("audit ring \u{2265} 95% full: records will drop
+    /// soon")` — fired when the audit-record ring crosses the 95% fill
+    /// threshold.  One step short of `audit_dropped_total` incrementing.
+    AuditRingCritical = 5,
 }
 
 impl LogKind {
     /// Total number of `LogKind` variants.  Used to size the bucket array.
-    pub const COUNT: usize = 4;
+    pub const COUNT: usize = 6;
 
     /// Stable numeric index for array lookups and Prometheus label ordering.
     #[inline]

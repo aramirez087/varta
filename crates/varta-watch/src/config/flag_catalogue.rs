@@ -222,6 +222,24 @@ pub const FLAGS: &[FlagSpec] = &[
         kind: FlagKind::U32,
         feature: "",
     },
+    FlagSpec {
+        cli: "--audit-fsync-budget-ms",
+        key: "audit_fsync_budget_ms",
+        kind: FlagKind::U32,
+        feature: "",
+    },
+    FlagSpec {
+        cli: "--audit-sync-interval-ms",
+        key: "audit_sync_interval_ms",
+        kind: FlagKind::U32,
+        feature: "",
+    },
+    FlagSpec {
+        cli: "--audit-rotation-budget-ms",
+        key: "audit_rotation_budget_ms",
+        kind: FlagKind::U32,
+        feature: "",
+    },
     // -------------------------------------------------------------------------
     // Recovery — stdio capture
     // -------------------------------------------------------------------------

@@ -509,6 +509,17 @@ fn run(cfg: Config) -> std::io::Result<()> {
                 max_bytes: cfg.recovery_audit_max_bytes,
                 sync_every: cfg.recovery_audit_sync_every,
                 daemon_pid: std::process::id(),
+                fsync_budget: std::time::Duration::from_millis(cfg.audit_fsync_budget_ms as u64),
+                sync_interval: if cfg.audit_sync_interval_ms == 0 {
+                    None
+                } else {
+                    Some(std::time::Duration::from_millis(
+                        cfg.audit_sync_interval_ms as u64,
+                    ))
+                },
+                rotation_budget: std::time::Duration::from_millis(
+                    cfg.audit_rotation_budget_ms as u64,
+                ),
             };
             let (sink, warnings) = varta_watch::audit::RecoveryAuditLog::create(path, audit_cfg)?;
             // Surface the warnings the audit sink raised at construction
@@ -1232,6 +1243,15 @@ fn run(cfg: Config) -> std::io::Result<()> {
         // and are retried next tick.
         if let Some(rec) = recovery.as_mut() {
             rec.flush_audit_pending(std::time::Duration::from_millis(10));
+            // Drive rotation incrementally — bounded by --audit-rotation-budget-ms.
+            // The state machine resumes from where the last tick left off when
+            // the budget was exceeded; a wedged filesystem can therefore never
+            // pin the poll loop for more than one rotation budget per tick.
+            if rec.audit_rotation_pending() || rec.audit_rotation_due() {
+                let _ = rec.drive_audit_rotation(std::time::Duration::from_millis(
+                    cfg.audit_rotation_budget_ms as u64,
+                ));
+            }
             #[cfg(feature = "prometheus-exporter")]
             if let Some(pe) = prom_export.as_mut() {
                 let dropped = rec.take_audit_dropped();
@@ -1242,6 +1262,37 @@ fn run(cfg: Config) -> std::io::Result<()> {
                 if budget_exceeded > 0 {
                     pe.record_audit_flush_budget_exceeded(budget_exceeded);
                 }
+                // New: per-fsync histogram + budget overrun counters.
+                for d in rec.take_audit_fsync_durations() {
+                    pe.record_audit_fsync_duration(d);
+                }
+                let fsync_overrun = rec.take_audit_fsync_budget_exceeded();
+                if fsync_overrun > 0 {
+                    pe.record_audit_fsync_budget_exceeded(fsync_overrun);
+                }
+                let rot_overrun = rec.take_audit_rotation_budget_exceeded();
+                if rot_overrun > 0 {
+                    pe.record_audit_rotation_budget_exceeded(rot_overrun);
+                }
+                let warn_cross = rec.take_audit_ring_watermark_warn();
+                if warn_cross > 0 {
+                    pe.record_audit_ring_watermark("warn", warn_cross);
+                }
+                let crit_cross = rec.take_audit_ring_watermark_critical();
+                if crit_cross > 0 {
+                    pe.record_audit_ring_watermark("critical", crit_cross);
+                }
+            }
+            #[cfg(not(feature = "prometheus-exporter"))]
+            {
+                // Drain new counters even without the exporter so they
+                // do not accumulate unbounded; the values are simply
+                // dropped on the floor.
+                let _ = rec.take_audit_fsync_durations();
+                let _ = rec.take_audit_fsync_budget_exceeded();
+                let _ = rec.take_audit_rotation_budget_exceeded();
+                let _ = rec.take_audit_ring_watermark_warn();
+                let _ = rec.take_audit_ring_watermark_critical();
             }
         }
 

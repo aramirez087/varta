@@ -97,6 +97,13 @@ const AUDIT_ROTATION_GENERATIONS: u32 = 5;
 /// and counted in [`RecoveryAuditLog::take_audit_dropped`].
 const AUDIT_RING_CAP: usize = 256;
 
+/// Maximum number of recent `fdatasync(2)` durations buffered for the
+/// exporter to drain into the `varta_audit_fsync_seconds` histogram.
+/// Small cap because the exporter drains every tick — backlog only
+/// accumulates when the exporter is disabled (Class A profile), in
+/// which case the buffer simply rotates oldest-out.
+const FSYNC_HISTORY_CAP: usize = 32;
+
 /// Header line written to a freshly-created v2 audit file.
 const AUDIT_HEADER_V2: &str = "# varta-watch recovery audit v2\n";
 
@@ -310,6 +317,55 @@ struct TailProbe {
     has_v2_header: bool,
 }
 
+/// Outcome of one `drive_audit_rotation` call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RotationOutcome {
+    /// Rotation was not required (size below `max_bytes` and no rotation
+    /// was already in progress).
+    NotNeeded,
+    /// Rotation advanced one or more sub-steps and is still in progress.
+    /// The next call to `drive_audit_rotation` will pick up where this
+    /// one left off.
+    Deferred,
+    /// Rotation completed (or was abandoned with a latched error in
+    /// `pending_err`).
+    Complete,
+}
+
+/// Internal rotation state machine.  Each variant represents the next
+/// piece of work to do; `drive_audit_rotation` advances one step per
+/// call, honouring the per-tick budget.
+#[derive(Debug, Clone)]
+enum RotationProgress {
+    /// No rotation in progress.  `drive_audit_rotation` enters this
+    /// state on completion; the hot path sets `needs_rotation = true`
+    /// to request the next rotation.
+    Idle,
+    /// Generation renames are still pending.  `next_gen` is the index
+    /// being moved on the *next* sub-step: 5 → 4 → 3 → 2 → 1, ending
+    /// with the live file at PATH → PATH.1.  The implementation
+    /// performs one rename per sub-step plus the `remove_file(PATH.5)`
+    /// kick-off when `next_gen == AUDIT_ROTATION_GENERATIONS`.
+    Renaming {
+        next_gen: u32,
+        final_chain: [u8; 32],
+    },
+    /// All renames done; open a fresh fd for the live PATH.
+    OpeningFd { final_chain: [u8; 32] },
+    /// fd open; write the v2 header.
+    WritingHeader { final_chain: [u8; 32] },
+    /// Header written; emit the post-rotation boot record and final
+    /// fsync.
+    EmittingBoot { final_chain: [u8; 32] },
+}
+
+impl RotationProgress {
+    #[inline]
+    fn is_idle(&self) -> bool {
+        matches!(self, RotationProgress::Idle)
+    }
+}
+
 /// Append-only audit sink. One file descriptor held for the daemon's life,
 /// reopened on rotation. Writes never block the recovery path: on IO error
 /// the failure is latched in `pending_err` and the daemon's main loop
@@ -325,11 +381,6 @@ pub struct RecoveryAuditLog {
     sync_every: u32,
     writes_since_sync: u32,
     daemon_pid: u32,
-    /// Reentry guard: true while we are inside `maybe_rotate`'s post-
-    /// rotation `boot` write. Without this, a tiny `max_bytes` whose
-    /// threshold is crossed by the boot record itself would re-trigger
-    /// rotation recursively until the stack overflows.
-    rotating: bool,
     /// Ring buffer of fully-formatted lines awaiting the maintenance phase
     /// drain. Hot-path callers enqueue here; `flush_pending` does the actual
     /// BufWriter write + fdatasync, bounded by a per-tick time budget.
@@ -338,7 +389,54 @@ pub struct RecoveryAuditLog {
     audit_dropped_total: u64,
     /// Ticks where `flush_pending` ran out of budget before draining the ring.
     audit_flush_budget_exceeded_total: u64,
+    /// Soft per-call budget for a single `fdatasync(2)`.  Set from
+    /// `AuditConfig::fsync_budget`.
+    fsync_budget: Duration,
+    /// Time-based fdatasync cadence.  `None` disables; with `Some(d)`,
+    /// the drain force-syncs after `d` has elapsed since the last sync.
+    sync_interval: Option<Duration>,
+    /// Monotonic timestamp of the most recent successful
+    /// `flush_and_sync` call.  `None` until the first sync.
+    last_sync_at: Option<Instant>,
+    /// Bounded ring of recent fsync durations.  The exporter drains
+    /// this once per tick; if backpressure outstrips the drain, oldest
+    /// samples are dropped (the histogram only records what we hand
+    /// off).
+    fsync_durations: VecDeque<Duration>,
+    /// Times a single `fdatasync(2)` exceeded `fsync_budget`.
+    audit_fsync_budget_exceeded_total: u64,
+    /// Times a single `drive_audit_rotation` call exceeded
+    /// `rotation_budget` and had to defer.
+    audit_rotation_budget_exceeded_total: u64,
+    /// Rising-edge counter — incremented once each time the ring fill
+    /// transitions from below 75% to ≥ 75%.
+    audit_ring_watermark_warn_total: u64,
+    /// Rising-edge counter — incremented once each time the ring fill
+    /// transitions from below 95% to ≥ 95%.
+    audit_ring_watermark_critical_total: u64,
+    /// Edge state for the warn watermark (true ⇒ already counted this
+    /// excursion; cleared on falling edge).
+    ring_above_warn: bool,
+    /// Edge state for the critical watermark.
+    ring_above_critical: bool,
+    /// Transient flag set during a single `flush_pending` drain when
+    /// one fsync has exceeded budget.  Causes the rest of the drain to
+    /// skip syncs; cleared on the next drain entry.
+    deferred_fsync_in_drain: bool,
+    /// Hot-path flag: set by `direct_write_line` (and `flush_pending`'s
+    /// drain) when `bytes_written >= max_bytes`.  The main loop calls
+    /// `drive_audit_rotation` when set.  Replaces the synchronous
+    /// `maybe_rotate` call from `direct_write_line`.
+    needs_rotation: bool,
+    /// Rotation state machine.  `Idle` ⇔ no rotation in progress.
+    rotation_progress: RotationProgress,
 }
+
+/// Ring high-watermark thresholds (75% and 95% of `AUDIT_RING_CAP`).
+/// Edge-triggered counters fire once when the fill rises past each
+/// level and re-arm only after the fill drops back below.
+const RING_WATERMARK_WARN: usize = (AUDIT_RING_CAP * 75) / 100;
+const RING_WATERMARK_CRITICAL: usize = (AUDIT_RING_CAP * 95) / 100;
 
 /// Configuration accepted by [`RecoveryAuditLog::create`]. Grouped into a
 /// struct so future flags (key file, signing mode, …) don't keep widening
@@ -356,6 +454,26 @@ pub struct AuditConfig {
     /// record so forensic tooling can correlate the audit chain to the
     /// systemd journal / PID-namespace transitions.
     pub daemon_pid: u32,
+    /// Soft per-call budget for a single `fdatasync(2)`.  If one fsync
+    /// exceeds this, the remaining records in the current drain are
+    /// written-to-BufWriter only and the sync is deferred to the next
+    /// tick.  Bounds the worst-case poll stall on a slow disk to one
+    /// fsync per tick.  Increments `audit_fsync_budget_exceeded_total`
+    /// on overrun.  Defaults to 50 ms; `Duration::ZERO` is invalid.
+    pub fsync_budget: Duration,
+    /// Time-based fdatasync cadence in addition to the record-count
+    /// cadence from `sync_every`.  `None` (default) disables the
+    /// time-based cadence — durability falls back to the record cadence
+    /// alone.  With `Some(d)`, the drain force-syncs after `d` has
+    /// elapsed since the last sync even when `writes_since_sync <
+    /// sync_every`.
+    pub sync_interval: Option<Duration>,
+    /// Per-tick wall-clock budget for the rotation state machine.
+    /// Rotation (rename × 5 + reopen + header + boot record + fsync)
+    /// advances incrementally; if a tick exceeds this budget the state
+    /// is preserved and the next tick resumes.  Defaults to 50 ms;
+    /// `Duration::ZERO` is invalid.
+    pub rotation_budget: Duration,
 }
 
 impl Default for AuditConfig {
@@ -364,6 +482,9 @@ impl Default for AuditConfig {
             max_bytes: None,
             sync_every: 1,
             daemon_pid: std::process::id(),
+            fsync_budget: Duration::from_millis(50),
+            sync_interval: None,
+            rotation_budget: Duration::from_millis(50),
         }
     }
 }
@@ -420,6 +541,18 @@ impl RecoveryAuditLog {
         }
         if cfg.sync_every > 1 {
             warnings.sync_relaxed = true;
+        }
+        if cfg.fsync_budget.is_zero() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "audit fsync_budget must be > 0",
+            ));
+        }
+        if cfg.rotation_budget.is_zero() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "audit rotation_budget must be > 0",
+            ));
         }
 
         // Probe the existing file (if any) to derive a continuity story.
@@ -489,10 +622,22 @@ impl RecoveryAuditLog {
             sync_every: cfg.sync_every,
             writes_since_sync: 0,
             daemon_pid: cfg.daemon_pid,
-            rotating: false,
             pending_lines: VecDeque::with_capacity(AUDIT_RING_CAP),
             audit_dropped_total: 0,
             audit_flush_budget_exceeded_total: 0,
+            fsync_budget: cfg.fsync_budget,
+            sync_interval: cfg.sync_interval,
+            last_sync_at: None,
+            fsync_durations: VecDeque::with_capacity(FSYNC_HISTORY_CAP),
+            audit_fsync_budget_exceeded_total: 0,
+            audit_rotation_budget_exceeded_total: 0,
+            audit_ring_watermark_warn_total: 0,
+            audit_ring_watermark_critical_total: 0,
+            ring_above_warn: false,
+            ring_above_critical: false,
+            deferred_fsync_in_drain: false,
+            needs_rotation: false,
+            rotation_progress: RotationProgress::Idle,
         };
 
         // Write the opening boot record covering whichever continuity case
@@ -586,11 +731,19 @@ impl RecoveryAuditLog {
         self.pending_err.take()
     }
 
-    /// Drain buffered lines to the BufWriter, stopping when `budget` elapses.
-    /// Called once per tick from the maintenance phase. Lines that remain after
-    /// budget exhaustion are kept in the ring and tried next tick.
+    /// Drain buffered lines to the BufWriter, stopping when `budget`
+    /// elapses.  Called once per tick from the maintenance phase.
+    /// Lines that remain after budget exhaustion are kept in the ring
+    /// and tried next tick.
+    ///
+    /// The drain is *deferral-aware*: if a single `fdatasync(2)` exceeds
+    /// `fsync_budget`, the remaining records in this drain are written
+    /// to the BufWriter only — fsync is skipped until the next drain.
+    /// This bounds the worst-case poll stall to one fsync per tick on a
+    /// slow disk.
     pub fn flush_pending(&mut self, budget: Duration) {
         let start = Instant::now();
+        self.deferred_fsync_in_drain = false;
         while !self.pending_lines.is_empty() {
             if start.elapsed() >= budget {
                 self.audit_flush_budget_exceeded_total =
@@ -598,7 +751,25 @@ impl RecoveryAuditLog {
                 break;
             }
             let line = self.pending_lines.pop_front().unwrap();
+            self.refresh_falling_edge_watermarks();
             self.direct_write_line(&line);
+        }
+        // One final falling-edge refresh after the drain (covers the
+        // case where the ring emptied this tick).
+        self.refresh_falling_edge_watermarks();
+    }
+
+    /// Clear watermark edge flags when the ring falls back below each
+    /// threshold.  Called after every `pop_front` so the rising-edge
+    /// counters re-arm correctly across drain/enqueue cycles.
+    #[inline]
+    fn refresh_falling_edge_watermarks(&mut self) {
+        let len = self.pending_lines.len();
+        if self.ring_above_critical && len < RING_WATERMARK_CRITICAL {
+            self.ring_above_critical = false;
+        }
+        if self.ring_above_warn && len < RING_WATERMARK_WARN {
+            self.ring_above_warn = false;
         }
     }
 
@@ -611,6 +782,50 @@ impl RecoveryAuditLog {
     /// before emptying the ring.
     pub fn take_audit_flush_budget_exceeded(&mut self) -> u64 {
         core::mem::replace(&mut self.audit_flush_budget_exceeded_total, 0)
+    }
+
+    /// Drain (and clear) buffered `fdatasync` durations for the
+    /// exporter to fold into the `varta_audit_fsync_seconds` histogram.
+    pub fn take_audit_fsync_durations(&mut self) -> Vec<Duration> {
+        let n = self.fsync_durations.len();
+        let mut out = Vec::with_capacity(n);
+        out.extend(self.fsync_durations.drain(..));
+        out
+    }
+
+    /// Take and reset the count of `fdatasync(2)` calls that exceeded
+    /// `fsync_budget`.
+    pub fn take_audit_fsync_budget_exceeded(&mut self) -> u64 {
+        core::mem::replace(&mut self.audit_fsync_budget_exceeded_total, 0)
+    }
+
+    /// Take and reset the count of `drive_audit_rotation` calls that
+    /// exceeded `rotation_budget`.
+    pub fn take_audit_rotation_budget_exceeded(&mut self) -> u64 {
+        core::mem::replace(&mut self.audit_rotation_budget_exceeded_total, 0)
+    }
+
+    /// Take and reset the rising-edge ring-warn watermark counter.
+    pub fn take_audit_ring_watermark_warn(&mut self) -> u64 {
+        core::mem::replace(&mut self.audit_ring_watermark_warn_total, 0)
+    }
+
+    /// Take and reset the rising-edge ring-critical watermark counter.
+    pub fn take_audit_ring_watermark_critical(&mut self) -> u64 {
+        core::mem::replace(&mut self.audit_ring_watermark_critical_total, 0)
+    }
+
+    /// Returns `true` while a rotation is in progress across ticks.
+    /// The main loop calls `drive_audit_rotation` whenever this is true.
+    pub fn audit_rotation_pending(&self) -> bool {
+        !self.rotation_progress.is_idle()
+    }
+
+    /// Returns `true` when the file has crossed its `max_bytes` cap and
+    /// a rotation should be started.  Cleared automatically when
+    /// `drive_audit_rotation` completes.
+    pub fn audit_rotation_due(&self) -> bool {
+        self.needs_rotation
     }
 
     /// Emit a `boot` record. `prev` is the prior chain to record in the
@@ -691,126 +906,269 @@ impl RecoveryAuditLog {
             return;
         }
         self.pending_lines.push_back(line.to_owned());
+        let len = self.pending_lines.len();
+        if !self.ring_above_warn && len >= RING_WATERMARK_WARN {
+            self.ring_above_warn = true;
+            self.audit_ring_watermark_warn_total =
+                self.audit_ring_watermark_warn_total.saturating_add(1);
+            crate::varta_warn_rl!(
+                crate::log_ratelimit::LogKind::AuditRingWarn,
+                "audit ring \u{2265} 75% full ({len}/{AUDIT_RING_CAP}); drain not keeping up"
+            );
+        }
+        if !self.ring_above_critical && len >= RING_WATERMARK_CRITICAL {
+            self.ring_above_critical = true;
+            self.audit_ring_watermark_critical_total =
+                self.audit_ring_watermark_critical_total.saturating_add(1);
+            crate::varta_error_rl!(
+                crate::log_ratelimit::LogKind::AuditRingCritical,
+                "audit ring \u{2265} 95% full ({len}/{AUDIT_RING_CAP}); records will start dropping"
+            );
+        }
     }
 
-    /// Write `line` directly to the BufWriter — bypass the ring. Used for
-    /// boot records (startup / rotation) and by `flush_pending` when draining.
+    /// Write `line` directly to the BufWriter — bypass the ring. Used
+    /// for boot records (startup / rotation) and by `flush_pending`
+    /// when draining.
+    ///
+    /// fsync cadence is governed by `sync_every` (record-count cadence)
+    /// PLUS the optional `sync_interval` (time-based cadence): the
+    /// drain syncs whenever either rule is satisfied.  When a fsync
+    /// exceeds `fsync_budget` mid-drain, `deferred_fsync_in_drain` is
+    /// set and subsequent records in the same drain skip the sync.
+    /// Rotation is no longer driven from here — the hot path simply
+    /// sets `needs_rotation = true` and the main loop calls
+    /// `drive_audit_rotation`.
     fn direct_write_line(&mut self, line: &str) {
         match self.sink.write_all(line.as_bytes()) {
             Ok(()) => {
                 self.bytes_written = self.bytes_written.saturating_add(line.len() as u64);
                 self.writes_since_sync = self.writes_since_sync.saturating_add(1);
-                if self.writes_since_sync >= self.sync_every {
+                let by_record = self.writes_since_sync >= self.sync_every;
+                let by_time = match (self.sync_interval, self.last_sync_at) {
+                    (Some(interval), Some(last)) => last.elapsed() >= interval,
+                    (Some(_), None) => true, // never synced — sync on first opportunity
+                    (None, _) => false,
+                };
+                if (by_record || by_time) && !self.deferred_fsync_in_drain {
+                    match self.flush_and_sync() {
+                        Ok(d) => {
+                            self.writes_since_sync = 0;
+                            if d > self.fsync_budget {
+                                self.deferred_fsync_in_drain = true;
+                            }
+                        }
+                        Err(e) => {
+                            self.pending_err = Some(e);
+                        }
+                    }
+                }
+                // Trip the rotation flag for the main loop — but only
+                // when there's a configured cap, we're not already
+                // rotating, and we've crossed the threshold.  The hot
+                // path NEVER drives rotation directly — that's
+                // `drive_audit_rotation`'s job (called from main).
+                if let Some(max) = self.max_bytes {
+                    if self.rotation_progress.is_idle()
+                        && !self.needs_rotation
+                        && self.bytes_written >= max
+                    {
+                        self.needs_rotation = true;
+                    }
+                }
+            }
+            Err(e) => {
+                self.pending_err = Some(e);
+            }
+        }
+    }
+
+    /// Flush BufWriter to the kernel, then `fdatasync` the file.  Both
+    /// must succeed for the data to be considered durable.  Returns
+    /// the wall-clock duration of the fsync (recorded into the bounded
+    /// `fsync_durations` ring for the exporter to drain).  On overrun,
+    /// `audit_fsync_budget_exceeded_total` is incremented.
+    fn flush_and_sync(&mut self) -> io::Result<Duration> {
+        self.sink.flush()?;
+        let t0 = Instant::now();
+        self.sink.get_ref().sync_data()?;
+        let d = t0.elapsed();
+        if self.fsync_durations.len() >= FSYNC_HISTORY_CAP {
+            self.fsync_durations.pop_front();
+        }
+        self.fsync_durations.push_back(d);
+        if d > self.fsync_budget {
+            self.audit_fsync_budget_exceeded_total =
+                self.audit_fsync_budget_exceeded_total.saturating_add(1);
+        }
+        self.last_sync_at = Some(Instant::now());
+        Ok(d)
+    }
+
+    /// Advance the rotation state machine by one sub-step at most.
+    /// Sub-steps:
+    ///   1. one `remove_file(PATH.5)` / `rename` per call (5 → 4 → … → 1),
+    ///   2. one `OpenOptions::open(PATH)` for the new live fd,
+    ///   3. one v2-header write,
+    ///   4. one post-rotation boot record + fsync.
+    ///
+    /// Returns `NotNeeded` when rotation is neither pending nor due,
+    /// `Deferred` when the per-tick budget elapsed mid-rotation (state
+    /// is preserved on `self`), and `Complete` when the new generation
+    /// is live and the chain-stitching boot record is durable.
+    pub fn drive_audit_rotation(&mut self, budget: Duration) -> RotationOutcome {
+        if self.rotation_progress.is_idle() && !self.needs_rotation {
+            return RotationOutcome::NotNeeded;
+        }
+        let call_start = Instant::now();
+        if self.rotation_progress.is_idle() {
+            // Kick-off: capture the final chain (so the post-rotation
+            // boot record can stitch across the rename) and flush the
+            // BufWriter so no pending bytes are lost in the rename.
+            // The flush+sync below is itself bounded by fsync_budget
+            // semantics via flush_and_sync.
+            let final_chain = self.prev_chain;
+            if let Err(e) = self.flush_and_sync() {
+                self.pending_err = Some(e);
+                // Leave rotation_progress idle and needs_rotation set;
+                // the next tick will retry the kick-off.
+                return RotationOutcome::Deferred;
+            }
+            self.rotation_progress = RotationProgress::Renaming {
+                next_gen: AUDIT_ROTATION_GENERATIONS,
+                final_chain,
+            };
+        }
+        loop {
+            // Honour the budget BEFORE doing the next sub-step.  Each
+            // sub-step is bounded (one rename, one open, one header
+            // write, one fsync), so this guard plus the per-sub-step
+            // cost gives a hard upper bound on the call.
+            if call_start.elapsed() > budget {
+                self.audit_rotation_budget_exceeded_total =
+                    self.audit_rotation_budget_exceeded_total.saturating_add(1);
+                return RotationOutcome::Deferred;
+            }
+            // Snapshot the current state's metadata so the borrow ends
+            // before we mutate `self`.
+            let progress = self.rotation_progress.clone();
+            match progress {
+                RotationProgress::Idle => {
+                    // Unreachable: we set Renaming above and only
+                    // transition back to Idle at the end of EmittingBoot.
+                    return RotationOutcome::Complete;
+                }
+                RotationProgress::Renaming {
+                    next_gen,
+                    final_chain,
+                } => {
+                    let path_str = self.path.to_string_lossy().into_owned();
+                    let sub_result = if next_gen == AUDIT_ROTATION_GENERATIONS {
+                        // First sub-step: remove the oldest generation
+                        // if it exists.
+                        let oldest = format!("{path_str}.{AUDIT_ROTATION_GENERATIONS}");
+                        match std::fs::remove_file(&oldest) {
+                            Ok(()) => Ok(()),
+                            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+                            Err(e) => Err(e),
+                        }
+                    } else {
+                        // Subsequent sub-steps: rename gen → gen+1.
+                        let src = format!("{path_str}.{next_gen}");
+                        let dst = format!("{path_str}.{}", next_gen + 1);
+                        match std::fs::rename(&src, &dst) {
+                            Ok(()) => Ok(()),
+                            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+                            Err(e) => Err(e),
+                        }
+                    };
+                    if let Err(e) = sub_result {
+                        self.pending_err = Some(e);
+                        // Abandon this rotation; reset state so the
+                        // next attempt starts fresh.
+                        self.rotation_progress = RotationProgress::Idle;
+                        self.needs_rotation = false;
+                        return RotationOutcome::Complete;
+                    }
+                    if next_gen > 1 {
+                        self.rotation_progress = RotationProgress::Renaming {
+                            next_gen: next_gen - 1,
+                            final_chain,
+                        };
+                    } else {
+                        // Final rename: live PATH → PATH.1.  Handle
+                        // the cross-device fallback (CrossesDevices)
+                        // here so OSS users on overlay/bind mounts get
+                        // the same migration behaviour as before.
+                        let first = format!("{path_str}.1");
+                        #[allow(clippy::incompatible_msrv)]
+                        let rename_result = match std::fs::rename(&self.path, &first) {
+                            Ok(()) => Ok(()),
+                            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+                            Err(e) if e.kind() == io::ErrorKind::CrossesDevices => {
+                                std::fs::copy(&self.path, &first)
+                                    .and_then(|_| std::fs::remove_file(&self.path))
+                            }
+                            Err(e) => Err(e),
+                        };
+                        if let Err(e) = rename_result {
+                            self.pending_err = Some(e);
+                            self.rotation_progress = RotationProgress::Idle;
+                            self.needs_rotation = false;
+                            return RotationOutcome::Complete;
+                        }
+                        self.rotation_progress = RotationProgress::OpeningFd { final_chain };
+                    }
+                }
+                RotationProgress::OpeningFd { final_chain } => {
+                    use std::os::unix::fs::OpenOptionsExt;
+                    let file = match OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .mode(0o600)
+                        .open(&self.path)
+                    {
+                        Ok(f) => f,
+                        Err(e) => {
+                            self.pending_err = Some(e);
+                            self.rotation_progress = RotationProgress::Idle;
+                            self.needs_rotation = false;
+                            return RotationOutcome::Complete;
+                        }
+                    };
+                    let sink_box: Box<dyn DurableSink> = Box::new(FileSink(file));
+                    self.sink = BufWriter::new(sink_box);
+                    self.bytes_written = 0;
+                    self.writes_since_sync = 0;
+                    self.rotation_progress = RotationProgress::WritingHeader { final_chain };
+                }
+                RotationProgress::WritingHeader { final_chain } => {
+                    if let Err(e) = self.sink.write_all(AUDIT_HEADER_V2.as_bytes()) {
+                        self.pending_err = Some(e);
+                        self.rotation_progress = RotationProgress::Idle;
+                        self.needs_rotation = false;
+                        return RotationOutcome::Complete;
+                    }
+                    self.bytes_written = AUDIT_HEADER_V2.len() as u64;
+                    self.rotation_progress = RotationProgress::EmittingBoot { final_chain };
+                }
+                RotationProgress::EmittingBoot { final_chain } => {
+                    // emit_boot calls emit_direct → direct_write_line,
+                    // which may also fsync; that fsync respects the
+                    // global fsync_budget but does NOT participate in
+                    // deferred_fsync_in_drain (we're not in a drain).
+                    self.emit_boot(BootReason::Rotation, Some(final_chain));
                     if let Err(e) = self.flush_and_sync() {
                         self.pending_err = Some(e);
                     } else {
                         self.writes_since_sync = 0;
                     }
+                    self.rotation_progress = RotationProgress::Idle;
+                    self.needs_rotation = false;
+                    return RotationOutcome::Complete;
                 }
-                self.maybe_rotate();
-            }
-            Err(e) => {
-                self.pending_err = Some(e);
             }
         }
-    }
-
-    /// Flush BufWriter to the kernel, then `fdatasync` the file. Both must
-    /// succeed for the data to be considered durable.
-    fn flush_and_sync(&mut self) -> io::Result<()> {
-        self.sink.flush()?;
-        self.sink.get_ref().sync_data()
-    }
-
-    fn maybe_rotate(&mut self) {
-        let Some(max) = self.max_bytes else {
-            return;
-        };
-        if self.bytes_written < max {
-            return;
-        }
-        if self.rotating {
-            // Reentry guard. A `max_bytes` so small that the post-rotation
-            // header + boot record alone exceed it would otherwise cause
-            // unbounded recursion via emit_boot → write_line → maybe_rotate.
-            return;
-        }
-        self.rotating = true;
-        // Capture the final chain *before* the rename — this becomes the
-        // `prev_chain` field on the post-rotation `boot` record so chain
-        // continuity spans across generations.
-        let final_chain = self.prev_chain;
-        if let Err(e) = self.flush_and_sync() {
-            self.pending_err = Some(e);
-            return;
-        }
-        if let Err(e) = Self::rotate(&self.path) {
-            self.pending_err = Some(e);
-            return;
-        }
-        use std::os::unix::fs::OpenOptionsExt;
-        let file = match OpenOptions::new()
-            .create(true)
-            .append(true)
-            .mode(0o600)
-            .open(&self.path)
-        {
-            Ok(f) => f,
-            Err(e) => {
-                self.pending_err = Some(e);
-                return;
-            }
-        };
-        let sink_box: Box<dyn DurableSink> = Box::new(FileSink(file));
-        self.sink = BufWriter::new(sink_box);
-        self.bytes_written = 0;
-        self.writes_since_sync = 0;
-        // Fresh v2 header on the post-rotation file.
-        if let Err(e) = self.sink.write_all(AUDIT_HEADER_V2.as_bytes()) {
-            self.pending_err = Some(e);
-            return;
-        }
-        self.bytes_written = AUDIT_HEADER_V2.len() as u64;
-        // Boot record stitches the chain across the rotation.
-        self.emit_boot(BootReason::Rotation, Some(final_chain));
-        if let Err(e) = self.flush_and_sync() {
-            self.pending_err = Some(e);
-        } else {
-            self.writes_since_sync = 0;
-        }
-        self.rotating = false;
-    }
-
-    fn rotate(path: &Path) -> io::Result<()> {
-        let path_str = path.to_string_lossy();
-        let oldest = format!("{path_str}.{AUDIT_ROTATION_GENERATIONS}");
-        match std::fs::remove_file(&oldest) {
-            Ok(()) => {}
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-            Err(e) => return Err(e),
-        }
-        for gen in (1..AUDIT_ROTATION_GENERATIONS).rev() {
-            let src = format!("{path_str}.{gen}");
-            let dst = format!("{path_str}.{}", gen + 1);
-            match std::fs::rename(&src, &dst) {
-                Ok(()) => {}
-                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-                Err(e) => return Err(e),
-            }
-        }
-        let first = format!("{path_str}.1");
-        // CrossesDevices: stable 1.85, MSRV 1.70; correct on Linux/macOS
-        #[allow(clippy::incompatible_msrv)]
-        match std::fs::rename(path, &first) {
-            Ok(()) => {}
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-            Err(e) if e.kind() == io::ErrorKind::CrossesDevices => {
-                std::fs::copy(path, &first)?;
-                std::fs::remove_file(path)?;
-            }
-            Err(e) => return Err(e),
-        }
-        Ok(())
     }
 
     /// Read up to the last [`TAIL_SCAN_BYTES`] of `path` and parse the
@@ -1051,6 +1409,9 @@ mod tests {
             max_bytes,
             sync_every,
             daemon_pid: 1234,
+            fsync_budget: Duration::from_millis(50),
+            sync_interval: None,
+            rotation_budget: Duration::from_millis(50),
         }
     }
 
@@ -1097,10 +1458,22 @@ mod tests {
             sync_every,
             writes_since_sync: 0,
             daemon_pid: 1234,
-            rotating: false,
             pending_lines: VecDeque::with_capacity(AUDIT_RING_CAP),
             audit_dropped_total: 0,
             audit_flush_budget_exceeded_total: 0,
+            fsync_budget: Duration::from_secs(1),
+            sync_interval: None,
+            last_sync_at: None,
+            fsync_durations: VecDeque::with_capacity(FSYNC_HISTORY_CAP),
+            audit_fsync_budget_exceeded_total: 0,
+            audit_rotation_budget_exceeded_total: 0,
+            audit_ring_watermark_warn_total: 0,
+            audit_ring_watermark_critical_total: 0,
+            ring_above_warn: false,
+            ring_above_critical: false,
+            deferred_fsync_in_drain: false,
+            needs_rotation: false,
+            rotation_progress: RotationProgress::Idle,
         };
         (log, ctr)
     }
@@ -1217,8 +1590,12 @@ mod tests {
                 template_len: 9,
             });
         }
-        // Flush the ring so rotation logic fires via direct_write_line/maybe_rotate.
+        // Flush the ring so the BufWriter sees the records and arms
+        // `needs_rotation`, then drive the rotation state machine to
+        // completion under a generous per-tick budget.
         log.flush_pending(Duration::MAX);
+        let outcome = log.drive_audit_rotation(Duration::from_secs(5));
+        assert_eq!(outcome, RotationOutcome::Complete);
         drop(log);
         assert!(path.with_extension("log.1").exists());
 
@@ -1415,6 +1792,315 @@ mod tests {
         assert!(len_after > 0);
         let _ = len_before;
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -----------------------------------------------------------------
+    // Audit-backpressure tests — fdatasync stall, rotation deferral,
+    // ring watermarks, time-based cadence, and default-config
+    // (Class C) no-regression.
+    //
+    // Each test substitutes a `DurableSink` impl with controlled
+    // latency so we exercise the bounded-budget paths without touching
+    // the real kernel.  These mirror the integration test names in the
+    // plan's "Tests" section.
+    // -----------------------------------------------------------------
+
+    /// Sink whose `sync_data()` sleeps for `delay`; per-write `write()`
+    /// is otherwise the same as `CountingSink` (counts writes + syncs,
+    /// records bytes).  Used to simulate a stalled fdatasync without
+    /// any LD_PRELOAD trickery.
+    struct SlowSink {
+        ctr: Arc<SyncCounter>,
+        delay: Duration,
+    }
+
+    impl Write for SlowSink {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            *self.ctr.writes.lock().unwrap() += 1;
+            self.ctr.buf.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl DurableSink for SlowSink {
+        fn sync_data(&self) -> io::Result<()> {
+            *self.ctr.syncs.lock().unwrap() += 1;
+            std::thread::sleep(self.delay);
+            Ok(())
+        }
+    }
+
+    /// Build a synthetic log around a test sink with explicit knobs.
+    fn synthetic_log_with(
+        sink: Box<dyn DurableSink>,
+        sync_every: u32,
+        fsync_budget: Duration,
+        sync_interval: Option<Duration>,
+        max_bytes: Option<u64>,
+    ) -> RecoveryAuditLog {
+        RecoveryAuditLog {
+            sink: BufWriter::new(sink),
+            path: PathBuf::from("/dev/null"),
+            max_bytes,
+            bytes_written: 0,
+            pending_err: None,
+            next_seq: 1,
+            prev_chain: [0u8; 32],
+            sync_every,
+            writes_since_sync: 0,
+            daemon_pid: 1234,
+            pending_lines: VecDeque::with_capacity(AUDIT_RING_CAP),
+            audit_dropped_total: 0,
+            audit_flush_budget_exceeded_total: 0,
+            fsync_budget,
+            sync_interval,
+            last_sync_at: None,
+            fsync_durations: VecDeque::with_capacity(FSYNC_HISTORY_CAP),
+            audit_fsync_budget_exceeded_total: 0,
+            audit_rotation_budget_exceeded_total: 0,
+            audit_ring_watermark_warn_total: 0,
+            audit_ring_watermark_critical_total: 0,
+            ring_above_warn: false,
+            ring_above_critical: false,
+            deferred_fsync_in_drain: false,
+            needs_rotation: false,
+            rotation_progress: RotationProgress::Idle,
+        }
+    }
+
+    fn dummy_spawn(pid: u32) -> SpawnRecord<'static> {
+        SpawnRecord {
+            wallclock_ms: 0,
+            observer_ns: 0,
+            agent_pid: pid,
+            child_pid: pid,
+            mode: "exec",
+            program: "p",
+            source: "inline",
+            template_len: 0,
+        }
+    }
+
+    /// One slow fsync mid-drain trips the deferral flag — subsequent
+    /// records in the same drain skip the sync and the budget overrun
+    /// counter increments exactly once.  Drain wall-time stays bounded
+    /// by a single fsync delay even though five records were enqueued.
+    #[test]
+    fn fsync_stall_skips_remaining_in_drain() {
+        let ctr = Arc::new(SyncCounter::default());
+        let sink = Box::new(SlowSink {
+            ctr: ctr.clone(),
+            delay: Duration::from_millis(80), // budget is 20 ms below
+        });
+        let mut log = synthetic_log_with(
+            sink,
+            1, // sync per record
+            Duration::from_millis(20),
+            None,
+            None,
+        );
+        for i in 0..5u32 {
+            log.record_spawn(&dummy_spawn(i));
+        }
+        assert_eq!(log.pending_lines.len(), 5);
+        let t0 = Instant::now();
+        log.flush_pending(Duration::from_secs(5));
+        let drain_wall = t0.elapsed();
+        // Exactly one fsync attempted (the first record's); the
+        // BufWriter then absorbs the remaining four record_writes
+        // without another sync.  The slow sink's underlying `write`
+        // counter only ticks when the BufWriter flushes — so it sees
+        // exactly one flush (1 sync), and the remaining bytes sit in
+        // the BufWriter awaiting the next maintenance tick.
+        let syncs = *ctr.syncs.lock().unwrap();
+        assert_eq!(syncs, 1, "deferral must skip subsequent fsyncs in drain");
+        assert_eq!(
+            log.pending_lines.len(),
+            0,
+            "all 5 records left the ring (BufWriter holds the unflushed bytes)"
+        );
+        assert_eq!(
+            log.audit_fsync_budget_exceeded_total, 1,
+            "budget exceeded counter increments exactly once per drain"
+        );
+        assert!(
+            log.deferred_fsync_in_drain,
+            "deferral flag stays set for the rest of this drain"
+        );
+        // Drain wall-time bounded by one fsync delay + small overhead.
+        assert!(
+            drain_wall < Duration::from_millis(250),
+            "drain wall-time {drain_wall:?} should be bounded by one fsync delay"
+        );
+    }
+
+    /// A tiny rotation budget makes `drive_audit_rotation` defer across
+    /// multiple ticks until the renames, fd open, header write, and
+    /// boot record are all complete.  The overrun counter must climb
+    /// at least once before completion.
+    #[test]
+    fn rotation_resumes_across_ticks() {
+        // Use a real on-disk file so the renames are observable.
+        let dir = tmpdir("rot-resume");
+        let path = dir.join("audit.log");
+        // Tiny cap forces rotation after a couple of spawn records.
+        let mut cfg = cfg(Some(120), 1);
+        cfg.rotation_budget = Duration::from_micros(1); // basically zero
+        let (mut log, _) = RecoveryAuditLog::create(&path, cfg).expect("create");
+        for i in 0..8u32 {
+            log.record_spawn(&dummy_spawn(i));
+        }
+        log.flush_pending(Duration::from_secs(1));
+        assert!(log.audit_rotation_due() || log.audit_rotation_pending());
+        // Drive rotation under a tiny budget — must return Deferred at
+        // least once before Complete.  Cap the loop to avoid infinite
+        // retries on a bug.
+        let mut saw_deferred = false;
+        let mut completed = false;
+        for _ in 0..32 {
+            let outcome = log.drive_audit_rotation(Duration::from_micros(1));
+            match outcome {
+                RotationOutcome::Deferred => saw_deferred = true,
+                RotationOutcome::Complete => {
+                    completed = true;
+                    break;
+                }
+                RotationOutcome::NotNeeded => panic!("rotation should be in progress"),
+            }
+        }
+        assert!(
+            saw_deferred,
+            "rotation must defer at least once under a 1us budget"
+        );
+        assert!(completed, "rotation must eventually complete");
+        assert!(log.audit_rotation_budget_exceeded_total >= 1);
+        drop(log);
+        assert!(
+            path.with_extension("log.1").exists(),
+            "first generation written"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Rising-edge watermarks: counters fire on the transition from
+    /// below threshold to above, and re-arm only after the fill drops
+    /// back below.
+    #[test]
+    fn ring_watermark_fires_at_75_and_95() {
+        let ctr = Arc::new(SyncCounter::default());
+        let sink = Box::new(CountingSink(ctr.clone()));
+        // Big fsync budget so the drain never marks deferral when we
+        // do drain; we control the fill explicitly via flush calls.
+        let mut log = synthetic_log_with(
+            Box::new(CountingSink(ctr.clone())) as Box<dyn DurableSink>,
+            1,
+            Duration::from_secs(10),
+            None,
+            None,
+        );
+        let _ = sink; // suppress unused: keep the Arc reference live
+                      // Fill up to just below 75%: WARN = floor(256*0.75) = 192
+                      // → enqueue 191 records, no crossing.
+        for i in 0..191u32 {
+            log.record_spawn(&dummy_spawn(i));
+        }
+        assert_eq!(log.audit_ring_watermark_warn_total, 0);
+        assert_eq!(log.audit_ring_watermark_critical_total, 0);
+        // Cross 75%.
+        log.record_spawn(&dummy_spawn(192));
+        assert_eq!(log.audit_ring_watermark_warn_total, 1);
+        assert_eq!(log.audit_ring_watermark_critical_total, 0);
+        // Push another 51 to cross 95% (CRIT = floor(256*0.95) = 243).
+        for i in 193..243u32 {
+            log.record_spawn(&dummy_spawn(i));
+        }
+        assert_eq!(log.audit_ring_watermark_critical_total, 0);
+        log.record_spawn(&dummy_spawn(243));
+        assert_eq!(log.audit_ring_watermark_critical_total, 1);
+        // Drain back to empty so the falling-edge flags clear, then
+        // refill past 75% — counters must increment again (rising-edge
+        // semantics, not "1-shot").
+        log.flush_pending(Duration::from_secs(5));
+        assert_eq!(log.pending_lines.len(), 0);
+        for i in 0..192u32 {
+            log.record_spawn(&dummy_spawn(1_000 + i));
+        }
+        assert_eq!(
+            log.audit_ring_watermark_warn_total, 2,
+            "warn counter re-arms after falling-edge"
+        );
+    }
+
+    /// With `sync_every = 64` but a 25 ms `sync_interval`, a single
+    /// record drained more than 25 ms after the last sync still
+    /// triggers a fdatasync.
+    #[test]
+    fn sync_interval_ms_overrides_record_cadence() {
+        let ctr = Arc::new(SyncCounter::default());
+        let sink = Box::new(CountingSink(ctr.clone()));
+        let mut log = synthetic_log_with(
+            sink,
+            64,
+            Duration::from_secs(10),
+            Some(Duration::from_millis(25)),
+            None,
+        );
+        log.record_spawn(&dummy_spawn(1));
+        // First drain — last_sync_at is None, so the time-based rule
+        // forces a sync immediately.
+        log.flush_pending(Duration::from_secs(1));
+        let syncs_after_first = *ctr.syncs.lock().unwrap();
+        assert_eq!(
+            syncs_after_first, 1,
+            "first drain must sync (last_sync_at=None)"
+        );
+        // Within the interval window — no time-based sync, and
+        // writes_since_sync (=0 after the prior sync) is still well
+        // below 64, so no record-based sync either.
+        log.record_spawn(&dummy_spawn(2));
+        log.flush_pending(Duration::from_secs(1));
+        let syncs_quick = *ctr.syncs.lock().unwrap();
+        assert_eq!(
+            syncs_quick, syncs_after_first,
+            "drain inside the interval must not sync (record cadence not yet met)"
+        );
+        // Wait past the interval and drain again — time-based rule fires.
+        std::thread::sleep(Duration::from_millis(30));
+        log.record_spawn(&dummy_spawn(3));
+        log.flush_pending(Duration::from_secs(1));
+        let syncs_after_interval = *ctr.syncs.lock().unwrap();
+        assert!(
+            syncs_after_interval > syncs_quick,
+            "drain past --audit-sync-interval-ms must force a sync"
+        );
+    }
+
+    /// Default Class C config (sync_every=1, sync_interval=None, fast
+    /// sink) is byte-for-byte unchanged: every record fsyncs and the
+    /// overrun counter stays at 0.
+    #[test]
+    fn fsync_budget_default_preserves_class_c() {
+        let ctr = Arc::new(SyncCounter::default());
+        let sink = Box::new(CountingSink(ctr.clone()));
+        let mut log = synthetic_log_with(
+            sink,
+            1,
+            Duration::from_secs(10), // fast sink → never exceeds
+            None,
+            None,
+        );
+        for i in 0..10u32 {
+            log.record_spawn(&dummy_spawn(i));
+        }
+        log.flush_pending(Duration::from_secs(5));
+        let syncs = *ctr.syncs.lock().unwrap();
+        // 10 records + sync_every=1 → 10 fsyncs from the drain.
+        assert_eq!(syncs, 10, "Class C cadence preserved");
+        assert_eq!(log.audit_fsync_budget_exceeded_total, 0);
+        assert_eq!(log.audit_dropped_total, 0);
     }
 
     #[test]

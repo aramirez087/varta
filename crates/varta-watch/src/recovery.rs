@@ -846,6 +846,81 @@ impl Recovery {
             .unwrap_or(0)
     }
 
+    /// Drain (and clear) buffered `fdatasync` durations from the audit
+    /// sink for the exporter to fold into the
+    /// `varta_audit_fsync_seconds` histogram.
+    pub fn take_audit_fsync_durations(&mut self) -> Vec<std::time::Duration> {
+        self.audit_sink
+            .as_mut()
+            .map(|s| s.take_audit_fsync_durations())
+            .unwrap_or_default()
+    }
+
+    /// Take and reset the count of `fdatasync(2)` calls on the audit
+    /// sink that exceeded `--audit-fsync-budget-ms`.
+    pub fn take_audit_fsync_budget_exceeded(&mut self) -> u64 {
+        self.audit_sink
+            .as_mut()
+            .map(|s| s.take_audit_fsync_budget_exceeded())
+            .unwrap_or(0)
+    }
+
+    /// Take and reset the count of `drive_audit_rotation` calls that
+    /// exceeded `--audit-rotation-budget-ms`.
+    pub fn take_audit_rotation_budget_exceeded(&mut self) -> u64 {
+        self.audit_sink
+            .as_mut()
+            .map(|s| s.take_audit_rotation_budget_exceeded())
+            .unwrap_or(0)
+    }
+
+    /// Take and reset the rising-edge ring-warn watermark counter.
+    pub fn take_audit_ring_watermark_warn(&mut self) -> u64 {
+        self.audit_sink
+            .as_mut()
+            .map(|s| s.take_audit_ring_watermark_warn())
+            .unwrap_or(0)
+    }
+
+    /// Take and reset the rising-edge ring-critical watermark counter.
+    pub fn take_audit_ring_watermark_critical(&mut self) -> u64 {
+        self.audit_sink
+            .as_mut()
+            .map(|s| s.take_audit_ring_watermark_critical())
+            .unwrap_or(0)
+    }
+
+    /// Returns `true` while an audit-log rotation is in progress across
+    /// ticks (state machine is past the kick-off).
+    pub fn audit_rotation_pending(&self) -> bool {
+        self.audit_sink
+            .as_ref()
+            .map(|s| s.audit_rotation_pending())
+            .unwrap_or(false)
+    }
+
+    /// Returns `true` when the audit file has crossed its `max_bytes`
+    /// cap and the next maintenance tick should drive rotation.
+    pub fn audit_rotation_due(&self) -> bool {
+        self.audit_sink
+            .as_ref()
+            .map(|s| s.audit_rotation_due())
+            .unwrap_or(false)
+    }
+
+    /// Advance the audit-log rotation state machine by at most one
+    /// per-sub-step unit of work; the call is bounded by `budget`.
+    /// Called once per maintenance tick when `audit_rotation_pending`
+    /// or `audit_rotation_due` is true.
+    pub fn drive_audit_rotation(
+        &mut self,
+        budget: std::time::Duration,
+    ) -> Option<crate::audit::RotationOutcome> {
+        self.audit_sink
+            .as_mut()
+            .map(|s| s.drive_audit_rotation(budget))
+    }
+
     /// Enable bounded stdout/stderr capture for child processes. `cap` is
     /// the combined per-child byte cap (stdout + stderr); a value of `0`
     /// disables capture. Pipes are read non-blockingly each tick to

@@ -213,6 +213,26 @@ pub fn parse_kv(input: &str) -> Result<ParsedConfig, String> {
             return Err("recovery_audit_sync_every must be >= 1".into());
         }
     }
+    if let Some(v) = out.singletons.get("audit_fsync_budget_ms") {
+        let n: u32 = v
+            .parse()
+            .map_err(|_| format!("audit_fsync_budget_ms: not a valid u32: {v:?}"))?;
+        if n == 0 {
+            return Err("audit_fsync_budget_ms must be >= 1".into());
+        }
+    }
+    if let Some(v) = out.singletons.get("audit_sync_interval_ms") {
+        v.parse::<u32>()
+            .map_err(|_| format!("audit_sync_interval_ms: not a valid u32: {v:?}"))?;
+    }
+    if let Some(v) = out.singletons.get("audit_rotation_budget_ms") {
+        let n: u32 = v
+            .parse()
+            .map_err(|_| format!("audit_rotation_budget_ms: not a valid u32: {v:?}"))?;
+        if n == 0 {
+            return Err("audit_rotation_budget_ms must be >= 1".into());
+        }
+    }
     if let Some(v) = out.singletons.get("eviction_scan_window") {
         let n: usize = v
             .parse()
@@ -382,6 +402,26 @@ fn render_constructor(parsed: &ParsedConfig, test_hooks_active: bool) -> String 
     let scrape_budget_ms: u64 = singleton_u64(parsed, "scrape_budget_ms", 250);
     s.push_str(&format!(
         "        scrape_budget: Duration::from_millis({scrape_budget_ms}),\n"
+    ));
+    let audit_fsync_budget_ms: u32 = singleton_u32(parsed, "audit_fsync_budget_ms", 50);
+    if audit_fsync_budget_ms == 0 {
+        // build-time validation: 0 is rejected at parse time in the argv path,
+        // and 0 here would silently never fire — surface as a hard build break.
+        panic!("audit_fsync_budget_ms must be >= 1");
+    }
+    s.push_str(&format!(
+        "        audit_fsync_budget_ms: {audit_fsync_budget_ms},\n"
+    ));
+    let audit_sync_interval_ms: u32 = singleton_u32(parsed, "audit_sync_interval_ms", 0);
+    s.push_str(&format!(
+        "        audit_sync_interval_ms: {audit_sync_interval_ms},\n"
+    ));
+    let audit_rotation_budget_ms: u32 = singleton_u32(parsed, "audit_rotation_budget_ms", 50);
+    if audit_rotation_budget_ms == 0 {
+        panic!("audit_rotation_budget_ms must be >= 1");
+    }
+    s.push_str(&format!(
+        "        audit_rotation_budget_ms: {audit_rotation_budget_ms},\n"
     ));
     let clock_source = match parsed.singletons.get("clock_source").map(String::as_str) {
         Some("boottime") => "crate::clock::ClockSource::Boottime",

@@ -81,6 +81,33 @@ pub const MIN_SCRAPE_BUDGET_MS: u64 = 50;
 /// abort the daemon, so the metric ceases to be a useful signal.
 pub const MAX_SCRAPE_BUDGET_MS: u64 = 60_000;
 
+/// Default value for `--audit-fsync-budget-ms`.  If a single
+/// `fdatasync(2)` on the audit file exceeds this, the remaining records
+/// in the current drain are written-to-BufWriter only and the sync is
+/// deferred to the next maintenance tick.  Bounds the worst-case poll
+/// stall on a slow disk to one fsync per tick.
+///
+/// Referenced only by the argv parser; the compile-time-config build
+/// reads its default directly from `build.rs`.
+#[cfg(not(feature = "compile-time-config"))]
+pub const DEFAULT_AUDIT_FSYNC_BUDGET_MS: u32 = 50;
+
+/// Default value for `--audit-sync-interval-ms`.  `0` disables the
+/// time-based cadence; durability falls back to the record-count cadence
+/// set by `--recovery-audit-sync-every` alone — the IEC 62304 Class C
+/// default semantics.  Operators who relax the record cadence pin a
+/// worst-case sync interval here.
+#[cfg(not(feature = "compile-time-config"))]
+pub const DEFAULT_AUDIT_SYNC_INTERVAL_MS: u32 = 0;
+
+/// Default value for `--audit-rotation-budget-ms`.  Rotation
+/// (rename × 5 + reopen + header + boot record + fsync) executes as a
+/// state machine; if a single tick exceeds this budget the state is
+/// preserved and resumed on the next tick.  Keeps a wedged filesystem
+/// from blocking the poll loop during rotation.
+#[cfg(not(feature = "compile-time-config"))]
+pub const DEFAULT_AUDIT_ROTATION_BUDGET_MS: u32 = 50;
+
 /// Parsed daemon configuration.
 #[derive(Clone, Debug)]
 pub struct Config {
@@ -302,6 +329,34 @@ pub struct Config {
     /// slowness.  Set by `--scrape-budget-ms`; defaults to
     /// [`crate::exporter::DEFAULT_SCRAPE_BUDGET`].
     pub scrape_budget: Duration,
+    /// Soft per-call budget for a single `fdatasync(2)` on the audit
+    /// log.  If one fsync exceeds this, the remaining records in the
+    /// current drain are written-to-BufWriter only and the fsync is
+    /// deferred to the next maintenance tick — bounds the worst-case
+    /// poll stall on a slow disk to one fsync per tick.  Increments
+    /// `varta_audit_fsync_budget_exceeded_total` on overrun.  Set by
+    /// `--audit-fsync-budget-ms`; defaults to
+    /// [`DEFAULT_AUDIT_FSYNC_BUDGET_MS`].  `0` is rejected.
+    pub audit_fsync_budget_ms: u32,
+    /// Time-based fdatasync cadence in addition to the record-count
+    /// cadence from `--recovery-audit-sync-every`.  `0` (default)
+    /// disables the time-based cadence; with a non-zero value, the
+    /// drain force-syncs after this many ms have elapsed since the
+    /// last sync even when the per-record threshold has not yet
+    /// been crossed.  Operators on safety-critical profiles keep
+    /// `--recovery-audit-sync-every=1` and ignore this flag; deployments
+    /// that relax the record cadence pin a worst-case sync interval
+    /// here.  Set by `--audit-sync-interval-ms`; defaults to
+    /// [`DEFAULT_AUDIT_SYNC_INTERVAL_MS`].
+    pub audit_sync_interval_ms: u32,
+    /// Per-tick wall-clock budget for the audit-log rotation state
+    /// machine.  Rotation (rename × 5 + reopen + header + boot record +
+    /// fsync) advances incrementally; if a tick exceeds this budget the
+    /// state is preserved and the next tick resumes.  Increments
+    /// `varta_audit_rotation_budget_exceeded_total` on overrun.  Set by
+    /// `--audit-rotation-budget-ms`; defaults to
+    /// [`DEFAULT_AUDIT_ROTATION_BUDGET_MS`].  `0` is rejected.
+    pub audit_rotation_budget_ms: u32,
     /// [test-hooks only] Sleep for this many milliseconds on the first poll
     /// iteration, simulating a wedged loop.  Used by the self-watchdog
     /// integration test (`tests/self_watchdog.rs`) to exercise the abort path

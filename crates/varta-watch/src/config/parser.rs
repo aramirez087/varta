@@ -97,6 +97,9 @@ impl Config {
         let mut recovery_capture_bytes: Option<u32> = None;
         let mut iteration_budget_ms: Option<u64> = None;
         let mut scrape_budget_ms: Option<u64> = None;
+        let mut audit_fsync_budget_ms: Option<u32> = None;
+        let mut audit_sync_interval_ms: Option<u32> = None;
+        let mut audit_rotation_budget_ms: Option<u32> = None;
         #[cfg(feature = "test-hooks")]
         let mut inject_wedge_ms: Option<u64> = None;
         let mut signal_handler_mode: Option<crate::signal_install::SignalHandlerMode> = None;
@@ -465,6 +468,48 @@ impl Config {
                         .ok_or(ConfigError::MissingValue("--scrape-budget-ms"))?;
                     scrape_budget_ms = Some(parse_u64("--scrape-budget-ms", &v)?);
                 }
+                "--audit-fsync-budget-ms" => {
+                    let v = iter
+                        .next()
+                        .ok_or(ConfigError::MissingValue("--audit-fsync-budget-ms"))?;
+                    let parsed = v.parse::<u32>().map_err(|_| ConfigError::BadInteger {
+                        flag: "--audit-fsync-budget-ms",
+                        raw: v.clone(),
+                    })?;
+                    if parsed == 0 {
+                        return Err(ConfigError::BadInteger {
+                            flag: "--audit-fsync-budget-ms",
+                            raw: v,
+                        });
+                    }
+                    audit_fsync_budget_ms = Some(parsed);
+                }
+                "--audit-sync-interval-ms" => {
+                    let v = iter
+                        .next()
+                        .ok_or(ConfigError::MissingValue("--audit-sync-interval-ms"))?;
+                    audit_sync_interval_ms =
+                        Some(v.parse::<u32>().map_err(|_| ConfigError::BadInteger {
+                            flag: "--audit-sync-interval-ms",
+                            raw: v,
+                        })?);
+                }
+                "--audit-rotation-budget-ms" => {
+                    let v = iter
+                        .next()
+                        .ok_or(ConfigError::MissingValue("--audit-rotation-budget-ms"))?;
+                    let parsed = v.parse::<u32>().map_err(|_| ConfigError::BadInteger {
+                        flag: "--audit-rotation-budget-ms",
+                        raw: v.clone(),
+                    })?;
+                    if parsed == 0 {
+                        return Err(ConfigError::BadInteger {
+                            flag: "--audit-rotation-budget-ms",
+                            raw: v,
+                        });
+                    }
+                    audit_rotation_budget_ms = Some(parsed);
+                }
                 other => return Err(ConfigError::UnknownFlag(other.to_string())),
             }
         }
@@ -696,6 +741,12 @@ impl Config {
             recovery_capture_bytes: recovery_capture_bytes_resolved,
             iteration_budget,
             scrape_budget,
+            audit_fsync_budget_ms: audit_fsync_budget_ms
+                .unwrap_or(super::types::DEFAULT_AUDIT_FSYNC_BUDGET_MS),
+            audit_sync_interval_ms: audit_sync_interval_ms
+                .unwrap_or(super::types::DEFAULT_AUDIT_SYNC_INTERVAL_MS),
+            audit_rotation_budget_ms: audit_rotation_budget_ms
+                .unwrap_or(super::types::DEFAULT_AUDIT_ROTATION_BUDGET_MS),
             #[cfg(feature = "test-hooks")]
             inject_wedge_ms,
             clock_source: clock_source.unwrap_or(ClockSource::Monotonic),
