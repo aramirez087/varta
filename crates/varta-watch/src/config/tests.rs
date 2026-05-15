@@ -1070,6 +1070,30 @@ fn recovery_env_defaults_to_empty() {
 }
 
 #[test]
+fn parses_recovery_inherit_env_flag() {
+    let cfg = Config::from_args(args(&[
+        "--socket",
+        "/s",
+        "--threshold-ms",
+        "100",
+        "--recovery-exec",
+        "/bin/true",
+        "--recovery-inherit-env",
+    ]))
+    .expect("parse");
+    assert!(cfg.recovery_inherit_env, "flag must enable inherit");
+}
+
+#[test]
+fn recovery_inherit_env_defaults_to_false() {
+    let cfg = Config::from_args(args(&["--socket", "/s", "--threshold-ms", "100"])).expect("parse");
+    assert!(
+        !cfg.recovery_inherit_env,
+        "recovery_inherit_env must default to false (secure)"
+    );
+}
+
+#[test]
 fn parses_heartbeat_file() {
     let cfg = Config::from_args(args(&[
         "--socket",

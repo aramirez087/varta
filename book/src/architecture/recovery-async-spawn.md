@@ -179,6 +179,43 @@ but the kill is surfaced no faster than one tick after the deadline.
   poll loop and is `!Send` by virtue of holding `std::process::Child`
   values, which is fine since the observer is single-threaded.
 
+## 7a. Recovery child environment policy
+
+Recovery subprocesses run with an **isolated environment by default**: the
+inherited observer environment is wiped, and the child only sees
+`PATH=/usr/bin:/bin` plus any explicit `--recovery-env KEY=VALUE` entries.
+This is the secure default since 2026-05-14 (cerebrum supersedes the prior
+"inherit by default" rationale).
+
+Rationale: observers typically run with secrets in their process
+environment — `AWS_*`, `GOOGLE_APPLICATION_CREDENTIALS`, OAuth bearer
+tokens, database URLs, Vault tokens. Inheriting that environment into a
+recovery child means any recovery template (or any binary on the recovery
+allowlist) becomes a credential-exfiltration vector. The blast radius is
+catastrophic and silent. We therefore default-clear.
+
+Configuration matrix:
+
+| Flags | Child env |
+|---|---|
+| *(none)* | `PATH=/usr/bin:/bin` only |
+| `--recovery-env KEY=VAL` (one or more) | `PATH=/usr/bin:/bin` + explicit allowlist |
+| `--recovery-inherit-env` | Full observer env inherited |
+| `--recovery-inherit-env --recovery-env KEY=VAL` | Inherited env + explicit overrides |
+
+**Migration from pre-2026-05-14 behaviour.** Operators whose recovery
+templates relied on inherited variables (e.g. `$HOME` for log paths) have
+two options:
+
+1. Preferred — allowlist explicitly: `--recovery-env HOME=/var/log/varta`.
+2. Escape hatch — full inheritance: pass `--recovery-inherit-env`. The
+   observer emits a one-shot stderr warning at startup naming the risk so
+   the choice is visible in SIEM/syslog audit trails alongside other
+   safety banners (shell-recovery, plaintext UDP, etc.).
+
+Enforcement is centralised in `Recovery::apply_env` (`recovery.rs`); both
+shell-mode and exec-mode children flow through it.
+
 ## 8. Out of scope for this epic
 
 - `varta-vlp` (frame ABI is frozen).

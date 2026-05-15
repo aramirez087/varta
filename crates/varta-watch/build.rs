@@ -290,6 +290,9 @@ fn render_constructor(parsed: &ParsedConfig, test_hooks_active: bool) -> String 
     } else {
         s.push_str("        recovery_env: Vec::new(),\n");
     }
+    // recovery_inherit_env (secure default: false).  When set to true in
+    // VARTA_CONFIG_FILE, the runtime emits a startup warning (see main.rs).
+    emit_bool(&mut s, parsed, "recovery_inherit_env");
     emit_option_path(&mut s, parsed, "file_export");
     emit_option_u64(&mut s, parsed, "export_file_max_bytes");
     let export_sync_every: u32 = singleton_u32(parsed, "export_file_sync_every", 0);

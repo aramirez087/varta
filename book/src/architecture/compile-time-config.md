@@ -103,7 +103,8 @@ strict_namespace_check = true
 | `recovery_cmd_file` | path | none | Read recovery_cmd from a hardened file. |
 | `recovery_exec_file` | path | none | Read recovery_exec_cmd from a hardened file. |
 | `recovery_debounce_ms` | u64 | `1000` | Per-pid debounce window. |
-| `recovery_env` | list-of-string | empty | `KEY=VALUE`; repeatable. |
+| `recovery_env` | list-of-string | empty | `KEY=VALUE`; repeatable. Layered on top of the base env chosen by `recovery_inherit_env`. |
+| `recovery_inherit_env` | bool | `false` | Inherit observer env into recovery children (legacy). Default-secure clears env to `PATH=/usr/bin:/bin`. |
 | `recovery_timeout_ms` | u64 | none | Kill-after deadline for recovery children. |
 | `recovery_audit_file` | path | none | TSV recovery audit log. |
 | `recovery_audit_max_bytes` | u64 | none | Audit-file rotation byte cap. |

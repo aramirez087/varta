@@ -105,6 +105,33 @@ iteration_budget_ms = 5
 }
 
 #[test]
+fn recovery_inherit_env_is_accepted_as_bool() {
+    let cfg = "\
+socket = /tmp/x.sock
+threshold_ms = 5000
+recovery_inherit_env = true
+";
+    let parsed = parse_kv(cfg).expect("parse recovery_inherit_env=true");
+    assert_eq!(
+        parsed
+            .singletons
+            .get("recovery_inherit_env")
+            .map(String::as_str),
+        Some("true")
+    );
+}
+
+#[test]
+fn recovery_inherit_env_default_is_absent() {
+    let cfg = "\
+socket = /tmp/x.sock
+threshold_ms = 5000
+";
+    let parsed = parse_kv(cfg).expect("parse without recovery_inherit_env");
+    assert!(!parsed.singletons.contains_key("recovery_inherit_env"));
+}
+
+#[test]
 fn recovery_audit_sync_every_zero_is_rejected() {
     let bad = "\
 socket = /tmp/x.sock

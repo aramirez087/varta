@@ -196,6 +196,12 @@ pub const FLAGS: &[FlagSpec] = &[
         feature: "",
     },
     FlagSpec {
+        cli: "--recovery-inherit-env",
+        key: "recovery_inherit_env",
+        kind: FlagKind::Bool,
+        feature: "",
+    },
+    FlagSpec {
         cli: "--recovery-timeout-ms",
         key: "recovery_timeout_ms",
         kind: FlagKind::U64,

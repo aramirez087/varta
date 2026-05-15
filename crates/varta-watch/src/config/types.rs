@@ -132,10 +132,18 @@ pub struct Config {
     /// Per-pid debounce window for `recovery_cmd` invocations.
     pub recovery_debounce: Duration,
     /// Environment variables passed to recovery child processes. Each entry
-    /// is in `KEY=VALUE` format. When set, the child's environment is cleared
-    /// to `PATH=/usr/bin:/bin` plus these explicit variables. When empty,
-    /// no environment variables are set (child inherits the observer's env).
+    /// is in `KEY=VALUE` format. Applied on top of the base env chosen by
+    /// [`Self::recovery_inherit_env`]: default-secure (cleared,
+    /// `PATH=/usr/bin:/bin` only) → these become an explicit allowlist;
+    /// inherit-mode → these override the inherited values for the named keys.
     pub recovery_env: Vec<String>,
+    /// Opt in to inheriting the observer's full environment for recovery
+    /// child processes. Default `false` (secure) — child env is cleared to
+    /// `PATH=/usr/bin:/bin` plus any explicit `recovery_env` entries.
+    /// Set via `--recovery-inherit-env`. See
+    /// `book/src/architecture/recovery.md` for the rationale and migration
+    /// guide.
+    pub recovery_inherit_env: bool,
     /// Optional path the file exporter appends one event-line per record to.
     pub file_export: Option<PathBuf>,
     /// Optional byte limit for the file export. When exceeded, the current

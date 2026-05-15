@@ -49,6 +49,7 @@ impl Config {
         let mut recovery_exec_file: Option<PathBuf> = None;
         let mut recovery_debounce_ms: Option<u64> = None;
         let mut recovery_env: Vec<String> = Vec::new();
+        let mut recovery_inherit_env: bool = false;
         let mut file_export: Option<PathBuf> = None;
         let mut export_file_max_bytes: Option<u64> = None;
         let mut export_file_sync_every: u32 = 0;
@@ -153,6 +154,9 @@ impl Config {
                         .next()
                         .ok_or(ConfigError::MissingValue("--recovery-env"))?;
                     recovery_env.push(v);
+                }
+                "--recovery-inherit-env" => {
+                    recovery_inherit_env = true;
                 }
                 "--socket-mode" => {
                     let v = iter
@@ -702,6 +706,7 @@ impl Config {
             recovery_exec_file,
             recovery_debounce,
             recovery_env,
+            recovery_inherit_env,
             file_export,
             export_file_max_bytes,
             export_file_sync_every,

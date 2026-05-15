@@ -512,6 +512,31 @@ fn run(cfg: Config) -> std::io::Result<()> {
         );
     }
 
+    // Audit-trail warning when the operator opts into legacy env inheritance
+    // for recovery child processes.  The default is to clear the child env
+    // (see `Recovery::apply_env`); the opt-in flag pulls in the observer's
+    // full env, which may contain secrets (`AWS_*`, OAuth bearers, database
+    // URLs, etc.).  Surfacing this once at startup ensures the choice is
+    // visible in any SIEM / syslog ingest alongside the other safety banners.
+    if cfg.recovery_inherit_env && recovery_mode.is_some() {
+        #[cfg(not(feature = "compile-time-config"))]
+        varta_warn!(
+            "--recovery-inherit-env is set: recovery child processes will inherit \
+             the observer's full environment. Audit the observer env for secrets \
+             (AWS_*, *_TOKEN, OAuth bearers, database URLs) before production. \
+             Prefer --recovery-env KEY=VALUE for explicit allowlisting."
+        );
+        // Class-A: the argv parser is excluded, but compile-time config can
+        // still enable inheritance.  Use neutral wording with no flag-name
+        // literals (cerebrum 2026-05-13 strings-audit discipline).
+        #[cfg(feature = "compile-time-config")]
+        varta_warn!(
+            "recovery child env inheritance is enabled (compile-time config); \
+             recovery subprocesses inherit the observer's environment. Audit \
+             observer env for secrets before deployment."
+        );
+    }
+
     // Optional audit log — opened once at startup. The same hardened
     // permission check (mode 0600, owned by observer UID) used for key/
     // token files protects the audit path: never publish recovery
@@ -638,6 +663,7 @@ fn run(cfg: Config) -> std::io::Result<()> {
         // fire just like `KernelAttested` ones — trust is structural.
         Recovery::with_timeout(mode, cfg.recovery_debounce, cfg.recovery_timeout)
             .with_recovery_env(cfg.recovery_env.clone())
+            .with_recovery_inherit_env(cfg.recovery_inherit_env)
             .with_shutdown_grace(cfg.shutdown_grace)
             .with_capture(capture_cap)
             .with_source(recovery_source.clone())

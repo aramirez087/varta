@@ -8,6 +8,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Security
+- **Recovery child environment is now isolated by default.** Pre-change,
+  `Recovery::apply_env` short-circuited when `recovery_env` was empty, so
+  recovery subprocesses inherited the observer's full process environment —
+  any `AWS_*`, `GOOGLE_APPLICATION_CREDENTIALS`, `*_TOKEN`, OAuth bearer, or
+  database URL set on the observer would leak into every recovery command.
+  The blast radius was silent: a misconfigured or compromised
+  `--recovery-cmd` / `--recovery-exec` (or any binary on the recovery
+  allowlist) became a credential-exfiltration vector. The new default
+  clears the child's environment and sets `PATH=/usr/bin:/bin` plus any
+  explicit `--recovery-env KEY=VALUE` entries. The new
+  `--recovery-inherit-env` flag (or `recovery_inherit_env=true` in
+  `VARTA_CONFIG_FILE`) restores legacy inheritance; when set, the observer
+  emits a one-shot stderr warning naming the risk. See
+  `book/src/architecture/recovery-async-spawn.md` §7a for the migration
+  guide. **Breaking behavioural change** for operators whose recovery
+  templates relied on inherited variables (e.g. `$HOME`) — failures are
+  loud (the recovery command itself fails), not silent.
 - **Zero `HashMap` in `varta-watch` production code.** The two remaining `std::collections::HashMap` sites (`Recovery.outstanding` and `PromExporter.ip_state`) have been replaced with a new generic `BoundedIndex<K>` (Murmur3 finalizer + 64-step linear probe + sentinel-encoded `slot_idx`) plus slab-backed wrappers (`OutstandingTable`, `IpStateTable`). `PidIndex` is now a thin newtype over `BoundedIndex<u32>`. Every map-like structure in `varta-watch` now has a tight WCET bound suitable for DO-178C-style worst-case analysis; SipHash randomisation and rehash-induced latency are structurally excluded. Three new Prometheus counters surface probe-budget exhaustion (`varta_tracker_pid_index_probe_exhausted_total`, `varta_recovery_outstanding_probe_exhausted_total`, `varta_prom_ip_state_probe_exhausted_total`) — all should remain at 0 at load factor ≤ 0.5. A new fail-closed `RecoveryOutcome::RefusedOutstandingCapacity` variant fires when the outstanding-child table is at capacity, mirroring the existing `RefusedDebounceCapacity` pattern.
 - **Continuous fuzzing posture upgraded to nightly long-form + OSS-Fuzz.** The CI `fuzz-smoke` job picks up the previously-missing `flag_catalogue_lookup` target plus four new targets for the bounded-collection modules (`bounded_index_u32`, `bounded_index_ip`, `outstanding_table`, `ip_state_table`), each running 30 s per push/PR. A new `fuzz-nightly.yml` workflow runs all twelve targets for 30 minutes nightly with a persistent corpus cache and auto-opens an issue on any crash. The `oss-fuzz/` directory ships the upstream Dockerfile / build.sh / project.yaml so the project can be registered with Google's OSS-Fuzz infrastructure.
 

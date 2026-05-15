@@ -532,10 +532,20 @@ pub struct Recovery {
     refused_outstanding_capacity: u64,
     pending_outcomes: Vec<RecoveryOutcome>,
     /// Explicit environment variables for child processes in `KEY=VALUE`
-    /// format. When non-empty, the child's environment is cleared to
-    /// `PATH=/usr/bin:/bin` plus these variables. When empty, the child
-    /// inherits the observer's environment (backward compatible).
+    /// format. Always applied on top of the env produced by
+    /// [`Self::recovery_inherit_env`] — either added to a cleared
+    /// `PATH=/usr/bin:/bin`-only env (default, secure) or layered on top of
+    /// the observer's inherited env (when `recovery_inherit_env` is true).
     recovery_env: Vec<String>,
+    /// When `true`, recovery child processes inherit the observer's full
+    /// environment (legacy behavior). When `false` (default), the child's
+    /// environment is cleared to `PATH=/usr/bin:/bin` plus any
+    /// [`Self::recovery_env`] overrides. Opt-in via `--recovery-inherit-env`.
+    /// Inversion of the pre-2026-05-14 default; see
+    /// `book/src/architecture/recovery.md` for the rationale (sensitive
+    /// observer env vars such as `AWS_*` or `*_TOKEN` would otherwise leak
+    /// into recovery subprocesses).
+    recovery_inherit_env: bool,
     /// Maximum wall-clock time the [`Drop`] impl will block waiting for
     /// outstanding children to exit after issuing `kill(2)`. Children that
     /// outlive the grace are abandoned to PID 1 (init) for reaping.  Tuned
@@ -644,6 +654,7 @@ impl Recovery {
             refused_outstanding_capacity: 0,
             pending_outcomes: Vec::new(),
             recovery_env: Vec::new(),
+            recovery_inherit_env: false,
             shutdown_grace: Duration::from_millis(crate::config::DEFAULT_SHUTDOWN_GRACE_MS),
             audit_sink: None,
             capture_cap: 0,
@@ -951,12 +962,29 @@ impl Recovery {
 
     /// Set explicit environment variables for child processes.
     ///
-    /// Each entry is in `KEY=VALUE` format. When non-empty, the child's
-    /// environment is cleared to `PATH=/usr/bin:/bin` plus these variables.
-    /// When empty, the child inherits the observer's environment (backward
-    /// compatible default).
+    /// Each entry is in `KEY=VALUE` format. Applied on top of whichever base
+    /// env [`Self::with_recovery_inherit_env`] selects: by default the base
+    /// is a cleared env containing only `PATH=/usr/bin:/bin`, so these entries
+    /// form an explicit allowlist. When inherit is enabled, these entries
+    /// override the inherited values for the named keys.
     pub fn with_recovery_env(mut self, env: Vec<String>) -> Self {
         self.recovery_env = env;
+        self
+    }
+
+    /// Opt in to inheriting the observer's full environment for recovery
+    /// children (legacy behavior).
+    ///
+    /// Default: `false`. The secure default clears the child's environment
+    /// to `PATH=/usr/bin:/bin` plus any [`Self::with_recovery_env`] overrides,
+    /// preventing observer-side secrets (`AWS_*`, `*_TOKEN`, OAuth bearers,
+    /// database URLs) from leaking into recovery subprocesses.
+    ///
+    /// Set to `true` only when a recovery template depends on inherited
+    /// variables (e.g. `$HOME`, `$LANG`) and the observer's environment has
+    /// been audited.
+    pub fn with_recovery_inherit_env(mut self, inherit: bool) -> Self {
+        self.recovery_inherit_env = inherit;
         self
     }
 
@@ -1455,16 +1483,20 @@ impl Recovery {
 
     /// Apply environment isolation to a child [`Command`].
     ///
-    /// When [`Self::recovery_env`] is non-empty, clears the environment to
-    /// `PATH=/usr/bin:/bin` plus the explicitly configured variables.  When
-    /// empty, does nothing (child inherits the observer's environment,
-    /// preserving backward compatibility).
+    /// Default (secure): clears the child's environment, sets
+    /// `PATH=/usr/bin:/bin`, then applies any [`Self::recovery_env`] entries
+    /// as an explicit allowlist. Prevents observer-side secrets (`AWS_*`,
+    /// `*_TOKEN`, OAuth bearers) from leaking into recovery subprocesses.
+    ///
+    /// When [`Self::recovery_inherit_env`] is `true`, the observer's full
+    /// environment is inherited and `recovery_env` entries layer on top as
+    /// overrides — legacy behavior for templates that depend on inherited
+    /// `$HOME`/`$LANG`/etc.
     fn apply_env(&self, cmd: &mut Command) {
-        if self.recovery_env.is_empty() {
-            return;
+        if !self.recovery_inherit_env {
+            cmd.env_clear();
+            cmd.env("PATH", "/usr/bin:/bin");
         }
-        cmd.env_clear();
-        cmd.env("PATH", "/usr/bin:/bin");
         for entry in &self.recovery_env {
             if let Some((key, value)) = entry.split_once('=') {
                 cmd.env(key, value);
@@ -1978,7 +2010,7 @@ mod tests {
                 });
                 assert!(
                     matches!(reaped, Some(s) if s.success()),
-                    "HOME should not be set when recovery_env is non-empty; got {reaped:?}"
+                    "HOME should not be set under default (cleared) env policy; got {reaped:?}"
                 );
             }
             other => panic!("expected Spawned, got {other:?}"),
@@ -2015,14 +2047,28 @@ mod tests {
 
     #[cfg(feature = "unsafe-shell-recovery")]
     #[test]
-    fn no_env_isolation_preserves_inherited_env() {
+    fn default_env_clears_inherited_env_even_without_overrides() {
+        // Secure default (post-2026-05-14): with neither --recovery-env nor
+        // --recovery-inherit-env set, the child must NOT see the observer's
+        // env. Asserts the inverse of the legacy behavior that would have
+        // leaked AWS_*/`*_TOKEN`/etc. into recovery subprocesses.
+        // SAFETY: this test mutates process env. It runs with no other env-
+        // sensitive tests in parallel because each test thread shares the
+        // same process. Using a uniquely-named var avoids cross-test races.
+        const SENTINEL: &str = "VARTA_TEST_LEAK_SENTINEL_DEFAULT";
+        // SAFETY: set_var is unsafe in 2024 edition; we accept the global
+        // mutation risk because the sentinel name is unique and we restore
+        // it on the way out.
+        unsafe {
+            std::env::set_var(SENTINEL, "must-not-leak");
+        }
         let mut rec = Recovery::with_timeout(
-            RecoveryMode::Shell("test -n \"$HOME\"".to_string()),
+            RecoveryMode::Shell(format!("test -z \"${SENTINEL}\"")),
             Duration::ZERO,
             None,
         );
-        // Default: recovery_env is empty → inherits observer's environment.
-        match rec.on_stall(1, BeatOrigin::KernelAttested, false) {
+        let outcome = rec.on_stall(1, BeatOrigin::KernelAttested, false);
+        match outcome {
             RecoveryOutcome::Spawned { .. } => {
                 std::thread::sleep(Duration::from_millis(100));
                 let outcomes = rec.try_reap();
@@ -2030,12 +2076,106 @@ mod tests {
                     RecoveryOutcome::Reaped { status, .. } => Some(status),
                     _ => None,
                 });
+                // SAFETY: restore env before any assertion can panic so we
+                // do not poison sibling tests.
+                unsafe {
+                    std::env::remove_var(SENTINEL);
+                }
                 assert!(
                     matches!(reaped, Some(s) if s.success()),
-                    "HOME should be inherited when recovery_env is empty; got {reaped:?}"
+                    "sentinel env var must NOT be inherited under default env policy; got {reaped:?}"
                 );
             }
-            other => panic!("expected Spawned, got {other:?}"),
+            other => {
+                unsafe {
+                    std::env::remove_var(SENTINEL);
+                }
+                panic!("expected Spawned, got {other:?}");
+            }
+        }
+    }
+
+    #[cfg(feature = "unsafe-shell-recovery")]
+    #[test]
+    fn inherit_env_opt_in_restores_legacy_inheritance() {
+        // With --recovery-inherit-env, the child sees the observer's env.
+        const SENTINEL: &str = "VARTA_TEST_LEAK_SENTINEL_OPTIN";
+        unsafe {
+            std::env::set_var(SENTINEL, "expected-to-be-inherited");
+        }
+        let mut rec = Recovery::with_timeout(
+            RecoveryMode::Shell(format!(
+                "test \"${SENTINEL}\" = \"expected-to-be-inherited\""
+            )),
+            Duration::ZERO,
+            None,
+        )
+        .with_recovery_inherit_env(true);
+        let outcome = rec.on_stall(1, BeatOrigin::KernelAttested, false);
+        match outcome {
+            RecoveryOutcome::Spawned { .. } => {
+                std::thread::sleep(Duration::from_millis(100));
+                let outcomes = rec.try_reap();
+                let reaped = outcomes.into_iter().find_map(|o| match o {
+                    RecoveryOutcome::Reaped { status, .. } => Some(status),
+                    _ => None,
+                });
+                unsafe {
+                    std::env::remove_var(SENTINEL);
+                }
+                assert!(
+                    matches!(reaped, Some(s) if s.success()),
+                    "sentinel env var must be inherited when --recovery-inherit-env is set; got {reaped:?}"
+                );
+            }
+            other => {
+                unsafe {
+                    std::env::remove_var(SENTINEL);
+                }
+                panic!("expected Spawned, got {other:?}");
+            }
+        }
+    }
+
+    #[cfg(feature = "unsafe-shell-recovery")]
+    #[test]
+    fn inherit_env_layered_with_explicit_overrides_takes_overrides() {
+        // With --recovery-inherit-env AND --recovery-env KEY=NEW, the
+        // override wins for that KEY even when the inherited value differs.
+        const KEY: &str = "VARTA_TEST_OVERRIDE_KEY";
+        unsafe {
+            std::env::set_var(KEY, "inherited-value");
+        }
+        let mut rec = Recovery::with_timeout(
+            RecoveryMode::Shell(format!("test \"${KEY}\" = \"override-value\"")),
+            Duration::ZERO,
+            None,
+        )
+        .with_recovery_inherit_env(true)
+        .with_recovery_env(vec![format!("{KEY}=override-value")]);
+        let outcome = rec.on_stall(1, BeatOrigin::KernelAttested, false);
+        match outcome {
+            RecoveryOutcome::Spawned { .. } => {
+                std::thread::sleep(Duration::from_millis(100));
+                let outcomes = rec.try_reap();
+                let reaped = outcomes.into_iter().find_map(|o| match o {
+                    RecoveryOutcome::Reaped { status, .. } => Some(status),
+                    _ => None,
+                });
+                unsafe {
+                    std::env::remove_var(KEY);
+                }
+                assert!(
+                    matches!(reaped, Some(s) if s.success()),
+                    "explicit --recovery-env override must beat inherited value; got {reaped:?}"
+                );
+            }
+            other => {
+                unsafe {
+                    std::env::remove_var(KEY);
+                }
+                panic!("expected Spawned, got {other:?}");
+            }
         }
     }
 

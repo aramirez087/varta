@@ -830,10 +830,33 @@ fn recovery_timeout_kill_after() {
 
 // ===== A5: --recovery-env (environment isolation) E2E ========================
 
-/// Spawns varta-watch with `--recovery-env VARTA_E2E_ENV=works`, uses a
-/// shell command that tests the env var and touches a marker only when set.
-/// Then verifies absence of env isolation still inherits `$HOME`.
+/// Three observers, three policies:
+///   1. `--recovery-env VARTA_E2E_ENV=works` (no inherit): allowlist works.
+///   2. neither flag (secure default): `$VARTA_E2E_SECRET` planted in the
+///      test process env is NOT leaked into the recovery child. This is the
+///      regression test for the post-2026-05-14 inversion of the default
+///      env policy (formerly: full inheritance, allowing AWS_*/`*_TOKEN`
+///      leakage into recovery subprocesses).
+///   3. `--recovery-inherit-env` (explicit opt-in): the same planted
+///      sentinel IS visible to the recovery child, confirming the legacy
+///      escape hatch is wired correctly.
+///
+/// The sentinel `VARTA_E2E_SECRET` is `set_var` on the test process for the
+/// duration of this test and removed at the end.  The custom test runner
+/// (`harness = false` in `main()`) executes contract tests sequentially,
+/// so cross-test env races are not a concern.
+#[allow(unsafe_code)]
 fn recovery_env_isolation() {
+    const SENTINEL_KEY: &str = "VARTA_E2E_SECRET";
+    const SENTINEL_VAL: &str = "must-not-leak";
+
+    // SAFETY: see crate-level note above (sequential runner).  We restore the
+    // env on every exit path below.
+    unsafe {
+        std::env::set_var(SENTINEL_KEY, SENTINEL_VAL);
+    }
+
+    // --- Observer 1: --recovery-env allowlist works ---
     let tmp = TempDir::new("renv");
     let socket = tmp.path().join("varta.sock");
     let marker_isolated = tmp.path().join("env-isolated.marker");
@@ -865,37 +888,28 @@ fn recovery_env_isolation() {
         "varta-watch did not bind socket within 3s"
     );
 
-    {
-        let mut agent = Varta::connect(&socket).expect("Varta::connect");
-        for _ in 0..10 {
-            let mut tries = 0u32;
-            loop {
-                match agent.beat(Status::Ok, 0) {
-                    BeatOutcome::Sent => break,
-                    BeatOutcome::Dropped => {
-                        tries += 1;
-                        if tries > 5_000 {
-                            panic!("kernel never accepted a beat");
-                        }
-                        std::thread::sleep(Duration::from_micros(500));
-                    }
-                    BeatOutcome::Failed(e) => panic!("unexpected hard failure: {e}"),
-                }
-            }
-        }
-    }
+    drive_beats(&socket, "observer 1");
 
     std::thread::sleep(Duration::from_millis(400));
-    assert!(
-        wait_until(|| marker_isolated.exists(), Duration::from_secs(3)),
-        "env-isolated marker did not appear"
-    );
+    let ok1 = wait_until(|| marker_isolated.exists(), Duration::from_secs(3));
+    if !ok1 {
+        unsafe {
+            std::env::remove_var(SENTINEL_KEY);
+        }
+        panic!("env-isolated marker did not appear");
+    }
 
-    // --- Second observer: no --recovery-env → $HOME should be inherited ---
-    let tmp2 = TempDir::new("renv-v2");
+    // --- Observer 2: secure default — sentinel must NOT leak into child ---
+    let tmp2 = TempDir::new("renv-default");
     let socket2 = tmp2.path().join("varta.sock");
-    let marker_inherited = tmp2.path().join("env-inherited.marker");
-    let cmd2 = format!("test -n \"$HOME\" && touch {}", marker_inherited.display());
+    let marker_secure = tmp2.path().join("secure-default.marker");
+    // Touch the marker ONLY when the sentinel is absent.  If the secret
+    // leaked into the recovery child, the marker is never created and the
+    // wait_until below times out, failing the test loudly.
+    let cmd2 = format!(
+        "test -z \"${SENTINEL_KEY}\" && touch {}",
+        marker_secure.display()
+    );
 
     let (mut child2, _prom_addr2) = spawn_watch(&[
         "--socket",
@@ -913,36 +927,100 @@ fn recovery_env_isolation() {
     ]);
     let _guard2 = ChildGuard(&mut child2);
 
-    assert!(
-        wait_until(|| socket2.exists(), Duration::from_secs(3)),
-        "varta-watch v2 did not bind socket within 3s"
+    let ok2_socket = wait_until(|| socket2.exists(), Duration::from_secs(3));
+    if !ok2_socket {
+        unsafe {
+            std::env::remove_var(SENTINEL_KEY);
+        }
+        panic!("varta-watch v2 did not bind socket within 3s");
+    }
+
+    drive_beats(&socket2, "observer 2");
+
+    std::thread::sleep(Duration::from_millis(400));
+    let ok2 = wait_until(|| marker_secure.exists(), Duration::from_secs(3));
+    if !ok2 {
+        unsafe {
+            std::env::remove_var(SENTINEL_KEY);
+        }
+        panic!(
+            "secure-default marker did not appear: sentinel {SENTINEL_KEY} \
+             must not be visible to recovery children when --recovery-inherit-env \
+             is absent (was the default flipped back to inherit?)"
+        );
+    }
+
+    // --- Observer 3: --recovery-inherit-env restores legacy inheritance ---
+    let tmp3 = TempDir::new("renv-inherit");
+    let socket3 = tmp3.path().join("varta.sock");
+    let marker_inherit = tmp3.path().join("inherit-optin.marker");
+    let cmd3 = format!(
+        "test \"${SENTINEL_KEY}\" = \"{SENTINEL_VAL}\" && touch {}",
+        marker_inherit.display()
     );
 
-    {
-        let mut agent = Varta::connect(&socket2).expect("Varta::connect v2");
-        for _ in 0..10 {
-            let mut tries = 0u32;
-            loop {
-                match agent.beat(Status::Ok, 0) {
-                    BeatOutcome::Sent => break,
-                    BeatOutcome::Dropped => {
-                        tries += 1;
-                        if tries > 5_000 {
-                            panic!("kernel never accepted a beat v2");
-                        }
-                        std::thread::sleep(Duration::from_micros(500));
+    let (mut child3, _prom_addr3) = spawn_watch(&[
+        "--socket",
+        socket3.to_str().unwrap(),
+        "--threshold-ms",
+        "200",
+        "--recovery-cmd",
+        &cmd3,
+        "--recovery-debounce-ms",
+        "0",
+        "--recovery-inherit-env",
+        "--prom-addr",
+        "127.0.0.1:0",
+        "--shutdown-after-secs",
+        "10",
+    ]);
+    let _guard3 = ChildGuard(&mut child3);
+
+    let ok3_socket = wait_until(|| socket3.exists(), Duration::from_secs(3));
+    if !ok3_socket {
+        unsafe {
+            std::env::remove_var(SENTINEL_KEY);
+        }
+        panic!("varta-watch v3 did not bind socket within 3s");
+    }
+
+    drive_beats(&socket3, "observer 3");
+
+    std::thread::sleep(Duration::from_millis(400));
+    let ok3 = wait_until(|| marker_inherit.exists(), Duration::from_secs(3));
+
+    // Always restore the env before any final panic.
+    unsafe {
+        std::env::remove_var(SENTINEL_KEY);
+    }
+    assert!(
+        ok3,
+        "inherit-optin marker did not appear: --recovery-inherit-env must \
+         restore legacy inheritance so {SENTINEL_KEY} is visible to the child"
+    );
+}
+
+/// Drive enough beats through the agent socket to push the observer past
+/// its stall threshold and trigger recovery.  Shared by the three sub-cases
+/// of [`recovery_env_isolation`].
+fn drive_beats(socket: &Path, tag: &str) {
+    let mut agent = Varta::connect(socket).unwrap_or_else(|e| panic!("Varta::connect {tag}: {e}"));
+    for _ in 0..10 {
+        let mut tries = 0u32;
+        loop {
+            match agent.beat(Status::Ok, 0) {
+                BeatOutcome::Sent => break,
+                BeatOutcome::Dropped => {
+                    tries += 1;
+                    if tries > 5_000 {
+                        panic!("kernel never accepted a beat ({tag})");
                     }
-                    BeatOutcome::Failed(e) => panic!("unexpected hard failure v2: {e}"),
+                    std::thread::sleep(Duration::from_micros(500));
                 }
+                BeatOutcome::Failed(e) => panic!("unexpected hard failure ({tag}): {e}"),
             }
         }
     }
-
-    std::thread::sleep(Duration::from_millis(400));
-    assert!(
-        wait_until(|| marker_inherited.exists(), Duration::from_secs(3)),
-        "inherited-env marker did not appear (HOME should be present without --recovery-env)"
-    );
 }
 
 // ===== M1: recovery audit log E2E ===========================================

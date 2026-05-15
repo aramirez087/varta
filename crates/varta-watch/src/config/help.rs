@@ -51,12 +51,21 @@ OPTIONAL:
     --recovery-debounce-ms <MS>    Per-pid debounce window for recovery
                                      invocations (default 1000).
     --recovery-env <KEY=VALUE>     Repeatable. Pass an environment variable
-                                     to recovery child processes. When set,
-                                     the child's environment is cleared and
-                                     only PATH=/usr/bin:/bin plus these
-                                     explicit variables are set. Without this
-                                     flag the child inherits the observer's
-                                     environment.
+                                     to recovery child processes. Layered on
+                                     top of the base env (cleared by default;
+                                     inherited if --recovery-inherit-env is
+                                     set).
+    --recovery-inherit-env         Inherit the observer's full environment
+                                     into recovery child processes (legacy
+                                     behaviour). WARNING: any AWS_*,
+                                     *_TOKEN, OAuth bearers, or database
+                                     URLs in the observer's env will be
+                                     visible to recovery subprocesses. The
+                                     default (without this flag) is to
+                                     clear the child env to PATH=/usr/bin:
+                                     /bin plus any explicit --recovery-env
+                                     entries. Use --recovery-env KEY=VAL
+                                     instead of this flag whenever feasible.
     --socket-mode <OCTAL>           File mode for the observer socket
                                      (default 0600 — owner-only r/w).
     --export-file <PATH>            Append one tab-separated event line per
