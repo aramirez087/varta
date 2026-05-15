@@ -25,7 +25,7 @@ use varta_vlp::crypto::{open, seal};
 // Helper: roundtrip a single (key, nonce, plaintext) tuple and assert success.
 // ---------------------------------------------------------------------------
 fn assert_roundtrip(key: &[u8; 32], nonce: &[u8; 12], plaintext: &[u8; 32]) {
-    let (ciphertext, tag) = seal(key, nonce, b"", plaintext);
+    let (ciphertext, tag) = seal(key, nonce, b"", plaintext).expect("seal must succeed");
     let decrypted = open(key, nonce, b"", &ciphertext, &tag)
         .unwrap_or_else(|_| panic!("roundtrip failed for a valid seal"));
     assert_eq!(
@@ -62,7 +62,7 @@ proptest! {
         if k1 == k2 {
             return Ok(());
         }
-        let (ciphertext, tag) = seal(&k1, &nonce, b"", &plaintext);
+        let (ciphertext, tag) = seal(&k1, &nonce, b"", &plaintext).expect("seal must succeed");
         let result = open(&k2, &nonce, b"", &ciphertext, &tag);
         prop_assert!(result.is_err(), "wrong key must be detected");
     }
@@ -77,7 +77,7 @@ proptest! {
         flip_byte in 0usize..32,
         flip_bit in 0u8..8,
     ) {
-        let (mut ciphertext, tag) = seal(&key, &nonce, b"", &plaintext);
+        let (mut ciphertext, tag) = seal(&key, &nonce, b"", &plaintext).expect("seal must succeed");
         ciphertext[flip_byte] ^= 1u8 << flip_bit;
         let result = open(&key, &nonce, b"", &ciphertext, &tag);
         prop_assert!(result.is_err(), "tampered ciphertext must be detected");
@@ -94,7 +94,7 @@ proptest! {
         flip_byte in 0usize..16,
         flip_bit in 0u8..8,
     ) {
-        let (ciphertext, mut tag) = seal(&key, &nonce, b"", &plaintext);
+        let (ciphertext, mut tag) = seal(&key, &nonce, b"", &plaintext).expect("seal must succeed");
         tag[flip_byte] ^= 1u8 << flip_bit;
         let result = open(&key, &nonce, b"", &ciphertext, &tag);
         prop_assert!(result.is_err(), "tampered tag must be detected");
@@ -110,8 +110,8 @@ proptest! {
         nonce in uniform::<_, 12>(any::<u8>()),
         plaintext in uniform::<_, 32>(any::<u8>()),
     ) {
-        let (ct1, tag1) = seal(&key, &nonce, b"", &plaintext);
-        let (ct2, tag2) = seal(&key, &nonce, b"", &plaintext);
+        let (ct1, tag1) = seal(&key, &nonce, b"", &plaintext).expect("seal must succeed");
+        let (ct2, tag2) = seal(&key, &nonce, b"", &plaintext).expect("seal must succeed");
         prop_assert_eq!(ct1, ct2, "encryption must be deterministic");
         prop_assert_eq!(tag1, tag2, "tag must be deterministic");
     }
@@ -127,7 +127,7 @@ proptest! {
         if n1 == n2 {
             return Ok(());
         }
-        let (ciphertext, tag) = seal(&key, &n1, b"", &plaintext);
+        let (ciphertext, tag) = seal(&key, &n1, b"", &plaintext).expect("seal must succeed");
         let result = open(&key, &n2, b"", &ciphertext, &tag);
         prop_assert!(result.is_err(), "wrong nonce must be detected");
     }
@@ -145,12 +145,13 @@ proptest! {
         iv_counter in any::<u32>(),
         plaintext in uniform::<_, 32>(any::<u8>()),
     ) {
-        let prefix = derive_iv_prefix(&session_salt, prefix_index);
+        let prefix =
+            derive_iv_prefix(&session_salt, prefix_index).expect("kdf must succeed");
         let mut nonce = [0u8; 12];
         nonce[..8].copy_from_slice(&prefix);
         nonce[8..].copy_from_slice(&iv_counter.to_le_bytes());
 
-        let (ciphertext, tag) = seal(&key, &nonce, b"", &plaintext);
+        let (ciphertext, tag) = seal(&key, &nonce, b"", &plaintext).expect("seal must succeed");
         let decrypted = open(&key, &nonce, b"", &ciphertext, &tag)
             .expect("rotated-prefix round-trip must decrypt");
         prop_assert_eq!(&decrypted, &plaintext);
@@ -169,8 +170,8 @@ proptest! {
         if idx_a == idx_b {
             return Ok(());
         }
-        let p_a = derive_iv_prefix(&session_salt, idx_a);
-        let p_b = derive_iv_prefix(&session_salt, idx_b);
+        let p_a = derive_iv_prefix(&session_salt, idx_a).expect("kdf must succeed");
+        let p_b = derive_iv_prefix(&session_salt, idx_b).expect("kdf must succeed");
         // Cryptographically extreme to collide on 64 bits.
         prop_assert_ne!(p_a, p_b);
     }

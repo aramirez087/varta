@@ -38,7 +38,7 @@
 use hkdf::Hkdf;
 use sha2::Sha256;
 
-use super::Key;
+use super::{KdfError, Key};
 
 /// Derive a per-agent 256-bit key from a master key and agent identity.
 ///
@@ -50,21 +50,20 @@ use super::Key;
 /// Different agent IDs produce independent uniformly-distributed output
 /// keys. The info-string domain separator (`varta-agent-v1`) ensures
 /// no key overlap with epoch derivation.
-pub fn derive_agent_key(master: &Key, agent_id: u32) -> Key {
+/// # Errors
+///
+/// Returns `Err(KdfError)` if HKDF expand fails. Unreachable for VLP's fixed
+/// `[u8; 32]` OKM against the pinned `hkdf` crate, but surfaced as `Result`
+/// so any future upstream change is observable rather than a silent abort.
+pub fn derive_agent_key(master: &Key, agent_id: u32) -> Result<Key, KdfError> {
     let hk = Hkdf::<Sha256>::new(None, master.as_bytes());
     // info = "varta-agent-v1\0" (15 bytes) || agent_id LE (4 bytes)
     let mut info = [0u8; 19];
     info[..15].copy_from_slice(b"varta-agent-v1\0");
     info[15..].copy_from_slice(&agent_id.to_le_bytes());
     let mut okm = [0u8; 32];
-    match hk.expand(&info, &mut okm) {
-        Ok(()) => {}
-        // `hkdf::InvalidLength` fires only when `okm.len() > 255 * 32 = 8160`
-        // bytes (HKDF-SHA256's expansion limit). `okm` is a fixed `[u8; 32]`.
-        // Unreachable by construction.
-        Err(_) => unreachable!("32-byte HKDF-SHA256 expand is infallible"),
-    }
-    Key::from_bytes(okm)
+    hk.expand(&info, &mut okm).map_err(|_| KdfError)?;
+    Ok(Key::from_bytes(okm))
 }
 
 /// Derive an 8-byte IV prefix from a 16-byte session salt and a `u32` index.
@@ -83,20 +82,20 @@ pub fn derive_agent_key(master: &Key, agent_id: u32) -> Key {
 /// this yields 2^64 unique nonces per session (~584M years at 1 kHz beat
 /// rate). The info string `varta-iv-prefix-v1` provides domain separation
 /// from `derive_agent_key` and `derive_epoch_key`.
-pub fn derive_iv_prefix(session_salt: &[u8; 16], prefix_index: u32) -> [u8; 8] {
+/// # Errors
+///
+/// Returns `Err(KdfError)` if HKDF expand fails. Unreachable for VLP's fixed
+/// `[u8; 8]` OKM against the pinned `hkdf` crate, but surfaced as `Result`
+/// so any future upstream change is observable rather than a silent abort.
+pub fn derive_iv_prefix(session_salt: &[u8; 16], prefix_index: u32) -> Result<[u8; 8], KdfError> {
     let hk = Hkdf::<Sha256>::new(None, session_salt);
     // info = "varta-iv-prefix-v1\0" (19 bytes) || prefix_index LE (4 bytes)
     let mut info = [0u8; 23];
     info[..19].copy_from_slice(b"varta-iv-prefix-v1\0");
     info[19..].copy_from_slice(&prefix_index.to_le_bytes());
     let mut okm = [0u8; 8];
-    match hk.expand(&info, &mut okm) {
-        Ok(()) => {}
-        // `hkdf::InvalidLength` fires only when `okm.len() > 255 * 32 = 8160`
-        // bytes. `okm` is a fixed `[u8; 8]`. Unreachable by construction.
-        Err(_) => unreachable!("8-byte HKDF-SHA256 expand is infallible"),
-    }
-    okm
+    hk.expand(&info, &mut okm).map_err(|_| KdfError)?;
+    Ok(okm)
 }
 
 /// Derive an epoch-scoped 256-bit key from an agent key.
@@ -111,20 +110,20 @@ pub fn derive_iv_prefix(session_salt: &[u8; 16], prefix_index: u32) -> [u8; 8] {
 /// Epoch is a 64-bit value. At one epoch per hour, this provides
 /// ~2^44 epochs (~2 trillion years) before wraparound. Typical
 /// deployments use Unix timestamps truncated to hourly granularity.
-pub fn derive_epoch_key(agent_key: &Key, epoch: u64) -> Key {
+/// # Errors
+///
+/// Returns `Err(KdfError)` if HKDF expand fails. Unreachable for VLP's fixed
+/// `[u8; 32]` OKM against the pinned `hkdf` crate, but surfaced as `Result`
+/// so any future upstream change is observable rather than a silent abort.
+pub fn derive_epoch_key(agent_key: &Key, epoch: u64) -> Result<Key, KdfError> {
     let hk = Hkdf::<Sha256>::new(None, agent_key.as_bytes());
     // info = "varta-epoch-v1\0" (15 bytes) || epoch LE (8 bytes)
     let mut info = [0u8; 23];
     info[..15].copy_from_slice(b"varta-epoch-v1\0");
     info[15..].copy_from_slice(&epoch.to_le_bytes());
     let mut okm = [0u8; 32];
-    match hk.expand(&info, &mut okm) {
-        Ok(()) => {}
-        // Same reasoning as `derive_agent_key`: `okm` is a fixed `[u8; 32]`,
-        // far below HKDF-SHA256's 8160-byte expansion limit. Unreachable.
-        Err(_) => unreachable!("32-byte HKDF-SHA256 expand is infallible"),
-    }
-    Key::from_bytes(okm)
+    hk.expand(&info, &mut okm).map_err(|_| KdfError)?;
+    Ok(Key::from_bytes(okm))
 }
 
 #[cfg(test)]
@@ -134,16 +133,16 @@ mod tests {
     #[test]
     fn derive_agent_key_deterministic() {
         let master = Key::from_bytes([0x42; 32]);
-        let k1 = derive_agent_key(&master, 1);
-        let k2 = derive_agent_key(&master, 1);
+        let k1 = derive_agent_key(&master, 1).expect("kdf must succeed");
+        let k2 = derive_agent_key(&master, 1).expect("kdf must succeed");
         assert_eq!(k1.as_bytes(), k2.as_bytes());
     }
 
     #[test]
     fn derive_agent_key_different_pids_produce_different_keys() {
         let master = Key::from_bytes([0x42; 32]);
-        let k1 = derive_agent_key(&master, 1);
-        let k2 = derive_agent_key(&master, 2);
+        let k1 = derive_agent_key(&master, 1).expect("kdf must succeed");
+        let k2 = derive_agent_key(&master, 2).expect("kdf must succeed");
         assert_ne!(k1.as_bytes(), k2.as_bytes());
     }
 
@@ -151,32 +150,32 @@ mod tests {
     fn derive_agent_key_different_masters_produce_different_keys() {
         let m1 = Key::from_bytes([0x42; 32]);
         let m2 = Key::from_bytes([0x43; 32]);
-        let k1 = derive_agent_key(&m1, 1);
-        let k2 = derive_agent_key(&m2, 1);
+        let k1 = derive_agent_key(&m1, 1).expect("kdf must succeed");
+        let k2 = derive_agent_key(&m2, 1).expect("kdf must succeed");
         assert_ne!(k1.as_bytes(), k2.as_bytes());
     }
 
     #[test]
     fn derive_epoch_key_deterministic() {
         let agent = Key::from_bytes([0xab; 32]);
-        let e1 = derive_epoch_key(&agent, 0);
-        let e2 = derive_epoch_key(&agent, 0);
+        let e1 = derive_epoch_key(&agent, 0).expect("kdf must succeed");
+        let e2 = derive_epoch_key(&agent, 0).expect("kdf must succeed");
         assert_eq!(e1.as_bytes(), e2.as_bytes());
     }
 
     #[test]
     fn derive_epoch_key_different_epochs_produce_different_keys() {
         let agent = Key::from_bytes([0xab; 32]);
-        let e1 = derive_epoch_key(&agent, 0);
-        let e2 = derive_epoch_key(&agent, 1);
+        let e1 = derive_epoch_key(&agent, 0).expect("kdf must succeed");
+        let e2 = derive_epoch_key(&agent, 1).expect("kdf must succeed");
         assert_ne!(e1.as_bytes(), e2.as_bytes());
     }
 
     #[test]
     fn key_hierarchy_is_one_way() {
         let master = Key::from_bytes([0x42; 32]);
-        let agent_key = derive_agent_key(&master, 7);
-        let epoch_key = derive_epoch_key(&agent_key, 0);
+        let agent_key = derive_agent_key(&master, 7).expect("kdf must succeed");
+        let epoch_key = derive_epoch_key(&agent_key, 0).expect("kdf must succeed");
 
         assert_ne!(epoch_key.as_bytes(), agent_key.as_bytes());
         assert_ne!(epoch_key.as_bytes(), master.as_bytes());
@@ -185,20 +184,17 @@ mod tests {
 
     #[test]
     fn agent_key_and_epoch_key_have_different_domains() {
-        // Derive an agent key. Then derive what looks like an "epoch key"
-        // but using the agent ID as the epoch — domain separation via the
-        // distinct info strings must produce different keys.
         let master = Key::from_bytes([0x42; 32]);
-        let agent_key = derive_agent_key(&master, 1000);
-        let fake_epoch = derive_epoch_key(&master, 1000);
+        let agent_key = derive_agent_key(&master, 1000).expect("kdf must succeed");
+        let fake_epoch = derive_epoch_key(&master, 1000).expect("kdf must succeed");
         assert_ne!(agent_key.as_bytes(), fake_epoch.as_bytes());
     }
 
     #[test]
     fn derive_iv_prefix_deterministic() {
         let salt = [0x42u8; 16];
-        let p1 = derive_iv_prefix(&salt, 0);
-        let p2 = derive_iv_prefix(&salt, 0);
+        let p1 = derive_iv_prefix(&salt, 0).expect("kdf must succeed");
+        let p2 = derive_iv_prefix(&salt, 0).expect("kdf must succeed");
         assert_eq!(p1, p2);
     }
 
@@ -206,12 +202,12 @@ mod tests {
     fn derive_iv_prefix_distinct_indices() {
         let salt = [0x42u8; 16];
         let samples = [
-            derive_iv_prefix(&salt, 0),
-            derive_iv_prefix(&salt, 1),
-            derive_iv_prefix(&salt, 2),
-            derive_iv_prefix(&salt, 3),
-            derive_iv_prefix(&salt, 4),
-            derive_iv_prefix(&salt, u32::MAX),
+            derive_iv_prefix(&salt, 0).expect("kdf must succeed"),
+            derive_iv_prefix(&salt, 1).expect("kdf must succeed"),
+            derive_iv_prefix(&salt, 2).expect("kdf must succeed"),
+            derive_iv_prefix(&salt, 3).expect("kdf must succeed"),
+            derive_iv_prefix(&salt, 4).expect("kdf must succeed"),
+            derive_iv_prefix(&salt, u32::MAX).expect("kdf must succeed"),
         ];
         // All six must be pairwise distinct.
         for i in 0..samples.len() {
@@ -230,25 +226,22 @@ mod tests {
         let salt_a = [0x01u8; 16];
         let salt_b = [0x02u8; 16];
         assert_ne!(
-            derive_iv_prefix(&salt_a, 0),
-            derive_iv_prefix(&salt_b, 0),
+            derive_iv_prefix(&salt_a, 0).expect("kdf must succeed"),
+            derive_iv_prefix(&salt_b, 0).expect("kdf must succeed"),
             "different salts must produce different prefixes"
         );
     }
 
     #[test]
     fn derive_iv_prefix_domain_separation() {
-        // A 16-byte salt extended to 32 bytes by zero-padding, used as both
-        // a master key and an agent key, must produce three independent
-        // outputs across the three info-string domains.
         let salt = [0x42u8; 16];
         let mut padded = [0u8; 32];
         padded[..16].copy_from_slice(&salt);
         let master = Key::from_bytes(padded);
 
-        let iv = derive_iv_prefix(&salt, 0);
-        let agent = derive_agent_key(&master, 0);
-        let epoch = derive_epoch_key(&master, 0);
+        let iv = derive_iv_prefix(&salt, 0).expect("kdf must succeed");
+        let agent = derive_agent_key(&master, 0).expect("kdf must succeed");
+        let epoch = derive_epoch_key(&master, 0).expect("kdf must succeed");
 
         // Compare iv (8 bytes) against the first 8 bytes of each derived key.
         assert_ne!(iv, agent.as_bytes()[..8]);

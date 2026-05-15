@@ -27,7 +27,8 @@ fuzz_target!(|data: &[u8]| {
         let aad: &[u8] = if data.len() >= 80 { &data[76..80] } else { b"" };
 
         // Roundtrip: encrypt then decrypt with same key/nonce/aad
-        let (ciphertext, tag) = varta_vlp::crypto::seal(&key, &nonce, aad, &plaintext);
+        let (ciphertext, tag) = varta_vlp::crypto::seal(&key, &nonce, aad, &plaintext)
+            .expect("seal must succeed for fixed-size inputs");
 
         match varta_vlp::crypto::open(&key, &nonce, aad, &ciphertext, &tag) {
             Ok(decrypted) => {

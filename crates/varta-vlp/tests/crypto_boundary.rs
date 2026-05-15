@@ -1,16 +1,14 @@
 //! Boundary-input regression tests for `varta-vlp::crypto`.
 //!
-//! The production code uses `match … unreachable!()` blocks on three call
-//! sites (`aead::seal`, `kdf::derive_agent_key`, `kdf::derive_epoch_key`) that
-//! delegate to RustCrypto APIs returning `Result`. Each `unreachable!()` is
-//! sound because the input shape is statically fixed: 32-byte plaintext into
-//! ChaCha20-Poly1305 and 32-byte OKM out of HKDF-SHA256, both well below the
-//! upstream error thresholds.
+//! `aead::seal`, `kdf::derive_agent_key`, `kdf::derive_epoch_key`, and
+//! `kdf::derive_iv_prefix` now return `Result` instead of panicking via
+//! `unreachable!()`. The error variants are unreachable for VLP's fixed-size
+//! inputs (32-byte plaintext into ChaCha20-Poly1305; 8/32-byte OKM out of
+//! HKDF-SHA256), but surfacing them as `Result` makes any future upstream
+//! change observable via `BeatOutcome::Failed` rather than a silent abort.
 //!
-//! These tests pin that contract: every boundary value of the variable
-//! inputs (key, nonce, agent_id, epoch) must complete without panicking. If
-//! a future refactor accidentally lifts one of those call sites to a
-//! non-fixed-size buffer, the panic surfaces here long before it ships.
+//! These tests assert `Ok(…)` — strictly stronger than the old "no panic"
+//! contract — and cover every boundary value of the variable inputs.
 
 #![cfg(feature = "crypto")]
 
@@ -29,7 +27,10 @@ fn seal_does_not_panic_on_boundary_keys_and_nonces() {
     for k in &keys {
         for n in &nonces {
             for p in &plaintexts {
-                let (_ct, _tag) = seal(k, n, b"", p);
+                assert!(
+                    seal(k, n, b"", p).is_ok(),
+                    "seal must return Ok for fixed-size inputs"
+                );
             }
         }
     }
@@ -43,7 +44,7 @@ fn seal_open_round_trip_at_boundaries() {
         ([0x5Au8; 32], [0xA5u8; 12], [0x42u8; 32]),
     ];
     for (k, n, p) in cases {
-        let (ct, tag) = seal(k, n, b"", p);
+        let (ct, tag) = seal(k, n, b"", p).expect("seal must succeed for fixed-size inputs");
         let pt = open(k, n, b"", &ct, &tag).expect("authentic ciphertext should decrypt");
         assert_eq!(&pt, p);
     }
@@ -54,7 +55,7 @@ fn open_rejects_tampered_tag_without_panic() {
     let k = [0x42u8; 32];
     let n = [0x11u8; 12];
     let p = [0x77u8; 32];
-    let (ct, mut tag) = seal(&k, &n, b"", &p);
+    let (ct, mut tag) = seal(&k, &n, b"", &p).expect("seal must succeed");
     tag[0] ^= 0x01;
     let err = open(&k, &n, b"", &ct, &tag).expect_err("tampered tag must fail to verify");
     assert_eq!(err, AuthError);
@@ -67,7 +68,7 @@ fn aad_binding_rejects_wrong_aad_at_open() {
     let p = [0xEFu8; 32];
     let aad: &[u8] = &[0x01, 0x00, 0x00, 0x00]; // agent_pid = 1 LE
 
-    let (ct, tag) = seal(&k, &n, aad, &p);
+    let (ct, tag) = seal(&k, &n, aad, &p).expect("seal must succeed");
 
     // Correct AAD must decrypt.
     open(&k, &n, aad, &ct, &tag).expect("correct AAD must verify");
@@ -93,9 +94,10 @@ fn aad_binding_rejects_wrong_aad_at_open() {
 fn derive_agent_key_does_not_panic_at_pid_boundaries() {
     let master = Key::from_bytes([0xC3u8; 32]);
     for pid in [0u32, 1u32, u32::MAX, u32::MAX - 1, 0x8000_0000u32] {
-        // Should never panic — `okm` is fixed [u8; 32], far below HKDF's
-        // 255 × 32 = 8160-byte limit.
-        let _k = derive_agent_key(&master, pid);
+        assert!(
+            derive_agent_key(&master, pid).is_ok(),
+            "derive_agent_key must return Ok for fixed 32-byte OKM"
+        );
     }
 }
 
@@ -103,7 +105,10 @@ fn derive_agent_key_does_not_panic_at_pid_boundaries() {
 fn derive_epoch_key_does_not_panic_at_epoch_boundaries() {
     let agent = Key::from_bytes([0xC3u8; 32]);
     for epoch in [0u64, 1u64, u64::MAX, u64::MAX - 1, 0x8000_0000_0000_0000u64] {
-        let _k = derive_epoch_key(&agent, epoch);
+        assert!(
+            derive_epoch_key(&agent, epoch).is_ok(),
+            "derive_epoch_key must return Ok for fixed 32-byte OKM"
+        );
     }
 }
 
@@ -117,9 +122,9 @@ fn full_key_hierarchy_chain_does_not_panic() {
     for m in &masters {
         let master = Key::from_bytes(*m);
         for pid in &pids {
-            let agent = derive_agent_key(&master, *pid);
+            let agent = derive_agent_key(&master, *pid).expect("kdf must succeed");
             for ep in &epochs {
-                let _epoch_key = derive_epoch_key(&agent, *ep);
+                let _epoch_key = derive_epoch_key(&agent, *ep).expect("kdf must succeed");
             }
         }
     }

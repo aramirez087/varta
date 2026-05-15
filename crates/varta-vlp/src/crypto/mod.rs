@@ -26,7 +26,7 @@ pub mod aead;
 pub mod hash;
 pub mod kdf;
 
-pub use aead::{open, seal, AuthError};
+pub use aead::{open, seal, AuthError, SealError};
 pub use hash::{audit_chain_hash, AUDIT_CHAIN_DOMAIN, AUDIT_CHAIN_OUT_BYTES};
 
 use zeroize::{Zeroize, ZeroizeOnDrop};
@@ -50,6 +50,12 @@ pub const SECURE_FRAME_BYTES: usize = 60;
 /// 4 (agent_pid) + 8 (iv_random) + 4 (iv_counter) + 32 (ciphertext) + 16 (tag) = 64.
 /// The `agent_pid` field is bound as AAD into the Poly1305 tag.
 pub const SECURE_FRAME_MASTER_BYTES: usize = 64;
+
+/// HKDF expand failure. Unreachable for VLP's fixed 8-byte / 32-byte OKM
+/// against the pinned `hkdf` crate; surfaced as `Result` so callers observe
+/// any future upstream change rather than aborting under `panic = "abort"`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KdfError;
 
 /// Error returned when a hex-encoded key fails to parse.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

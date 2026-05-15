@@ -254,7 +254,7 @@ impl SecureUdpListener {
         let master = self.master_key.as_ref()?;
 
         use varta_vlp::crypto::kdf;
-        let agent_key = kdf::derive_agent_key(master, agent_pid);
+        let agent_key = kdf::derive_agent_key(master, agent_pid).ok()?;
         let plaintext = crypto::open(agent_key.as_bytes(), nonce, aad, ciphertext, tag).ok()?;
 
         // Defense-in-depth: verify the decrypted frame's inner PID matches
@@ -745,7 +745,8 @@ mod tests {
         let mut nonce = [0u8; NONCE_BYTES];
         nonce[..8].copy_from_slice(&iv_random);
         nonce[8..12].copy_from_slice(&iv_counter.to_le_bytes());
-        let (ciphertext, tag) = crypto::seal(key.as_bytes(), &nonce, b"", plaintext);
+        let (ciphertext, tag) = crypto::seal(key.as_bytes(), &nonce, b"", plaintext)
+            .expect("seal infallible for fixed-size inputs");
 
         let mut wire = [0u8; 60];
         wire[0..8].copy_from_slice(&iv_random);

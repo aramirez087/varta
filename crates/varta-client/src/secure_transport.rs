@@ -144,7 +144,8 @@ impl SecureUdpTransport {
         sock.set_nonblocking(true)?;
 
         let iv_session_salt = read_iv_session_salt()?;
-        let iv_prefix = kdf::derive_iv_prefix(&iv_session_salt, 0);
+        let iv_prefix = kdf::derive_iv_prefix(&iv_session_salt, 0)
+            .map_err(|_| io::Error::new(io::ErrorKind::Other, "key derivation failure"))?;
 
         Ok(SecureUdpTransport {
             sock,
@@ -188,7 +189,8 @@ impl SecureUdpTransport {
         use varta_vlp::crypto::kdf;
 
         let peer_pid = std::process::id();
-        let agent_key = kdf::derive_agent_key(&master_key, peer_pid);
+        let agent_key = kdf::derive_agent_key(&master_key, peer_pid)
+            .map_err(|_| io::Error::new(io::ErrorKind::Other, "key derivation failure"))?;
 
         let sock = bind_ephemeral(&addr)?;
         sock.connect(addr)?;
@@ -198,7 +200,8 @@ impl SecureUdpTransport {
         // `iv_random` field. The PID is sent as a plaintext AAD field in
         // the 64-byte wire frame.
         let iv_session_salt = read_iv_session_salt()?;
-        let iv_prefix = kdf::derive_iv_prefix(&iv_session_salt, 0);
+        let iv_prefix = kdf::derive_iv_prefix(&iv_session_salt, 0)
+            .map_err(|_| io::Error::new(io::ErrorKind::Other, "key derivation failure"))?;
 
         Ok(SecureUdpTransport {
             sock,
@@ -267,7 +270,8 @@ impl SecureUdpTransport {
             self.iv_prefix = varta_vlp::crypto::kdf::derive_iv_prefix(
                 &self.iv_session_salt,
                 self.iv_prefix_index,
-            );
+            )
+            .map_err(|_| io::Error::new(io::ErrorKind::Other, "key derivation failure"))?;
             return Ok(1);
         }
         // Prefix index also exhausted (2^64 nonces — ~584M years at 1
@@ -309,7 +313,8 @@ impl BeatTransport for SecureUdpTransport {
             let agent_pid = std::process::id();
             let agent_pid_bytes = agent_pid.to_le_bytes();
             let (ciphertext, tag) =
-                crypto::seal(self.key.as_bytes(), &nonce, &agent_pid_bytes, buf);
+                crypto::seal(self.key.as_bytes(), &nonce, &agent_pid_bytes, buf)
+                    .map_err(|_| io::Error::new(io::ErrorKind::Other, "AEAD seal failure"))?;
 
             let mut frame = [0u8; SECURE_FRAME_MASTER_LEN];
             frame[0..4].copy_from_slice(&agent_pid_bytes);
@@ -322,7 +327,8 @@ impl BeatTransport for SecureUdpTransport {
         } else {
             // Shared-key wire format (60 bytes):
             // [iv_random: 8] [iv_counter: 4] [ciphertext: 32] [tag: 16]
-            let (ciphertext, tag) = crypto::seal(self.key.as_bytes(), &nonce, b"", buf);
+            let (ciphertext, tag) = crypto::seal(self.key.as_bytes(), &nonce, b"", buf)
+                .map_err(|_| io::Error::new(io::ErrorKind::Other, "AEAD seal failure"))?;
 
             let mut frame = [0u8; SECURE_FRAME_LEN];
             frame[..8].copy_from_slice(&self.iv_prefix);
@@ -360,7 +366,8 @@ impl BeatTransport for SecureUdpTransport {
         // session.
         self.iv_session_salt = read_iv_session_salt()?;
         self.iv_prefix_index = 0;
-        self.iv_prefix = kdf::derive_iv_prefix(&self.iv_session_salt, 0);
+        self.iv_prefix = kdf::derive_iv_prefix(&self.iv_session_salt, 0)
+            .map_err(|_| io::Error::new(io::ErrorKind::Other, "key derivation failure"))?;
         self.iv_counter = 0;
 
         Ok(())

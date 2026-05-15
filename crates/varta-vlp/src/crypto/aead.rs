@@ -28,6 +28,12 @@ use chacha20poly1305::{
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AuthError;
 
+/// AEAD seal failure. Unreachable for VLP's fixed `[u8; 32]` inputs against
+/// `chacha20poly1305 = "=0.10.1"`; surfaced as `Result` so the caller observes
+/// any future upstream change rather than aborting under `panic = "abort"`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SealError;
+
 /// Encrypt a 32-byte plaintext and produce a 16-byte authentication tag.
 ///
 /// # Parameters
@@ -41,28 +47,29 @@ pub struct AuthError;
 ///
 /// # Returns
 ///
-/// `(ciphertext, tag)` where `ciphertext` is 32 bytes and `tag` is 16 bytes.
+/// `Ok((ciphertext, tag))` where `ciphertext` is 32 bytes and `tag` is 16 bytes.
 /// The transport layer joins these with the caller-provided nonce prefix
 /// for a total of 60 bytes (shared-key) or 64 bytes (master-key).
+///
+/// Returns `Err(SealError)` if the underlying AEAD encrypt fails. This branch
+/// is unreachable for VLP's fixed `[u8; 32]` inputs against the pinned
+/// `chacha20poly1305 = "=0.10.1"` crate, but is surfaced as a `Result` so
+/// that any future upstream change is observable (via `BeatOutcome::Failed`)
+/// rather than a silent process abort under `panic = "abort"`.
 pub fn seal(
     key: &[u8; 32],
     nonce: &[u8; 12],
     aad: &[u8],
     plaintext: &[u8; 32],
-) -> ([u8; 32], [u8; 16]) {
+) -> Result<([u8; 32], [u8; 16]), SealError> {
     let cipher = ChaCha20Poly1305::new(chacha20poly1305::Key::from_slice(key));
     let mut ct = *plaintext;
-    let tag = match cipher.encrypt_in_place_detached(Nonce::from_slice(nonce), aad, &mut ct) {
-        Ok(t) => t,
-        // `chacha20poly1305::aead::Error` is returned only when the plaintext
-        // length plus AAD length would exceed ChaCha20-Poly1305's 2^32-block
-        // limit. AAD is empty (`b""`), the buffer is a fixed `[u8; 32]`, and
-        // the nonce is a fixed `[u8; 12]`. Unreachable by construction.
-        Err(_) => unreachable!("ChaCha20Poly1305 encrypt is infallible for fixed-size inputs"),
-    };
+    let tag = cipher
+        .encrypt_in_place_detached(Nonce::from_slice(nonce), aad, &mut ct)
+        .map_err(|_| SealError)?;
     let mut tag_bytes = [0u8; 16];
     tag_bytes.copy_from_slice(&tag);
-    (ct, tag_bytes)
+    Ok((ct, tag_bytes))
 }
 
 /// Verify and decrypt a ChaCha20-Poly1305 AEAD ciphertext.
@@ -117,7 +124,7 @@ mod tests {
         ];
         let plaintext = [0xdeu8; 32];
 
-        let (ct, tag) = seal(&key, &nonce, b"", &plaintext);
+        let (ct, tag) = seal(&key, &nonce, b"", &plaintext).expect("seal must succeed");
 
         // Verify via open — round-trip proves seal produces a valid AEAD frame.
         let decrypted = open(&key, &nonce, b"", &ct, &tag).expect("round-trip must succeed");
@@ -142,7 +149,7 @@ mod tests {
             0x63, 0x6c, 0x61, 0x73,
         ];
 
-        let (ciphertext, tag) = seal(&key, &nonce, b"", &plaintext);
+        let (ciphertext, tag) = seal(&key, &nonce, b"", &plaintext).expect("seal must succeed");
         let decrypted = open(&key, &nonce, b"", &ciphertext, &tag)
             .expect("roundtrip with RFC params should succeed");
         assert_eq!(decrypted, plaintext);
@@ -177,7 +184,7 @@ mod tests {
             0xef, 0x33,
         ];
 
-        let (ciphertext, tag) = seal(&key, &nonce, b"", &plaintext);
+        let (ciphertext, tag) = seal(&key, &nonce, b"", &plaintext).expect("seal must succeed");
 
         assert_eq!(ciphertext, expected_ciphertext);
         assert_eq!(tag, expected_tag);
@@ -189,7 +196,7 @@ mod tests {
         let nonce = [0x42u8; 12];
         let plaintext = [0xdeu8; 32];
 
-        let (ciphertext, tag) = seal(&key, &nonce, b"", &plaintext);
+        let (ciphertext, tag) = seal(&key, &nonce, b"", &plaintext).expect("seal must succeed");
         assert_ne!(ciphertext, plaintext, "encryption should change data");
 
         let decrypted = open(&key, &nonce, b"", &ciphertext, &tag)
@@ -207,7 +214,7 @@ mod tests {
         let nonce = [0x01u8; 12];
         let plaintext = [0xdeu8; 32];
 
-        let (ciphertext, tag) = seal(&key_a, &nonce, b"", &plaintext);
+        let (ciphertext, tag) = seal(&key_a, &nonce, b"", &plaintext).expect("seal must succeed");
 
         let result = open(&key_b, &nonce, b"", &ciphertext, &tag);
         assert!(result.is_err(), "decryption with wrong key must fail");
@@ -220,7 +227,7 @@ mod tests {
         let nonce_b = [0x02u8; 12];
         let plaintext = [0xdeu8; 32];
 
-        let (ciphertext, tag) = seal(&key, &nonce_a, b"", &plaintext);
+        let (ciphertext, tag) = seal(&key, &nonce_a, b"", &plaintext).expect("seal must succeed");
 
         let result = open(&key, &nonce_b, b"", &ciphertext, &tag);
         assert!(result.is_err(), "decryption with wrong nonce must fail");
@@ -232,7 +239,7 @@ mod tests {
         let nonce = [0x42u8; 12];
         let plaintext = [0xdeu8; 32];
 
-        let (mut ciphertext, tag) = seal(&key, &nonce, b"", &plaintext);
+        let (mut ciphertext, tag) = seal(&key, &nonce, b"", &plaintext).expect("seal must succeed");
         ciphertext[15] ^= 0x01;
 
         let result = open(&key, &nonce, b"", &ciphertext, &tag);
@@ -248,7 +255,7 @@ mod tests {
         let nonce = [0x42u8; 12];
         let plaintext = [0xdeu8; 32];
 
-        let (ciphertext, mut tag) = seal(&key, &nonce, b"", &plaintext);
+        let (ciphertext, mut tag) = seal(&key, &nonce, b"", &plaintext).expect("seal must succeed");
         tag[0] ^= 0x01;
 
         let result = open(&key, &nonce, b"", &ciphertext, &tag);
@@ -261,8 +268,8 @@ mod tests {
         let nonce = [0x42u8; 12];
         let plaintext = [0xdeu8; 32];
 
-        let (ct1, tag1) = seal(&key, &nonce, b"", &plaintext);
-        let (ct2, tag2) = seal(&key, &nonce, b"", &plaintext);
+        let (ct1, tag1) = seal(&key, &nonce, b"", &plaintext).expect("seal must succeed");
+        let (ct2, tag2) = seal(&key, &nonce, b"", &plaintext).expect("seal must succeed");
 
         assert_eq!(ct1, ct2, "same input must produce same ciphertext");
         assert_eq!(tag1, tag2, "same input must produce same tag");
@@ -277,7 +284,7 @@ mod tests {
         let plaintext = [0x33u8; 32];
         let aad: &[u8] = &[0x01, 0x02, 0x03, 0x04]; // simulates agent_pid LE
 
-        let (ct, tag) = seal(&key, &nonce, aad, &plaintext);
+        let (ct, tag) = seal(&key, &nonce, aad, &plaintext).expect("seal must succeed");
 
         // Correct AAD must succeed.
         let decrypted = open(&key, &nonce, aad, &ct, &tag).expect("correct AAD must verify");
@@ -304,7 +311,7 @@ mod tests {
         let plaintext = [0x77u8; 32];
         let aad = [0x01u8, 0x00, 0x00, 0x00]; // agent_pid = 1 LE
 
-        let (ct, tag) = seal(&key, &nonce, &aad, &plaintext);
+        let (ct, tag) = seal(&key, &nonce, &aad, &plaintext).expect("seal must succeed");
 
         // Tamper one byte of the AAD (simulates on-wire agent_pid mutation).
         let mut tampered_aad = aad;
