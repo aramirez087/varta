@@ -381,21 +381,29 @@ impl BeatTransport for SecureUdpTransport {
     fn reconnect(&mut self) -> io::Result<()> {
         use varta_vlp::crypto::kdf;
 
+        // --- Prepare phase: every fallible call writes to a local.  Any
+        //     `?` below this comment block returns with `self` byte-identical
+        //     to entry.  The observer tracks per-sender state by
+        //     (SocketAddr, iv_prefix); a new salt produces a fresh prefix
+        //     series that the observer treats as a new session.
         let sock = bind_ephemeral(&self.addr)?;
         sock.connect(self.addr)?;
         sock.set_nonblocking(true)?;
-        self.sock = sock;
-
-        // Refresh the session salt and re-derive prefix-0.  The observer
-        // tracks per-sender state by (SocketAddr, iv_prefix); a new salt
-        // produces a fresh prefix series that the observer treats as a new
-        // session.
-        self.iv_session_salt = read_iv_session_salt()?;
-        self.iv_prefix_index = 0;
-        self.iv_prefix = kdf::derive_iv_prefix(&self.iv_session_salt, 0)
+        let new_salt = read_iv_session_salt()?;
+        let new_prefix = kdf::derive_iv_prefix(&new_salt, 0)
             .map_err(|_| io::Error::new(io::ErrorKind::Other, "key derivation failure"))?;
-        self.iv_counter = 0;
 
+        // --- Commit phase: NO `?` operator below this line.  Any future
+        //     change that introduces a fallible call here is a transactional
+        //     regression — a partial commit could leave `self.sock` paired
+        //     with a stale `iv_session_salt`/`iv_prefix`, an internally
+        //     inconsistent state that subsequent `advance_nonce` calls would
+        //     have to converge out of via retry.
+        self.sock = sock;
+        self.iv_session_salt = new_salt;
+        self.iv_prefix = new_prefix;
+        self.iv_prefix_index = 0;
+        self.iv_counter = 0;
         Ok(())
     }
 }
@@ -766,6 +774,60 @@ mod tests {
         assert_eq!(tx.iv_counter, 1);
         // Prefix-0 of the new salt is overwhelmingly likely to differ.
         assert_ne!(tx.iv_prefix_for_test(), prefix_before);
+    }
+
+    /// Successful `reconnect()` must atomically update all five state
+    /// fields: the connected socket (verified by the source port changing
+    /// after re-bind), the session salt, the derived prefix-0,
+    /// `iv_prefix_index = 0`, and `iv_counter = 0`.
+    ///
+    /// Regression guard for the transactional contract: every fallible
+    /// step in `reconnect()` writes to a local, and the five `self.*`
+    /// writes happen in a tail block with no `?` operator.  An inverted
+    /// write order or a partial commit (e.g. `self.sock = sock` ahead of
+    /// a still-fallible step) would either trip this test or leave one of
+    /// the five assertions below false.
+    ///
+    /// The port assertion is deterministic, not probabilistic: the old
+    /// `self.sock` is still held when `bind_ephemeral` runs for the new
+    /// socket, so the kernel cannot grant the same ephemeral port to both.
+    #[test]
+    fn reconnect_success_updates_all_iv_state_and_socket_port() {
+        let addr = SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::LOCALHOST, 9876, 0, 0));
+        let key = Key::from_bytes([0x42; 32]);
+        let mut tx = SecureUdpTransport::connect(addr, key).expect("connect");
+
+        // Drive non-default state so every reset is observable.
+        tx.set_iv_counter_for_test(123);
+        tx.set_iv_prefix_index_for_test(7);
+
+        let port_before = tx.sock.local_addr().expect("local_addr").port();
+        let salt_before = tx.iv_session_salt;
+        let prefix_before = tx.iv_prefix_for_test();
+
+        <SecureUdpTransport as BeatTransport>::reconnect(&mut tx)
+            .expect("reconnect on loopback must succeed");
+
+        assert_eq!(tx.iv_counter, 0, "iv_counter must reset to 0");
+        assert_eq!(
+            tx.iv_prefix_index_for_test(),
+            0,
+            "iv_prefix_index must reset to 0"
+        );
+        assert_ne!(
+            tx.iv_session_salt, salt_before,
+            "salt must be re-read from OS entropy (1-in-2^128 collision)"
+        );
+        assert_ne!(
+            tx.iv_prefix_for_test(),
+            prefix_before,
+            "prefix must be re-derived from the new salt"
+        );
+        assert_ne!(
+            tx.sock.local_addr().expect("local_addr").port(),
+            port_before,
+            "ephemeral source port must differ after re-bind"
+        );
     }
 
     /// Commit-on-success contract: a failed `send(2)` (e.g. `WouldBlock` on
