@@ -46,6 +46,7 @@ pub mod hw_watchdog;
 pub mod listener;
 pub mod log;
 pub mod log_ratelimit;
+mod nonblock_fd;
 pub mod notify;
 pub mod observer;
 pub mod peer_cred;

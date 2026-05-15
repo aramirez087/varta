@@ -36,6 +36,7 @@ use std::process::{Child, ChildStderr, ChildStdout, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use crate::audit::{CompleteOutcome, CompleteRecord, RecoveryAuditLog, RefusedRecord, SpawnRecord};
+use crate::nonblock_fd::set_nonblocking_fd;
 use crate::outstanding_table::{InsertError as OutstandingInsertError, OutstandingTable};
 use crate::peer_cred::BeatOrigin;
 
@@ -46,59 +47,6 @@ use crate::peer_cred::BeatOrigin;
 /// blowing the `recovery_reap` phase budget. A rotating cursor ensures
 /// fairness: pids not visited this tick are visited first next tick.
 const REAP_MAX_PER_TICK: usize = 64;
-
-// fcntl(2) flags. Hand-rolled to avoid pulling `libc` into a production crate.
-#[cfg(target_os = "linux")]
-const O_NONBLOCK_FCNTL: i32 = 0x800;
-#[cfg(any(
-    target_os = "macos",
-    target_os = "ios",
-    target_os = "freebsd",
-    target_os = "netbsd",
-    target_os = "openbsd",
-    target_os = "dragonfly",
-))]
-const O_NONBLOCK_FCNTL: i32 = 0x0004;
-
-#[cfg(any(target_os = "solaris", target_os = "illumos"))]
-const O_NONBLOCK_FCNTL: i32 = 0x80;
-
-#[cfg(not(any(
-    target_os = "linux",
-    target_os = "macos",
-    target_os = "ios",
-    target_os = "freebsd",
-    target_os = "netbsd",
-    target_os = "openbsd",
-    target_os = "dragonfly",
-    target_os = "solaris",
-    target_os = "illumos",
-)))]
-compile_error!("O_NONBLOCK_FCNTL value is unknown for this target — add it to the cfg gates above");
-
-// F_GETFL = 3, F_SETFL = 4: IEEE Std 1003.1-2017 §<fcntl.h>. These values
-// are historically stable across every Unix in the wild; no cfg gating needed.
-const F_GETFL: i32 = 3;
-const F_SETFL: i32 = 4;
-
-extern "C" {
-    fn fcntl(fd: i32, cmd: i32, ...) -> i32;
-}
-
-/// Best-effort set `O_NONBLOCK` on a raw fd. Failure is logged-only — the
-/// drain loop checks `WouldBlock` and falls back to a single bounded
-/// `read` if the flag could not be set, so a failing fcntl never blocks
-/// the observer.
-fn set_nonblocking_fd(fd: i32) -> bool {
-    // SAFETY: F_GETFL/F_SETFL are standard fcntl commands. The fd is owned
-    // by the ChildStdout/ChildStderr handle for the duration of this call.
-    let flags = unsafe { fcntl(fd, F_GETFL) };
-    if flags < 0 {
-        return false;
-    }
-    let rc = unsafe { fcntl(fd, F_SETFL, flags | O_NONBLOCK_FCNTL) };
-    rc >= 0
-}
 
 /// Take the piped stdout/stderr handles off `child` (when capture is
 /// enabled) and mark them non-blocking. Returns `(None, None)` when
