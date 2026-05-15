@@ -67,6 +67,13 @@ impl<V: Copy> IpStateTable<V> {
         self.ip_to_slot.len()
     }
 
+    /// Test-only emptiness check.  The only caller is the
+    /// `allow_ip_burst_zero_is_unlimited` test in `exporter.rs`, which is
+    /// gated `#[cfg(all(test, feature = "prometheus-exporter"))]`.  Without
+    /// `#[cfg(test)]` here, this method appears as `dead_code` when
+    /// `varta-watch` is built as a transitive dep with `prometheus-exporter`
+    /// enabled but `cfg(test)` off.
+    #[cfg(test)]
     pub fn is_empty(&self) -> bool {
         self.ip_to_slot.len() == 0
     }
@@ -131,11 +138,9 @@ impl<V: Copy + LastSeen> IpStateTable<V> {
         // the slab while iterating it.  Bounded by `len()` which is in
         // turn bounded by capacity.
         let mut victims: Vec<IpAddr> = Vec::new();
-        for slot in self.slab.iter() {
-            if let Some(s) = slot {
-                if now.saturating_duration_since(s.state.last_seen()) >= ttl {
-                    victims.push(s.ip);
-                }
+        for s in self.slab.iter().flatten() {
+            if now.saturating_duration_since(s.state.last_seen()) >= ttl {
+                victims.push(s.ip);
             }
         }
         for ip in victims {
@@ -148,14 +153,12 @@ impl<V: Copy + LastSeen> IpStateTable<V> {
     /// make room.  O(capacity).
     pub fn oldest_ip(&self) -> Option<IpAddr> {
         let mut best: Option<(IpAddr, Instant)> = None;
-        for slot in self.slab.iter() {
-            if let Some(s) = slot {
-                let seen = s.state.last_seen();
-                match best {
-                    None => best = Some((s.ip, seen)),
-                    Some((_, b)) if seen < b => best = Some((s.ip, seen)),
-                    _ => {}
-                }
+        for s in self.slab.iter().flatten() {
+            let seen = s.state.last_seen();
+            match best {
+                None => best = Some((s.ip, seen)),
+                Some((_, b)) if seen < b => best = Some((s.ip, seen)),
+                _ => {}
             }
         }
         best.map(|(ip, _)| ip)

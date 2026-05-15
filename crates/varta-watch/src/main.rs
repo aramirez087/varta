@@ -908,9 +908,9 @@ fn run(cfg: Config) -> std::io::Result<()> {
         // watchdog's Acquire load on CURRENT_STAGE.
         #[cfg(feature = "prometheus-exporter")]
         {
-            LAST_STAGE_ENTRY_NS
-                .get(IterStage::DrainPending as usize)
-                .map(|a| a.store(observer_now_ns(), Ordering::Relaxed));
+            if let Some(a) = LAST_STAGE_ENTRY_NS.get(IterStage::DrainPending as usize) {
+                a.store(observer_now_ns(), Ordering::Relaxed);
+            }
             CURRENT_STAGE.store(IterStage::DrainPending as u8, Ordering::Release);
         }
 
@@ -1057,9 +1057,9 @@ fn run(cfg: Config) -> std::io::Result<()> {
         if let Some(pe) = prom_export.as_mut() {
             pe.record_stage_duration(IterStage::DrainPending, stage_start.elapsed());
             stage_start = Instant::now();
-            LAST_STAGE_ENTRY_NS
-                .get(IterStage::Poll as usize)
-                .map(|a| a.store(observer_now_ns(), Ordering::Relaxed));
+            if let Some(a) = LAST_STAGE_ENTRY_NS.get(IterStage::Poll as usize) {
+                a.store(observer_now_ns(), Ordering::Relaxed);
+            }
             CURRENT_STAGE.store(IterStage::Poll as u8, Ordering::Release);
         }
 
@@ -1111,9 +1111,9 @@ fn run(cfg: Config) -> std::io::Result<()> {
         if let Some(pe) = prom_export.as_mut() {
             pe.record_stage_duration(IterStage::Poll, stage_start.elapsed());
             stage_start = Instant::now();
-            LAST_STAGE_ENTRY_NS
-                .get(IterStage::Maintenance as usize)
-                .map(|a| a.store(observer_now_ns(), Ordering::Relaxed));
+            if let Some(a) = LAST_STAGE_ENTRY_NS.get(IterStage::Maintenance as usize) {
+                a.store(observer_now_ns(), Ordering::Relaxed);
+            }
             CURRENT_STAGE.store(IterStage::Maintenance as u8, Ordering::Release);
         }
 
@@ -1386,9 +1386,9 @@ fn run(cfg: Config) -> std::io::Result<()> {
         if let Some(pe) = prom_export.as_mut() {
             pe.record_stage_duration(IterStage::Maintenance, stage_start.elapsed());
             stage_start = Instant::now();
-            LAST_STAGE_ENTRY_NS
-                .get(IterStage::RecoveryReap as usize)
-                .map(|a| a.store(observer_now_ns(), Ordering::Relaxed));
+            if let Some(a) = LAST_STAGE_ENTRY_NS.get(IterStage::RecoveryReap as usize) {
+                a.store(observer_now_ns(), Ordering::Relaxed);
+            }
             CURRENT_STAGE.store(IterStage::RecoveryReap as u8, Ordering::Release);
         }
 
@@ -1442,9 +1442,9 @@ fn run(cfg: Config) -> std::io::Result<()> {
         if let Some(pe) = prom_export.as_mut() {
             // Record recovery_reap stage before entering serve_pending.
             pe.record_stage_duration(IterStage::RecoveryReap, stage_start.elapsed());
-            LAST_STAGE_ENTRY_NS
-                .get(IterStage::ServePending as usize)
-                .map(|a| a.store(observer_now_ns(), Ordering::Relaxed));
+            if let Some(a) = LAST_STAGE_ENTRY_NS.get(IterStage::ServePending as usize) {
+                a.store(observer_now_ns(), Ordering::Relaxed);
+            }
             CURRENT_STAGE.store(IterStage::ServePending as u8, Ordering::Release);
 
             // Bracket serve_pending so its wall time is observable
@@ -1463,9 +1463,9 @@ fn run(cfg: Config) -> std::io::Result<()> {
             pe.record_serve_pending_duration(serve_elapsed);
             pe.record_stage_duration(IterStage::ServePending, serve_elapsed);
             stage_start = Instant::now(); // housekeeping starts after serve_pending
-            LAST_STAGE_ENTRY_NS
-                .get(IterStage::Housekeeping as usize)
-                .map(|a| a.store(observer_now_ns(), Ordering::Relaxed));
+            if let Some(a) = LAST_STAGE_ENTRY_NS.get(IterStage::Housekeeping as usize) {
+                a.store(observer_now_ns(), Ordering::Relaxed);
+            }
             CURRENT_STAGE.store(IterStage::Housekeeping as u8, Ordering::Release);
         }
 
