@@ -153,7 +153,13 @@ fn crc_detects_bit_flip() {
 /// nightly exhaustive testing proves the invariant holds universally.
 #[kani::proof]
 fn encode_decode_roundtrips() {
-    let original = Frame::new(Status::Ok, 42u32, 0x0123456789ABCDEFu64, 0x0FEDCBA987654321u64, 0x12345678u32);
+    let original = Frame::new(
+        Status::Ok,
+        42u32,
+        0x0123456789ABCDEFu64,
+        0x0FEDCBA987654321u64,
+        0x12345678u32,
+    );
     let mut buf = [0u8; 32];
     original.encode(&mut buf);
     let decoded = Frame::decode(&buf).expect("constructable frame decodes");
