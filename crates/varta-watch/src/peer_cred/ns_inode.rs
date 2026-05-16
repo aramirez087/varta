@@ -171,6 +171,7 @@ mod ns_tests {
     }
 
     #[test]
+    #[cfg(not(miri))]
     fn observer_can_read_its_own_namespace_inode() {
         // /proc/self/ns/pid is always readable for the running process on
         // Linux with /proc mounted. CI runners satisfy both.
