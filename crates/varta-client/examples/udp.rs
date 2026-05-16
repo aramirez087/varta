@@ -21,7 +21,7 @@ fn main() {
         };
         match agent.beat(status, i) {
             BeatOutcome::Sent => eprintln!("beat {i:>2}: Sent    (status={status:?})"),
-            BeatOutcome::Dropped => eprintln!("beat {i:>2}: Dropped (status={status:?})"),
+            BeatOutcome::Dropped(r) => eprintln!("beat {i:>2}: Dropped ({r}) (status={status:?})"),
             BeatOutcome::Failed(e) => {
                 eprintln!("beat {i:>2}: Failed  (status={status:?}, err={e})")
             }

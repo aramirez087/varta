@@ -21,7 +21,7 @@ fn main() -> std::io::Result<()> {
     for _ in 0..10 {
         match agent.beat(varta_client::Status::Ok, 0) {
             varta_client::BeatOutcome::Sent => {}
-            varta_client::BeatOutcome::Dropped => {
+            varta_client::BeatOutcome::Dropped(_) => {
                 eprintln!("varta: beat dropped (observer down or queue full)");
             }
             varta_client::BeatOutcome::Failed(e) => {

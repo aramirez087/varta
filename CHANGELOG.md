@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Breaking: `BeatOutcome::Dropped` now carries a `DropReason` payload.**
+  `classify_send_error` returns `Dropped(DropReason)` instead of the unit
+  variant `Dropped`. Operators can now distinguish kernel buffer pressure
+  (`KernelQueueFull`) from observer-absent (`NoObserver`) from peer-teardown
+  (`PeerGone`) from disk-full (`StorageFull`). Migrate match arms:
+  `BeatOutcome::Dropped => …` → `BeatOutcome::Dropped(_) => …` (ignoring
+  reason) or match the specific `DropReason` variant for richer diagnostics.
+  `DropReason` is `Copy + Eq`, fits in one byte, and adds no heap footprint
+  to the steady-state beat path.
+
 ### Security
 - **Default-on UDS rate limiting closes same-UID flood gap.** Three layered
   defenses are now enabled by default for all out-of-the-box deployments:

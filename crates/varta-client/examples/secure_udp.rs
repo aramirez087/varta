@@ -63,7 +63,7 @@ fn main() -> io::Result<()> {
         let outcome = agent.beat(status, i);
         match outcome {
             BeatOutcome::Sent => println!("beat {i}: sent (status={status:?})"),
-            BeatOutcome::Dropped => println!("beat {i}: dropped"),
+            BeatOutcome::Dropped(r) => println!("beat {i}: dropped ({r})"),
             BeatOutcome::Failed(e) => eprintln!("beat {i}: failed — {e}"),
         }
 

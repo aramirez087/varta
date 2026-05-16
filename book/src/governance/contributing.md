@@ -8,7 +8,7 @@ Every contribution must adhere to these load-bearing invariants:
 
 1.  **Zero Registry Dependencies**: Production crates (`varta-vlp`, `varta-client`, `varta-watch`) must have empty `[dependencies]` sections (other than internal path dependencies).
 2.  **Zero Heap Allocation**: No heap allocation is permitted on the `beat()` path after connection. We verify this with `zero_alloc` tests using a guard allocator.
-3.  **Non-Blocking I/O**: The beat path must never block. `WouldBlock` is handled as `Dropped`.
+3.  **Non-Blocking I/O**: The beat path must never block. `WouldBlock` is handled as `Dropped(DropReason::KernelQueueFull)`.
 4.  **ABI Stability**: Any change to the 32-byte `Frame` layout is a breaking change and requires a VLP version bump.
 5.  **Strict Linting**: We run with `deny(unsafe_code)` at the workspace level. Permitted unsafe blocks (e.g., for FFI) must be explicitly allowed with `#[allow(unsafe_code)]` to create an audit trail.
 

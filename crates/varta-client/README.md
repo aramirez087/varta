@@ -17,9 +17,9 @@ fn main() -> std::io::Result<()> {
     let mut agent = Varta::connect("/tmp/varta.sock")?;
     loop {
         match agent.beat(Status::Ok, 0) {
-            BeatOutcome::Sent    => {}
-            BeatOutcome::Dropped => { /* observer absent — safe to ignore */ }
-            BeatOutcome::Failed(e) => eprintln!("beat error: {e}"),
+            BeatOutcome::Sent         => {}
+            BeatOutcome::Dropped(_)   => { /* observer absent or queue full — safe to ignore */ }
+            BeatOutcome::Failed(e)    => eprintln!("beat error: {e}"),
         }
         std::thread::sleep(std::time::Duration::from_millis(500));
     }
@@ -42,8 +42,17 @@ fn main() -> std::io::Result<()> {
 | Variant | Meaning |
 |---------|---------|
 | `Sent` | Kernel accepted the datagram. |
-| `Dropped` | Observer absent, queue full, or socket vanished — treat as no-op. |
-| `Failed(io::Error)` | Unexpected I/O error; the inner error does not allocate. |
+| `Dropped(DropReason)` | Datagram not delivered — treat as no-op. The `DropReason` identifies the underlying cause (see table below). |
+| `Failed(BeatError)` | Unexpected I/O error; the inner error does not allocate. |
+
+### `DropReason`
+
+| Variant | Source errors | Interpretation |
+|---------|--------------|----------------|
+| `KernelQueueFull` | `WouldBlock`, `ENOBUFS` | Transient burst; observer is likely alive. Retry or rely on `set_reconnect_after`. |
+| `NoObserver` | `NotFound`, `ConnectionRefused` | Observer not yet bound — expected during rolling restarts. |
+| `PeerGone` | `ConnectionReset`, `NotConnected`, `BrokenPipe` | Channel was live and disappeared (crash or shutdown). Call `reconnect` to recover. |
+| `StorageFull` | `StorageFull` | Host filesystem full; operator intervention required. |
 
 ### `Status`
 
@@ -94,7 +103,7 @@ message and any user hooks). The sole heap allocation is the `Box` created by
   path dep on `varta-vlp`); no registry crate is pulled in.
 - **Zero steady-state allocation.** After `Varta::connect`, `beat()` does not
   touch the heap. Verified by a guard-allocator test in `varta-tests`.
-- **Non-blocking.** The socket is set to non-blocking mode at `connect()` time; `WouldBlock` is treated as `Dropped` — the caller never stalls.
+- **Non-blocking.** The socket is set to non-blocking mode at `connect()` time; `WouldBlock` is treated as `Dropped(DropReason::KernelQueueFull)` — the caller never stalls.
 
 ## See also
 

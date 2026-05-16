@@ -68,7 +68,7 @@ fn beat_returns_dropped_when_observer_absent() {
 
     let outcome = client.beat(Status::Ok, 0);
     assert!(
-        matches!(outcome, BeatOutcome::Dropped),
+        matches!(outcome, BeatOutcome::Dropped(_)),
         "expected Dropped, got {outcome}"
     );
 }

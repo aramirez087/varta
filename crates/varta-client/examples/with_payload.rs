@@ -28,7 +28,7 @@ fn main() -> std::io::Result<()> {
         let payload = ((depth as u32) << 16) | (err as u32);
         match agent.beat(varta_client::Status::Ok, payload) {
             varta_client::BeatOutcome::Sent => {}
-            varta_client::BeatOutcome::Dropped => {
+            varta_client::BeatOutcome::Dropped(_) => {
                 eprintln!("varta: beat dropped (observer down or queue full)");
             }
             varta_client::BeatOutcome::Failed(e) => {

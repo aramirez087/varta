@@ -278,7 +278,7 @@ fn client_to_observer_to_recovery_full_loop() {
             loop {
                 match agent.beat(Status::Ok, 0) {
                     BeatOutcome::Sent => break,
-                    BeatOutcome::Dropped => {
+                    BeatOutcome::Dropped(_) => {
                         tries += 1;
                         if tries > 5_000 {
                             panic!("kernel never accepted a beat within 5000 retries");
@@ -568,7 +568,7 @@ fn recovery_exec_mode_touch_marker_file() {
             loop {
                 match agent.beat(Status::Ok, 0) {
                     BeatOutcome::Sent => break,
-                    BeatOutcome::Dropped => {
+                    BeatOutcome::Dropped(_) => {
                         tries += 1;
                         if tries > 5_000 {
                             panic!("kernel never accepted a beat within 5000 retries");
@@ -663,7 +663,7 @@ fn recovery_cmd_file_mode() {
             loop {
                 match agent.beat(Status::Ok, 0) {
                     BeatOutcome::Sent => break,
-                    BeatOutcome::Dropped => {
+                    BeatOutcome::Dropped(_) => {
                         tries += 1;
                         if tries > 5_000 {
                             panic!("kernel never accepted a beat");
@@ -737,7 +737,7 @@ fn recovery_exec_file_mode() {
             loop {
                 match agent.beat(Status::Ok, 0) {
                     BeatOutcome::Sent => break,
-                    BeatOutcome::Dropped => {
+                    BeatOutcome::Dropped(_) => {
                         tries += 1;
                         if tries > 5_000 {
                             panic!("kernel never accepted a beat");
@@ -808,7 +808,7 @@ fn recovery_timeout_kill_after() {
             loop {
                 match agent.beat(Status::Ok, 0) {
                     BeatOutcome::Sent => break,
-                    BeatOutcome::Dropped => {
+                    BeatOutcome::Dropped(_) => {
                         tries += 1;
                         if tries > 5_000 {
                             panic!("kernel never accepted a beat");
@@ -1046,7 +1046,7 @@ fn drive_beats(socket: &Path, tag: &str) {
         loop {
             match agent.beat(Status::Ok, 0) {
                 BeatOutcome::Sent => break,
-                BeatOutcome::Dropped => {
+                BeatOutcome::Dropped(_) => {
                     tries += 1;
                     if tries > 5_000 {
                         panic!("kernel never accepted a beat ({tag})");
@@ -1102,7 +1102,7 @@ fn recovery_audit_log_records_spawn_and_complete() {
             loop {
                 match agent.beat(Status::Ok, 0) {
                     BeatOutcome::Sent => break,
-                    BeatOutcome::Dropped => {
+                    BeatOutcome::Dropped(_) => {
                         tries += 1;
                         if tries > 5_000 {
                             panic!("kernel never accepted a beat within 5000 retries");
@@ -1229,7 +1229,7 @@ fn recovery_audit_log_chain_survives_rotation_and_restart() {
             loop {
                 match agent.beat(Status::Ok, 0) {
                     BeatOutcome::Sent => break,
-                    BeatOutcome::Dropped => {
+                    BeatOutcome::Dropped(_) => {
                         tries += 1;
                         if tries > 5_000 {
                             panic!("kernel never accepted a beat within 5000 retries");
@@ -1321,7 +1321,7 @@ fn recovery_audit_log_chain_survives_rotation_and_restart() {
             loop {
                 match agent.beat(Status::Ok, 0) {
                     BeatOutcome::Sent => break,
-                    BeatOutcome::Dropped => {
+                    BeatOutcome::Dropped(_) => {
                         tries += 1;
                         if tries > 5_000 {
                             panic!("kernel never accepted a beat within 5000 retries");
@@ -1526,7 +1526,7 @@ fn file_export_writes_tsv() {
             loop {
                 match agent.beat(Status::Ok, 0) {
                     BeatOutcome::Sent => break,
-                    BeatOutcome::Dropped => {
+                    BeatOutcome::Dropped(_) => {
                         tries += 1;
                         if tries > 5_000 {
                             panic!("kernel never accepted a beat");
@@ -1632,7 +1632,7 @@ fn file_export_rotation() {
             loop {
                 match agent1.beat(Status::Ok, 0) {
                     BeatOutcome::Sent => break,
-                    BeatOutcome::Dropped => {
+                    BeatOutcome::Dropped(_) => {
                         tries += 1;
                         if tries > 5_000 {
                             panic!("kernel never accepted a beat agent1");
@@ -1790,7 +1790,7 @@ fn client_reconnect_after_observer_restart() {
         loop {
             match agent.beat(Status::Ok, 0) {
                 BeatOutcome::Sent => break,
-                BeatOutcome::Dropped => {
+                BeatOutcome::Dropped(_) => {
                     tries += 1;
                     if tries > 5_000 {
                         panic!("kernel never accepted a beat v1");
@@ -1858,7 +1858,7 @@ fn client_reconnect_after_observer_restart() {
         loop {
             match agent.beat(Status::Ok, 0) {
                 BeatOutcome::Sent => break,
-                BeatOutcome::Dropped => {
+                BeatOutcome::Dropped(_) => {
                     tries += 1;
                     if tries > 5_000 {
                         panic!("kernel never accepted a beat v2");
@@ -1916,7 +1916,7 @@ fn client_auto_reconnect_after_dropped() {
     loop {
         match agent.beat(Status::Ok, 0) {
             BeatOutcome::Sent => break,
-            BeatOutcome::Dropped => {
+            BeatOutcome::Dropped(_) => {
                 std::thread::sleep(Duration::from_millis(50));
             }
             BeatOutcome::Failed(e) => panic!("warmup beat failed: {e}"),
@@ -1933,7 +1933,7 @@ fn client_auto_reconnect_after_dropped() {
     let mut dropped_count = 0u32;
     for _ in 0..10 {
         match agent.beat(Status::Ok, 0) {
-            BeatOutcome::Dropped => {
+            BeatOutcome::Dropped(_) => {
                 dropped_count += 1;
             }
             BeatOutcome::Sent => {
@@ -2000,7 +2000,7 @@ fn signal_handling_graceful_shutdown() {
                 loop {
                     match agent.beat(Status::Ok, 0) {
                         BeatOutcome::Sent => break,
-                        BeatOutcome::Dropped => {
+                        BeatOutcome::Dropped(_) => {
                             tries += 1;
                             if tries > 5_000 {
                                 panic!("kernel never accepted a beat before sigterm");
@@ -2150,7 +2150,7 @@ fn run_agent_child(socket_path: &str) {
         loop {
             match agent.beat(Status::Ok, i as u32) {
                 BeatOutcome::Sent => break,
-                BeatOutcome::Dropped => {
+                BeatOutcome::Dropped(_) => {
                     tries += 1;
                     if tries > 500 {
                         std::process::exit(1);
@@ -2182,7 +2182,7 @@ fn run_degraded_child(socket_path: &str) {
         loop {
             match agent.beat(Status::Degraded, 0) {
                 BeatOutcome::Sent => break,
-                BeatOutcome::Dropped => {
+                BeatOutcome::Dropped(_) => {
                     tries += 1;
                     if tries > 500 {
                         std::process::exit(1);
@@ -2294,7 +2294,7 @@ fn iteration_budget_holds_under_slow_scrape_load() {
             loop {
                 match agent.beat(Status::Ok, 0) {
                     BeatOutcome::Sent => break,
-                    BeatOutcome::Dropped => {
+                    BeatOutcome::Dropped(_) => {
                         tries += 1;
                         if tries > 5_000 {
                             panic!("kernel never accepted a beat within 5000 retries");
@@ -2460,7 +2460,7 @@ fn serve_pending_seconds_separates_scrape_from_beat_path() {
             loop {
                 match agent.beat(Status::Ok, 0) {
                     BeatOutcome::Sent => break,
-                    BeatOutcome::Dropped => {
+                    BeatOutcome::Dropped(_) => {
                         tries += 1;
                         if tries > 5_000 {
                             panic!("kernel never accepted a beat within 5000 retries");
@@ -2989,7 +2989,7 @@ fn secure_udp_client_to_observer_beats() {
         for _ in 0..10 {
             match agent.beat(varta_client::Status::Ok, 0) {
                 varta_client::BeatOutcome::Sent => {}
-                varta_client::BeatOutcome::Dropped => {
+                varta_client::BeatOutcome::Dropped(_) => {
                     std::thread::sleep(Duration::from_millis(50));
                 }
                 varta_client::BeatOutcome::Failed(e) => {
@@ -3093,7 +3093,7 @@ fn secure_udp_counter_wrap_continues_under_load() {
 
         // One warm-up beat under prefix-index 0.
         match agent.beat(varta_client::Status::Ok, 0) {
-            varta_client::BeatOutcome::Sent | varta_client::BeatOutcome::Dropped => {}
+            varta_client::BeatOutcome::Sent | varta_client::BeatOutcome::Dropped(_) => {}
             varta_client::BeatOutcome::Failed(e) => panic!("unexpected hard failure: {e}"),
         }
 
@@ -3110,7 +3110,7 @@ fn secure_udp_counter_wrap_continues_under_load() {
         // This beat hits the wrap branch — must rotate prefix without
         // re-reading OS entropy.
         match agent.beat(varta_client::Status::Ok, 0) {
-            varta_client::BeatOutcome::Sent | varta_client::BeatOutcome::Dropped => {}
+            varta_client::BeatOutcome::Sent | varta_client::BeatOutcome::Dropped(_) => {}
             varta_client::BeatOutcome::Failed(e) => panic!("wrap-rotation beat failed: {e}"),
         }
 
@@ -3129,7 +3129,7 @@ fn secure_udp_counter_wrap_continues_under_load() {
         // session against the observer's replay state.
         for _ in 0..5 {
             match agent.beat(varta_client::Status::Ok, 0) {
-                varta_client::BeatOutcome::Sent | varta_client::BeatOutcome::Dropped => {}
+                varta_client::BeatOutcome::Sent | varta_client::BeatOutcome::Dropped(_) => {}
                 varta_client::BeatOutcome::Failed(e) => {
                     panic!("post-rotation beat failed: {e}")
                 }

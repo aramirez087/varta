@@ -204,7 +204,7 @@ mod linux {
                 loop {
                     match agent.beat(varta_client::Status::Ok, 0) {
                         varta_client::BeatOutcome::Sent => break,
-                        varta_client::BeatOutcome::Dropped => {
+                        varta_client::BeatOutcome::Dropped(_) => {
                             tries += 1;
                             assert!(
                                 tries <= 5_000,

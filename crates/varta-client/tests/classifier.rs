@@ -5,7 +5,7 @@
 
 use std::io::{self, Write};
 
-use varta_client::{classify_send_error, BeatError, BeatOutcome};
+use varta_client::{classify_send_error, BeatError, BeatOutcome, DropReason};
 
 // The ENOBUFS constant is module-private in client.rs, so it is replicated
 // here with identical cfg guards. If the numeric value ever changes it must
@@ -147,22 +147,83 @@ fn enobufs_matches_system_header() {
 fn enobufs_classifies_as_dropped() {
     let err = io::Error::from_raw_os_error(ENOBUFS_FOR_THIS_OS);
     assert!(
-        matches!(classify_send_error(&err), BeatOutcome::Dropped),
-        "ENOBUFS (code {ENOBUFS_FOR_THIS_OS}) should classify as Dropped"
+        matches!(
+            classify_send_error(&err),
+            BeatOutcome::Dropped(DropReason::KernelQueueFull)
+        ),
+        "ENOBUFS (code {ENOBUFS_FOR_THIS_OS}) should classify as Dropped(KernelQueueFull)"
     );
 }
 
 #[test]
 fn wouldblock_classifies_as_dropped() {
     let err = io::Error::from(io::ErrorKind::WouldBlock);
-    assert!(matches!(classify_send_error(&err), BeatOutcome::Dropped));
+    assert!(matches!(
+        classify_send_error(&err),
+        BeatOutcome::Dropped(DropReason::KernelQueueFull)
+    ));
 }
 
 #[test]
 fn connection_refused_classifies_as_dropped() {
     let err = io::Error::from(io::ErrorKind::ConnectionRefused);
-    assert!(matches!(classify_send_error(&err), BeatOutcome::Dropped));
+    assert!(matches!(
+        classify_send_error(&err),
+        BeatOutcome::Dropped(DropReason::NoObserver)
+    ));
 }
+
+#[test]
+fn not_found_classifies_as_no_observer() {
+    let err = io::Error::from(io::ErrorKind::NotFound);
+    assert!(matches!(
+        classify_send_error(&err),
+        BeatOutcome::Dropped(DropReason::NoObserver)
+    ));
+}
+
+#[test]
+fn connection_reset_classifies_as_peer_gone() {
+    let err = io::Error::from(io::ErrorKind::ConnectionReset);
+    assert!(matches!(
+        classify_send_error(&err),
+        BeatOutcome::Dropped(DropReason::PeerGone)
+    ));
+}
+
+#[test]
+fn not_connected_classifies_as_peer_gone() {
+    let err = io::Error::from(io::ErrorKind::NotConnected);
+    assert!(matches!(
+        classify_send_error(&err),
+        BeatOutcome::Dropped(DropReason::PeerGone)
+    ));
+}
+
+#[test]
+fn broken_pipe_classifies_as_peer_gone() {
+    let err = io::Error::from(io::ErrorKind::BrokenPipe);
+    assert!(matches!(
+        classify_send_error(&err),
+        BeatOutcome::Dropped(DropReason::PeerGone)
+    ));
+}
+
+#[test]
+fn storage_full_classifies_as_storage_full() {
+    let err = io::Error::from(io::ErrorKind::StorageFull);
+    assert!(matches!(
+        classify_send_error(&err),
+        BeatOutcome::Dropped(DropReason::StorageFull)
+    ));
+}
+
+// Structural invariant: DropReason is Copy + Eq and fits in one byte.
+const _: () = {
+    const fn assert_copy_eq<T: Copy + Eq>() {}
+    assert_copy_eq::<DropReason>();
+    assert!(core::mem::size_of::<DropReason>() == 1);
+};
 
 #[test]
 fn permission_denied_classifies_as_failed() {

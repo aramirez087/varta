@@ -69,21 +69,24 @@ pub fn classify_send_error(e: &io::Error) -> BeatOutcome {
     //     minted a dedicated ErrorKind for it on this toolchain.
     if let Some(code) = e.raw_os_error() {
         if code == ENOBUFS {
-            return BeatOutcome::Dropped;
+            return BeatOutcome::Dropped(DropReason::KernelQueueFull);
         }
     }
 
     match e.kind() {
-        // (b) Peer not present or channel transiently full.
-        io::ErrorKind::WouldBlock
-        | io::ErrorKind::ConnectionRefused
-        | io::ErrorKind::ConnectionReset
-        | io::ErrorKind::NotFound
+        // (b) Transient kernel pressure.
+        io::ErrorKind::WouldBlock => BeatOutcome::Dropped(DropReason::KernelQueueFull),
+        // (c) Observer not bound yet or socket file missing.
+        io::ErrorKind::ConnectionRefused | io::ErrorKind::NotFound => {
+            BeatOutcome::Dropped(DropReason::NoObserver)
+        }
+        // (d) Peer socket torn down since the last beat.
+        io::ErrorKind::ConnectionReset
         | io::ErrorKind::NotConnected
-        | io::ErrorKind::BrokenPipe
-        | io::ErrorKind::StorageFull => BeatOutcome::Dropped,
-
-        // (c) Unexpected error: capture as a Copy POD that cannot allocate.
+        | io::ErrorKind::BrokenPipe => BeatOutcome::Dropped(DropReason::PeerGone),
+        // (e) Host out of disk space.
+        io::ErrorKind::StorageFull => BeatOutcome::Dropped(DropReason::StorageFull),
+        // (f) Unexpected error: capture as a Copy POD that cannot allocate.
         _ => BeatOutcome::Failed(BeatError::from_io(e)),
     }
 }
@@ -148,6 +151,54 @@ impl fmt::Display for BeatError {
 
 impl std::error::Error for BeatError {}
 
+/// Reason why a [`BeatOutcome::Dropped`] was produced.
+///
+/// Four-way taxonomy covering every `io::Error` classified as `Dropped`
+/// by [`classify_send_error`]. `Copy` by construction; fits in a single byte
+/// (statically asserted below). Operators can match on this to distinguish
+/// "observer not yet listening" from "socket torn down" from "host full".
+#[derive(Copy, Clone, Eq, PartialEq, Debug)]
+pub enum DropReason {
+    /// The kernel send buffer or socket queue was full (transient).
+    ///
+    /// Source: `WouldBlock` or `ENOBUFS`. The observer is likely alive;
+    /// retry after a short back-off or rely on
+    /// [`set_reconnect_after`](Varta::set_reconnect_after).
+    KernelQueueFull,
+    /// No observer is bound at the target path or address.
+    ///
+    /// Source: `NotFound` or `ConnectionRefused`. Expected during a
+    /// rolling observer restart before the new process has bound the socket.
+    NoObserver,
+    /// The peer socket was torn down since the last successful beat.
+    ///
+    /// Source: `ConnectionReset`, `NotConnected`, or `BrokenPipe`. The
+    /// channel was live and then disappeared — typically a crash or explicit
+    /// observer shutdown. Call [`reconnect`](Varta::reconnect) to recover.
+    PeerGone,
+    /// The host filesystem is out of space (UDS socket path on a full volume).
+    ///
+    /// Source: `StorageFull`. Retrying without clearing disk space will not
+    /// resolve this; operator intervention is required.
+    StorageFull,
+}
+
+impl fmt::Display for DropReason {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::KernelQueueFull => f.write_str("kernel queue full"),
+            Self::NoObserver => f.write_str("no observer"),
+            Self::PeerGone => f.write_str("peer gone"),
+            Self::StorageFull => f.write_str("storage full"),
+        }
+    }
+}
+
+// Four variants fit in a single byte — no heap footprint on the beat path.
+const _: () = {
+    assert!(core::mem::size_of::<DropReason>() == 1);
+};
+
 /// Result of a single [`Varta::beat`] call.
 ///
 /// `beat()` never blocks and never panics; the kernel's view of the send is
@@ -157,11 +208,11 @@ impl std::error::Error for BeatError {}
 pub enum BeatOutcome {
     /// The 32-byte datagram was accepted by the kernel.
     Sent,
-    /// The kernel could not accept the datagram and the agent should treat
-    /// this as a no-op. Possible causes: the observer is not listening, the
-    /// socket file vanished, or the per-socket queue is full
-    /// (`WouldBlock` under non-blocking I/O).
-    Dropped,
+    /// The kernel could not accept the datagram; the agent should treat
+    /// this as a no-op. The [`DropReason`] payload identifies the underlying
+    /// cause and lets operators distinguish "observer absent" from "peer gone"
+    /// from "kernel pressure" from "disk full".
+    Dropped(DropReason),
     /// An unexpected I/O error surfaced from the underlying `send(2)`.
     /// Callers wanting an `io::Error` can call [`BeatError::to_io_error`].
     Failed(BeatError),
@@ -171,7 +222,7 @@ impl fmt::Debug for BeatOutcome {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Sent => write!(f, "Sent"),
-            Self::Dropped => write!(f, "Dropped"),
+            Self::Dropped(r) => write!(f, "Dropped({r:?})"),
             Self::Failed(e) => write!(f, "Failed({e:?})"),
         }
     }
@@ -181,7 +232,7 @@ impl fmt::Display for BeatOutcome {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Sent => write!(f, "sent"),
-            Self::Dropped => write!(f, "dropped"),
+            Self::Dropped(r) => write!(f, "dropped: {r}"),
             Self::Failed(e) => write!(f, "failed: {e}"),
         }
     }
@@ -518,14 +569,14 @@ impl<T: BeatTransport> Varta<T> {
         frame.encode(&mut self.buf);
         let outcome = self.send_frame();
         match &outcome {
-            BeatOutcome::Dropped => {
+            BeatOutcome::Dropped(_) => {
                 self.consecutive_dropped = self.consecutive_dropped.saturating_add(1);
                 if self.reconnect_after > 0
                     && self.consecutive_dropped >= self.reconnect_after
                     && self.transport.reconnect().is_ok()
                 {
                     let retry = self.send_frame();
-                    if matches!(&retry, BeatOutcome::Dropped) {
+                    if matches!(&retry, BeatOutcome::Dropped(_)) {
                         self.consecutive_dropped = self.reconnect_after;
                     } else {
                         self.consecutive_dropped = 0;
@@ -544,7 +595,8 @@ impl<T: BeatTransport> Varta<T> {
     /// Re-establish the underlying transport connection.
     ///
     /// After an observer restart the old channel is stale — every `beat()`
-    /// returns [`BeatOutcome::Dropped`] forever. Call `reconnect` to establish
+    /// returns [`BeatOutcome::Dropped`] (with reason [`DropReason::PeerGone`]
+    /// or [`DropReason::NoObserver`]) until reconnected. Call `reconnect` to establish
     /// a fresh connection to the target stored at [`connect`](Self::connect)
     /// time. Agent identity (`nonce`, `start` clock) is preserved.
     ///
