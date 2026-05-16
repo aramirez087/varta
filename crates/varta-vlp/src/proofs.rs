@@ -50,10 +50,9 @@ fn decode_never_panics() {
 
 /// **M7 Step 2 — classification + post-condition coverage.**
 ///
-/// For every 32-byte input whose CRC trailer matches the body
-/// (i.e. inputs that pass the CRC gate), [`Frame::decode`] returns
-/// either an [`Err`] of one of the named [`DecodeError`] variants or
-/// an [`Ok(Frame)`] whose fields satisfy every documented post-condition:
+/// For every 32-byte input, [`Frame::decode`] returns either an [`Err`]
+/// of one of the named [`DecodeError`] variants or an [`Ok(Frame)`]
+/// whose fields satisfy every documented post-condition:
 ///
 /// * `frame.magic == MAGIC`
 /// * `frame.version == VERSION`
@@ -63,18 +62,19 @@ fn decode_never_panics() {
 /// * `frame.timestamp != u64::MAX` (the `BadTimestamp` gate fires first).
 /// * `frame.nonce != NONCE_TERMINAL` unless `frame.status == Critical`.
 ///
-/// The input is constrained to "CRC-valid" so the proof focuses on the
-/// post-CRC branches.  CRC-detection is proved separately by
-/// [`crc_detects_bit_flip`] in Step 3.
+/// The harness does NOT stamp a matching CRC over `bytes[0..28]`.
+/// Kani explores both CRC-valid inputs (the `Ok(frame)` arm, reachable
+/// when the SMT solver picks `bytes[28..32] == compute(bytes[0..28])`)
+/// and CRC-invalid inputs (the `Err(BadCrc)` arm).  Stamping the CRC
+/// externally introduced a second symbolic 28-iteration table-lookup
+/// loop that CBMC had to prove equivalent to the one inside
+/// `Frame::decode` — the same SMT-equivalence problem that forced the
+/// removal of `crc_compute_is_total` (see comment below).  CRC
+/// detection is proved separately by [`crc_detects_bit_flip`] in
+/// Step 3, so this harness needs no CRC constraint.
 #[kani::proof]
 fn decode_classification() {
-    let mut bytes: [u8; 32] = kani::any();
-    // Stamp a matching CRC over bytes 0..28 so the input passes the
-    // CRC gate.  Without this constraint Kani would also explore the
-    // BadCrc branch — which is fine, just less informative for this
-    // harness.  CRC behaviour is proved in its own harness.
-    let crc = crc32c::compute(&bytes[0..28]);
-    bytes[28..32].copy_from_slice(&crc.to_le_bytes());
+    let bytes: [u8; 32] = kani::any();
 
     match Frame::decode(&bytes) {
         Ok(frame) => {

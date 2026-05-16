@@ -114,9 +114,26 @@ itself.  It is a **required gate** — a failed proof blocks merge.  PRs
 that do not touch the protocol crate skip the job and short-circuit to
 "passing", keeping turnaround time bounded for unrelated changes.
 
-Job timeout is 30 minutes.  Locally, the full suite runs in well under
-that on Apple Silicon; the wider GHA budget accommodates slower
-runners and proof additions.
+Job timeout is 30 minutes per harness (matrix fan-out — each harness
+runs in parallel in its own job).  Locally, every per-PR harness runs
+in under two minutes on Apple Silicon.
+
+### Long-form proofs (nightly)
+
+`crc_detects_bit_flip` is excluded from the per-PR matrix.  Two
+symbolic 28-iteration table-lookup expressions over inputs that differ
+by one of 224 bit positions exceed CBMC's 30-min budget — locally
+observed at >13 min CPU time without completion.  It runs in
+`.github/workflows/kani-nightly.yml` with a 6 h budget on a daily
+schedule and auto-opens a GitHub issue on failure.
+
+CRC bit-flip detection is also guaranteed by the polynomial
+construction of CRC-32C/Castagnoli (HD=8 for short messages); the
+nightly harness is a structural sanity check on the table generator
+and byte-at-a-time loop, not the source of the cryptographic
+guarantee.  The const-asserts and RFC 3720 reference vectors in
+`crc32c.rs` already catch any per-PR regression in the table or
+algorithm.
 
 ## Roadmap
 

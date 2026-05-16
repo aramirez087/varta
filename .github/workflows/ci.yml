@@ -496,6 +496,13 @@ jobs:
     # own 30-min budget and runs in parallel — a single slow proof can no
     # longer starve the rest of the suite.  Add a new entry here when adding
     # a new harness to crates/varta-vlp/src/proofs.rs.
+    #
+    # `proofs::crc_detects_bit_flip` is intentionally NOT in this matrix —
+    # it has two symbolic 28-iteration table-lookup expressions that CBMC
+    # cannot discharge within a 30-min budget.  It runs in `kani-nightly.yml`
+    # with a 6 h budget instead.  CRC bit-flip detection is also guaranteed
+    # by polynomial construction (CRC-32C/Castagnoli) and exercised by the
+    # const-asserts and reference vectors in `crc32c.rs`.
     runs-on: ubuntu-latest
     timeout-minutes: 30
     strategy:
@@ -506,7 +513,6 @@ jobs:
         harness:
           - proofs::decode_never_panics
           - proofs::decode_classification
-          - proofs::crc_detects_bit_flip
           - proofs::encode_decode_roundtrips
           - proofs::decode_error_precedence
     steps:

@@ -1,0 +1,85 @@
+name: kani-nightly
+
+# Long-form symbolic verification — proofs whose SMT state space exceeds
+# the per-PR `kani-proofs` job's 30-min budget.  Currently:
+#
+#   * `crc_detects_bit_flip` — two symbolic 28-iteration table-lookup
+#     expressions over inputs that differ by one of 224 bit positions.
+#     CBMC must prove inequality of the two CRCs for every bit position;
+#     locally observed >13 min CPU time without completion.  CRC bit-flip
+#     detection is guaranteed by polynomial construction (CRC-32C /
+#     Castagnoli, HD=8 for short messages); this harness is a structural
+#     sanity check on the table generator and the byte-at-a-time loop,
+#     not the source of the cryptographic guarantee.  See
+#     book/src/architecture/verification.md.
+#
+# Add a new matrix entry when a future harness exceeds the per-PR budget.
+# Per-PR proofs live in `.github/workflows/ci.yml :: kani-proofs`.
+
+on:
+  schedule:
+    - cron: "33 4 * * *"   # 04:33 UTC daily (offset from fuzz-nightly @ 04:17)
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  long-form:
+    name: kani-nightly (${{ matrix.harness }})
+    runs-on: ubuntu-latest
+    # 6 h budget — well above the locally-observed runtime, leaves margin
+    # for CBMC version upgrades that change the heuristic cost.
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      matrix:
+        harness:
+          - proofs::crc_detects_bit_flip
+
+    steps:
+      - name: checkout
+        uses: actions/checkout@v4
+
+      - name: rust toolchain (stable — Kani works on stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: cache kani install
+        id: cache-kani
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/cargo-kani
+            ~/.cargo/bin/kani
+            ~/.kani
+          key: kani-v1-${{ runner.os }}
+
+      - name: install kani-verifier
+        if: steps.cache-kani.outputs.cache-hit != 'true'
+        run: |
+          cargo install --locked kani-verifier
+          cargo kani setup
+
+      - name: cargo kani -p varta-vlp --harness ${{ matrix.harness }}
+        run: cargo kani -p varta-vlp --harness ${{ matrix.harness }} --exact
+
+      - name: open issue on failure
+        if: failure()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const harness = '${{ matrix.harness }}';
+            const runId = context.runId;
+            const runUrl = `${context.payload.repository.html_url}/actions/runs/${runId}`;
+            await github.rest.issues.create({
+              ...context.repo,
+              title: `kani-nightly: ${harness} failed (run ${runId})`,
+              labels: ['kani-failure', 'bug'],
+              body: `Nightly Kani verification reported a failure for **${harness}**.\n\n` +
+                    `* Run: ${runUrl}\n\n` +
+                    `Reproduce locally:\n\n` +
+                    "```\n" +
+                    `cargo kani -p varta-vlp --harness ${harness} --exact\n` +
+                    "```\n"
+            });
