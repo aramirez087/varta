@@ -19,6 +19,14 @@ use super::kernel_abi::KernelSigAction;
 // `__NR_rt_sigaction` = 13 (x86_64 native syscall table).
 // `sigsetsize` (4th arg) = 8 bytes — one `unsigned long` on 64-bit Linux.
 
+/// Invoke the Linux `rt_sigaction(2)` syscall directly, bypassing any libc wrapper.
+///
+/// Returns `0` on success or a negative `-errno` value on failure.
+///
+/// # Safety
+/// - `act` must be a valid pointer to an initialised [`KernelSigAction`], or null.
+/// - `oact` must be a valid writable pointer to a [`KernelSigAction`]-sized slot, or null.
+/// - No concurrent thread may race on the same signal disposition while this call executes.
 #[cfg(target_arch = "x86_64")]
 #[inline]
 pub unsafe fn rt_sigaction_raw(
@@ -53,6 +61,14 @@ pub unsafe fn rt_sigaction_raw(
 // Syscall ABI: number in `x8`; args in `x0..x5`; result in `x0`.
 // `__NR_rt_sigaction` = 134 (generic Linux ABI, same as riscv64).
 
+/// Invoke the Linux `rt_sigaction(2)` syscall directly, bypassing any libc wrapper.
+///
+/// Returns `0` on success or a negative `-errno` value on failure.
+///
+/// # Safety
+/// - `act` must be a valid pointer to an initialised [`KernelSigAction`], or null.
+/// - `oact` must be a valid writable pointer to a [`KernelSigAction`]-sized slot, or null.
+/// - No concurrent thread may race on the same signal disposition while this call executes.
 #[cfg(target_arch = "aarch64")]
 #[inline]
 pub unsafe fn rt_sigaction_raw(
@@ -86,6 +102,14 @@ pub unsafe fn rt_sigaction_raw(
 // `__NR_rt_sigaction` = 134 (same generic Linux ABI as aarch64).
 // References: arch/riscv/include/uapi/asm/unistd.h (via <asm-generic/unistd.h>)
 
+/// Invoke the Linux `rt_sigaction(2)` syscall directly, bypassing any libc wrapper.
+///
+/// Returns `0` on success or a negative `-errno` value on failure.
+///
+/// # Safety
+/// - `act` must be a valid pointer to an initialised [`KernelSigAction`], or null.
+/// - `oact` must be a valid writable pointer to a [`KernelSigAction`]-sized slot, or null.
+/// - No concurrent thread may race on the same signal disposition while this call executes.
 #[cfg(target_arch = "riscv64")]
 #[inline]
 pub unsafe fn rt_sigaction_raw(

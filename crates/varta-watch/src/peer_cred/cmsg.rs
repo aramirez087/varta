@@ -562,8 +562,7 @@ mod miri_cmsg_tests {
     /// → `extract_pid_uid` returns `None`.
     #[test]
     fn illumos_opaque_extraction_returns_none_on_invalid() {
-        use super::super::platform::illumos::{Cmsghdr, IllumosCmsg, Msghdr};
-        use core::mem;
+        use super::super::platform::illumos::{IllumosCmsg, Msghdr};
 
         let illumos_hdr_size = <IllumosCmsg as CmsgPlatform>::cmsg_hdr_size();
         let payload_len = 8usize;

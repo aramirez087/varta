@@ -189,12 +189,13 @@ jobs:
         uses: dtolnay/rust-toolchain@nightly
 
       - name: install cargo-fuzz
-        # Pin the installer step itself — `cargo install --locked` consumes
-        # the cargo-fuzz `Cargo.lock`, not ours.  Keeps the tool's
-        # transitive deps reproducible.  `cargo fuzz run` subcommands below
-        # do not accept `--locked`; the fuzz harness manages its own
-        # workspace under `fuzz/`.
-        run: cargo install --locked cargo-fuzz
+        # Do NOT pass --locked: cargo-fuzz 0.13.1's own lockfile pins
+        # rustix 0.36.5, which uses #[cfg_attr(rustc_attrs, rustc_layout_*)]
+        # — internal rustc attributes now rejected on recent nightly builds.
+        # Omitting --locked lets cargo resolve a newer rustix that is
+        # compatible.  `cargo fuzz run` subcommands manage their own
+        # workspace under `fuzz/` and are unaffected.
+        run: cargo install cargo-fuzz
 
       - name: fuzz frame_decode (30 s)
         run: cargo fuzz run frame_decode fuzz/corpus/frame_decode -- -max_total_time=30
@@ -238,6 +239,10 @@ jobs:
   miri:
     name: miri (unsafe-code interpretation)
     runs-on: ubuntu-latest
+    # rust-toolchain.toml pins the workspace to stable; RUSTUP_TOOLCHAIN
+    # overrides that for every step in this job so cargo-miri gets nightly.
+    env:
+      RUSTUP_TOOLCHAIN: nightly
     steps:
       - uses: actions/checkout@v4
       - name: rust toolchain (nightly + miri)

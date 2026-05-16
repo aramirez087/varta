@@ -74,19 +74,22 @@ pub(super) unsafe fn install(handler: extern "C" fn(i32)) -> io::Result<()> {
         let old = unsafe { old.assume_init() };
 
         if old.sa_handler != handler as *const () {
-            return Err(io::Error::other(
+            return Err(io::Error::new(
+                io::ErrorKind::Other,
                 "rt_sigaction readback: kernel reports a different sa_handler than we installed",
             ));
         }
         if old.sa_flags & SA_RESTART == 0 {
-            return Err(io::Error::other(
+            return Err(io::Error::new(
+                io::ErrorKind::Other,
                 "rt_sigaction readback: kernel did not preserve SA_RESTART",
             ));
         }
         #[cfg(target_arch = "x86_64")]
         {
             if old.sa_flags & SA_RESTORER == 0 {
-                return Err(io::Error::other(
+                return Err(io::Error::new(
+                    io::ErrorKind::Other,
                     "rt_sigaction readback: SA_RESTORER not set in installed action \
                      (libc wrapper hijacked the syscall?)",
                 ));
@@ -96,7 +99,8 @@ pub(super) unsafe fn install(handler: extern "C" fn(i32)) -> io::Result<()> {
             // function does not require `unsafe`; only *calling* an
             // `unsafe extern "C"` function does).
             if old.sa_restorer != varta_signal_restorer as *const () {
-                return Err(io::Error::other(
+                return Err(io::Error::new(
+                    io::ErrorKind::Other,
                     "rt_sigaction readback: kernel did not install our trampoline \
                      (libc override, or kernel rt_sigreturn ABI changed?)",
                 ));

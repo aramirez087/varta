@@ -160,7 +160,8 @@ unsafe fn verify_live_delivery() -> io::Result<()> {
             // SAFETY: old.as_mut_ptr() was fully initialised by install_one_direct.
             let old_init = unsafe { old.assume_init() };
             unsafe { rt_sigaction_raw(SIGUSR1, &old_init, std::ptr::null_mut()) };
-            return Err(io::Error::other(
+            return Err(io::Error::new(
+                io::ErrorKind::Other,
                 "signal smoke test: SIGUSR1 not delivered within 50 ms — \
                  trampoline ABI broken or kernel signal delivery disabled?",
             ));

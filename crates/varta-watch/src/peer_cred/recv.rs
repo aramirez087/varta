@@ -182,7 +182,7 @@ pub(crate) fn recv_authenticated(fd: i32) -> RecvResult {
                     _ => return RecvResult::IoError(err),
                 }
             }
-            break ret as isize;
+            break ret;
         };
 
         if plat::ctrl_truncated(&mhdr) {

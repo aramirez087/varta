@@ -2202,6 +2202,9 @@ mod tests {
             max_bytes: None,
             sync_every: 1,
             daemon_pid: 7777,
+            fsync_budget: Duration::from_millis(50),
+            rotation_budget: Duration::from_millis(50),
+            sync_interval: None,
         };
 
         let extract_chain = |p: &Path| -> String {
