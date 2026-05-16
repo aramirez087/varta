@@ -52,7 +52,7 @@ pub const SA_RESTART: u64 = 0x1000_0000;
 /// kernel struct, so we do not set this flag.
 #[cfg(all(not(feature = "libc-signal-mode"), target_arch = "x86_64"))]
 pub const SA_RESTORER: u64 = 0x0400_0000;
-/// `SA_RESTORER`: not applicable on non-x86_64 architectures.
+/// Not applicable on non-x86_64; defined for API consistency.
 #[cfg(all(not(feature = "libc-signal-mode"), not(target_arch = "x86_64")))]
 #[allow(dead_code)]
 pub const SA_RESTORER: u64 = 0;
