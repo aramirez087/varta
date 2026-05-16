@@ -305,6 +305,18 @@ mod miri_cmsg_tests {
         cmsg_align(cmsg_hdr_size() + mem::size_of::<plat::Ucred>())
     }
 
+    /// 8-byte-aligned scratch buffer for cmsg walker tests.
+    ///
+    /// Plain `[u8; N]` arrays guarantee only 1-byte alignment. Miri flags
+    /// `unsafe { &*hdr_ptr }` (needs 8-byte alignment for `Cmsghdr.cmsg_len:
+    /// usize`) as UB when the backing allocation has alignment 1.
+    /// `#[repr(align(8))]` ensures `buf.as_ptr()` is 8-byte aligned; combined
+    /// with `cmsg_align`-bounded cursor advances every `base + cursor` pointer
+    /// meets the alignment requirement. Pattern matches production `AncBuf` in
+    /// `recv.rs`. See cerebrum 2026-05-16.
+    #[repr(align(8))]
+    struct AlignedBuf([u8; 512]);
+
     /// Write a single SCM_CREDENTIALS `cmsghdr + ucred` into `buf` starting
     /// at `offset`.  Returns the number of bytes written (== CMSG_SPACE).
     fn write_scm_credentials(buf: &mut [u8], offset: usize, pid: i32, uid: u32, gid: u32) {
@@ -357,10 +369,10 @@ mod miri_cmsg_tests {
 
     #[test]
     fn single_scm_credentials_returns_pid_uid() {
-        let mut buf = [0u8; 256];
-        write_scm_credentials(&mut buf, 0, 1234, 1000, 100);
+        let mut abuf = AlignedBuf([0u8; 512]);
+        write_scm_credentials(&mut abuf.0, 0, 1234, 1000, 100);
         let controllen = cmsg_space_ucred();
-        let mhdr = make_mhdr(&buf, controllen);
+        let mhdr = make_mhdr(&abuf.0, controllen);
         let result = plat::peer_pid_after_recv(0, &mhdr);
         assert_eq!(result, Some((1234, 1000)));
     }
@@ -368,7 +380,8 @@ mod miri_cmsg_tests {
     #[test]
     fn truncated_cmsg_length_returns_none() {
         // Write a cmsg whose cmsg_len is smaller than hdr+ucred.
-        let mut buf = [0u8; 256];
+        let mut abuf = AlignedBuf([0u8; 512]);
+        let buf = &mut abuf.0;
         let hdr_size = cmsg_hdr_size();
         // cmsg_len = hdr_size only (no room for ucred).
         let truncated_len: usize = hdr_size;
@@ -378,14 +391,15 @@ mod miri_cmsg_tests {
         buf[mem::size_of::<usize>() + 4..mem::size_of::<usize>() + 8]
             .copy_from_slice(&plat::SCM_CREDENTIALS.to_ne_bytes());
         let controllen = cmsg_space_ucred();
-        let mhdr = make_mhdr(&buf, controllen);
+        let mhdr = make_mhdr(buf, controllen);
         let result = plat::peer_pid_after_recv(0, &mhdr);
         assert_eq!(result, None, "truncated cmsg must not produce a pid");
     }
 
     #[test]
     fn unknown_cmsg_type_returns_none() {
-        let mut buf = [0u8; 256];
+        let mut abuf = AlignedBuf([0u8; 512]);
+        let buf = &mut abuf.0;
         // Write a valid-length cmsg but with a different cmsg_type.
         let hdr_size = cmsg_hdr_size();
         let cmsg_len: usize = hdr_size + mem::size_of::<plat::Ucred>();
@@ -397,7 +411,7 @@ mod miri_cmsg_tests {
             .copy_from_slice(&wrong_type.to_ne_bytes());
         // controllen too small for a second cmsg → walk stops after one cmsg.
         let controllen = cmsg_space_ucred();
-        let mhdr = make_mhdr(&buf, controllen);
+        let mhdr = make_mhdr(buf, controllen);
         let result = plat::peer_pid_after_recv(0, &mhdr);
         assert_eq!(result, None, "unknown cmsg_type must not produce a pid");
     }
@@ -406,7 +420,8 @@ mod miri_cmsg_tests {
     fn multiple_cmsgs_finds_credentials_in_second() {
         // First cmsg: unknown type, second cmsg: SCM_CREDENTIALS.
         let space = cmsg_space_ucred();
-        let mut buf = [0u8; 512];
+        let mut abuf = AlignedBuf([0u8; 512]);
+        let buf = &mut abuf.0;
 
         // First cmsg — unknown type, valid length.
         let hdr_size = cmsg_hdr_size();
@@ -419,10 +434,10 @@ mod miri_cmsg_tests {
             .copy_from_slice(&wrong_type.to_ne_bytes());
 
         // Second cmsg — SCM_CREDENTIALS with pid=5678.
-        write_scm_credentials(&mut buf, space, 5678, 2000, 200);
+        write_scm_credentials(buf, space, 5678, 2000, 200);
 
         let controllen = space * 2;
-        let mhdr = make_mhdr(&buf, controllen);
+        let mhdr = make_mhdr(buf, controllen);
         let result = plat::peer_pid_after_recv(0, &mhdr);
         assert_eq!(result, Some((5678, 2000)));
     }
@@ -430,12 +445,12 @@ mod miri_cmsg_tests {
     #[test]
     fn trailing_padding_does_not_confuse_walker() {
         // A single SCM_CREDENTIALS cmsg followed by extra zero bytes.
-        let mut buf = [0u8; 256];
-        write_scm_credentials(&mut buf, 0, 999, 42, 42);
+        let mut abuf = AlignedBuf([0u8; 512]);
+        write_scm_credentials(&mut abuf.0, 0, 999, 42, 42);
         // Report controllen as the full buffer — walker must stop at the
         // cmsg whose cmsg_len does not leave room for another header.
         let controllen = 128;
-        let mhdr = make_mhdr(&buf, controllen);
+        let mhdr = make_mhdr(&abuf.0, controllen);
         let result = plat::peer_pid_after_recv(0, &mhdr);
         assert_eq!(result, Some((999, 42)));
     }
@@ -674,7 +689,8 @@ mod miri_cmsg_tests {
     /// forever. The walker advances by at least `cmsg_hdr_size` per step.
     #[test]
     fn zero_cmsg_len_does_not_infinite_loop() {
-        let mut buf = [0u8; 256];
+        let mut abuf = AlignedBuf([0u8; 512]);
+        let buf = &mut abuf.0;
         // Write a cmsg with cmsg_len == 0 but otherwise valid header bytes.
         let zero_len: usize = 0;
         buf[..mem::size_of::<usize>()].copy_from_slice(&zero_len.to_ne_bytes());
@@ -682,7 +698,7 @@ mod miri_cmsg_tests {
             .copy_from_slice(&plat::SOL_SOCKET.to_ne_bytes());
         buf[mem::size_of::<usize>() + 4..mem::size_of::<usize>() + 8]
             .copy_from_slice(&plat::SCM_CREDENTIALS.to_ne_bytes());
-        let mhdr = make_mhdr(&buf, buf.len());
+        let mhdr = make_mhdr(buf, buf.len());
         // Must return None — cmsg_len < needed; must terminate (test would
         // hang otherwise).
         let result = plat::peer_pid_after_recv(0, &mhdr);
