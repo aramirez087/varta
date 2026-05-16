@@ -676,14 +676,26 @@ mod tests {
     /// Bind a fresh UDS listener at a unique tempdir path and return both
     /// the listener (kept alive by the caller) and its path. The listener
     /// silently drops every datagram — enough to satisfy `Varta::connect`.
+    ///
+    /// The path embeds (pid, nanos, atomic counter). The counter guards
+    /// against same-process collisions when two unit tests in the same
+    /// `cargo test` run hit the same `SystemTime::now()` nanosecond value —
+    /// observed on macOS CI runners where the clock granularity is coarser
+    /// than on Apple Silicon. Without the counter, parallel test execution
+    /// can produce `AlreadyExists` from `create_dir`.
     fn bind_listener() -> (UnixDatagram, std::path::PathBuf) {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static TEMPDIR_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+        let counter = TEMPDIR_COUNTER.fetch_add(1, Ordering::Relaxed);
         let dir = std::env::temp_dir().join(format!(
-            "varta-clock-{}-{}",
+            "varta-clock-{}-{}-{}",
             std::process::id(),
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .map(|d| d.as_nanos())
-                .unwrap_or(0)
+                .unwrap_or(0),
+            counter
         ));
         std::fs::create_dir(&dir).expect("create tempdir");
         // Cerebrum 2026-05-13: process-wide umask from a concurrent

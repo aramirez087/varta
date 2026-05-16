@@ -457,9 +457,6 @@ impl Tracker {
                     self.capacity_exceeded = self.capacity_exceeded.saturating_add(1);
                     return Update::CapacityExceeded;
                 };
-                if evicted_slot.stall_emitted {
-                    self.stall_emitted_count = self.stall_emitted_count.saturating_sub(1);
-                }
                 let _ = self.pid_to_index.remove(evicted_slot.pid);
                 let Some(slot_mut) = self.entries.get_mut(evict_idx) else {
                     self.invariant_violations = self.invariant_violations.saturating_add(1);
@@ -479,7 +476,9 @@ impl Tracker {
                 if self.pid_to_index.insert(frame.pid, evict_idx).is_err() {
                     // Probe budget exhausted — roll back the slot write so
                     // the table stays internally consistent and surface
-                    // CapacityExceeded to the caller.
+                    // CapacityExceeded to the caller. The `stall_emitted_count`
+                    // decrement is deferred to the commit point below, so no
+                    // rollback of the counter is needed here.
                     if let Some(slot_mut) = self.entries.get_mut(evict_idx) {
                         *slot_mut = evicted_slot;
                     }
@@ -488,6 +487,17 @@ impl Tracker {
                     let _ = self.pid_to_index.insert(evicted_slot.pid, evict_idx);
                     self.capacity_exceeded = self.capacity_exceeded.saturating_add(1);
                     return Update::CapacityExceeded;
+                }
+                // Commit-on-success: `stall_emitted_count` is decremented only
+                // after the new pid is pinned in the index. If the index insert
+                // had failed above, the slot rollback would have restored the
+                // old `stall_emitted = true` flag — decrementing the counter
+                // before the insert (the pre-commit-on-success layout) caused
+                // an `observed > tracked` divergence, surfaced by the
+                // `tracker_record` fuzz target. Pattern mirrors cerebrum
+                // 2026-05-15 (AEAD nonce state mutation).
+                if evicted_slot.stall_emitted {
+                    self.stall_emitted_count = self.stall_emitted_count.saturating_sub(1);
                 }
                 self.evictions = self.evictions.saturating_add(1);
                 self.last_evicted_pid = Some(evicted_slot.pid);

@@ -23,13 +23,26 @@ use std::sync::atomic::{AtomicBool, Ordering};
 // Bring in the real kernel-ABI types and syscall wrapper from the production
 // signal_install module.  This eliminates the parallel-duplicate maintenance
 // hazard that existed when these were copy-pasted here.
+//
+// `feature = "test-hooks"` mirrors the lib-side gate on `__test_signal_abi`
+// (see `crates/varta-watch/src/lib.rs`): the lib only exposes the module
+// when `cfg(test)` is true on the lib *or* `test-hooks` is enabled. For
+// integration tests, the lib is a dependency built without `cfg(test)`, so
+// `test-hooks` is the only path that exposes the module. Without this
+// condition, `cargo clippy --no-default-features` on Linux x86_64 fails
+// with E0432 because the import resolves to a configured-out item.
 #[cfg(all(
     target_os = "linux",
     target_arch = "x86_64",
-    not(feature = "libc-signal-mode")
+    not(feature = "libc-signal-mode"),
+    feature = "test-hooks"
 ))]
 use varta_watch::__test_signal_abi::varta_signal_restorer;
-#[cfg(all(target_os = "linux", not(feature = "libc-signal-mode")))]
+#[cfg(all(
+    target_os = "linux",
+    not(feature = "libc-signal-mode"),
+    feature = "test-hooks"
+))]
 use varta_watch::__test_signal_abi::{rt_sigaction_raw, KernelSigAction, SA_RESTART, SA_RESTORER};
 
 static GOT_SIGNAL: AtomicBool = AtomicBool::new(false);
@@ -143,7 +156,8 @@ extern "C" fn restorer_test_handle(_sig: i32) {
 #[cfg(all(
     target_os = "linux",
     target_arch = "x86_64",
-    not(feature = "libc-signal-mode")
+    not(feature = "libc-signal-mode"),
+    feature = "test-hooks"
 ))]
 #[test]
 fn restorer_symbol_is_addressable() {
@@ -164,7 +178,8 @@ fn restorer_symbol_is_addressable() {
 #[cfg(all(
     target_os = "linux",
     target_arch = "x86_64",
-    not(feature = "libc-signal-mode")
+    not(feature = "libc-signal-mode"),
+    feature = "test-hooks"
 ))]
 #[test]
 fn linux_restorer_is_ours() {
@@ -237,7 +252,8 @@ fn linux_restorer_is_ours() {
 #[cfg(all(
     target_os = "linux",
     target_arch = "aarch64",
-    not(feature = "libc-signal-mode")
+    not(feature = "libc-signal-mode"),
+    feature = "test-hooks"
 ))]
 #[test]
 fn linux_aarch64_direct_syscall_roundtrips() {
@@ -292,7 +308,8 @@ fn linux_aarch64_direct_syscall_roundtrips() {
 #[cfg(all(
     target_os = "linux",
     target_arch = "riscv64",
-    not(feature = "libc-signal-mode")
+    not(feature = "libc-signal-mode"),
+    feature = "test-hooks"
 ))]
 #[test]
 fn linux_riscv64_direct_syscall_roundtrips() {
