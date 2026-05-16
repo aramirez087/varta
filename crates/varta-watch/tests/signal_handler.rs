@@ -141,10 +141,26 @@ fn sigurg_handler_sets_atomic_flag() {
 // real `signal_install` module via `__test_signal_abi`.
 // ---------------------------------------------------------------------------
 
-#[cfg(target_os = "linux")]
+// Same gate-set as the integration tests below — `feature = "test-hooks"`
+// is required because `restorer_test_handle` is only referenced from tests
+// that depend on `varta_watch::__test_signal_abi`, which the lib only exposes
+// under that feature when built as a dependency (see lib.rs).  Without the
+// matching gate, `cargo clippy -p varta-watch` on Linux without `test-hooks`
+// fails with dead-code on the static + function below.
+#[cfg(all(
+    target_os = "linux",
+    target_arch = "x86_64",
+    not(feature = "libc-signal-mode"),
+    feature = "test-hooks"
+))]
 static GOT_RESTORER_SIGNAL: AtomicBool = AtomicBool::new(false);
 
-#[cfg(target_os = "linux")]
+#[cfg(all(
+    target_os = "linux",
+    target_arch = "x86_64",
+    not(feature = "libc-signal-mode"),
+    feature = "test-hooks"
+))]
 extern "C" fn restorer_test_handle(_sig: i32) {
     GOT_RESTORER_SIGNAL.store(true, Ordering::Release);
 }

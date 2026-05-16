@@ -16,8 +16,8 @@ fuzz_target!(|data: &[u8]| {
     let master = Key::from_bytes(master_bytes);
 
     // Different agent IDs must produce different keys.
-    let k0 = kdf::derive_agent_key(&master, 0);
-    let k1 = kdf::derive_agent_key(&master, 1);
+    let k0 = kdf::derive_agent_key(&master, 0).expect("kdf must succeed");
+    let k1 = kdf::derive_agent_key(&master, 1).expect("kdf must succeed");
     assert_ne!(
         k0.as_bytes(),
         k1.as_bytes(),
@@ -25,8 +25,8 @@ fuzz_target!(|data: &[u8]| {
     );
 
     // Different epochs must produce different keys.
-    let e0 = kdf::derive_epoch_key(&k0, 0);
-    let e1 = kdf::derive_epoch_key(&k0, 1);
+    let e0 = kdf::derive_epoch_key(&k0, 0).expect("kdf must succeed");
+    let e1 = kdf::derive_epoch_key(&k0, 1).expect("kdf must succeed");
     assert_ne!(
         e0.as_bytes(),
         e1.as_bytes(),
@@ -41,7 +41,7 @@ fuzz_target!(|data: &[u8]| {
     );
 
     // Determinism: same inputs produce same outputs.
-    let k0_again = kdf::derive_agent_key(&master, 0);
+    let k0_again = kdf::derive_agent_key(&master, 0).expect("kdf must succeed");
     assert_eq!(
         k0.as_bytes(),
         k0_again.as_bytes(),
@@ -62,17 +62,17 @@ fuzz_target!(|data: &[u8]| {
             data[36], data[37], data[38], data[39],
             data[40], data[41], data[42], data[43],
         ]);
-        let key = kdf::derive_agent_key(&master, agent_id);
-        let ekey = kdf::derive_epoch_key(&key, epoch);
+        let key = kdf::derive_agent_key(&master, agent_id).expect("kdf must succeed");
+        let ekey = kdf::derive_epoch_key(&key, epoch).expect("kdf must succeed");
 
         // Determinism for fuzzed inputs.
-        let key2 = kdf::derive_agent_key(&master, agent_id);
+        let key2 = kdf::derive_agent_key(&master, agent_id).expect("kdf must succeed");
         assert_eq!(
             key.as_bytes(),
             key2.as_bytes(),
             "determinism for fuzzed agent_id"
         );
-        let ekey2 = kdf::derive_epoch_key(&key, epoch);
+        let ekey2 = kdf::derive_epoch_key(&key, epoch).expect("kdf must succeed");
         assert_eq!(
             ekey.as_bytes(),
             ekey2.as_bytes(),

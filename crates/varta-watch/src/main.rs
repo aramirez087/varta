@@ -759,6 +759,10 @@ fn run(cfg: Config) -> std::io::Result<()> {
         (None, true) => Some(Duration::from_secs(AUTO_DEADLINE_SECS)),
         (None, false) => None,
     };
+    // Captured so we can join the watchdog thread before emitting STOPPING=1
+    // on clean shutdown — otherwise a tick scheduled before the join can
+    // append a stray WATCHDOG=1 after STOPPING=1 (race seen on macOS CI).
+    let mut wdt_handle: Option<std::thread::JoinHandle<()>> = None;
 
     if let Some(deadline) = wdt_deadline {
         let deadline_ns = deadline.as_nanos() as u64;
@@ -777,7 +781,7 @@ fn run(cfg: Config) -> std::io::Result<()> {
             None => Duration::from_millis(500),
         };
         let mut wdt_notifier = wdt_notifier;
-        std::thread::Builder::new()
+        let handle = std::thread::Builder::new()
             .name("varta-watchdog".into())
             .spawn(move || loop {
                 std::thread::sleep(tick_sleep);
@@ -840,6 +844,7 @@ fn run(cfg: Config) -> std::io::Result<()> {
                     n.tick();
                 }
             })?;
+        wdt_handle = Some(handle);
     } else if sd_notify.watchdog_half_interval().is_some() {
         // Defensive: should be unreachable because `take_watchdog_notifier`
         // returns Some when the interval is set AND the socket is open.
@@ -1555,6 +1560,14 @@ fn run(cfg: Config) -> std::io::Result<()> {
     // Clean shutdown — disarm hardware watchdog and notify service manager.
     if let Some(ref hw) = hw_wdt {
         hw.arm_disarm_on_drop();
+    }
+    // Stop the self-watchdog thread BEFORE STOPPING=1 so a scheduled tick
+    // cannot append a stray WATCHDOG=1 after STOPPING=1.  The break above
+    // can fire from the `shutdown_after` deadline path which never sets
+    // SHUTDOWN, so latch it here unconditionally.
+    SHUTDOWN.store(1, Ordering::Release);
+    if let Some(h) = wdt_handle.take() {
+        let _ = h.join();
     }
     sd_notify.stopping();
 
