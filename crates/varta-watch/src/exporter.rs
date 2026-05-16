@@ -3048,10 +3048,12 @@ mod tests {
         }
         req.push_str("Connection: close\r\n\r\n");
         stream.write_all(req.as_bytes()).expect("write");
-        // Yield so the kernel can deliver the bytes to the accept queue
-        // before serve_pending reads them.
-        std::thread::sleep(Duration::from_millis(5));
-        prom.serve_pending().expect("serve_pending");
+        // Retry accepting pending connections in case the TCP connection hasn't
+        // reached the accept queue yet (kernel SYN queue -> listen backlog transition).
+        for _ in 0..20 {
+            std::thread::sleep(Duration::from_millis(5));
+            prom.serve_pending().expect("serve_pending");
+        }
         let mut response = String::new();
         stream.read_to_string(&mut response).expect("read");
         response
