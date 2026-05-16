@@ -22,6 +22,20 @@
 // runner (harness = false) below uses eprintln! for test status output,
 // which is correct: harness = false tests report results to stderr.
 
+// Scenario-based submodules — stubs only; implementations migrate in session 04.
+// `#[path]` is required because end_to_end.rs is the crate root; without it,
+// `mod basic;` would resolve to tests/basic.rs (sibling), not tests/end_to_end/basic.rs.
+#[path = "end_to_end/basic.rs"]
+mod basic;
+#[path = "end_to_end/observability.rs"]
+mod observability;
+#[path = "end_to_end/reconnect.rs"]
+mod reconnect;
+#[path = "end_to_end/recovery.rs"]
+mod recovery;
+#[path = "end_to_end/secure_udp.rs"]
+mod secure_udp;
+
 use std::io::{BufRead, Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::os::unix::fs::OpenOptionsExt;
