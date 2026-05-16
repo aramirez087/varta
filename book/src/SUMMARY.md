@@ -20,6 +20,7 @@
 - [Safety Profiles](architecture/safety-profiles.md)
 - [Supply-Chain Posture](architecture/supply-chain.md)
 - [Bounded Collections](architecture/bounded-collections.md)
+- [Deployment Ceiling & Sharding](architecture/deployment-ceiling-and-sharding.md)
 - [Signal-Handler Installation](architecture/signal-install.md)
 - [Graceful Shutdown](architecture/graceful-shutdown.md)
 

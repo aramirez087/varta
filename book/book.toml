@@ -19,9 +19,9 @@ additional-js = ["mermaid.min.js", "mermaid-init.js"]
 [output.html.search]
 limit-results = 30
 use-boolean-and = true
-boost-title = 2.0
-boost-hierarchy = 1.2
-boost-paragraph = 1.0
+boost-title = 2
+boost-hierarchy = 1
+boost-paragraph = 1
 expand = true
 heading-split-level = 3
 copy-js = true

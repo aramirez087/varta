@@ -614,6 +614,11 @@ rate(varta_recovery_last_fired_evictions_total[5m]) > 0.1
 varta_recovery_invariant_violations_total > 0
 ```
 
+For the deployment-side answer to *exceeding* the 4096-agent cap —
+running multiple `varta-watch` instances and fanning agents across
+them — see
+[Deployment Ceiling & Sharding](deployment-ceiling-and-sharding.md).
+
 ### Bounded-WCET guarantee
 
 Every `LastFiredTable` operation is a linear scan over a fixed-size
