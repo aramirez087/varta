@@ -130,7 +130,7 @@ listener cleanup.
 
 ## Cross-references
 
-* Recovery `Drop` impl: `crates/varta-watch/src/recovery.rs:1472-1507`
+* Recovery `Drop` impl: `crates/varta-watch/src/recovery/mod.rs:904-928`
 * Signal handler installation: `crates/varta-watch/src/signal_install/`
 * Observer self-liveness (the WATCHDOG=1 channel): [Stall Detection & Liveness]
 * Configuration constants: `DEFAULT_SHUTDOWN_GRACE_MS`,

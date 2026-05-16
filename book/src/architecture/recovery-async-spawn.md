@@ -1,6 +1,6 @@
 # Recovery — Non-Blocking Spawn / Async Reap
 
-> Status: implemented (Sessions 01–03 completed). The `--recovery-timeout-ms` flag is live in `varta-watch`; see `crates/varta-watch/src/config.rs` and `crates/varta-watch/src/recovery.rs`.
+> Status: implemented (Sessions 01–03 completed). The `--recovery-timeout-ms` flag is live in `varta-watch`; see `crates/varta-watch/src/config/` and `crates/varta-watch/src/recovery/`.
 
 ## 1. Problem
 
@@ -223,7 +223,7 @@ exec-mode children flow through it.
 ## 9. Cross-references
 
 - Session 02 (`docs/claude-sessions/recovery-async-spawn/session-02-recovery-impl.md`)
-  owns the green-phase implementation in `crates/varta-watch/src/recovery.rs`
+  owns the green-phase implementation in `crates/varta-watch/src/recovery/`
   and the `try_reap` wiring in `crates/varta-watch/src/main.rs` /
   `observer.rs`.
 - Session 03 (`docs/claude-sessions/recovery-async-spawn/session-03-cli-and-loop-integration.md`)
