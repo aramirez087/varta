@@ -39,16 +39,19 @@ pub const DEFAULT_PROM_RATE_LIMIT_BURST: u32 = 10;
 /// Default per-pid maximum beat rate in beats per second.
 /// Enabled by default to provide a baseline DoS ceiling.
 /// Set `--max-beat-rate 0` to disable.
+#[cfg(not(feature = "compile-time-config"))]
 pub const DEFAULT_MAX_BEAT_RATE: u32 = 100;
 
 /// Default global beat rate cap across all senders combined, in beats per
 /// second.  Provides a hard ceiling that defeats per-pid rotation attacks.
 /// Set `--global-beat-rate 0` to disable.  Sized for 50 concurrent agents
 /// × 100 bps.
+#[cfg(not(feature = "compile-time-config"))]
 pub const DEFAULT_GLOBAL_BEAT_RATE: u32 = 5_000;
 
 /// Default global burst capacity (token-bucket capacity).  2× the refill
 /// rate so 50 agents can co-restart within a 1 s window.
+#[cfg(not(feature = "compile-time-config"))]
 pub const DEFAULT_GLOBAL_BEAT_BURST: u32 = 10_000;
 
 /// Default receive-buffer size requested via `SO_RCVBUF` on the observer
@@ -56,6 +59,7 @@ pub const DEFAULT_GLOBAL_BEAT_BURST: u32 = 10_000;
 /// default global rate.  Linux doubles the value then clamps to
 /// `net.core.rmem_max` (~208 KiB stock); the gauge surfaces the actual
 /// granted value.  Set `--uds-rcvbuf-bytes 0` to leave the kernel default.
+#[cfg(not(feature = "compile-time-config"))]
 pub const DEFAULT_UDS_RCVBUF_BYTES: u32 = 1_048_576;
 
 /// Default wall-clock budget (in milliseconds) [`crate::recovery::Recovery`]

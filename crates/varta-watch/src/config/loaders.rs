@@ -2,7 +2,7 @@ use super::types::Config;
 #[cfg(feature = "secure-udp")]
 use super::validate::read_secret_file;
 use super::validate::validate_recovery_file;
-#[cfg(any(feature = "secure-udp", feature = "prometheus-exporter"))]
+#[cfg(feature = "prometheus-exporter")]
 use super::validate::validate_secret_file;
 
 impl Config {

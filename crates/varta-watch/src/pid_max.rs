@@ -74,8 +74,9 @@ mod tests {
     fn read_pid_max_does_not_exceed_modern_default_on_typical_hosts() {
         let v = read_pid_max();
         assert!(
-            v <= u32::MAX,
-            "pid_max must fit in u32 (Frame::pid is u32): {v}"
+            v <= LINUX_DEFAULT_PID_MAX,
+            "pid_max must not exceed the modern kernel default on typical hosts: \
+             got {v}, expected ≤ {LINUX_DEFAULT_PID_MAX}"
         );
     }
 

@@ -197,6 +197,20 @@ jobs:
         # workspace under `fuzz/` and are unaffected.
         run: cargo install cargo-fuzz
 
+      - name: ensure fuzz corpus directories exist
+        # `fuzz/corpus` is gitignored (cargo-fuzz writes generated inputs into
+        # it), so any target that passes an explicit corpus path to
+        # `cargo fuzz run` needs the directory pre-created on a clean checkout.
+        run: |
+          mkdir -p \
+            fuzz/corpus/frame_decode \
+            fuzz/corpus/aead_roundtrip \
+            fuzz/corpus/peer_cred_cmsg \
+            fuzz/corpus/bounded_index_u32 \
+            fuzz/corpus/bounded_index_ip \
+            fuzz/corpus/outstanding_table \
+            fuzz/corpus/ip_state_table
+
       - name: fuzz frame_decode (30 s)
         run: cargo fuzz run frame_decode fuzz/corpus/frame_decode -- -max_total_time=30
 
