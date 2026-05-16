@@ -33,6 +33,7 @@ const ENOBUFS_FOR_THIS_OS: i32 = 111;
 ///
 /// This guards against kernel errno renumbering silently misclassifying
 /// `ENOBUFS` (transient `Dropped`) as an unexpected `Failed` error.
+#[cfg(not(miri))]
 #[test]
 fn enobufs_matches_system_header() {
     #[cfg(target_os = "linux")]
