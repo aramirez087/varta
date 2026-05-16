@@ -21,7 +21,7 @@ use super::kernel_abi::KernelSigAction;
 
 #[cfg(target_arch = "x86_64")]
 #[inline]
-pub(super) unsafe fn rt_sigaction_raw(
+pub unsafe fn rt_sigaction_raw(
     sig: i32,
     act: *const KernelSigAction,
     oact: *mut KernelSigAction,
@@ -55,7 +55,7 @@ pub(super) unsafe fn rt_sigaction_raw(
 
 #[cfg(target_arch = "aarch64")]
 #[inline]
-pub(super) unsafe fn rt_sigaction_raw(
+pub unsafe fn rt_sigaction_raw(
     sig: i32,
     act: *const KernelSigAction,
     oact: *mut KernelSigAction,
@@ -88,7 +88,7 @@ pub(super) unsafe fn rt_sigaction_raw(
 
 #[cfg(target_arch = "riscv64")]
 #[inline]
-pub(super) unsafe fn rt_sigaction_raw(
+pub unsafe fn rt_sigaction_raw(
     sig: i32,
     act: *const KernelSigAction,
     oact: *mut KernelSigAction,

@@ -45,15 +45,15 @@ use syscall::rt_sigaction_raw;
 /// `SA_RESTART`: restart syscalls interrupted by this signal (no `EINTR`).
 /// Verified against `<asm-generic/signal-defs.h>`.
 #[cfg(not(feature = "libc-signal-mode"))]
-pub(crate) const SA_RESTART: u64 = 0x1000_0000;
+pub const SA_RESTART: u64 = 0x1000_0000;
 
 /// `SA_RESTORER`: kernel uses `sa_restorer` as the signal-return trampoline.
 /// x86_64 requires this; on aarch64 / riscv64 the field is absent from the
 /// kernel struct, so we do not set this flag.
 #[cfg(all(not(feature = "libc-signal-mode"), target_arch = "x86_64"))]
-pub(crate) const SA_RESTORER: u64 = 0x0400_0000;
+pub const SA_RESTORER: u64 = 0x0400_0000;
 #[cfg(all(not(feature = "libc-signal-mode"), not(target_arch = "x86_64")))]
-pub(crate) const SA_RESTORER: u64 = 0; // not applicable; never used
+pub const SA_RESTORER: u64 = 0; // not applicable; never used
 
 /// Install SIGINT / SIGTERM handlers on Linux.
 ///

@@ -1045,7 +1045,10 @@ mod tests {
         // Immediate follow-up: the gate must close again until another full
         // interval elapses.
         let refreshed_again = obs.maybe_refresh_pid_max();
-        assert!(!refreshed_again, "second call within new interval must skip");
+        assert!(
+            !refreshed_again,
+            "second call within new interval must skip"
+        );
         assert_eq!(
             obs.last_pid_max_refresh_ns, first_ts,
             "skip must leave the new timestamp untouched"

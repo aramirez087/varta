@@ -53,5 +53,5 @@ extern "C" {
     /// `__NR_rt_sigreturn` and does not return to userspace.
     // SAFETY: only ever taken as a function-pointer value
     // (`varta_signal_restorer as *const ()`) and handed to `rt_sigaction(2)`.
-    pub(crate) fn varta_signal_restorer();
+    pub fn varta_signal_restorer();
 }

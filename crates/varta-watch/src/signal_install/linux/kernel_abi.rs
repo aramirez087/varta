@@ -34,7 +34,7 @@
 
 #[cfg(target_arch = "x86_64")]
 #[repr(C)]
-pub(crate) struct KernelSigAction {
+pub struct KernelSigAction {
     pub sa_handler: *const (),
     pub sa_flags: u64,
     pub sa_restorer: *const (),
@@ -58,7 +58,7 @@ const _: () = assert!(core::mem::offset_of!(KernelSigAction, sa_mask) == 24);
 
 #[cfg(target_arch = "aarch64")]
 #[repr(C)]
-pub(crate) struct KernelSigAction {
+pub struct KernelSigAction {
     pub sa_handler: *const (),
     pub sa_flags: u64,
     pub sa_mask: u64,
@@ -82,7 +82,7 @@ const _: () = assert!(core::mem::offset_of!(KernelSigAction, sa_mask) == 16);
 
 #[cfg(target_arch = "riscv64")]
 #[repr(C)]
-pub(crate) struct KernelSigAction {
+pub struct KernelSigAction {
     pub sa_handler: *const (),
     pub sa_flags: u64,
     pub sa_mask: u64,
