@@ -1,0 +1,8 @@
+{
+  "skillOverrides": {
+    "optimize-claude-md": "name-only",
+    "remotion-best-practices": "name-only",
+    "vercel-react-best-practices": "name-only",
+    "web-design-guidelines": "name-only"
+  }
+}
