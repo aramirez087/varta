@@ -1,6 +1,6 @@
 # Recovery audit log (schema v2)
 
-The recovery audit log (`varta-watch/src/audit.rs`) is the canonical
+The recovery audit log (`varta-watch/src/audit/`) is the canonical
 forensic record of every recovery action the daemon took or refused. It
 exists to satisfy three operational requirements:
 

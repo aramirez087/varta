@@ -29,7 +29,7 @@ Three independent tables enforce the 4096-agent ceiling:
 | Table                 | Constant                                                    | Defined in                              |
 | --------------------- | ----------------------------------------------------------- | --------------------------------------- |
 | Tracker (per-pid)     | `MAX_CAPACITY = 4096`                                       | `crates/varta-watch/src/tracker.rs`     |
-| Debounce ledger       | `MAX_LAST_FIRED_CAPACITY = 4096`                            | `crates/varta-watch/src/recovery.rs`    |
+| Debounce ledger       | `MAX_LAST_FIRED_CAPACITY = 4096`                            | `crates/varta-watch/src/recovery/mod.rs` |
 | Outstanding children  | Sized at construction from tracker capacity (≤ 4096)        | `crates/varta-watch/src/outstanding_table.rs` |
 
 Above 4096 agents on a single observer, the behaviour is **graceful
