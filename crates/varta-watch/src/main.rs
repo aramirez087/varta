@@ -199,6 +199,9 @@ fn write_heartbeat_atomic(path: &Path, contents: &[u8]) -> io::Result<()> {
 }
 
 fn main() -> ExitCode {
+    #[cfg(feature = "json-log")]
+    varta_watch::log::init_session_id();
+
     // Branch the configuration source on the `compile-time-config` feature.
     // Default builds parse argv (SRE profile); Class-A builds reject any argv
     // and read the baked-in constant produced by build.rs from

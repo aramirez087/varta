@@ -8,10 +8,15 @@
 //! # JSON schema (one object per line)
 //!
 //! ```json
-//! {"ts_ns":1720000000000000000,"level":"info","msg":"observer bound on /tmp/varta.sock"}
-//! {"ts_ns":1720000001000000000,"level":"warn","pid":42,"msg":"agent 42 stalled"}
-//! {"ts_ns":1720000002000000000,"level":"error","pid":42,"child_pid":99,"error":"ECONNREFUSED","msg":"recovery for pid 42 failed"}
+//! {"ts_ns":1720000000000000000,"session_id":"a3b4c5d6e7f80102","level":"info","msg":"observer bound on /tmp/varta.sock"}
+//! {"ts_ns":1720000001000000000,"session_id":"a3b4c5d6e7f80102","level":"warn","pid":42,"msg":"agent 42 stalled"}
+//! {"ts_ns":1720000002000000000,"session_id":"a3b4c5d6e7f80102","level":"error","pid":42,"child_pid":99,"error":"ECONNREFUSED","msg":"recovery for pid 42 failed"}
 //! ```
+//!
+//! The `session_id` field is a 16-character lowercase hex string seeded from
+//! `/dev/urandom` at observer startup.  All log lines from a single process
+//! lifetime share the same value, allowing SIEM consumers to correlate entries
+//! across restarts without external injection.
 //!
 //! # JSON string escaping
 //!
@@ -34,6 +39,34 @@
 
 #[cfg(feature = "json-log")]
 use std::io::{self, Write};
+#[cfg(feature = "json-log")]
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// Per-process session identifier seeded from `/dev/urandom` at startup.
+/// Included in every JSON log line so all entries from one observer run
+/// can be correlated even after a restart.
+#[cfg(feature = "json-log")]
+static SESSION_ID: AtomicU64 = AtomicU64::new(0);
+
+/// Seed the session identifier. Call once from `main()` before any
+/// `varta_*` macro fires. Falls back to a deterministic mix of PID and
+/// startup timestamp if `/dev/urandom` is unavailable.
+#[cfg(feature = "json-log")]
+pub fn init_session_id() {
+    let id = (|| -> Option<u64> {
+        use std::io::Read;
+        let mut buf = [0u8; 8];
+        std::fs::File::open("/dev/urandom")
+            .and_then(|mut f| f.read_exact(&mut buf))
+            .ok()?;
+        Some(u64::from_le_bytes(buf))
+    })()
+    .unwrap_or_else(|| {
+        let pid = std::process::id() as u64;
+        pid.wrapping_mul(0x9e3779b97f4a7c15).wrapping_add(ts_ns())
+    });
+    SESSION_ID.store(id, Ordering::Relaxed);
+}
 
 /// Wall-clock timestamp for log entries, derived from `UNIX_EPOCH`.
 #[cfg(feature = "json-log")]
@@ -73,7 +106,13 @@ pub fn emit_json(
 ) {
     let mut stderr = io::stderr().lock();
 
-    let _ = write!(&mut stderr, "{{\"ts_ns\":{}", ts_ns());
+    let session_id = SESSION_ID.load(Ordering::Relaxed);
+    let _ = write!(
+        &mut stderr,
+        "{{\"ts_ns\":{},\"session_id\":\"{:016x}\"",
+        ts_ns(),
+        session_id,
+    );
 
     // level
     let _ = stderr.write_all(b",");
@@ -412,7 +451,14 @@ mod tests {
 
     #[cfg(feature = "json-log")]
     mod json_tests {
-        use super::super::write_json_str;
+        use super::super::{write_json_str, SESSION_ID};
+        use std::sync::atomic::Ordering;
+
+        #[test]
+        fn session_id_initializes_without_panic() {
+            super::super::init_session_id();
+            let _ = SESSION_ID.load(Ordering::Relaxed);
+        }
 
         #[test]
         fn json_string_escaping() {

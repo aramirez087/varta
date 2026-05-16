@@ -25,7 +25,7 @@ workspace = true
 [dependencies]
 
 [features]
-default = []
+default = ["json-log"]
 # Internal: shared UDP socket wiring (UdpSocket bind/recv) used by both
 # secure and plaintext UDP listeners.  Not user-facing on its own —
 # enable `secure-udp` or `unsafe-plaintext-udp` instead.
