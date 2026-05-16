@@ -840,6 +840,14 @@ pub struct PromExporter {
     rate_limited_total: [u64; 2],
     /// Effective SO_RCVBUF size in bytes for the observer UDS, set at startup.
     uds_rcvbuf_bytes: u32,
+    /// Observer's currently cached `/proc/sys/kernel/pid_max` value. Seeded at
+    /// startup from [`crate::observer::Observer::pid_max`] and refreshed via
+    /// `set_pid_max_current` whenever the observer's maintenance-phase
+    /// re-read fires. Surfaced as `varta_pid_max_current` (gauge) so
+    /// operators can detect runtime `sysctl -w kernel.pid_max=...` changes
+    /// (`delta(varta_pid_max_current[5m]) != 0`). On non-Linux this stays
+    /// at `u32::MAX` and the gate is effectively disabled.
+    pid_max_current: u32,
     /// Times the observer's monotonic clock returned a value strictly less
     /// than the previously observed one and the forward clamp absorbed the
     /// regression. Surfaced as `varta_observer_clock_regression_total`;
@@ -1114,6 +1122,7 @@ impl PromExporter {
             secure_aead_attempts_total: 0,
             rate_limited_total: [0; 2],
             uds_rcvbuf_bytes: 0,
+            pid_max_current: 0,
             clock_regressions_total: 0,
             clock_jumps_forward_total: 0,
             nonce_wrap_total: 0,
@@ -1303,6 +1312,15 @@ impl PromExporter {
     /// Record the effective SO_RCVBUF size granted by the kernel at startup.
     pub fn set_uds_rcvbuf_bytes(&mut self, bytes: u32) {
         self.uds_rcvbuf_bytes = bytes;
+    }
+
+    /// Set the observer's currently cached `pid_max`. Called once at startup
+    /// (with the value [`crate::observer::Observer::pid_max`] read from
+    /// `/proc/sys/kernel/pid_max`) and again from the maintenance phase
+    /// whenever [`crate::observer::Observer::maybe_refresh_pid_max`] fires.
+    /// Surfaced as the `varta_pid_max_current` gauge.
+    pub fn set_pid_max_current(&mut self, value: u32) {
+        self.pid_max_current = value;
     }
 
     /// Record one or more observer clock-regression events drained from
@@ -2147,6 +2165,21 @@ impl PromExporter {
             self.body_buf,
             "varta_frame_rejected_pid_above_max_total {}",
             self.frame_rejected_pid_above_max_total
+        );
+        // varta_pid_max_current — observer's currently cached pid_max value.
+        // Seeded at startup and refreshed at most every 60 s from
+        // /proc/sys/kernel/pid_max. Operators alert on changes via
+        // `delta(varta_pid_max_current[5m]) != 0`. On non-Linux this is
+        // `u32::MAX` (gate effectively disabled).
+        self.body_buf.push_str(
+            "# HELP varta_pid_max_current Observer's cached /proc/sys/kernel/pid_max (refreshed every 60s).\n",
+        );
+        self.body_buf
+            .push_str("# TYPE varta_pid_max_current gauge\n");
+        let _ = writeln!(
+            self.body_buf,
+            "varta_pid_max_current {}",
+            self.pid_max_current
         );
         // varta_tracker_namespace_conflict_total — beats dropped because the
         // slot's pinned PID-namespace inode disagreed with the beat's inode

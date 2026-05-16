@@ -36,9 +36,9 @@ use std::io;
 
 use super::mode::SignalHandlerMode;
 #[cfg(not(feature = "libc-signal-mode"))]
-use std::sync::atomic::{AtomicBool, Ordering};
-#[cfg(not(feature = "libc-signal-mode"))]
 use kernel_abi::KernelSigAction;
+#[cfg(not(feature = "libc-signal-mode"))]
+use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(not(feature = "libc-signal-mode"))]
 use syscall::rt_sigaction_raw;
 

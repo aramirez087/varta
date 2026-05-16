@@ -354,8 +354,7 @@ fn bind_fsyncs_parent_directory_after_stale_recovery() {
 #[ignore = "probe always fails in the multi-threaded test harness; \
             the success case is validated by the production binary startup"]
 fn pre_thread_attestation_succeeds_when_single_threaded() {
-    let _tok = PreThreadAttestation::new()
-        .expect("single-threaded probe must succeed");
+    let _tok = PreThreadAttestation::new().expect("single-threaded probe must succeed");
 }
 
 /// PreThreadAttestation — the probe must reject a multi-threaded process.

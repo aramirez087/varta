@@ -717,6 +717,7 @@ fn run(cfg: Config) -> std::io::Result<()> {
             pe.set_tracker_config(cfg.tracker_capacity, cfg.eviction_scan_window);
             pe.set_signal_handler_mode(cfg.signal_handler_mode.as_str());
             pe.set_uds_rcvbuf_bytes(observer.uds_rcvbuf_bytes());
+            pe.set_pid_max_current(observer.pid_max());
             if let Ok(bound_addr) = pe.local_addr() {
                 let line = format!("{bound_addr}\n");
                 let _ = std::io::stdout().lock().write_all(line.as_bytes());
@@ -1241,6 +1242,20 @@ fn run(cfg: Config) -> std::io::Result<()> {
             #[cfg(feature = "prometheus-exporter")]
             if let Some(pe) = prom_export.as_mut() {
                 pe.record_frame_namespace_mismatches(frame_ns_mismatches);
+            }
+        }
+
+        // Periodically re-read /proc/sys/kernel/pid_max so a sysctl-driven
+        // runtime change (e.g. `sysctl -w kernel.pid_max=...`) is picked up
+        // within one PID_MAX_REFRESH_INTERVAL_NS without daemon restart.
+        // The call is gated internally by elapsed time; ~1 /proc read per
+        // minute, off the hot path. Updates the Prometheus gauge whether
+        // or not the value changed, so dashboards always reflect the
+        // current cached ceiling.
+        if observer.maybe_refresh_pid_max() {
+            #[cfg(feature = "prometheus-exporter")]
+            if let Some(pe) = prom_export.as_mut() {
+                pe.set_pid_max_current(observer.pid_max());
             }
         }
 

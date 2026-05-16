@@ -37,6 +37,14 @@ pub(crate) const RATE_LIMIT_N: usize = 2;
 /// loaded host and far below any plausible sleep or migration interval.
 const CLOCK_JUMP_FORWARD_THRESHOLD_NS: u64 = 5_000_000_000;
 
+/// Re-read `/proc/sys/kernel/pid_max` at most every 60 s. Bounded so that an
+/// operator-driven `sysctl -w kernel.pid_max=...` change is picked up without
+/// daemon restart; coarse enough that the `/proc` read never appears on any
+/// latency profile (the refresh runs in the maintenance phase, not on the
+/// poll hot path). Hardcoded — no CLI knob, matching the self-watchdog
+/// cadence convention.
+const PID_MAX_REFRESH_INTERVAL_NS: u64 = 60_000_000_000;
+
 /// Global per-observer token bucket — one shared across all senders.
 ///
 /// Guards against per-pid rotation attacks where an attacker cycles through
@@ -281,6 +289,12 @@ pub struct Observer {
     /// Count of beats dropped at ingress because `frame.pid > pid_max`.
     /// Surfaced as `varta_frame_rejected_pid_above_max_total`.
     pid_above_max_drops: u64,
+    /// Monotonic-clock timestamp (ns) of the most recent `pid_max` refresh
+    /// from `/proc/sys/kernel/pid_max`. `0` until the first periodic refresh
+    /// fires from [`Observer::maybe_refresh_pid_max`]; the value cached at
+    /// `Observer::new` covers the startup window until then. Compared against
+    /// `self.now_ns()` with [`PID_MAX_REFRESH_INTERVAL_NS`].
+    last_pid_max_refresh_ns: u64,
     /// Effective `SO_RCVBUF` size granted by the kernel for the observer UDS,
     /// in bytes.  `0` if `--uds-rcvbuf-bytes 0` was used or tuning failed.
     /// Set by [`Observer::bind`] from the [`UdsListener::rcvbuf_bytes`] accessor.
@@ -347,6 +361,7 @@ impl Observer {
             cross_namespace_drops: 0,
             pid_max: crate::pid_max::read_pid_max(),
             pid_above_max_drops: 0,
+            last_pid_max_refresh_ns: 0,
             uds_rcvbuf_bytes: 0,
         })
     }
@@ -408,7 +423,13 @@ impl Observer {
         clock_source: ClockSource,
         pre_thread: &PreThreadAttestation,
     ) -> io::Result<Self> {
-        let listener = UdsListener::bind(path, socket_mode, read_timeout, uds_rcvbuf_bytes, pre_thread)?;
+        let listener = UdsListener::bind(
+            path,
+            socket_mode,
+            read_timeout,
+            uds_rcvbuf_bytes,
+            pre_thread,
+        )?;
         let rcvbuf = listener.rcvbuf_bytes();
         let mut obs = Self::from_listener(
             listener,
@@ -789,6 +810,29 @@ impl Observer {
         self.pid_max
     }
 
+    /// Re-read `/proc/sys/kernel/pid_max` if at least
+    /// [`PID_MAX_REFRESH_INTERVAL_NS`] has elapsed since the last refresh.
+    /// Cheap no-op otherwise (single `u64` compare).
+    ///
+    /// Intended to be called from the daemon's maintenance phase — *not*
+    /// from `poll()` — so the I/O hot path stays untouched. Picks up
+    /// runtime `sysctl -w kernel.pid_max=...` changes within one interval.
+    /// On non-Linux targets, [`crate::pid_max::read_pid_max`] returns
+    /// `u32::MAX` so the gate stays effectively disabled and this method
+    /// is a steady no-op.
+    ///
+    /// Returns `true` when a refresh actually ran this call (regardless of
+    /// whether the read value changed), `false` when gated by the interval.
+    pub fn maybe_refresh_pid_max(&mut self) -> bool {
+        let now_ns = self.now_ns();
+        if now_ns.saturating_sub(self.last_pid_max_refresh_ns) < PID_MAX_REFRESH_INTERVAL_NS {
+            return false;
+        }
+        self.pid_max = crate::pid_max::read_pid_max();
+        self.last_pid_max_refresh_ns = now_ns;
+        true
+    }
+
     /// Drain and reset the per-tracker namespace-conflict counter — beats
     /// dropped because the beat's namespace inode disagreed with the slot's
     /// pinned namespace inode (first-namespace-wins). Surfaced as
@@ -931,6 +975,100 @@ mod tests {
             !path.exists(),
             "socket file must be removed after observer drop"
         );
+    }
+
+    #[test]
+    fn maybe_refresh_pid_max_respects_interval() {
+        // Drive the cadence gate without exercising the /proc read itself —
+        // the value `read_pid_max` returns is host-dependent (kernel default
+        // 4_194_304 on Linux, u32::MAX elsewhere); we assert the gate's
+        // *timing* contract, not the value.
+        //
+        // The observer's monotonic clock is anchored to `Observer::new` (see
+        // `Clock::new`), so `now_ns()` starts near zero and only crosses
+        // PID_MAX_REFRESH_INTERVAL_NS after ~60 s of real uptime. The test
+        // advances the observer's `last_now_ns` directly via the forward
+        // clamp to simulate elapsed time without sleeping.
+        let mut obs = Observer::new(
+            Duration::from_secs(1),
+            64,
+            EvictionPolicy::Strict,
+            DEFAULT_EVICTION_SCAN_WINDOW,
+            None,
+            0,
+            0,
+            ClockSource::Monotonic,
+        )
+        .expect("Observer::new should succeed");
+
+        let initial = obs.pid_max();
+        assert_eq!(
+            obs.last_pid_max_refresh_ns, 0,
+            "fresh Observer has not yet run a periodic refresh"
+        );
+
+        // Immediately after construction the observer clock is still inside
+        // the startup window. `now_ns() - 0 < INTERVAL`, so the gate skips:
+        // `Observer::new` has already read pid_max, no need to re-read yet.
+        let refreshed_at_startup = obs.maybe_refresh_pid_max();
+        assert!(
+            !refreshed_at_startup,
+            "first call within startup window must skip (Observer::new already read pid_max)"
+        );
+        assert_eq!(
+            obs.last_pid_max_refresh_ns, 0,
+            "skip must leave the timestamp untouched"
+        );
+
+        // Simulate >60 s of observer uptime by pushing the forward-clamped
+        // monotonic anchor past the interval. The next `now_ns()` reading
+        // will be clamped to at least this value.
+        obs.last_now_ns = PID_MAX_REFRESH_INTERVAL_NS + 1_000_000_000;
+        // The forward clamp registers the real raw clock as a regression
+        // when computing now_ns; drain it so unrelated tests stay clean.
+        let refreshed_after_interval = obs.maybe_refresh_pid_max();
+        assert!(
+            refreshed_after_interval,
+            "refresh must fire once the interval has elapsed since startup"
+        );
+        let first_ts = obs.last_pid_max_refresh_ns;
+        assert!(
+            first_ts >= PID_MAX_REFRESH_INTERVAL_NS,
+            "post-interval refresh stamps a fresh timestamp >= INTERVAL"
+        );
+        assert_eq!(
+            obs.pid_max(),
+            initial,
+            "refresh re-reads the same host value within a single test process"
+        );
+
+        // Immediate follow-up: the gate must close again until another full
+        // interval elapses.
+        let refreshed_again = obs.maybe_refresh_pid_max();
+        assert!(!refreshed_again, "second call within new interval must skip");
+        assert_eq!(
+            obs.last_pid_max_refresh_ns, first_ts,
+            "skip must leave the new timestamp untouched"
+        );
+
+        // Rewind the recorded timestamp by more than the interval and confirm
+        // the gate opens again.
+        obs.last_pid_max_refresh_ns = first_ts.saturating_sub(PID_MAX_REFRESH_INTERVAL_NS + 1);
+        let refreshed_after_rewind = obs.maybe_refresh_pid_max();
+        assert!(
+            refreshed_after_rewind,
+            "refresh must fire after rewinding the recorded timestamp"
+        );
+        assert!(
+            obs.last_pid_max_refresh_ns >= first_ts,
+            "rewind-driven refresh records a fresh timestamp"
+        );
+
+        // Test produced clock regressions as a side effect of pushing
+        // `last_now_ns` past the real raw clock; drain so subsequent suite
+        // state stays neutral. The count is non-deterministic (depends on
+        // how many `now_ns()` calls were issued by `maybe_refresh_pid_max`).
+        let _ = obs.drain_clock_regressions();
     }
 
     #[test]
