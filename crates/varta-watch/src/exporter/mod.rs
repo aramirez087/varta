@@ -3467,3 +3467,13 @@ mod tests {
         );
     }
 }
+
+// Submodule stubs — implementations migrate here in sessions 02 and 03.
+// Declared private so sessions can promote visibility incrementally.
+#[cfg(feature = "prometheus-exporter")]
+mod bearer_token;
+mod file;
+#[cfg(feature = "prometheus-exporter")]
+mod http;
+#[cfg(feature = "prometheus-exporter")]
+mod prometheus;
