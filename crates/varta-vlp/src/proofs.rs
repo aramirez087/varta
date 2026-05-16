@@ -140,7 +140,27 @@ fn crc_detects_bit_flip() {
     kani::assert(original != flipped_crc, "single-bit flip changes CRC");
 }
 
-/// **M7 Step 4 — encode/decode round-trip isomorphism.**
+/// **M7 Step 4a — encode/decode round-trip (smoke test for per-PR budget).**
+///
+/// The buffer produced by [`Frame::encode`] on a constructable [`Frame`]
+/// decodes back to a [`Frame`] with identical fields.  This variant uses
+/// concrete field values to stay within the per-PR CI budget (<1s);
+/// the exhaustive multi-dimensional symbolic variant runs in kani-nightly.yml.
+///
+/// CRC computation over symbolic fields creates large SMT state
+/// (even with only 2 symbolic variables, >2 min locally); smoke-testing
+/// with concrete fields verifies the encode/decode path works, while
+/// nightly exhaustive testing proves the invariant holds universally.
+#[kani::proof]
+fn encode_decode_roundtrips() {
+    let original = Frame::new(Status::Ok, 42u32, 0x0123456789ABCDEFu64, 0x0FEDCBA987654321u64, 0x12345678u32);
+    let mut buf = [0u8; 32];
+    original.encode(&mut buf);
+    let decoded = Frame::decode(&buf).expect("constructable frame decodes");
+    kani::assert(decoded == original, "fields preserved");
+}
+
+/// **M7 Step 4b — exhaustive encode/decode round-trip (nightly variant).**
 ///
 /// For every constructable [`Frame`] whose field values satisfy the
 /// documented invariants ([`Frame::decode`] docstring), the buffer
@@ -151,8 +171,13 @@ fn crc_detects_bit_flip() {
 /// * `timestamp < u64::MAX` (reserved sentinel).
 /// * `status ∈ {Ok, Degraded, Critical}` (Stall is observer-synthesised).
 /// * `nonce != NONCE_TERMINAL` unless `status == Critical`.
+///
+/// This exhaustive multi-dimensional symbolic variant explores all status
+/// values and nonce constraints, creating large SMT state via CRC
+/// computation over symbolic fields.  CBMC runtime is >80s locally;
+/// runs in kani-nightly.yml with 6h budget.
 #[kani::proof]
-fn encode_decode_roundtrips() {
+fn encode_decode_roundtrips_exhaustive() {
     let pid: u32 = kani::any();
     kani::assume(pid >= 2);
 
@@ -180,7 +205,7 @@ fn encode_decode_roundtrips() {
     kani::assert(decoded == original, "fields preserved bit-for-bit");
 }
 
-/// **M7 Step 4 — error-gate precedence.**
+/// **M7 Step 4c — error-gate precedence.**
 ///
 /// For every 32-byte input that fails decode, the first gate in the
 /// documented order (magic → version → CRC → status → pid →

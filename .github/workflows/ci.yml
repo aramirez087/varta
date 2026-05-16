@@ -497,12 +497,18 @@ jobs:
     # longer starve the rest of the suite.  Add a new entry here when adding
     # a new harness to crates/varta-vlp/src/proofs.rs.
     #
-    # `proofs::crc_detects_bit_flip` is intentionally NOT in this matrix —
-    # it has two symbolic 28-iteration table-lookup expressions that CBMC
-    # cannot discharge within a 30-min budget.  It runs in `kani-nightly.yml`
-    # with a 6 h budget instead.  CRC bit-flip detection is also guaranteed
-    # by polynomial construction (CRC-32C/Castagnoli) and exercised by the
-    # const-asserts and reference vectors in `crc32c.rs`.
+    # Two harnesses are intentionally NOT in this matrix:
+    #
+    # * `proofs::crc_detects_bit_flip` — two symbolic 28-iteration table-lookup
+    #   expressions; CBMC cannot discharge within 30-min budget.  6h budget in
+    #   kani-nightly.yml.  CRC bit-flip detection guaranteed by polynomial
+    #   construction (CRC-32C/Castagnoli); const-asserts in crc32c.rs.
+    #
+    # * `proofs::encode_decode_roundtrips_exhaustive` — exhaustive round-trip
+    #   over all status values + symbolic pid/timestamp/nonce/payload.  CRC
+    #   computation over symbolic fields creates >80s state.  Per-PR uses
+    #   concrete-value smoke test (~0.9s); nightly runs exhaustive symbolic
+    #   variant (~90s).
     runs-on: ubuntu-latest
     timeout-minutes: 30
     strategy:

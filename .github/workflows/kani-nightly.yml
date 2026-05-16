@@ -13,6 +13,12 @@ name: kani-nightly
 #     not the source of the cryptographic guarantee.  See
 #     book/src/architecture/verification.md.
 #
+#   * `encode_decode_roundtrips_exhaustive` — exhaustive round-trip test
+#     with symbolic pid, timestamp, status, nonce, and payload.  CBMC
+#     computes CRC over symbolically-computed frame bytes, creating large
+#     SMT state; locally observed >80s CPU time.  Per-PR CI runs a lighter
+#     variant with concrete status.
+#
 # Add a new matrix entry when a future harness exceeds the per-PR budget.
 # Per-PR proofs live in `.github/workflows/ci.yml :: kani-proofs`.
 
@@ -37,6 +43,7 @@ jobs:
       matrix:
         harness:
           - proofs::crc_detects_bit_flip
+          - proofs::encode_decode_roundtrips_exhaustive
 
     steps:
       - name: checkout
