@@ -7,10 +7,14 @@ title = "The Varta Book"
 [build]
 build-dir = "book"
 
+[preprocessor.mermaid]
+command = "mdbook-mermaid"
+
 [output.html]
 git-repository-url = "https://github.com/aramirez087/Varta"
 edit-url-template = "https://github.com/aramirez087/Varta/edit/main/book/{path}"
 preferred-dark-theme = "navy"
+additional-js = ["mermaid.min.js", "mermaid-init.js"]
 
 [output.html.search]
 limit-results = 30

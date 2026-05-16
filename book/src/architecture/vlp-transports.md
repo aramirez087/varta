@@ -6,22 +6,26 @@ allow swapping out the underlying socket type without modifying the protocol cor
 
 ## Architecture
 
-```
-┌──────────────────────────────────────────────────────────────────┐
-│  varta-vlp                                                       │
-│   Frame (32 bytes) │ Status │ DecodeError                        │
-│   Zero dependencies. Never changes.                              │
-└────────────┬───────────────────────────────┬─────────────────────┘
-             │                               │
-┌────────▼─────────┐            ┌────────▼──────────┐
-     │  varta-client     │            │  varta-watch       │
-     │                   │            │                    │
-     │  BeatTransport    │            │  BeatListener      │
-     │   ├── UdsTransport│            │   ├── UdsListener  │
-     │   ├── UdpTransport│            │   ├── UdpListener  │
-     │   └── SecureUdpTransport (secure-udp feat.)│   └── SecureUdpListener (secure-udp feat.)│
-     │       (udp feat.) │            │       (udp feat.) │
-     └───────────────────┘            └────────────────────┘
+```mermaid
+graph TD
+    VLP["<b>varta-vlp</b><br/>Frame (32 bytes) · Status · DecodeError<br/><i>Zero dependencies. Never changes.</i>"]
+
+    VLP --> CLIENT
+    VLP --> WATCH
+
+    subgraph CLIENT["varta-client"]
+        BT["BeatTransport"]
+        BT --> UdsT["UdsTransport"]
+        BT --> UdpT["UdpTransport<br/><i>(udp feat.)</i>"]
+        BT --> SecT["SecureUdpTransport<br/><i>(secure-udp feat.)</i>"]
+    end
+
+    subgraph WATCH["varta-watch"]
+        BL["BeatListener"]
+        BL --> UdsL["UdsListener"]
+        BL --> UdpL["UdpListener<br/><i>(udp feat.)</i>"]
+        BL --> SecL["SecureUdpListener<br/><i>(secure-udp feat.)</i>"]
+    end
 ```
 
 ### Agent side (`varta-client`)
