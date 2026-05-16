@@ -441,6 +441,27 @@ jobs:
             exit 1
           fi
 
+      # --- unsafe-plaintext-udp vs compile-time-config -----------------------
+      # Mission-critical (Class-A) builds must not link the plaintext UDP
+      # listener, which has no per-datagram authentication or replay
+      # protection.  The compile_error! in lib.rs rejects the combination at
+      # build time; CI confirms the diagnostic fires.
+      - name: unsafe-plaintext-udp + compile-time-config rejected by compile_error!
+        env:
+          VARTA_CONFIG_FILE: ${{ github.workspace }}/crates/varta-watch/tests/fixtures/safety_critical.varta.conf
+        run: |
+          if cargo build --locked -p varta-watch --release \
+            --no-default-features --features unsafe-plaintext-udp,compile-time-config 2>&1 \
+            | tee /tmp/plaintext-udp-combo.log \
+            | grep -qF "cannot be combined with"
+          then
+            echo "OK: unsafe-plaintext-udp + compile-time-config rejected by compile_error!"
+          else
+            echo "FAIL: combination should have triggered compile_error!"
+            cat /tmp/plaintext-udp-combo.log
+            exit 1
+          fi
+
   kani-proofs:
     name: kani-proofs (symbolic verification of varta-vlp)
     # Symbolic verification of `Frame::decode` and the CRC-32C primitive.

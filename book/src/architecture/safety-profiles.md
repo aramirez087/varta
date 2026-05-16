@@ -77,6 +77,13 @@ unsafe-plaintext-udp = ["udp-core"]
 Even with this feature, the listener **will not bind** unless
 `--i-accept-plaintext-udp` is also passed at runtime.
 
+This feature is **structurally unavailable in Class-A builds** —
+`compile-time-config` + `unsafe-plaintext-udp` is rejected by a
+`compile_error!` in `crates/varta-watch/src/lib.rs`.  Mission-critical
+deployments must use `secure-udp` (AEAD-authenticated, per-sender replay
+shadow) for any UDP transport; plaintext UDP has no replay protection and
+can be used by a network attacker to suppress stall detection.
+
 ---
 
 ## Class-A safety-critical features
@@ -114,8 +121,11 @@ the feature is on:
 - `Config::HELP` is a neutral one-liner that contains no flag names.
 - The binary refuses any argv tokens with `CompileTimeArgvForbidden`.
 
-Cannot be combined with `prometheus-exporter` — the combination is
-rejected at compile time by a `compile_error!` in `lib.rs`.
+Cannot be combined with `prometheus-exporter`, `libc-signal-mode`, or
+`unsafe-plaintext-udp` — each combination is rejected at compile time by
+a dedicated `compile_error!` in `lib.rs`.  The Class-A binary is
+structurally free of the HTTP exporter, the libc-signal indirection, and
+the plaintext UDP listener; none of those code paths can be linked in.
 
 ```sh
 export VARTA_CONFIG_FILE=/etc/varta/varta.conf

@@ -38,6 +38,17 @@ compile_error!(
      feature matrix."
 );
 
+#[cfg(all(feature = "unsafe-plaintext-udp", feature = "compile-time-config"))]
+compile_error!(
+    "`unsafe-plaintext-udp` cannot be combined with `compile-time-config` \
+     — plaintext UDP has no per-datagram authentication or replay \
+     protection, so a network attacker can suppress stall detection by \
+     forging beats.  Class-A safety-critical (mission-critical) builds \
+     must use `secure-udp` for any UDP transport.  See \
+     book/src/architecture/safety-profiles.md for the supported feature \
+     matrix."
+);
+
 pub mod audit;
 pub mod clock;
 pub mod config;
