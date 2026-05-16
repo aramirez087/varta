@@ -97,6 +97,60 @@ The hook chains the previously installed hook (preserving the default panic
 message and any user hooks). The sole heap allocation is the `Box` created by
 `std::panic::set_hook` at install time; the hook closure itself is stack-only.
 
+## Fork recovery & tracker semantics
+
+`Varta` snapshots the calling process's PID at `connect()` time and compares
+`std::process::id()` against the snapshot on every `beat()`. If they differ
+— i.e. the process executing `beat()` is a forked child that inherited the
+parent's `Varta` — the client transparently recovers:
+
+1. `transport.reconnect()` runs (re-binds the underlying socket; on
+   secure-UDP, refreshes the IV salt from OS entropy so AEAD nonce uniqueness
+   is preserved across the fork boundary).
+2. The per-connection counters (`nonce`, `start`, `last_timestamp`,
+   `consecutive_dropped`) reset, because the child's frame stream is
+   logically a new connection from the observer's perspective — every wire
+   field is keyed by `frame.pid`, which is now the child's PID.
+3. The `fork_recoveries` counter increments. Surface it as
+   `varta_client_fork_recoveries_total` via `Varta::fork_recoveries()` if
+   you publish client-side telemetry.
+
+Once recovered, the child's first beat goes into a fresh tracker slot on
+the observer (different PID → different slot), so the child's frames never
+race the parent's frames at the protocol level.
+
+### The parent-pid stall window
+
+The auto-recovery handles the *child*. The *parent* is harder: if the
+parent process forks and then exits (a classic daemonise pattern), its PID
+disappears from the kernel but the observer's tracker slot for that PID
+keeps aging. After `--threshold-ms` it stalls; if recovery is configured
+for kernel-attested origins, the observer may fire a recovery command for
+a PID that no longer exists.
+
+The fix is on the agent side, not the observer side. Two patterns work:
+
+* **Preferred — emit a terminal frame before the parent exits.** Send one
+  last `Status::Critical` beat from the parent immediately before
+  `exit(0)`. The observer records the critical frame and treats subsequent
+  silence as expected. The panic hook does this for free with
+  `nonce == NONCE_TERMINAL`; for clean exits, hand-roll the call:
+
+  ```rust,ignore
+  let _ = agent.beat(Status::Critical, 0);  // "I am leaving"
+  std::process::exit(0);
+  ```
+
+* **Alternative — widen the threshold.** If the parent reliably exits
+  within a few hundred milliseconds of fork, set `--threshold-ms` on the
+  observer above that window so the parent's slot is collected (per
+  `EVICTION_MULTIPLIER × threshold_ns`) before recovery would fire.
+
+The child's slot is never affected by this concern: it has a different PID,
+its own slot, and its own monotonically resetting nonce stream. There is no
+within-PID nonce collision because the IV salt + counter rotate on
+secure-UDP and the plaintext transports do not key on continuity.
+
 ## Constraints
 
 - **Zero production dependencies.** `[dependencies]` is empty (plus the

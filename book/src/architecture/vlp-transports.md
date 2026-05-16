@@ -330,6 +330,25 @@ intentionally low-level; the safety policy lives one layer up.
 Direct-transport users must call `SecureUdpTransport::reconnect()`
 themselves in the forked child before the first beat.
 
+### Parent-pid stall window (transport-agnostic)
+
+Auto-recovery handles the *child*. The *parent* does not get a free pass:
+if the parent forks and then `exit(0)`s (the daemonise pattern), its PID
+disappears from the kernel but the observer's tracker slot for that PID
+keeps aging. After `--threshold-ms` the slot stalls; if recovery is
+configured for kernel-attested origins, the observer may fire a recovery
+command for a PID that no longer exists. This applies to every transport
+(UDS, plaintext UDP, secure UDP) — it is a property of the
+silence-equals-stall contract, not of any particular wire format.
+
+The fix is on the agent side. The recommended pattern is to emit a final
+`Status::Critical` beat from the parent immediately before its terminal
+`exit()` — the observer records the critical frame and treats subsequent
+silence as expected closure rather than as a stall. See
+[`crates/varta-client/README.md` — *Fork recovery & tracker semantics*](../../crates/varta-client/README.md#fork-recovery--tracker-semantics)
+for the operator-side patterns and the alternative `--threshold-ms`
+widening approach.
+
 ### Panic-hook parallel
 
 `install_panic_handler_secure_udp` caches an 8-byte IV at install time

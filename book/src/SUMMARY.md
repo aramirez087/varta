@@ -9,6 +9,7 @@
 
 - [The VLP Frame](architecture/vlp-frame.md)
 - [Transports](architecture/vlp-transports.md)
+- [Threat Model](architecture/threat-model.md)
 - [Stall Detection & Liveness](architecture/observer-liveness.md)
 - [Recovery & Async Spawning](architecture/recovery-async-spawn.md)
 - [Shell-Mode Recovery Removal](architecture/recovery-shell-removal.md)
@@ -20,6 +21,7 @@
 - [Supply-Chain Posture](architecture/supply-chain.md)
 - [Bounded Collections](architecture/bounded-collections.md)
 - [Signal-Handler Installation](architecture/signal-install.md)
+- [Graceful Shutdown](architecture/graceful-shutdown.md)
 
 ---
 

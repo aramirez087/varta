@@ -106,6 +106,12 @@ Benchmark results are in [book/src/benchmarks/results.md](book/src/benchmarks/re
 The steady-state `beat()` path is designed to be invisible at runtime: one
 stack encode, one `send(2)`, no allocations.
 
+## Security
+
+Varta is built for high-assurance environments.
+- [**Formal Threat Model**](book/src/architecture/threat-model.md) — STRIDE analysis, trust boundaries, and mitigations.
+- [**Security Policy**](SECURITY.md) — reporting vulnerabilities.
+
 ## Constraints
 
 - **No registry dependencies** in any production crate.

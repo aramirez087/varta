@@ -58,9 +58,20 @@ compile_error!(
 
 /// Sentinel nonce value reserved for terminal panic frames.
 ///
-/// Regular beats from `varta_client::Varta::beat` wrap to 0 on exhaustion
-/// so that observers can unambiguously identify a panic-fired critical frame
-/// by its nonce alone.
+/// Emitted only by `varta_client::panic::install*` panic hooks, paired with
+/// [`Status::Critical`]. Regular beats from `varta_client::Varta::beat`
+/// increment monotonically from 1 and wrap to 0 on exhaustion (the wrap
+/// boundary in the client is `NONCE_TERMINAL - 1 → 0`), so the regular-beat
+/// nonce stream structurally never collides with this sentinel.
+///
+/// [`Frame::decode`] enforces `NONCE_TERMINAL ⇒ Status::Critical`
+/// ([`DecodeError::BadNonce`] otherwise). The converse is *not* enforced —
+/// operators may emit `Status::Critical` for non-panic alerts at any nonce.
+/// Downstream consumers that need to distinguish "panic terminal" from
+/// "operational critical" must inspect both `status` *and* `nonce`.
+///
+/// See `book/src/architecture/vlp-frame.md` ("Nonce semantics") for the
+/// full protocol-level rationale.
 pub const NONCE_TERMINAL: u64 = u64::MAX;
 
 /// Health status reported by an agent in a single VLP frame.
@@ -131,7 +142,13 @@ pub struct Frame {
     pub timestamp: u64,
     /// Strictly increasing counter, starting at 1 on the first beat after
     /// `Varta::connect`. The panic hook pins this to [`NONCE_TERMINAL`] to
-    /// mark a final critical frame. Regular beats wrap to 0 on exhaustion.
+    /// mark a final critical frame.
+    ///
+    /// Regular beats wrap at `NONCE_TERMINAL - 1 → 0` on exhaustion, so the
+    /// regular-beat nonce stream **structurally never collides** with
+    /// [`NONCE_TERMINAL`]. A wire frame with `nonce == NONCE_TERMINAL` is, by
+    /// construction, a panic frame (and [`Frame::decode`] enforces it must
+    /// also carry [`Status::Critical`]).
     pub nonce: u64,
     /// Free-form 4-byte payload — application-defined health context (queue
     /// depth, error code, etc.). Carried opaquely by the protocol. Shrunk

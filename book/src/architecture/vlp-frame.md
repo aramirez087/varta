@@ -22,6 +22,50 @@ offset │ size │ field      │ notes
                                                               total 32 bytes
 ```
 
+## Nonce semantics
+
+The 8-byte `nonce` field at offset 16 carries two distinct kinds of value:
+
+* **Regular beats** from `varta_client::Varta::beat` use a per-connection
+  counter that starts at **1** on the first beat after `Varta::connect` and
+  increments monotonically. On exhaustion the counter wraps at
+  `NONCE_TERMINAL - 1 → 0` — so the regular-beat stream cycles through
+  `1, 2, 3, …, u64::MAX - 1, 0, 1, 2, …` and **structurally never emits
+  `NONCE_TERMINAL`** (== `u64::MAX`).
+* **Panic frames** from `varta_client::panic::install*` hooks pin the nonce
+  to `NONCE_TERMINAL` and the status to `Status::Critical`. This is the
+  unique on-wire marker for a panic-terminated agent.
+
+`Frame::decode` enforces the wire-side invariant
+`nonce == NONCE_TERMINAL ⇒ status == Status::Critical`; any other status
+paired with the sentinel is rejected as `DecodeError::BadNonce`. The
+[Kani harness] in `crates/varta-vlp/src/proofs.rs` proves this for every
+decodable byte pattern.
+
+The converse — `Status::Critical ⇒ nonce == NONCE_TERMINAL` — is **not**
+enforced. Agents legitimately emit `Status::Critical` at regular nonce
+values for operational alerts (queue full, shedding load, etc.).
+Downstream consumers (alert rules, log dashboards, recovery filters) that
+need to distinguish "panic terminal" from "operational critical" must
+inspect **both** `status` and `nonce`:
+
+| `status` | `nonce` | meaning |
+|----------|---------|---------|
+| `Critical` | `NONCE_TERMINAL` | panic-hook terminal frame |
+| `Critical` | any other value (including `0` after wrap) | operational critical alert |
+| `Ok` / `Degraded` | any value `≠ NONCE_TERMINAL` | normal beat |
+| any | `NONCE_TERMINAL` with status `≠ Critical` | rejected at decode (`BadNonce`) |
+
+Wrap to `0` is rare in practice (an agent emitting one beat per millisecond
+takes ~584 million years to consume `u64::MAX - 1`), but it is structurally
+correct and observable: an agent that does wrap will continue emitting
+without observer ambiguity, because nonce `0` paired with `Critical` is
+classified as "operational critical," not "panic." The Kani harness covers
+the wire boundary; the wrap arithmetic itself lives in `varta-client` and
+is straight-line code in `Varta::beat`.
+
+[Kani harness]: ./verification.md
+
 ## v0.2 wire integrity (CRC-32C)
 
 Bytes 28..32 carry a CRC-32C (Castagnoli, polynomial `0x1EDC6F41`,

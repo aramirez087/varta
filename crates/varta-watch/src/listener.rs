@@ -53,17 +53,61 @@ extern "C" {
     ) -> i32;
 }
 
-// SOL_SOCKET level constant (POSIX — same value across Linux, macOS, BSDs, illumos).
+// SOL_SOCKET / SO_RCVBUF — platform-scoped FFI constants for setsockopt(2).
+//
+// Sources verified against vendor headers:
+//   linux:   include/uapi/asm-generic/socket.h    (SOL_SOCKET=1,      SO_RCVBUF=8)
+//   macOS:   xnu/bsd/sys/socket.h                 (SOL_SOCKET=0xffff, SO_RCVBUF=0x1002)
+//   *BSD:    sys/socket.h                         (SOL_SOCKET=0xffff, SO_RCVBUF=0x1002)
+//   illumos: usr/src/uts/common/sys/socket.h      (SOL_SOCKET=0xffff, SO_RCVBUF=0x1002)
+//
+// Adding a new target_os requires verifying these two constants against the
+// platform's headers and extending the cfg-any lists below. The `compile_error!`
+// fallback prevents silent drift to wrong values on an untested platform.
 #[cfg(target_os = "linux")]
 const SOL_SOCKET: i32 = 1;
-#[cfg(not(target_os = "linux"))]
+#[cfg(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "freebsd",
+    target_os = "dragonfly",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    target_os = "illumos",
+    target_os = "solaris",
+))]
 const SOL_SOCKET: i32 = 0xffff_u32 as i32;
 
-// SO_RCVBUF socket option.
 #[cfg(target_os = "linux")]
 const SO_RCVBUF: i32 = 8;
-#[cfg(not(target_os = "linux"))]
+#[cfg(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "freebsd",
+    target_os = "dragonfly",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    target_os = "illumos",
+    target_os = "solaris",
+))]
 const SO_RCVBUF: i32 = 0x1002;
+
+#[cfg(not(any(
+    target_os = "linux",
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "freebsd",
+    target_os = "dragonfly",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    target_os = "illumos",
+    target_os = "solaris",
+)))]
+compile_error!(
+    "varta-watch has no verified SOL_SOCKET / SO_RCVBUF values for this target_os. \
+     Verify against the platform's <sys/socket.h> and extend the cfg-any lists in \
+     crates/varta-watch/src/listener.rs."
+);
 
 /// Attests that the process is single-threaded at construction time.
 ///

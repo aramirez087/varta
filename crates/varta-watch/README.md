@@ -103,6 +103,18 @@ never blocks on a slow command. Completed children are reaped automatically
 each poll tick. If `--recovery-timeout-ms` is set, any child that exceeds the
 deadline is killed via kill(2) and then reaped.
 
+## Graceful shutdown
+
+`SIGINT` and `SIGTERM` set an atomic latch; the next poll iteration finishes
+cleanly, `STOPPING=1` is sent to systemd (when `--sd-notify` is wired),
+outstanding recovery children are killed and reaped within the
+`--shutdown-grace-ms` window (default 5 s), the audit log drains and
+`fdatasync(2)`s, and the observer's UDS socket file is unlinked on the way
+out. systemd `TimeoutStopSec=` should be at least `shutdown_grace_ms +
+audit_fsync_budget_ms + ~200 ms` (≈ 5.3 s with defaults). See
+[`book/src/architecture/graceful-shutdown.md`](../../book/src/architecture/graceful-shutdown.md)
+for the full sequence, signal disposition table, and the cost of `SIGKILL`.
+
 ## Constraints
 
 - **Zero production registry dependencies.** Only `varta-vlp` (path dep) and
