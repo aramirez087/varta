@@ -765,8 +765,7 @@ impl core::fmt::Display for ConfigError {
             }
             ConfigError::ShellRecoveryNotCompiledIn => write!(
                 f,
-                "shell-mode recovery has been permanently removed; \
-                 use --recovery-exec instead ({REF})"
+                "shell-mode recovery has been permanently removed ({REF})"
             ),
             ConfigError::ClockSourceUnsupported { platform, .. } => write!(
                 f,
