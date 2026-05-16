@@ -172,9 +172,13 @@ impl<'a, P: CmsgPlatform> Iterator for CmsgIter<'a, P>
 where
     P::Hdr: 'a,
 {
-    type Item = &'a P::Hdr;
+    /// `(header, payload_data_ptr)` — `payload_data_ptr` is derived from
+    /// `self.base` (full-buffer provenance) so that `extract_pid_uid`
+    /// implementations can safely cast it past the header size without
+    /// violating Stacked Borrows.
+    type Item = (&'a P::Hdr, *const u8);
 
-    fn next(&mut self) -> Option<&'a P::Hdr> {
+    fn next(&mut self) -> Option<(&'a P::Hdr, *const u8)> {
         if self.base.is_null() {
             return None;
         }
@@ -204,6 +208,10 @@ where
         if len > self.controllen - self.cursor {
             return None;
         }
+        // Derive data_ptr from self.base (full-buffer provenance) before
+        // advancing the cursor. Using self.base avoids narrowing provenance
+        // to sizeof(Hdr) that would occur if derived from the `hdr` reference.
+        let data_ptr = unsafe { self.base.add(self.cursor + P::cmsg_hdr_size()) };
         // Advance the cursor for the next iteration. Clamp the advance to
         // at least `cmsg_hdr_size` so an adversarial `cmsg_len == 0` (or
         // anything smaller than the header itself) cannot stall the walk in
@@ -211,7 +219,7 @@ where
         // wrapping into a small value that could look in-bounds.
         let advance = core::cmp::max(cmsg_align(len), P::cmsg_hdr_size());
         self.cursor = self.cursor.saturating_add(advance);
-        Some(hdr)
+        Some((hdr, data_ptr))
     }
 }
 
@@ -240,7 +248,7 @@ pub(super) fn find_credential<P: CmsgPlatform>(mhdr: &P::Msghdr) -> Option<(u32,
     // SAFETY: documented by this function's contract — callers commit that
     // `mhdr` was populated by `recvmsg(2)` (or an equivalent fabricator).
     let iter = unsafe { CmsgIter::<P>::new(mhdr) };
-    for hdr in iter {
+    for (hdr, data_ptr) in iter {
         if P::cmsg_level(hdr) != P::TARGET_LEVEL || P::cmsg_type(hdr) != P::TARGET_TYPE {
             continue;
         }
@@ -252,9 +260,11 @@ pub(super) fn find_credential<P: CmsgPlatform>(mhdr: &P::Msghdr) -> Option<(u32,
         //   immediately above.
         // - The iterator already proved `cursor + cmsg_len(hdr) <=
         //   controllen`, so the payload lies fully inside the readable region.
+        // - `data_ptr` is derived from the iterator's `self.base` (full-buffer
+        //   provenance) — not from the `hdr` reference — so retagging into a
+        //   larger credential type is provenance-clean under Stacked Borrows.
         // - The buffer outlives this call (stack-allocated in
         //   `recv_authenticated`) — satisfying `extract_pid_uid`'s contract.
-        let data_ptr = unsafe { (hdr as *const P::Hdr as *const u8).add(P::cmsg_hdr_size()) };
         let payload_len = P::cmsg_len(hdr).saturating_sub(P::cmsg_hdr_size());
         return unsafe { P::extract_pid_uid(data_ptr, payload_len) };
     }
