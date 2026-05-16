@@ -19,6 +19,11 @@ jobs:
   long-form:
     name: fuzz-nightly (${{ matrix.target }})
     runs-on: ubuntu-latest
+    env:
+      # The workspace rust-toolchain.toml pins stable, which would override
+      # the nightly toolchain installed below and break -Zsanitizer=address.
+      # Force nightly for all cargo/rustc invocations in this job.
+      RUSTUP_TOOLCHAIN: nightly
     strategy:
       fail-fast: false
       matrix:
