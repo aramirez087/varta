@@ -486,13 +486,29 @@ jobs:
           fi
 
   kani-proofs:
-    name: kani-proofs (symbolic verification of varta-vlp)
+    name: kani-proofs (${{ matrix.harness }})
     # Symbolic verification of `Frame::decode` and the CRC-32C primitive.
     # Required gate on every PR that touches the protocol crate.  See
     # book/src/architecture/verification.md for the strategy and a mapping
     # from harness names to invariants proved.
+    #
+    # Fan-out: one matrix entry per `#[kani::proof]` harness.  Each gets its
+    # own 30-min budget and runs in parallel — a single slow proof can no
+    # longer starve the rest of the suite.  Add a new entry here when adding
+    # a new harness to crates/varta-vlp/src/proofs.rs.
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        # Fully-qualified harness names (`<module>::<fn>`) — required by
+        # `cargo kani --harness ... --exact`.  Confirmed via `cargo kani list`.
+        harness:
+          - proofs::decode_never_panics
+          - proofs::decode_classification
+          - proofs::crc_detects_bit_flip
+          - proofs::encode_decode_roundtrips
+          - proofs::decode_error_precedence
     steps:
       - name: checkout
         uses: actions/checkout@v4
@@ -510,18 +526,36 @@ jobs:
         if: steps.changes.outputs.vlp == 'true' || github.event_name == 'push'
         uses: dtolnay/rust-toolchain@stable
 
-      - name: install kani-verifier
+      # Cache the cargo-kani binary AND the kani toolchain (~/.kani holds
+      # the CBMC binary + kani-compiler, ~600MB).  Without this, every run
+      # rebuilds kani-verifier from source (~3-5 min) and re-downloads the
+      # toolchain (~2-5 min).  Bump the `-v1` suffix to force a refresh
+      # after a kani-verifier upgrade or a CBMC change.
+      - name: cache kani install
         if: steps.changes.outputs.vlp == 'true' || github.event_name == 'push'
+        id: cache-kani
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/cargo-kani
+            ~/.cargo/bin/kani
+            ~/.kani
+          key: kani-v1-${{ runner.os }}
+
+      - name: install kani-verifier
+        if: (steps.changes.outputs.vlp == 'true' || github.event_name == 'push') && steps.cache-kani.outputs.cache-hit != 'true'
         run: |
           cargo install --locked kani-verifier
           cargo kani setup
 
-      - name: cargo kani -p varta-vlp
+      - name: cargo kani -p varta-vlp --harness ${{ matrix.harness }}
         if: steps.changes.outputs.vlp == 'true' || github.event_name == 'push'
         # `cargo kani` does not forward `--locked` to its inner `cargo
         # build`; the kani harness lives outside the workspace lockfile
         # contract.  Tracked as a follow-up.
-        run: cargo kani -p varta-vlp
+        # `--exact` pins the harness selector so a future `decode_classification_v2`
+        # would not also be picked up by the `decode_classification` entry.
+        run: cargo kani -p varta-vlp --harness ${{ matrix.harness }} --exact
 
       - name: skip notice
         if: steps.changes.outputs.vlp != 'true' && github.event_name != 'push'

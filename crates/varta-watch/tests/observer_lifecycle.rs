@@ -351,6 +351,7 @@ fn bind_fsyncs_parent_directory_after_stale_recovery() {
 /// process because the test harness spawns infrastructure threads before the
 /// first test function runs; any probe here would falsely detect multi-threadedness.
 #[test]
+// JUSTIFY: cargo test harness is multi-threaded; success case verified at production startup.
 #[ignore = "probe always fails in the multi-threaded test harness; \
             the success case is validated by the production binary startup"]
 fn pre_thread_attestation_succeeds_when_single_threaded() {

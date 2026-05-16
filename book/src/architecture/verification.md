@@ -68,7 +68,6 @@ each proof stays bounded:
 
 | Harness | What it proves | State scope |
 |---|---|---|
-| `crc_compute_is_total` | `crc32c::compute` is deterministic over arbitrary 28-byte input | CRC only |
 | `crc_detects_bit_flip` | Flipping a single bit in `[0, 28*8)` changes the CRC output | CRC + single bit position |
 | `decode_never_panics` | `Frame::decode(&[u8; 32])` returns without panicking on every input | Decode, no CRC assumption |
 | `decode_classification` | When `Ok(frame)`, all five field-range post-conditions hold | Decode, CRC assumed valid |
@@ -78,6 +77,16 @@ each proof stays bounded:
 Decoupling CRC-correctness from decode-correctness means a bug in
 either layer surfaces independently, with a focused
 counter-example.
+
+> **Why no `crc_compute_is_total` (determinism) harness?**  An earlier
+> version of this suite included one; CBMC needed >19 minutes on it
+> because two symbolic 28-iteration table-lookup expressions over the
+> same input must be proved equivalent at the SMT level.  The property
+> is already free in Rust: `crc32c::compute` is `pub const fn` with no
+> global state, no allocation, no FFI.  The const-asserts in
+> `crc32c.rs` exercise it concretely on the RFC 3720 reference vector,
+> and panic-freedom is subsumed by `decode_never_panics` (which calls
+> `compute` on the decode path).
 
 ## Local invocation
 

@@ -74,22 +74,28 @@ fn enobufs_matches_system_header() {
     )))]
     let header_paths: &[&str] = &[];
 
-    let mut found_content: Option<String> = None;
+    // Concatenate every header that exists.  On Linux the kernel-headers
+    // package splits errnos across `errno-base.h` (1–34) and `errno.h` (35+);
+    // ENOBUFS=105 lives in the latter, so reading only the first hit (as the
+    // original loop did) caused the test to fail on Ubuntu CI runners that
+    // had `errno-base.h` present.  macOS / *BSD bundle every code in one
+    // file, so concatenation is a no-op there.
+    let mut combined = String::new();
+    let mut any_found = false;
     for path in header_paths {
         if let Ok(content) = std::fs::read_to_string(path) {
-            found_content = Some(content);
-            break;
+            any_found = true;
+            combined.push_str(&content);
+            combined.push('\n');
         }
     }
 
-    let content = match found_content {
-        Some(c) => c,
-        None => {
-            let _ = io::stderr()
-                .write_all(b"enobufs_matches_system_header: no errno header found; skipping\n");
-            return;
-        }
-    };
+    if !any_found {
+        let _ = io::stderr()
+            .write_all(b"enobufs_matches_system_header: no errno header found; skipping\n");
+        return;
+    }
+    let content = combined;
 
     let mut seen_enobufs = false;
     for line in content.lines() {
