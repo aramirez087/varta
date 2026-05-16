@@ -1799,14 +1799,12 @@ impl PromExporter {
     }
 
     fn serve_one(&mut self, mut stream: TcpStream, render_fresh: bool) -> io::Result<()> {
-        // Accepted streams inherit the listener's non-blocking flag on both
-        // Linux (via `accept4(SOCK_NONBLOCK)` in libstd) and macOS (libstd
-        // calls `fcntl(F_SETFL, O_NONBLOCK)` post-accept). We intentionally
-        // do *not* set a blocking read/write timeout here: a blocking socket
-        // would let a slow peer hold the observer poll loop hostage for up
-        // to the timeout per request. The PROM_READ_DEADLINE /
-        // PROM_WRITE_TIMEOUT below are wall-clock budgets enforced by the
-        // loops themselves, not socket-level timeouts.
+        // Linux accept4(2) with SOCK_CLOEXEC does *not* propagate O_NONBLOCK
+        // to the accepted socket — the man page is explicit on this.  Set it
+        // unconditionally so the deadline loops below are the actual latency
+        // bounds, not a kernel blocking wait.  Do *not* use set_read_timeout /
+        // set_write_timeout: those silently re-enable blocking mode.
+        stream.set_nonblocking(true)?;
         let deadline = Instant::now() + PROM_READ_DEADLINE;
         // 512 bytes is enough for a request line + Authorization header +
         // typical scrape headers (Prometheus' default request is ~110 bytes
