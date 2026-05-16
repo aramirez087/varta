@@ -139,7 +139,7 @@ jobs:
             case "$name" in \#*|"") continue ;; esac
             case "$kind" in
               test|no-harness)
-                grep -qE "^[[:space:]]*fn[[:space:]]+${name}\b" "$file" \
+                grep -qE "^[[:space:]]*(pub(\([^)]+\))?[[:space:]]+)?fn[[:space:]]+${name}\b" "$file" \
                   || { echo "FAIL [$kind] $name @ $file"; exit 1; }
                 ;;
               bench-assertion)
