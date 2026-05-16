@@ -457,7 +457,14 @@ mod miri_cmsg_tests {
 
         let total = bsd_hdr_size + mem::size_of::<Cmsgcred>();
         let aligned_total = cmsg_align(total);
-        let mut buf = vec![0u8; aligned_total];
+        // CRITICAL: Match recv.rs's AncBuf pattern — the buffer MUST be
+        // aligned to 8 bytes. A Vec<u8> only guarantees 1-byte alignment,
+        // which causes miri to detect unaligned pointer dereferences.
+        // Use a stack array wrapped in #[repr(align(8))].
+        #[repr(align(8))]
+        struct AlignedBuf([u8; 256]);
+        let mut buf_wrapper = AlignedBuf([0u8; 256]);
+        let buf = &mut buf_wrapper.0[..aligned_total];
 
         // Write BSD cmsghdr at offset 0:
         //   cmsg_len (u32, 4 bytes), cmsg_level (i32, 4), cmsg_type (i32, 4)
@@ -525,7 +532,14 @@ mod miri_cmsg_tests {
         let payload_len = 8usize;
         let total = illumos_hdr_size + payload_len;
         let aligned_total = cmsg_align(total);
-        let mut buf = vec![0u8; aligned_total];
+        // CRITICAL: Match recv.rs's AncBuf pattern — the buffer MUST be
+        // aligned to 8 bytes. A Vec<u8> only guarantees 1-byte alignment,
+        // which causes miri to detect unaligned pointer dereferences.
+        // Use a stack array wrapped in #[repr(align(8))].
+        #[repr(align(8))]
+        struct AlignedBuf([u8; 256]);
+        let mut buf_wrapper = AlignedBuf([0u8; 256]);
+        let buf = &mut buf_wrapper.0[..aligned_total];
 
         // Write illumos cmsghdr: cmsg_len (u32), cmsg_level (i32), cmsg_type (i32)
         let cmsg_len: u32 = total as u32;
@@ -568,7 +582,12 @@ mod miri_cmsg_tests {
         let payload_len = 8usize;
         let total = illumos_hdr_size + payload_len;
         let aligned_total = cmsg_align(total);
-        let mut buf = vec![0u8; aligned_total];
+        // CRITICAL: Match recv.rs's AncBuf pattern — the buffer MUST be
+        // aligned to 8 bytes.
+        #[repr(align(8))]
+        struct AlignedBuf([u8; 256]);
+        let mut buf_wrapper = AlignedBuf([0u8; 256]);
+        let buf = &mut buf_wrapper.0[..aligned_total];
 
         let cmsg_len: u32 = total as u32;
         let sol_socket: i32 = 0xffff;
@@ -609,7 +628,13 @@ mod miri_cmsg_tests {
 
         // Claim cmsg_len = hdr_size - 1 (strictly less than needed = hdr_size).
         let truncated_len: u32 = (illumos_hdr_size - 1) as u32;
-        let mut buf = vec![0u8; illumos_hdr_size + 8];
+        // CRITICAL: Match recv.rs's AncBuf pattern — the buffer MUST be
+        // aligned to 8 bytes.
+        #[repr(align(8))]
+        struct AlignedBuf([u8; 256]);
+        let mut buf_wrapper = AlignedBuf([0u8; 256]);
+        let buf = &mut buf_wrapper.0[..illumos_hdr_size + 8];
+
         buf[0..4].copy_from_slice(&truncated_len.to_ne_bytes());
         let sol_socket: i32 = 0xffff;
         let scm_ucred: i32 = 0x1012;
