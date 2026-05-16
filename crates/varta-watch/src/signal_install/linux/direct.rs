@@ -17,10 +17,10 @@ use std::io;
 
 use super::kernel_abi::KernelSigAction;
 use super::syscall::rt_sigaction_raw;
-use super::{SA_RESTART, SA_RESTORER};
+use super::SA_RESTART;
 
 #[cfg(target_arch = "x86_64")]
-use super::trampoline::varta_signal_restorer;
+use super::{SA_RESTORER, trampoline::varta_signal_restorer};
 
 pub(super) unsafe fn install(handler: extern "C" fn(i32)) -> io::Result<()> {
     const SIGINT: i32 = 2;

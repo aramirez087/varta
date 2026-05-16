@@ -34,7 +34,15 @@ pub(crate) fn validate_secret_file(path: &Path) -> std::io::Result<String> {
     ))]
     const O_NOFOLLOW: i32 = 0x0100;
 
-    #[cfg(any(target_os = "linux", target_os = "illumos", target_os = "solaris"))]
+    // Linux: on aarch64 and some other architectures, O_NOFOLLOW is 0o100000 (0x8000);
+    // on x86_64 and generic Linux, it's 0o400000 (0x20000). We try both.
+    #[cfg(target_arch = "aarch64")]
+    const O_NOFOLLOW: i32 = 0x8000;
+
+    #[cfg(all(target_os = "linux", not(target_arch = "aarch64")))]
+    const O_NOFOLLOW: i32 = 0x20000;
+
+    #[cfg(any(target_os = "illumos", target_os = "solaris"))]
     const O_NOFOLLOW: i32 = 0x20000;
 
     #[cfg(not(any(
