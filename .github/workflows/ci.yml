@@ -949,6 +949,9 @@ jobs:
       - name: helm install (sidecar mode, no hostPath required on kind)
         run: |
           set -euxo pipefail
+          # Clean up stale namespace from prior failed runs
+          kubectl delete namespace varta --ignore-not-found=true || true
+          sleep 2
           token=$(openssl rand -hex 32)
           helm upgrade --install varta-watch charts/varta-watch \
             --create-namespace --namespace varta \
