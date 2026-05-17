@@ -71,6 +71,19 @@ jobs:
           # Place the compiled book at /book
           cp -r book/book _site/book
 
+      - name: install redirect
+        run: |
+          # Derive latest released version from CHANGELOG.md (first ## [X.Y.Z] line, skips Unreleased).
+          version=$(grep -m1 '## \[[0-9]' CHANGELOG.md | grep -oP '\d+\.\d+\.\d+')
+          raw_url="https://raw.githubusercontent.com/aramirez087/Varta/v${version}/scripts/install.sh"
+          mkdir -p _site/install.sh
+          cat > _site/install.sh/index.html <<EOF
+          <!DOCTYPE html>
+          <meta http-equiv="refresh" content="0;url=${raw_url}">
+          <title>Redirect</title>
+          <p>Redirecting to <a href="${raw_url}">install script</a>...</p>
+          EOF
+
       - name: upload pages artifact
         uses: actions/upload-pages-artifact@v3
         with:
