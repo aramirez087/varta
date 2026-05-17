@@ -1,0 +1,38 @@
+---
+# PodMonitor alternative to ServiceMonitor.
+#
+# Use this when you do NOT want a Service in front of varta-watch (e.g.
+# a strict sidecar-only deployment where each pod has its own observer
+# and you scrape pods directly). Otherwise prefer ServiceMonitor.
+apiVersion: monitoring.coreos.com/v1
+kind: PodMonitor
+metadata:
+  name: varta-watch
+  namespace: varta
+  labels:
+    app.kubernetes.io/name: varta-watch
+    app.kubernetes.io/component: observer
+    release: kube-prometheus-stack
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: varta-watch
+  namespaceSelector:
+    matchNames:
+      - varta
+  podMetricsEndpoints:
+    - port: metrics
+      path: /metrics
+      scheme: http
+      interval: 15s
+      scrapeTimeout: 10s
+      bearerTokenSecret:
+        name: varta-prom-token
+        key: token
+      relabelings:
+        - sourceLabels: [__meta_kubernetes_pod_node_name]
+          targetLabel: node
+        - sourceLabels: [__meta_kubernetes_pod_name]
+          targetLabel: pod
+        - targetLabel: service
+          replacement: varta-watch

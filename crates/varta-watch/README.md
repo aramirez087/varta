@@ -57,6 +57,12 @@ varta_stalls_total{pid="1234"} 1
 varta_status{pid="1234"} 0
 ```
 
+The full 58-metric catalogue (by subsystem) and turn-key alert rules /
+recording rules / Grafana dashboard live under
+[`observability/`](../../observability/). Start at
+[`book/src/operations/monitoring.md`](../../book/src/operations/monitoring.md)
+for the operator guide.
+
 ## File export schema
 
 Each line is tab-separated with a fixed column count:

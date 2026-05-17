@@ -1,0 +1,49 @@
+---
+# kube-prometheus ServiceMonitor for varta-watch.
+#
+# Requires:
+#   - prometheus-operator CRDs installed
+#   - the Prometheus CR in your cluster has `serviceMonitorSelector` that
+#     matches `release: <your-kube-prometheus-release>` (the default for
+#     kube-prometheus-stack), or matches the `app.kubernetes.io/name`
+#     label below
+#   - the headless Service from varta-watch.deployment.yaml exists
+#   - the bearer-token Secret `varta-prom-token` exists in the same
+#     namespace
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: varta-watch
+  namespace: varta
+  labels:
+    app.kubernetes.io/name: varta-watch
+    app.kubernetes.io/component: observer
+    # Match this to your kube-prometheus release label. The kube-prometheus
+    # chart defaults to `release: <chart-release-name>`.
+    release: kube-prometheus-stack
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: varta-watch
+  namespaceSelector:
+    matchNames:
+      - varta
+  endpoints:
+    - port: metrics
+      path: /metrics
+      scheme: http
+      interval: 15s
+      scrapeTimeout: 10s
+      bearerTokenSecret:
+        name: varta-prom-token
+        key: token
+      # Add `instance` label that matches the Pod IP for per-host
+      # disambiguation -- kube-prometheus relabels target -> instance
+      # by default; keep this section for explicitness.
+      relabelings:
+        - sourceLabels: [__meta_kubernetes_pod_node_name]
+          targetLabel: node
+        - sourceLabels: [__meta_kubernetes_pod_name]
+          targetLabel: pod
+        - targetLabel: service
+          replacement: varta-watch

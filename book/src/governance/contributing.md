@@ -49,4 +49,4 @@ cargo miri test -p varta-vlp
 
 ## Code of Conduct
 
-We follow the [Contributor Covenant](CODE_OF_CONDUCT.md). Please be respectful and professional.
+We follow the [Contributor Covenant](../../CODE_OF_CONDUCT.md). Please be respectful and professional.

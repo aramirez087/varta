@@ -1,0 +1,65 @@
+[Unit]
+Description=Varta health observer
+Documentation=https://github.com/aramirez087/Varta
+Documentation=man:varta-watch(8)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+# Type=notify is required to satisfy WatchdogSec= below. varta-watch's
+# build.rs / sd_notify integration sends READY=1 once the listeners are
+# bound and emits WATCHDOG=1 from the in-process self-watchdog thread.
+Type=notify
+NotifyAccess=main
+
+# --self-watchdog-secs 4 auto-enables when $WATCHDOG_USEC is set by
+# systemd (i.e. when WatchdogSec= is non-zero). Tighter than WatchdogSec
+# so the in-process abort path fires before systemd restarts the unit.
+ExecStart=/usr/local/bin/varta-watch \
+    --uds-path /run/varta/varta.sock \
+    --prom-addr 127.0.0.1:9100 \
+    --prom-token-file /etc/varta/prom.token \
+    --self-watchdog-secs 4
+
+# Systemd will SIGABRT-then-SIGKILL if we miss two WATCHDOG=1 pings.
+WatchdogSec=8s
+Restart=on-failure
+RestartSec=2s
+TimeoutStopSec=10s
+
+# Run unprivileged.
+User=varta
+Group=varta
+RuntimeDirectory=varta
+RuntimeDirectoryMode=0755
+StateDirectory=varta
+
+# Hardening. Most flags are no-ops if your kernel/systemd are old; leave
+# them in -- they only reduce attack surface, never break startup.
+LockPersonality=true
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+ProtectProc=invisible
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+MemoryDenyWriteExecute=true
+SystemCallFilter=@system-service
+SystemCallFilter=~@mount @swap @reboot
+SystemCallArchitectures=native
+
+# Cap memory + tasks to keep a runaway recovery from starving the host.
+LimitNOFILE=4096
+TasksMax=64
+
+[Install]
+WantedBy=multi-user.target

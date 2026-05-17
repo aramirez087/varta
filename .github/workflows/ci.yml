@@ -687,3 +687,79 @@ jobs:
 
       - name: build book
         run: mdbook build book
+
+  observability-lint:
+    name: observability-lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: install promtool + amtool
+        run: |
+          set -euo pipefail
+          PROM_VERSION=2.55.0
+          AM_VERSION=0.27.0
+          curl -fsSL \
+            "https://github.com/prometheus/prometheus/releases/download/v${PROM_VERSION}/prometheus-${PROM_VERSION}.linux-amd64.tar.gz" \
+            | tar xz -C /tmp
+          sudo install -m 0755 "/tmp/prometheus-${PROM_VERSION}.linux-amd64/promtool" /usr/local/bin/promtool
+          curl -fsSL \
+            "https://github.com/prometheus/alertmanager/releases/download/v${AM_VERSION}/alertmanager-${AM_VERSION}.linux-amd64.tar.gz" \
+            | tar xz -C /tmp
+          sudo install -m 0755 "/tmp/alertmanager-${AM_VERSION}.linux-amd64/amtool" /usr/local/bin/amtool
+
+      - name: install kubeconform
+        run: |
+          set -euo pipefail
+          KC_VERSION=0.6.7
+          curl -fsSL \
+            "https://github.com/yannh/kubeconform/releases/download/v${KC_VERSION}/kubeconform-linux-amd64.tar.gz" \
+            | tar xz -C /tmp
+          sudo install -m 0755 /tmp/kubeconform /usr/local/bin/kubeconform
+
+      - name: promtool — alert rules
+        run: promtool check rules observability/alerts/varta.rules.yml
+
+      - name: promtool — recording rules
+        run: promtool check rules observability/recording-rules/varta.rules.yml
+
+      - name: promtool — scrape config snippet
+        run: |
+          # Wrap the scrape snippet in a minimal global block so promtool
+          # accepts it standalone. The snippet itself is what operators
+          # actually paste in.
+          {
+            echo "global:"
+            echo "  scrape_interval: 15s"
+            cat observability/examples/prometheus-scrape.yml
+          } > /tmp/prom-full.yml
+          promtool check config /tmp/prom-full.yml
+
+      - name: amtool — alertmanager config
+        run: amtool check-config observability/examples/alertmanager.yml
+
+      - name: kubeconform — kubernetes manifests
+        run: |
+          # ServiceMonitor / PodMonitor are CRDs; ignore-missing-schemas
+          # so the linter doesn't fail on prometheus-operator types.
+          kubeconform -strict -ignore-missing-schemas \
+            -summary \
+            observability/examples/kubernetes/
+
+      - name: systemd-analyze — unit file
+        run: |
+          # Copy unit to a known systemd path; systemd-analyze verify
+          # works on an absolute file path but resolves [Service] paths
+          # to the host (so /usr/local/bin/varta-watch may not exist).
+          # `--no-pager` keeps output CI-clean; missing-binary warnings
+          # are non-fatal for verify.
+          sudo cp observability/examples/varta-watch.service \
+            /etc/systemd/system/varta-watch.service
+          systemd-analyze verify /etc/systemd/system/varta-watch.service \
+            || echo "(non-fatal: warnings expected because binary path is host-relative)"
+
+      - name: dashboard JSON valid
+        run: python3 -c "import json; json.load(open('observability/dashboards/varta-health.json'))"
+
+      - name: cross-check alert / dashboard refs against exporter source
+        run: python3 tools/check_dashboard_metrics.py

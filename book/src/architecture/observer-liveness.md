@@ -168,16 +168,11 @@ counter.  If it stops advancing, the observer is wedged or dead.
 ### Prometheus uptime scraper
 
 `/metrics` exposes `varta_watch_uptime_seconds`.  A second Prometheus instance
-(or Alertmanager rule) can alert when the gauge stops increasing:
-
-```promql
-# Alert when varta-watch uptime has not increased for 30 seconds.
-alert: VartaWatchStalled
-expr: rate(varta_watch_uptime_seconds[30s]) == 0
-for: 30s
-labels:
-  severity: critical
-```
+(or Alertmanager rule) can alert when the gauge stops increasing. The
+canonical `VartaWatchStalled` rule ships in
+[`observability/alerts/varta.rules.yml`](https://github.com/aramirez087/Varta/blob/main/observability/alerts/varta.rules.yml);
+see [Monitoring & Alerting](../operations/monitoring.md#vartawatchstalled)
+for the operator-facing rationale.
 
 ---
 
@@ -379,64 +374,22 @@ rate is unsustainably high.  Non-zero `audit_flush_budget_exceeded_total`
 is a precursor: lines are accumulating faster than they drain, but no data
 is lost yet.
 
-```promql
-# Page immediately — audit records are being permanently dropped.
-alert: VartaAuditRecordDropped
-expr: increase(varta_recovery_audit_dropped_total[5m]) > 0
-for: 0m
-labels: { severity: critical }
-
-# Warn — audit flush is consistently running out of budget.
-alert: VartaAuditFlushBudgetPressure
-expr: rate(varta_recovery_audit_flush_budget_exceeded_total[5m]) > 0.1
-for: 5m
-labels: { severity: warning }
-
-# Warn — recovery reap is capping at REAP_MAX_PER_TICK=64 each tick.
-alert: VartaRecoveryReapTruncated
-expr: rate(varta_recovery_reap_truncated_total[5m]) > 0.1
-for: 5m
-labels: { severity: warning }
-```
+The canonical alert rules covering all three observer-liveness symptoms
+(`VartaAuditRecordDropped`, `VartaAuditFlushBudgetPressure`,
+`VartaRecoveryReapTruncated`) plus the iteration-budget /
+beat-path-latency family (`VartaIterationBudgetOverruns`,
+`VartaIterationP99High`, `VartaScrapeStormPressure`,
+`VartaBeatPathP99High`) live in
+[`observability/alerts/varta.rules.yml`](https://github.com/aramirez087/Varta/blob/main/observability/alerts/varta.rules.yml).
+The beat-path-latency derivation uses the
+`varta:beat_path_seconds:p99_5m` recording rule (defined in
+[`observability/recording-rules/varta.rules.yml`](https://github.com/aramirez087/Varta/blob/main/observability/recording-rules/varta.rules.yml))
+so dashboards and alerts read identical numbers.
 
 ### Recommended Prometheus alerts
 
-```promql
-# Warn — more than 10% of recent iterations exceeded the soft budget.
-alert: VartaIterationBudgetOverruns
-expr: rate(varta_observer_iteration_budget_exceeded_total[5m])
-    / rate(varta_observer_iteration_seconds_count[5m]) > 0.10
-for: 5m
-labels: { severity: warning }
-
-# Crit — 99th-percentile iteration time has exceeded 500 ms (twice the budget).
-alert: VartaIterationP99High
-expr: histogram_quantile(0.99,
-        sum by (le) (rate(varta_observer_iteration_seconds_bucket[5m]))) > 0.5
-for: 5m
-labels: { severity: critical }
-
-# Warn — sustained scrape pressure (≥10% of serve_pending calls over budget).
-# Fires on scrape-storm symptoms specifically, NOT on beat-path slowness.
-alert: VartaScrapeStormPressure
-expr: rate(varta_observer_scrape_budget_exceeded_total[5m])
-    / rate(varta_observer_serve_pending_seconds_count[5m]) > 0.10
-for: 5m
-labels: { severity: warning }
-
-# Crit — beat-path P99 latency exceeds 200 ms.  Derived: subtract scrape
-# time from iteration time so this alarm is immune to scrape storms.
-# (See "Observing scrape-induced latency" for the approximation caveat —
-# put this in a recording rule for production use.)
-alert: VartaBeatPathP99High
-expr: |
-  (histogram_quantile(0.99,
-     sum by (le) (rate(varta_observer_iteration_seconds_bucket[5m])))
-   - histogram_quantile(0.99,
-     sum by (le) (rate(varta_observer_serve_pending_seconds_bucket[5m])))) > 0.2
-for: 5m
-labels: { severity: critical }
-```
+See [Monitoring & Alerting](../operations/monitoring.md#alert-catalogue)
+for the catalogue with per-alert runbooks and severity routing.
 
 ---
 

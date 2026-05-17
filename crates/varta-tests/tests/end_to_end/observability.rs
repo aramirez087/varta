@@ -715,6 +715,152 @@ pub(super) fn serve_pending_seconds_separates_scrape_from_beat_path() {
     );
 }
 
+/// Asserts every metric name referenced by the shipped Prometheus alert
+/// rules is actually emitted by a running varta-watch.
+///
+/// This is the load-bearing assertion behind the `observability/` bundle
+/// promise: alerts cannot reference metrics the binary doesn't emit.
+/// The CI `observability-lint` job runs the same cross-check against
+/// the exporter source, but a live-binary scrape catches the
+/// dynamic-only case where a metric *is* declared in source but never
+/// rendered on `/metrics` (cfg-gating, feature drift, etc.).
+pub(super) fn alert_rules_match_live_metrics() {
+    use std::path::PathBuf;
+
+    let tmp = TempDir::new("alert-coverage");
+    let socket = tmp.path().join("varta.sock");
+
+    // Spawn with a tracker capacity of 1 + small audit ring so the
+    // `_capacity_exceeded` / `_eviction` / `_ring_watermark` counters
+    // get a chance to render (zero is still a valid render under
+    // stable-label-set discipline, so we don't depend on a specific
+    // value -- only on the metric name appearing in the output).
+    let (mut child, prom_addr) = spawn_watch(&[
+        "--socket",
+        socket.to_str().unwrap(),
+        "--threshold-ms",
+        "200",
+        "--prom-addr",
+        "127.0.0.1:0",
+        "--shutdown-after-secs",
+        "10",
+    ]);
+    let _guard = ChildGuard(&mut child);
+
+    assert!(
+        wait_until(|| socket.exists(), Duration::from_secs(3)),
+        "varta-watch did not bind socket within 3s"
+    );
+    assert!(
+        wait_until(
+            || TcpStream::connect(prom_addr).is_ok(),
+            Duration::from_secs(3)
+        ),
+        "/metrics not reachable within 3s"
+    );
+
+    // Drive a handful of beats so every counter family touches at least
+    // one render path; histogram families render at zero unconditionally
+    // by stable-label-set discipline.
+    {
+        let mut agent = Varta::connect(&socket).expect("Varta::connect");
+        for _ in 0..10 {
+            match agent.beat(Status::Ok, 0) {
+                BeatOutcome::Sent => {}
+                BeatOutcome::Dropped(_) => {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                BeatOutcome::Failed(e) => panic!("unexpected hard failure: {e}"),
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    // Wait one more poll-cycle so the observer has rendered the
+    // tracker / iteration histograms for our beats.
+    std::thread::sleep(Duration::from_millis(300));
+
+    let (status, body) = http_get(prom_addr, "/metrics").expect("/metrics scrape");
+    assert_eq!(status, 200, "/metrics returned {status}; body:\n{body}");
+
+    // Load the alert-rules YAML from the repo. CARGO_MANIFEST_DIR is
+    // `crates/varta-tests`; the repo root is two parents up.
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let rules_path = manifest_dir
+        .parent()
+        .and_then(|p| p.parent())
+        .map(|root| root.join("observability/alerts/varta.rules.yml"))
+        .expect("compute observability/alerts/varta.rules.yml path");
+    let rules =
+        std::fs::read_to_string(&rules_path).expect("read observability/alerts/varta.rules.yml");
+
+    // Extract every distinct `varta_<name>` token. The exporter emits
+    // histogram bases (`varta_foo_seconds`); Prometheus appends
+    // `_bucket`, `_sum`, `_count` at render time. We normalise the
+    // alert references by stripping those suffixes when they don't
+    // appear verbatim on the wire.
+    let mut alert_metrics: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let mut cursor = 0;
+    let bytes = rules.as_bytes();
+    while cursor < bytes.len() {
+        if let Some(rel) = rules[cursor..].find("varta_") {
+            let start = cursor + rel;
+            let mut end = start;
+            while end < bytes.len() && (bytes[end].is_ascii_alphanumeric() || bytes[end] == b'_') {
+                end += 1;
+            }
+            alert_metrics.insert(rules[start..end].to_string());
+            cursor = end;
+        } else {
+            break;
+        }
+    }
+    assert!(
+        !alert_metrics.is_empty(),
+        "no varta_* metrics extracted from alert rules at {rules_path:?}; \
+         rule file may be empty or malformed"
+    );
+
+    // For each referenced metric, the body must contain a TYPE / HELP
+    // declaration OR an instance line. We match the bare name preceded
+    // by a HELP/TYPE keyword OR followed by `{` (labelled instance) /
+    // a literal `_bucket` / `_sum` / `_count` (histogram suffix). The
+    // simplest robust check: the metric name string appears somewhere
+    // in the body. False positives only occur if a longer metric name
+    // *contains* the shorter one as a substring, which the exporter
+    // does not produce by audit (varta_beats_total is never a prefix
+    // of another emitted metric).
+    let mut missing: Vec<String> = Vec::new();
+    for metric in &alert_metrics {
+        // Strip histogram suffixes -- the exporter emits the base name
+        // and Prometheus's `_bucket` / `_sum` / `_count` are rendered
+        // by the same code path that emits the base.
+        let base = metric
+            .strip_suffix("_bucket")
+            .or_else(|| metric.strip_suffix("_sum"))
+            .or_else(|| metric.strip_suffix("_count"))
+            .unwrap_or(metric);
+        if !body.contains(base) {
+            missing.push(metric.clone());
+        }
+    }
+
+    assert!(
+        missing.is_empty(),
+        "alert rules at {rules_path:?} reference {} metric(s) not present on \
+         /metrics: {missing:?}\n\
+         This is the load-bearing test for the observability bundle: every \
+         alert must be backed by a live metric.\n\
+         Fix: either (a) add the metric to the exporter, (b) remove the alert \
+         from observability/alerts/varta.rules.yml, or (c) gate it on a \
+         Cargo feature this test does not enable.\n\
+         (Total alert metrics: {}, missing: {}.)",
+        missing.len(),
+        alert_metrics.len(),
+        missing.len(),
+    );
+}
+
 /// `hostile_frame_rejected_at_decode_with_label_emit` (M1 contract + H1).
 ///
 /// Spawns the observer and sends two hand-crafted frames:

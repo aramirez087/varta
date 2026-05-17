@@ -1,0 +1,116 @@
+---
+# Alertmanager configuration tailored to the Varta alert rule set.
+#
+# Routes off the `severity` label that every Varta alert carries:
+#   severity=critical  -> page on-call via PagerDuty
+#   severity=warning   -> ticket via Slack
+#   severity=info      -> low-traffic Slack channel, 24h repeat
+#
+# The `inhibit_rules:` block suppresses warning / info alerts from any
+# instance whose observer is already down (VartaWatchStalled firing).
+# The instance is gone -- downstream symptoms (decode errors, rate-limit
+# drops, audit ring pressure) are noise.
+#
+# Replace placeholder routing keys / webhook URLs before deploying.
+
+global:
+  resolve_timeout: 5m
+  # slack_api_url: 'https://hooks.slack.com/services/REPLACE/ME/REPLACE'
+
+route:
+  receiver: default-slack
+  group_by: ['alertname', 'service', 'instance']
+  group_wait: 30s
+  group_interval: 5m
+  repeat_interval: 4h
+  routes:
+    - matchers:
+        - service = "varta-watch"
+        - severity = "critical"
+      receiver: varta-pagerduty
+      group_wait: 10s
+      repeat_interval: 1h
+      continue: false
+
+    - matchers:
+        - service = "varta-watch"
+        - severity = "warning"
+      receiver: varta-slack
+      repeat_interval: 4h
+      continue: false
+
+    - matchers:
+        - service = "varta-watch"
+        - severity = "info"
+      receiver: varta-slack-noise
+      repeat_interval: 24h
+      continue: false
+
+receivers:
+  - name: default-slack
+    slack_configs:
+      - channel: '#alerts'
+        send_resolved: true
+        title: '{{ .CommonLabels.alertname }} ({{ .Status }})'
+        text: |
+          {{ range .Alerts }}
+          *{{ .Annotations.summary }}*
+          {{ .Annotations.description }}
+          *Runbook:* {{ .Annotations.runbook_url }}
+          {{ end }}
+
+  - name: varta-pagerduty
+    pagerduty_configs:
+      - routing_key: 'REPLACE_WITH_PAGERDUTY_INTEGRATION_KEY'
+        send_resolved: true
+        description: '{{ .CommonAnnotations.summary }}'
+        details:
+          alertname: '{{ .CommonLabels.alertname }}'
+          instance: '{{ .CommonLabels.instance }}'
+          severity: '{{ .CommonLabels.severity }}'
+          runbook_url: '{{ .CommonAnnotations.runbook_url }}'
+
+  - name: varta-slack
+    slack_configs:
+      - channel: '#varta-alerts'
+        send_resolved: true
+        title: '[varta-watch] {{ .CommonLabels.alertname }} ({{ .Status }})'
+        text: |
+          {{ range .Alerts }}
+          *Instance:* `{{ .Labels.instance }}`
+          *Summary:* {{ .Annotations.summary }}
+          {{ .Annotations.description }}
+          <{{ .Annotations.runbook_url }}|Runbook>
+          {{ end }}
+
+  - name: varta-slack-noise
+    slack_configs:
+      - channel: '#varta-noise'
+        send_resolved: false
+        title: '[varta-watch info] {{ .CommonLabels.alertname }}'
+        text: |
+          {{ range .Alerts }}
+          {{ .Annotations.summary }}
+          <{{ .Annotations.runbook_url }}|Runbook>
+          {{ end }}
+
+inhibit_rules:
+  # When the observer is dead, suppress everything else from the same
+  # instance -- the symptoms are downstream of the wedge.
+  - source_matchers:
+      - alertname = "VartaWatchStalled"
+      - service = "varta-watch"
+    target_matchers:
+      - service = "varta-watch"
+      - severity =~ "warning|info"
+    equal: ['instance']
+
+  # When the tracker capacity is exceeded, suppress eviction-truncation
+  # warnings from the same instance -- capacity is the root cause.
+  - source_matchers:
+      - alertname = "VartaTrackerCapacityExceeded"
+      - service = "varta-watch"
+    target_matchers:
+      - alertname = "VartaTrackerEvictionTruncated"
+      - service = "varta-watch"
+    equal: ['instance']

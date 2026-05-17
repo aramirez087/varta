@@ -152,6 +152,10 @@ fn main() -> ExitCode {
         "hostile_frame_rejected_at_decode_with_label_emit",
         observability::hostile_frame_rejected_at_decode_with_label_emit,
     );
+    failed += run_one(
+        "alert_rules_match_live_metrics",
+        observability::alert_rules_match_live_metrics,
+    );
     #[cfg(feature = "udp")]
     {
         failed += run_one(
@@ -192,7 +196,7 @@ fn main() -> ExitCode {
         );
     }
 
-    let total = 19u32
+    let total = 20u32
         + if cfg!(feature = "udp") { 1 } else { 0 }
         + if cfg!(feature = "secure-udp") { 1 } else { 0 }
         + if cfg!(all(feature = "secure-udp", feature = "test-hooks")) {

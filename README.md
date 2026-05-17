@@ -113,8 +113,19 @@ varta-watch \
 Then inspect the metrics:
 
 ```sh
-curl -s http://127.0.0.1:9100/metrics
+curl -s -H "Authorization: Bearer $(cat /etc/varta/prom.token)" \
+  http://127.0.0.1:9100/metrics
 ```
+
+## Production monitoring
+
+A turn-key Prometheus + Grafana + Alertmanager bundle ships at
+[`observability/`](observability/) — alert rules, recording rules, a
+24-panel Grafana dashboard, and ready-to-paste systemd / Docker /
+Kubernetes manifests. See [`observability/README.md`](observability/README.md)
+for the load order or
+[`book/src/operations/monitoring.md`](book/src/operations/monitoring.md)
+for the operator-facing prose.
 
 | `varta-watch` | [README](crates/varta-watch/README.md) | Observer binary — stall detection, file export, Prometheus. |
 

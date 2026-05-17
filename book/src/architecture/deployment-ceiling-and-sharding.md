@@ -85,35 +85,21 @@ pressure:
 
 ## Recommended alerts
 
-```promql
-# Warn — tracker eviction window is exhausting; nearing structural cap.
-alert: VartaTrackerEvictionTruncated
-expr: rate(varta_tracker_eviction_scan_truncated_total[5m]) > 0
-for: 5m
-labels: { severity: warning }
-```
+Three capacity-tier alerts cover the deployment-ceiling failure modes:
 
-```promql
-# Warn — new agents are being dropped at the tracker cap.
-alert: VartaTrackerCapacityExceeded
-expr: rate(varta_tracker_capacity_exceeded_total[5m]) > 0
-for: 5m
-labels: { severity: warning }
-```
+- `VartaTrackerEvictionTruncated` (**warning**) — eviction window
+  exhausting; structural cap approaching.
+- `VartaTrackerCapacityExceeded` (**critical**) — new agents being
+  dropped at the cap.
+- `VartaOutstandingProbeExhausted` (**critical**) — outstanding-children
+  index probe exhausting under load.
 
-```promql
-# Warn — outstanding-children index probe is exhausting under load.
-alert: VartaOutstandingProbeExhausted
-expr: rate(varta_recovery_outstanding_probe_exhausted_total[5m]) > 0
-for: 5m
-labels: { severity: warning }
-```
-
-The complementary critical-severity alert on
-`varta_recovery_refused_total{reason="debounce_capacity"}` and the
-debounce-eviction-rate warning are documented in
-[Stall Detection & Liveness](observer-liveness.md#recommended-alerts);
-operators monitoring deployment scale should configure both sets.
+All three ship in
+[`observability/alerts/varta.rules.yml`](https://github.com/aramirez087/Varta/blob/main/observability/alerts/varta.rules.yml);
+see [Monitoring & Alerting](../operations/monitoring.md#critical-page-on-call)
+for per-alert runbooks and the related liveness-tier rules
+(`VartaIterationBudgetOverruns`, `VartaBeatPathP99High`) that
+operators monitoring deployment scale should configure alongside.
 
 ## Horizontal sharding pattern
 

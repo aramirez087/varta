@@ -40,6 +40,14 @@
 
 ---
 
+# Operations
+
+- [Monitoring & Alerting](operations/monitoring.md)
+- [SLOs & Tuning](operations/slos.md)
+- [Deployment Patterns](operations/deployment.md)
+
+---
+
 # Performance
 
 - [Benchmark Results](benchmarks/results.md)
