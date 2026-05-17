@@ -97,7 +97,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     CC_x86_64_unknown_linux_musl="$LINKER" \
     CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER="$LINKER" \
     CC_aarch64_unknown_linux_musl="$LINKER" \
-    RUSTFLAGS='-C target-feature=+crt-static -C link-arg=-static' \
+    RUSTFLAGS='-C target-feature=+crt-static -C link-arg=-static-pie' \
       cargo build \
         --locked \
         --release \
