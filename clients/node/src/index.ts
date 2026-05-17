@@ -1,4 +1,4 @@
-// Public surface of `@varta/client`. See `README.md` for the parity
+// Public surface of `@varta-health/client`. See `README.md` for the parity
 // table against the Rust, Python, and Go clients.
 
 export { Varta } from "./client.js";

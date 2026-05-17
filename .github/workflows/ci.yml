@@ -1055,14 +1055,18 @@ jobs:
       - name: helm install (sidecar mode, no hostPath required on kind)
         run: |
           set -euxo pipefail
-          # Chart template (namespace.yaml) owns namespace creation when
-          # namespace.create=true (default). Do NOT pass --create-namespace
-          # or kubectl create — both produce a non-Helm-managed namespace
-          # that conflicts with the chart's templated Namespace resource
-          # ("namespaces \"varta\" already exists" on install).
+          # Helm 3 needs the target namespace to exist before it can
+          # persist the release secret, so the chart's templated
+          # Namespace resource cannot bootstrap its own release storage.
+          # Let Helm create the namespace (--create-namespace) and tell
+          # the chart to skip its Namespace template
+          # (namespace.create=false) so there is exactly one owner and
+          # no "invalid ownership metadata" conflict (see bug-041).
           token=$(openssl rand -hex 32)
           helm upgrade --install varta-watch charts/varta-watch \
+            --create-namespace \
             --namespace varta \
+            --set namespace.create=false \
             --set mode=sidecar \
             --set image.repository=varta-watch \
             --set image.tag=ci \

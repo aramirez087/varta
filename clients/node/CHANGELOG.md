@@ -4,6 +4,12 @@ All notable changes to the Node.js client live here. Versions follow
 [Semantic Versioning](https://semver.org). The wire protocol version is
 governed independently — see `book/src/spec/vlp.md` in the workspace.
 
+## [0.2.1] — 2026-05-17
+
+### Fixed
+
+- Documentation: corrected npm package name from `@varta/client` to `@varta-health/client` in all README and book documentation.
+
 ## [0.2.0] — 2026-05-17
 
 Lift the two documented v0.1.0 limitations.

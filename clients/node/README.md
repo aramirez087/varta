@@ -1,12 +1,12 @@
 # Varta — Node.js client
 
-[![npm](https://img.shields.io/npm/v/@varta/client.svg)](https://www.npmjs.com/package/@varta/client)
+[![npm](https://img.shields.io/npm/v/@varta-health/client.svg)](https://www.npmjs.com/package/@varta-health/client)
 [![License](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue.svg)](LICENSE)
 
 Production Node.js client for the [Varta](https://github.com/aramirez087/Varta) health protocol.
 
 ```bash
-npm install @varta/client
+npm install @varta-health/client
 ```
 
 Requires Node.js 18 LTS or newer. ESM-only. Ships compiled `.js` + `.d.ts`. AEAD primitives come from Node's built-in `node:crypto`; UDS support is loaded from the optional `node-unix-socket` addon.
@@ -20,7 +20,7 @@ The wire is 32 bytes per beat. No HTTP, no JSON, no extra packages for the base 
 ## Quickstart
 
 ```ts
-import { Varta, Status } from "@varta/client";
+import { Varta, Status } from "@varta-health/client";
 
 // Connect once at startup. path must match --socket on your observer.
 const agent = Varta.connectUds("/var/run/varta.sock");
@@ -132,7 +132,7 @@ For UDS, the kernel returns `ECONNREFUSED`/`ENOENT` synchronously, so peer-gone 
 Register once at startup. Any uncaught exception, unhandled rejection, or terminating signal (`SIGTERM`/`SIGINT`/`SIGQUIT`/`SIGHUP`) emits a `Critical` beat with `nonce=NONCE_TERMINAL` before the process exits.
 
 ```ts
-import { panic } from "@varta/client";
+import { panic } from "@varta-health/client";
 
 // For UDS deployments:
 panic.installSignalHandlerUds("/var/run/varta.sock");
@@ -155,7 +155,7 @@ await panic.run(async () => {
 
 ```ts
 import { readFileSync } from "node:fs";
-import { Varta, Status } from "@varta/client";
+import { Varta, Status } from "@varta-health/client";
 
 // key must be exactly 32 raw bytes. Load from a Kubernetes secret, Vault, etc.
 const key = readFileSync("/etc/varta/secure.key");

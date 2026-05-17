@@ -1,8 +1,8 @@
 # Node.js client
 
-[![npm](https://img.shields.io/npm/v/@varta/client.svg)](https://www.npmjs.com/package/@varta/client)
+[![npm](https://img.shields.io/npm/v/@varta-health/client.svg)](https://www.npmjs.com/package/@varta-health/client)
 
-The Node.js client (`npm install @varta/client`) is a first-class peer
+The Node.js client (`npm install @varta-health/client`) is a first-class peer
 of the Rust `varta-client` crate. It tracks the same wire-format
 contract, passes the same `tools/vlp-test-vectors.json` conformance
 suite, and interoperates with the same `varta-watch` observer binary.
@@ -10,7 +10,7 @@ suite, and interoperates with the same `varta-watch` observer binary.
 ## Install
 
 ```bash
-npm install @varta/client
+npm install @varta-health/client
 ```
 
 Requires Node.js 18 LTS or newer. ESM-only. Ships compiled JavaScript
@@ -22,7 +22,7 @@ HKDF-SHA256 come from Node's built-in `node:crypto`.
 ## 20-line example
 
 ```ts
-import { Varta, Status, DropReason } from "@varta/client";
+import { Varta, Status, DropReason } from "@varta-health/client";
 
 const agent = Varta.connectUds("/var/run/varta.sock");
 setInterval(() => {
@@ -57,6 +57,6 @@ matrix see the package README in the repo:
 
 ## Source
 
-- [npm page](https://www.npmjs.com/package/@varta/client)
+- [npm page](https://www.npmjs.com/package/@varta-health/client)
 - [GitHub source](https://github.com/aramirez087/Varta/tree/main/clients/node)
 - [Issue tracker](https://github.com/aramirez087/Varta/issues)
