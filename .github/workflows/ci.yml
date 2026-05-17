@@ -950,7 +950,7 @@ jobs:
         run: |
           set -euxo pipefail
           token=$(openssl rand -hex 32)
-          helm install varta-watch charts/varta-watch \
+          helm upgrade --install varta-watch charts/varta-watch \
             --create-namespace --namespace varta \
             --set mode=sidecar \
             --set image.repository=varta-watch \
