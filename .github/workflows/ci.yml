@@ -797,9 +797,19 @@ jobs:
 
       - name: --help exits zero, names varta-watch
         run: |
-          out=$(docker run --rm --platform linux/amd64 varta-watch:ci-smoke --help 2>&1)
-          printf '%s\n' "$out" | head -n3
-          printf '%s\n' "$out" | grep -qE 'varta-watch'
+          set -x
+          docker image inspect varta-watch:ci-smoke \
+            --format '{{.Os}}/{{.Architecture}} entrypoint={{json .Config.Entrypoint}} user={{.Config.User}}'
+          tmp=$(mktemp)
+          set +e
+          docker run --rm varta-watch:ci-smoke --help >"$tmp" 2>&1
+          rc=$?
+          set -e
+          echo "--- exit=$rc ---"
+          head -n 20 "$tmp" || true
+          echo "--- end ---"
+          test "$rc" -eq 0
+          grep -qE 'varta-watch' "$tmp"
 
       - name: buildx — linux/arm64 (build only, no run)
         uses: docker/build-push-action@v6
