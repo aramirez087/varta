@@ -113,6 +113,60 @@ export async function bindUdpRecorder(): Promise<{
   };
 }
 
+// Build a short UDS path inside a fresh tempdir. macOS / BSD enforce
+// `sun_path` ≤ 104 chars; `mkdtemp` under the OS tmpdir keeps comfortably
+// below that on every platform we test.
+export function makeUdsPath(): { path: string; cleanup: () => void } {
+  const t = makeTempDir();
+  return { path: join(t.dir, "varta.sock"), cleanup: t.cleanup };
+}
+
+// Bind a `node-unix-socket` recorder on the returned path. Skips
+// gracefully if the optional addon is not available.
+export async function bindUdsRecorder(): Promise<{
+  path: string;
+  received: Buffer[];
+  wait: (n: number, timeoutMs?: number) => Promise<void>;
+  close: () => Promise<void>;
+} | null> {
+  let mod: typeof import("node-unix-socket");
+  try {
+    mod = (await import("node-unix-socket")) as typeof import("node-unix-socket");
+  } catch {
+    return null;
+  }
+  const { path: udsPath, cleanup } = makeUdsPath();
+  const sock = new mod.DgramSocket();
+  const received: Buffer[] = [];
+  sock.on("data", (data) => {
+    received.push(Buffer.from(data));
+  });
+  sock.bind(udsPath);
+  return {
+    path: udsPath,
+    received,
+    async wait(n, timeoutMs = 2000): Promise<void> {
+      const start = Date.now();
+      while (received.length < n) {
+        if (Date.now() - start > timeoutMs) {
+          throw new Error(
+            `bindUdsRecorder: timed out waiting for ${n} datagrams; got ${received.length}`,
+          );
+        }
+        await new Promise((r) => setTimeout(r, 5));
+      }
+    },
+    async close(): Promise<void> {
+      try {
+        sock.close();
+      } catch {
+        // Already closed.
+      }
+      cleanup();
+    },
+  };
+}
+
 // Path to the repo root — three levels up from `clients/node/tests`.
 export function repoRoot(): string {
   const here = dirname(fileURLToPath(import.meta.url));

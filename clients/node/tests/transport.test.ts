@@ -4,10 +4,15 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { randomBytes } from "node:crypto";
 
-import { SecureUdpTransport, UdpTransport } from "../src/transport.js";
+import {
+  SecureUdpTransport,
+  UdpTransport,
+  UdsTransport,
+  UdsUnavailableError,
+} from "../src/transport.js";
 import { decode, encodeInto, FRAME_BYTES, Status } from "../src/vlp.js";
 import { decodeShared, decodeMaster } from "../src/vlp_secure.js";
-import { bindUdpRecorder } from "./helpers.js";
+import { bindUdpRecorder, bindUdsRecorder, makeUdsPath } from "./helpers.js";
 
 test("UdpTransport.send delivers a 32-byte frame to a UDP listener", async () => {
   const listener = await bindUdpRecorder();
@@ -112,6 +117,96 @@ test("SecureUdpTransport counter advances commit-on-success", async () => {
   } finally {
     await listener.close();
   }
+});
+
+test("UdsTransport.send delivers a 32-byte frame to a UDS recorder", async (t) => {
+  const listener = await bindUdsRecorder();
+  if (listener === null) {
+    t.skip("node-unix-socket addon not installed; skipping UDS transport test");
+    return;
+  }
+  try {
+    const tx = new UdsTransport(listener.path);
+    const buf = Buffer.alloc(FRAME_BYTES);
+    encodeInto(buf, Status.Ok, 12345, 1n, 1n, 0xabcd);
+    tx.send(buf);
+    await listener.wait(1);
+    const frame = decode(listener.received[0]!);
+    assert.equal(frame.status, Status.Ok);
+    assert.equal(frame.pid, 12345);
+    assert.equal(frame.payload, 0xabcd);
+    tx.close();
+  } finally {
+    await listener.close();
+  }
+});
+
+test("UdsTransport.reconnect rebuilds the socket", async (t) => {
+  const listener = await bindUdsRecorder();
+  if (listener === null) {
+    t.skip("node-unix-socket addon not installed; skipping UDS transport test");
+    return;
+  }
+  try {
+    const tx = new UdsTransport(listener.path);
+    const buf = Buffer.alloc(FRAME_BYTES);
+    encodeInto(buf, Status.Ok, 1, 1n, 1n, 1);
+    tx.send(buf);
+    await listener.wait(1);
+    tx.reconnect();
+    encodeInto(buf, Status.Ok, 1, 2n, 2n, 2);
+    tx.send(buf);
+    await listener.wait(2);
+    assert.equal(decode(listener.received[0]!).payload, 1);
+    assert.equal(decode(listener.received[1]!).payload, 2);
+    tx.close();
+  } finally {
+    await listener.close();
+  }
+});
+
+test("UdsTransport surfaces ENOENT when the observer path does not exist", async (t) => {
+  let installed = false;
+  try {
+    await import("node-unix-socket");
+    installed = true;
+  } catch {
+    // Fall through to skip.
+  }
+  if (!installed) {
+    t.skip("node-unix-socket addon not installed; skipping UDS transport test");
+    return;
+  }
+  const { path, cleanup } = makeUdsPath();
+  try {
+    const tx = new UdsTransport(path);
+    const buf = Buffer.alloc(FRAME_BYTES);
+    encodeInto(buf, Status.Ok, 1, 1n, 1n, 0);
+    // First send queues the error onto pendingError via the
+    // sendTo callback (no peer on `path`).
+    tx.send(buf);
+    // Give libuv a tick to deliver the sendTo callback.
+    await new Promise((r) => setTimeout(r, 20));
+    let threw: NodeJS.ErrnoException | null = null;
+    try {
+      tx.send(buf);
+    } catch (e) {
+      threw = e as NodeJS.ErrnoException;
+    }
+    assert.ok(threw, "second send must throw the queued ENOENT");
+    assert.equal(threw!.code, "ENOENT");
+    tx.close();
+  } finally {
+    cleanup();
+  }
+});
+
+test("UdsTransport raises UdsUnavailableError when the addon is missing", () => {
+  // Smoke-test: we can't truly remove the addon at runtime, but the
+  // error class must at least be constructible from outside.
+  const err = new UdsUnavailableError(new Error("simulated"));
+  assert.equal(err.name, "UdsUnavailableError");
+  assert.match(err.message, /node-unix-socket/);
 });
 
 test("SecureUdpTransport.reconnect rotates session salt + resets counter", async () => {

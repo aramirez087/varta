@@ -4,6 +4,45 @@ All notable changes to the Node.js client live here. Versions follow
 [Semantic Versioning](https://semver.org). The wire protocol version is
 governed independently — see `book/src/spec/vlp.md` in the workspace.
 
+## [0.2.0] — 2026-05-17
+
+Lift the two documented v0.1.0 limitations.
+
+### Added
+
+- `Varta.connectUds(path)` constructor. Reaches API parity with the
+  Rust, Python, and Go clients. UDS gives the observer kernel-attested
+  peer credentials (`BeatOrigin::KernelAttested`) so Node agents now
+  qualify for recovery commands.
+- `panic.installSignalHandlerUds(path)` parallel to the UDP variant.
+  Pre-binds a UDS socket at install time so emission is alloc-free
+  in the hot path.
+- `UdsTransport` and `UdsUnavailableError` exported from
+  `@varta-health/client` for custom-transport authors.
+
+### Changed
+
+- `UdpTransport` and `SecureUdpTransport` now use connected-mode
+  sockets (`dgram.Socket.connect`). ICMP `port unreachable` is routed
+  through the socket's error event and surfaces as
+  `{ kind: "dropped", reason: DropReason.NoObserver }` on the next
+  beat (1–2 beat latency). Previously every send to a dead observer
+  reported `Sent`; the agent had no way to observe the failure.
+
+### Optional dependency
+
+- `node-unix-socket` (`^0.2.7`, MIT, napi-rs prebuilds for
+  darwin-x64/arm64 and linux-x64/arm64 gnu+musl). Listed under
+  `optionalDependencies` — install never fails on a platform without
+  a published prebuild; UDP/secure-UDP work everywhere.
+
+### Notes
+
+- macOS ICMP propagation is best-effort; peer-gone may stay
+  invisible at the agent layer on darwin. Observer-side stall
+  detection remains the canonical signal.
+- Windows still unsupported (no AF_UNIX SOCK_DGRAM path).
+
 ## [0.1.0] — 2026-05-17
 
 Initial release. Production client for the Varta health protocol.

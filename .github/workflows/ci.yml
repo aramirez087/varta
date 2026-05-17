@@ -734,10 +734,11 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: build varta-watch (release, prometheus-exporter + plaintext-udp)
-        # Node has no UDS-datagram path in stdlib, so the interop test
-        # speaks plaintext UDP. The `unsafe-plaintext-udp` feature gate
-        # is required for the observer to accept that listener. Loopback
-        # only — the test binds 127.0.0.1.
+        # The Node interop test now drives BOTH UDS (via the optional
+        # `node-unix-socket` addon, since 0.2.0) and loopback UDP
+        # against the same observer process. UDS is default; the
+        # `unsafe-plaintext-udp` feature stays on so the UDP branch
+        # still runs. Loopback only — the test binds 127.0.0.1.
         run: cargo build --locked --release -p varta-watch --features "prometheus-exporter unsafe-plaintext-udp"
 
       - name: install deps
@@ -1054,13 +1055,10 @@ jobs:
       - name: helm install (sidecar mode, no hostPath required on kind)
         run: |
           set -euxo pipefail
-          # Chart template (namespace.yaml) owns namespace creation when
-          # namespace.create=true (default). Do NOT pass --create-namespace
-          # or kubectl-create — both produce a non-Helm-managed namespace
-          # that conflicts with the chart's templated Namespace resource.
           token=$(openssl rand -hex 32)
           helm upgrade --install varta-watch charts/varta-watch \
             --namespace varta \
+            --create-namespace \
             --set mode=sidecar \
             --set image.repository=varta-watch \
             --set image.tag=ci \

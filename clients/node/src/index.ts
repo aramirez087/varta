@@ -31,6 +31,8 @@ export {
 export {
   UdpTransport,
   SecureUdpTransport,
+  UdsTransport,
+  UdsUnavailableError,
   type BeatTransport,
 } from "./transport.js";
 export * as panic from "./panic.js";

@@ -30,6 +30,7 @@ import {
   type BeatTransport,
   SecureUdpTransport,
   UdpTransport,
+  UdsTransport,
 } from "./transport.js";
 import {
   encodeInto,
@@ -92,6 +93,15 @@ export class Varta {
   }
 
   // ─── constructors ─────────────────────────────────────────────
+
+  // Connect to a `varta-watch` observer over a Unix domain datagram
+  // socket. Requires the optional `node-unix-socket` addon; raises
+  // `UdsUnavailableError` if it could not be loaded (missing prebuild,
+  // Windows, etc.). Preferred same-host transport: gives the observer
+  // kernel-attested `BeatOrigin` and unlocks recovery eligibility.
+  static connectUds(path: string): Varta {
+    return new Varta(new UdsTransport(path));
+  }
 
   static connectUdp(host: string, port: number): Varta {
     return new Varta(new UdpTransport(host, port));

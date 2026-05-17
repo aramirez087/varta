@@ -1,17 +1,24 @@
-// Beat transport abstractions — UDP and ChaCha20-Poly1305-AEAD UDP.
+// Beat transport abstractions — UDS (AF_UNIX/SOCK_DGRAM), plaintext
+// UDP, and ChaCha20-Poly1305-AEAD UDP.
 //
-// UDS (AF_UNIX/SOCK_DGRAM) is intentionally NOT implemented in this
-// release. Node's stdlib `dgram` module accepts only `"udp4"` and
-// `"udp6"` socket types; the `"unix_dgram"` type that exists in some
-// platform sockets APIs is rejected with `ERR_SOCKET_BAD_TYPE`. Adding
-// UDS would require a native addon (breaking the zero-dep posture) or
-// pulling in `node:net.Socket(fd)` over a manually opened AF_UNIX FD
-// (no portable JS path exists). For same-host deployments, use
-// `Varta.connectUdp("127.0.0.1", port)` — loopback is the same
-// security domain as UDS on a single host.
+// The UDS transport relies on the `node-unix-socket` napi-rs addon
+// (listed under `optionalDependencies`). It ships prebuilds for
+// darwin-x64/arm64 and linux-x64/arm64 (gnu + musl); installing on a
+// platform without a published prebuild succeeds with the addon
+// absent, and the UDS transport raises `UdsUnavailableError` at
+// construction. UDP / secure-UDP work on every Node platform with
+// only the stdlib.
+//
+// UDP and secure-UDP use connected-mode sockets (`dgram.Socket.connect`)
+// so the kernel's ICMP `port unreachable` is queued onto the socket's
+// `error` event and surfaces as `DropReason.NoObserver` on a subsequent
+// beat. Pre-`connect` event sends are queued internally by libuv;
+// errors from any source (send callback, recvmsg ICMP, async connect)
+// drain into `pendingError` for the next caller.
 
 import { randomBytes } from "node:crypto";
 import { createSocket, type Socket } from "node:dgram";
+import { createRequire } from "node:module";
 
 import {
   encodeMaster,
@@ -23,19 +30,15 @@ import {
 
 export interface BeatTransport {
   // Synchronous send. Returns nothing on success; throws a
-  // `NodeJS.ErrnoException`-shaped error on failure. The Node libuv
-  // model means most kernel-level errors actually arrive on the NEXT
-  // call's path (via the cached `pendingError`); the implementations
-  // below already paper over that asymmetry so callers see Rust-style
-  // synchronous semantics.
+  // `NodeJS.ErrnoException`-shaped error on failure. libuv may report
+  // kernel-level errors on a later send's callback or via a recvmsg
+  // ICMP error event; transports drain those into `pendingError` so
+  // callers see Rust-style synchronous semantics.
   send(buf: Buffer): void;
   reconnect(): void;
   close(): void;
 }
 
-// Common helper: drain a libuv async error captured on a previous
-// `socket.send` callback. Returns the error if one is queued and
-// clears the slot, or `null` if the slot is empty.
 function takePendingError(holder: { pendingError: NodeJS.ErrnoException | null }):
   | NodeJS.ErrnoException
   | null {
@@ -44,48 +47,114 @@ function takePendingError(holder: { pendingError: NodeJS.ErrnoException | null }
   return e;
 }
 
-// ─── Plaintext UDP ──────────────────────────────────────────────
+// ─── UDS (AF_UNIX/SOCK_DGRAM) ──────────────────────────────────
 
-export class UdpTransport implements BeatTransport {
-  private socket: Socket;
-  private readonly host: string;
-  private readonly port: number;
+export class UdsUnavailableError extends Error {
+  readonly cause: unknown;
+  constructor(cause: unknown) {
+    super(
+      "UDS transport requires the optional `node-unix-socket` addon. " +
+        "Install it with `npm install node-unix-socket`, or fall back to " +
+        "`Varta.connectUdp(\"127.0.0.1\", port)` on platforms without a prebuild.",
+    );
+    this.name = "UdsUnavailableError";
+    this.cause = cause;
+  }
+}
+
+// `node-unix-socket`'s `DgramSocket` reports errors without populating
+// `err.code` / `err.errno`. Translate the human-readable message back
+// into the symbolic form that `classifySendError` expects.
+function normalizeUdsError(err: unknown): NodeJS.ErrnoException {
+  const e = (err instanceof Error ? err : new Error(String(err))) as NodeJS.ErrnoException;
+  if (typeof e.code === "string" && e.code.length > 0) return e;
+  const msg = (e.message ?? "").toLowerCase();
+  if (msg.includes("no such file")) e.code = "ENOENT";
+  else if (msg.includes("connection refused")) e.code = "ECONNREFUSED";
+  else if (msg.includes("no buffer space")) e.code = "ENOBUFS";
+  else if (msg.includes("resource temporarily unavailable")) e.code = "EAGAIN";
+  else if (msg.includes("would block")) e.code = "EWOULDBLOCK";
+  else if (msg.includes("no space left")) e.code = "ENOSPC";
+  else if (msg.includes("broken pipe")) e.code = "EPIPE";
+  else if (msg.includes("connection reset")) e.code = "ECONNRESET";
+  else if (msg.includes("transport endpoint is not connected")) e.code = "ENOTCONN";
+  return e;
+}
+
+interface DgramSocketLike {
+  bind(socketPath: string): void;
+  sendTo(
+    buf: Buffer,
+    offset: number,
+    length: number,
+    destPath: string,
+    onWrite?: (err: undefined | Error) => void,
+  ): void;
+  close(): void;
+  on(event: "error", listener: (err: Error) => void): unknown;
+  on(event: "data", listener: (buf: Buffer, path: string) => void): unknown;
+}
+
+interface NodeUnixSocketModule {
+  DgramSocket: new () => DgramSocketLike;
+}
+
+let cachedNodeUnixSocket: NodeUnixSocketModule | null | "missing" = null;
+
+const requireFromHere = createRequire(import.meta.url);
+
+function loadNodeUnixSocket(): NodeUnixSocketModule {
+  if (cachedNodeUnixSocket === "missing") {
+    throw new UdsUnavailableError(new Error("module not installed"));
+  }
+  if (cachedNodeUnixSocket !== null) return cachedNodeUnixSocket;
+  try {
+    // `createRequire` keeps this importable from an ESM build without a
+    // top-level `await import` (which would force every consumer to
+    // tolerate an async load even when they never touch UDS).
+    const mod = requireFromHere("node-unix-socket") as NodeUnixSocketModule;
+    cachedNodeUnixSocket = mod;
+    return mod;
+  } catch (err) {
+    cachedNodeUnixSocket = "missing";
+    throw new UdsUnavailableError(err);
+  }
+}
+
+export class UdsTransport implements BeatTransport {
+  private socket: DgramSocketLike;
+  private readonly path: string;
   pendingError: NodeJS.ErrnoException | null = null;
 
-  constructor(host: string, port: number) {
-    this.host = host;
-    this.port = port;
+  constructor(path: string) {
+    this.path = path;
     this.socket = this.openSocket();
   }
 
-  private openSocket(): Socket {
-    const family: "udp4" | "udp6" = this.host.includes(":") ? "udp6" : "udp4";
-    const s = createSocket(family);
-    // Swallow `error` events; they would otherwise crash the process.
-    // The pending-error slot captures them for the next `send` call.
+  private openSocket(): DgramSocketLike {
+    const { DgramSocket } = loadNodeUnixSocket();
+    const s = new DgramSocket();
+    // Upstream's `onError` self-closes the socket and re-emits as
+    // `error`. Drain into pendingError so the next beat surfaces it,
+    // and rely on `reconnect()` to rebuild. Most sendTo failures
+    // arrive on the per-call callback (not this event), so this path
+    // is rare.
     s.on("error", (err) => {
-      this.pendingError = err as NodeJS.ErrnoException;
+      this.pendingError = normalizeUdsError(err);
     });
-    s.unref();
     return s;
   }
 
   send(buf: Buffer): void {
     const queued = takePendingError(this);
     if (queued !== null) throw queued;
-    // Use addressed sends instead of connected sends — `socket.connect`
-    // is async and a `send()` issued before its `connect` event lands
-    // fails with `ERR_SOCKET_DGRAM_NOT_CONNECTED`. The libuv callback
-    // path still surfaces kernel-level send errors via `pendingError`.
-    //
-    // Copy the caller's scratch buffer before handing off to libuv:
-    // `dgram.Socket.send` does NOT internally copy, and the agent
-    // reuses a single 32-byte buffer across beats, so a non-copy
-    // would let later beats overwrite earlier in-flight datagrams.
+    // Copy the caller's scratch buffer before handing off to libuv —
+    // matching the UDP transports' guard. The agent reuses a single
+    // 32-byte buffer across beats.
     const owned = Buffer.from(buf);
-    this.socket.send(owned, this.port, this.host, (err) => {
+    this.socket.sendTo(owned, 0, owned.length, this.path, (err) => {
       if (err !== null && err !== undefined) {
-        this.pendingError = err as NodeJS.ErrnoException;
+        this.pendingError = normalizeUdsError(err);
       }
     });
   }
@@ -109,7 +178,103 @@ export class UdpTransport implements BeatTransport {
   }
 }
 
-// ─── Secure UDP (ChaCha20-Poly1305 AEAD) ────────────────────────
+// ─── Plaintext UDP (connected-mode) ────────────────────────────
+
+// Bound on how many beats may queue while `socket.connect` is in
+// flight. IPv4 numeric connect completes in one libuv tick, so the
+// queue is normally empty by the second beat; this cap exists only to
+// guard against a `connect` that never fires (peer DNS issues etc.).
+const PRE_CONNECT_QUEUE_LIMIT = 64;
+
+export class UdpTransport implements BeatTransport {
+  private socket: Socket;
+  private readonly host: string;
+  private readonly port: number;
+  private connected = false;
+  private preConnectQueue: Buffer[] = [];
+  pendingError: NodeJS.ErrnoException | null = null;
+
+  constructor(host: string, port: number) {
+    this.host = host;
+    this.port = port;
+    this.socket = this.openSocket();
+  }
+
+  private openSocket(): Socket {
+    const family: "udp4" | "udp6" = this.host.includes(":") ? "udp6" : "udp4";
+    const s = createSocket(family);
+    // ICMP `port unreachable` for a connected dgram socket lands here
+    // (libuv's recvmsg path), as do async-connect failures and any
+    // out-of-band socket errors. Swallow into pendingError so the next
+    // `send()` call surfaces it instead of crashing the process.
+    s.on("error", (err) => {
+      this.pendingError = err as NodeJS.ErrnoException;
+    });
+    s.unref();
+    // Connect for ICMP error propagation. Node's `dgram.Socket.send`
+    // rejects the connected-mode (no-port/host) signature while the
+    // socket is still CONNECTING; queue pre-connect-event beats and
+    // flush them once the `connect` callback fires.
+    this.connected = false;
+    s.connect(this.port, this.host, () => {
+      this.connected = true;
+      while (this.preConnectQueue.length > 0) {
+        const owned = this.preConnectQueue.shift()!;
+        s.send(owned, (err) => {
+          if (err !== null && err !== undefined) {
+            this.pendingError = err as NodeJS.ErrnoException;
+          }
+        });
+      }
+    });
+    return s;
+  }
+
+  send(buf: Buffer): void {
+    const queued = takePendingError(this);
+    if (queued !== null) throw queued;
+    // Buffer copy: libuv does NOT copy before handing to the kernel,
+    // and the caller reuses a single 32-byte scratch buffer.
+    const owned = Buffer.from(buf);
+    if (!this.connected) {
+      if (this.preConnectQueue.length >= PRE_CONNECT_QUEUE_LIMIT) {
+        const e: NodeJS.ErrnoException = new Error(
+          "UdpTransport: pre-connect queue full",
+        );
+        e.code = "ENOBUFS";
+        throw e;
+      }
+      this.preConnectQueue.push(owned);
+      return;
+    }
+    this.socket.send(owned, (err) => {
+      if (err !== null && err !== undefined) {
+        this.pendingError = err as NodeJS.ErrnoException;
+      }
+    });
+  }
+
+  reconnect(): void {
+    try {
+      this.socket.close();
+    } catch {
+      // Already closed — fine.
+    }
+    this.pendingError = null;
+    this.preConnectQueue = [];
+    this.socket = this.openSocket();
+  }
+
+  close(): void {
+    try {
+      this.socket.close();
+    } catch {
+      // Already closed.
+    }
+  }
+}
+
+// ─── Secure UDP (ChaCha20-Poly1305 AEAD, connected-mode) ───────
 
 export type SecureUdpKind = "shared" | "master";
 
@@ -132,6 +297,8 @@ export class SecureUdpTransport implements BeatTransport {
   private ivPrefix: Buffer;
   private prefixIndex: number;
   private counter: number;
+  private connected = false;
+  private preConnectQueue: Buffer[] = [];
   pendingError: NodeJS.ErrnoException | null = null;
 
   private constructor(host: string, port: number, secret: SecureKey) {
@@ -169,6 +336,18 @@ export class SecureUdpTransport implements BeatTransport {
       this.pendingError = err as NodeJS.ErrnoException;
     });
     s.unref();
+    this.connected = false;
+    s.connect(this.port, this.host, () => {
+      this.connected = true;
+      while (this.preConnectQueue.length > 0) {
+        const wire = this.preConnectQueue.shift()!;
+        s.send(wire, (err) => {
+          if (err !== null && err !== undefined) {
+            this.pendingError = err as NodeJS.ErrnoException;
+          }
+        });
+      }
+    });
     return s;
   }
 
@@ -190,17 +369,10 @@ export class SecureUdpTransport implements BeatTransport {
     const queued = takePendingError(this);
     if (queued !== null) throw queued;
 
-    // The IV (8-byte prefix + 4-byte LE counter) is reserved
-    // synchronously here. The Rust client uses commit-on-success
-    // because its `send(2)` is synchronous and a `WouldBlock` lets it
-    // safely re-use the nonce on retry. Node's `dgram.send` queues
-    // datagrams via libuv async, so multiple concurrent calls would
-    // all see the same proposed counter and encrypt distinct
-    // plaintexts under the same nonce — that is the classic
-    // ChaCha20-Poly1305 nonce-reuse footgun. We reserve and advance
-    // synchronously here so every queued frame carries a unique IV;
-    // a callback-reported `pendingError` simply burns one nonce
-    // slot, which is harmless.
+    // IV reservation is synchronous (cerebrum 2026-05-17 §4): every
+    // queued frame carries a unique nonce even under concurrent
+    // emits. A libuv-reported failure burns a nonce slot — harmless,
+    // since nonces are one-shot.
     const ivRandom = Buffer.alloc(IV_RANDOM_BYTES);
     this.ivPrefix.copy(ivRandom, 0, 0, IV_RANDOM_BYTES);
     const counter = this.counter;
@@ -225,7 +397,18 @@ export class SecureUdpTransport implements BeatTransport {
       );
     }
 
-    this.socket.send(wire, this.port, this.host, (err) => {
+    if (!this.connected) {
+      if (this.preConnectQueue.length >= PRE_CONNECT_QUEUE_LIMIT) {
+        const e: NodeJS.ErrnoException = new Error(
+          "SecureUdpTransport: pre-connect queue full",
+        );
+        e.code = "ENOBUFS";
+        throw e;
+      }
+      this.preConnectQueue.push(wire);
+      return;
+    }
+    this.socket.send(wire, (err) => {
       if (err !== null && err !== undefined) {
         this.pendingError = err as NodeJS.ErrnoException;
       }
@@ -239,7 +422,7 @@ export class SecureUdpTransport implements BeatTransport {
       // Already closed.
     }
     this.pendingError = null;
-    // Prepare a fresh session in locals; commit at the end without `?`.
+    this.preConnectQueue = [];
     const newSalt = randomBytes(SESSION_SALT_BYTES);
     const newPrefixIndex = 0;
     const newIvPrefix = deriveIvPrefix(newSalt, newPrefixIndex);

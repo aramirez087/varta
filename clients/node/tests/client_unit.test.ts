@@ -104,13 +104,10 @@ test("beat sends a valid VLP frame to the bound listener", async () => {
 });
 
 test("beat against a closed listener does not throw", async () => {
-  // Unlike connected UDP, Node's `dgram.send` with explicit (host, port)
-  // arguments does NOT receive ICMP-unreach back from the kernel, so the
-  // "no observer" condition is silently dropped at the network layer.
-  // This is consistent with how the wire protocol is designed (fire and
-  // forget; the observer detects absence via stall). What we DO need to
-  // guarantee is that beats keep returning a structured `BeatOutcome`
-  // without crashing the agent — exercise that here.
+  // The connected-mode UDP transport may surface ICMP `port unreachable`
+  // as `DropReason.NoObserver` (Linux) or stay silent (macOS, where
+  // ICMP propagation is racy). Either way, beats must keep returning a
+  // structured `BeatOutcome` without crashing the agent.
   const listener = await bindUdpRecorder();
   const { host, port } = listener;
   await listener.close();

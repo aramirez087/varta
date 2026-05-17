@@ -5,10 +5,11 @@
 
 Production Node.js client for the [Varta](https://github.com/aramirez087/Varta)
 health protocol. Emits 32-byte VLP heartbeats to a `varta-watch` observer
-over plaintext UDP or ChaCha20-Poly1305-encrypted UDP. Written in
-TypeScript; ships compiled `.js` + `.d.ts`. Zero npm runtime
-dependencies — the AEAD primitives come from Node's built-in
-`node:crypto`.
+over Unix domain sockets, plaintext UDP, or ChaCha20-Poly1305-encrypted
+UDP. Written in TypeScript; ships compiled `.js` + `.d.ts`. The AEAD
+primitives come from Node's built-in `node:crypto`; UDS support is
+loaded from the optional `node-unix-socket` addon (prebuilds for
+darwin-x64/arm64 and linux-x64/arm64 gnu+musl).
 
 ```bash
 npm install @varta/client
@@ -19,7 +20,7 @@ npm install @varta/client
 ```ts
 import { Varta, Status } from "@varta/client";
 
-const agent = await Varta.connectUdp("127.0.0.1", 5876);
+const agent = Varta.connectUds("/var/run/varta.sock");
 setInterval(() => {
   const outcome = agent.beat(Status.Ok);
   if (outcome.kind === "dropped") {
@@ -29,11 +30,17 @@ setInterval(() => {
 }, 500);
 ```
 
+Loopback UDP for same-host deployments where UDS isn't available:
+
+```ts
+const agent = Varta.connectUdp("127.0.0.1", 5876);
+```
+
 ## API parity with `varta-client` (Rust)
 
 | Rust                                                | Node.js                                                                     |
 | --------------------------------------------------- | --------------------------------------------------------------------------- |
-| `Varta::connect(path)` (UDS)                        | _Not supported in 0.1.0_ — see "Non-goals" below                            |
+| `Varta::connect(path)` (UDS)                        | `Varta.connectUds(path)` — requires the optional `node-unix-socket` addon   |
 | `Varta::connect_udp(addr)`                          | `Varta.connectUdp(host, port)`                                              |
 | `Varta::connect_secure_udp(addr, key)`              | `Varta.connectSecureUdp(host, port, key)`                                   |
 | `Varta::connect_secure_udp_with_master(addr, mkey)` | `Varta.connectSecureUdpWithMaster(host, port, masterKey)`                   |
@@ -44,7 +51,7 @@ setInterval(() => {
 | `classify_send_error`                               | `classifySendError(err)`                                                    |
 | `Varta::reconnect`, `set_reconnect_after`           | `reconnect()`, `setReconnectAfter(n)`                                       |
 | `Varta::clock_regressions()`, `fork_recoveries()`   | `clockRegressions()`, `forkRecoveries()` — return `bigint`                  |
-| `install_panic_handler*`                            | `panic.installSignalHandlerUdp` / `installSignalHandlerSecureUdp`           |
+| `install_panic_handler*`                            | `panic.installSignalHandlerUds` / `installSignalHandlerUdp` / `installSignalHandlerSecureUdp` |
 | `panic::run` (defer/recover)                        | `panic.run(fn)`                                                             |
 
 ## Hard invariants
@@ -69,28 +76,50 @@ The Node.js client preserves the Rust client's wire-level contract:
    and AEAD vector. Drift between languages is impossible without
    breaking both tests in the same PR.
 
-## Non-goals (0.1.0)
+## Unix Domain Sockets
 
-- **Unix Domain Sockets.** Node's stdlib does not expose `AF_UNIX` /
-  `SOCK_DGRAM`; only stream-mode `unix:` sockets are reachable from
-  `node:net`. Shipping UDS support would require a native addon and
-  break the zero-dep posture. For same-host deployments use
-  `Varta.connectUdp("127.0.0.1", port)` — loopback is the same
-  security domain. If you need authenticated same-host transport,
-  use `Varta.connectSecureUdp` against `127.0.0.1` with a key
-  configured on the observer.
-- **`accept-degraded-entropy` secure-UDP variant.** Reserved for
-  embedded targets that lack `/dev/urandom`; Node itself does not
-  run on such targets.
-- **Browser support.** This package targets Node.js ≥ 18 LTS only.
-  It uses `node:dgram`, `node:crypto`, `node:os`, and `node:process`.
+UDS is the canonical same-host transport. The observer reads kernel
+peer credentials over `SCM_CREDENTIALS` / `SCM_CREDS` / `LOCAL_PEERTOKEN`
+and classifies the source as `BeatOrigin::KernelAttested` — recovery
+commands gate on that classification, so UDS is the only Node
+transport eligible for recovery.
+
+UDS is loaded from `node-unix-socket`, an optional dependency.
+Prebuilds are published for:
+
+| Platform              | Prebuild |
+| --------------------- | -------- |
+| `darwin-arm64`        | ✅       |
+| `darwin-x64`          | ✅       |
+| `linux-x64-gnu`       | ✅       |
+| `linux-x64-musl`      | ✅       |
+| `linux-arm64-gnu`     | ✅       |
+| `linux-arm64-musl`    | ✅       |
+| `linux-arm-gnueabihf` | ✅       |
+| Windows               | —        |
+
+Installing on a platform without a prebuild (or with `npm install
+--no-optional`) leaves UDS unavailable; UDP and secure-UDP still
+work. `Varta.connectUds` throws `UdsUnavailableError` in that case.
+
+## Peer-gone detection
+
+The UDP and secure-UDP transports use connected-mode sockets. On
+Linux, the kernel surfaces ICMP `port unreachable` on the next beat
+as `{ kind: "dropped", reason: DropReason.NoObserver }` (1–2 beat
+latency). On macOS and BSDs, ICMP propagation is best-effort — the
+peer-absent condition may stay invisible at the agent layer and the
+observer's stall-detection metric remains the canonical signal.
+
+For UDS, the kernel returns `ECONNREFUSED` / `ENOENT` synchronously,
+so peer-gone detection is reliable on every platform.
 
 ## Latency note
 
 Node cannot match the ~1 µs-per-beat budget of the Rust client.
 Measured cost on a modern x86_64 host is **~5–15 µs per `beat()`**
-including frame allocation, UDP `send`, and outcome dispatch. The
-Node client is intended for tooling, batch jobs, Express/Fastify
+including frame allocation, send, and outcome dispatch. The Node
+client is intended for tooling, batch jobs, Express/Fastify
 sidecars, and process supervisors — not for tight inner loops
 emitting kilo-beats per second.
 
@@ -101,7 +130,7 @@ import { Varta, Status } from "@varta/client";
 import { readFileSync } from "node:fs";
 
 const key = readFileSync("/etc/varta/secure.key");   // 32 raw bytes
-const agent = await Varta.connectSecureUdp("127.0.0.1", 5876, key);
+const agent = Varta.connectSecureUdp("127.0.0.1", 5876, key);
 agent.beat(Status.Ok);
 ```
 
@@ -113,11 +142,17 @@ extra install is required.
 ```ts
 import { panic } from "@varta/client";
 
-panic.installSignalHandlerUdp("127.0.0.1", 5876);
+panic.installSignalHandlerUds("/var/run/varta.sock");
 // any uncaught exception, unhandled rejection, or terminating
 // signal (SIGTERM/SIGINT/SIGQUIT/SIGHUP) now emits a Critical beat
 // with nonce=NONCE_TERMINAL before the process exits.
 ```
+
+`installSignalHandlerUdp(host, port)` and
+`installSignalHandlerSecureUdp(host, port, key)` provide equivalent
+hooks for the UDP transports. All three pre-bind their socket at
+install time so emission is async-signal-safe — no allocation or
+DNS in the hot path.
 
 For deferred panic emission inside an async pipeline:
 
@@ -126,9 +161,6 @@ await panic.run(async () => {
   await mainLoop();   // any throw inside emits Critical, then re-throws
 });
 ```
-
-The handler pre-binds its socket at install time so emission is
-async-signal-safe — no allocation or DNS in the hot path.
 
 ## Stability
 

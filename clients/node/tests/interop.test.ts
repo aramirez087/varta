@@ -1,8 +1,10 @@
 // Live interop: Node agent ↔ real `varta-watch` observer.
 //
-// Spawns the built observer binary, drives beats from the Node client
-// over plaintext UDP (UDS is not supported on Node — see README), then
-// scrapes `/metrics` and asserts the observer saw the traffic.
+// Spawns the built observer binary once, drives beats from the Node
+// client over BOTH transports the observer is configured to listen
+// on (UDS — the canonical kernel-attested path — and loopback UDP),
+// scrapes `/metrics` after each, and asserts the observer saw the
+// traffic.
 //
 // Skipped unless the `VARTA_WATCH_BIN` env var points at a built
 // binary (or `target/release/varta-watch` exists relative to the
@@ -41,6 +43,7 @@ async function pickEphemeralUdpPort(): Promise<number> {
 async function spawnObserver(binary: string): Promise<{
   promAddr: { host: string; port: number };
   agentPort: number;
+  udsPath: string;
   proc: ChildProcessByStdio<Writable, Readable, Readable>;
   cleanup: () => Promise<void>;
 }> {
@@ -123,7 +126,7 @@ async function spawnObserver(binary: string): Promise<{
     tmp.cleanup();
   };
 
-  return { promAddr, agentPort, proc, cleanup };
+  return { promAddr, agentPort, udsPath, proc, cleanup };
 }
 
 async function scrapeMetrics(addr: { host: string; port: number }): Promise<string> {
@@ -193,6 +196,75 @@ test("Node agent beats reach varta-watch over UDP and appear in /metrics", async
 
     // Look for any non-zero `varta_*` counter — confirms the observer
     // observed traffic on the UDP socket.
+    let anyNonZero = false;
+    for (const line of body.split("\n")) {
+      if (line.startsWith("#") || !line.startsWith("varta_")) continue;
+      const parts = line.split(" ");
+      const value = parseFloat(parts[parts.length - 1] ?? "0");
+      if (Number.isFinite(value) && value > 0) {
+        anyNonZero = true;
+        break;
+      }
+    }
+    assert.ok(anyNonZero, "no varta_ metric reached a non-zero value");
+  } finally {
+    await observer.cleanup();
+  }
+});
+
+test("Node agent beats reach varta-watch over UDS and appear in /metrics", async (t) => {
+  const binary = locateWatchBinary();
+  if (!binary || !existsSync(binary)) {
+    console.log(
+      `[skip] varta-watch binary not found at ${binary}; build with ` +
+        "`cargo build --release -p varta-watch --features prometheus-exporter` " +
+        "or set VARTA_WATCH_BIN",
+    );
+    return;
+  }
+  let installed = false;
+  try {
+    await import("node-unix-socket");
+    installed = true;
+  } catch {
+    // Skip if the optional addon is unavailable.
+  }
+  if (!installed) {
+    t.skip("node-unix-socket addon not installed; skipping UDS interop test");
+    return;
+  }
+
+  const observer = await spawnObserver(binary);
+  try {
+    // Wait for the observer to bind the UDS path.
+    {
+      const start = Date.now();
+      while (!existsSync(observer.udsPath)) {
+        if (Date.now() - start > 5000) {
+          assert.fail(`observer never created UDS path ${observer.udsPath}`);
+        }
+        await new Promise((r) => setTimeout(r, 25));
+      }
+    }
+
+    const agent = Varta.connectUds(observer.udsPath);
+    let sent = 0;
+    for (let i = 0; i < 50; i++) {
+      const outcome = agent.beat(Status.Ok);
+      if (outcome.kind === "sent") sent += 1;
+      else if (outcome.kind === "dropped") {
+        await new Promise((r) => setTimeout(r, 1));
+      } else {
+        assert.fail(`unexpected outcome: ${JSON.stringify(outcome)}`);
+      }
+    }
+    agent.close();
+
+    assert.ok(sent >= 10, `expected ≥10 successful beats, got ${sent}`);
+    await new Promise((r) => setTimeout(r, 500));
+
+    const body = await scrapeMetrics(observer.promAddr);
+    assert.ok(body.includes("varta_"), `no varta_ metrics in body: ${body.slice(0, 400)}`);
     let anyNonZero = false;
     for (const line of body.split("\n")) {
       if (line.startsWith("#") || !line.startsWith("varta_")) continue;

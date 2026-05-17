@@ -14,16 +14,17 @@ npm install @varta/client
 ```
 
 Requires Node.js 18 LTS or newer. ESM-only. Ships compiled JavaScript
-plus TypeScript declarations. **Zero npm runtime dependencies** —
-ChaCha20-Poly1305 and HKDF-SHA256 come from Node's built-in
-`node:crypto`.
+plus TypeScript declarations. The only registry dependency is an
+**optional** native addon (`node-unix-socket`) for the UDS transport;
+UDP and secure-UDP work without it. ChaCha20-Poly1305 and
+HKDF-SHA256 come from Node's built-in `node:crypto`.
 
 ## 20-line example
 
 ```ts
 import { Varta, Status, DropReason } from "@varta/client";
 
-const agent = Varta.connectUdp("127.0.0.1", 5876);
+const agent = Varta.connectUds("/var/run/varta.sock");
 setInterval(() => {
   const outcome = agent.beat(Status.Ok);
   if (outcome.kind === "dropped") {
@@ -43,10 +44,10 @@ matrix see the package README in the repo:
 
 | Transport | Status | Notes |
 | --------- | ------ | ----- |
-| Plaintext UDP | Supported | `Varta.connectUdp(host, port)` |
+| Unix Domain Sockets | Supported (0.2.0+) | `Varta.connectUds(path)`. Requires the optional `node-unix-socket` addon (prebuilds for darwin x64/arm64 and linux x64/arm64 gnu+musl). The only transport classified `BeatOrigin::KernelAttested`, so it is the only Node transport eligible for observer-driven recovery. |
+| Plaintext UDP | Supported | `Varta.connectUdp(host, port)`. Connected-mode socket; on Linux ICMP `port unreachable` surfaces as `DropReason.NoObserver` on a subsequent beat. macOS ICMP propagation is best-effort. |
 | Secure UDP (ChaCha20-Poly1305) | Supported | `Varta.connectSecureUdp(host, port, key)` |
 | Master-key secure UDP | Supported | `Varta.connectSecureUdpWithMaster(host, port, masterKey)` |
-| Unix Domain Sockets | **Not in 0.1.0** | Node stdlib does not expose `AF_UNIX`/`SOCK_DGRAM`. Adding it would require a native addon and break the zero-dep posture. Use loopback UDP for same-host deployments — the security domain is identical. |
 
 ## Stability
 

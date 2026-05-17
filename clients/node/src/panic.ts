@@ -15,6 +15,10 @@ import { randomBytes } from "node:crypto";
 import { createSocket, type Socket } from "node:dgram";
 
 import {
+  UdsTransport,
+  UdsUnavailableError,
+} from "./transport.js";
+import {
   encodeShared,
   KEY_BYTES,
   deriveIvPrefix,
@@ -69,8 +73,6 @@ function arm(emit: () => void): void {
 
   process.on("uncaughtException", (err) => {
     trigger();
-    // Re-throw so Node's default crash printer still runs and the
-    // process exits with code 1 — preserves Node's standard behaviour.
     setImmediate(() => {
       throw err;
     });
@@ -86,8 +88,6 @@ function arm(emit: () => void): void {
   for (const sig of FATAL_SIGNALS) {
     process.on(sig, () => {
       trigger();
-      // Restore default handler and re-raise so the process exits with
-      // the canonical signal-derived code (128 + signum on POSIX).
       process.removeAllListeners(sig);
       process.kill(process.pid, sig);
     });
@@ -125,6 +125,31 @@ export function installSignalHandlerUdp(host: string, port: number): void {
 }
 
 // Install a panic emitter that publishes a Critical+NONCE_TERMINAL
+// frame over UDS. Pre-binds a `UdsTransport` at install time so the
+// hot path performs no module load. Throws
+// `PanicInstallError(kind="UdsUnavailable")` if the optional
+// `node-unix-socket` addon is missing.
+export function installSignalHandlerUds(path: string): void {
+  let transport: UdsTransport;
+  try {
+    transport = new UdsTransport(path);
+  } catch (err) {
+    if (err instanceof UdsUnavailableError) {
+      throw new PanicInstallError("UdsUnavailable", err.message);
+    }
+    throw new PanicInstallError("SocketBind", (err as Error).message);
+  }
+  const frame = buildCriticalFrame();
+  arm(() => {
+    try {
+      transport.send(frame);
+    } catch {
+      // Best effort.
+    }
+  });
+}
+
+// Install a panic emitter that publishes a Critical+NONCE_TERMINAL
 // frame over ChaCha20-Poly1305 AEAD UDP. Fail-closed entropy posture:
 // `crypto.randomBytes(16)` is invoked once at install time; if it
 // throws, `PanicInstallError(kind="EntropyUnavailable")` propagates
@@ -152,9 +177,6 @@ export function installSignalHandlerSecureUdp(
     throw new PanicInstallError("SocketBind", (err as Error).message);
   }
 
-  // Capture state by reference inside the closure. `installPid` lets
-  // the hook detect post-`fork(2)` execution and re-read entropy
-  // before the IV is reused.
   const state = {
     salt,
     installPid: process.pid,
@@ -168,7 +190,7 @@ export function installSignalHandlerSecureUdp(
         try {
           state.salt = randomBytes(SESSION_SALT_BYTES);
         } catch {
-          return; // fail-closed: skip emission rather than reuse stale IV
+          return;
         }
         state.installPid = process.pid;
         state.counter = 0;
@@ -193,9 +215,6 @@ export async function run(fn: () => void | Promise<void>): Promise<void> {
   try {
     await fn();
   } catch (err) {
-    // Emit by triggering the uncaughtException pathway — re-throws
-    // are caught by the armed handler installed via `arm()`. If no
-    // handler is installed, the error simply propagates.
     throw err;
   }
 }
