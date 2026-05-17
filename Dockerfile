@@ -97,7 +97,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     CC_x86_64_unknown_linux_musl="$LINKER" \
     CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER="$LINKER" \
     CC_aarch64_unknown_linux_musl="$LINKER" \
-    RUSTFLAGS='-C target-feature=+crt-static -C link-arg=-static-pie' \
+    RUSTFLAGS='-C target-feature=+crt-static' \
       cargo build \
         --locked \
         --release \
@@ -108,13 +108,14 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
         -p varta-watch; \
     cp "target/$RUST_TARGET/release/varta-watch" /out-varta-watch; \
     echo '=== file (pre-strip) ==='; file /out-varta-watch; \
-    echo '=== --help (pre-strip) ==='; \
-    /out-varta-watch --help 2>&1 | head -5; echo "rc=$?"; \
-    strip /out-varta-watch || true; \
-    echo '=== file (post-strip) ==='; file /out-varta-watch; \
-    echo '=== --help (post-strip) ==='; \
-    /out-varta-watch --help 2>&1 | head -5; echo "rc=$?"; \
-    echo '=== readelf -l (PT_INTERP) ==='; readelf -l /out-varta-watch | grep -A1 INTERP || echo 'no PT_INTERP (static)'
+    echo '=== ldd ==='; ldd /out-varta-watch 2>&1 || true; \
+    echo '=== --help raw stderr ==='; \
+    set +e; /out-varta-watch --help; rc=$?; set -e; \
+    echo "rc=$rc"; \
+    echo '=== --help via strace (first 80 lines) ==='; \
+    apt-get update >/dev/null && apt-get install -y --no-install-recommends strace >/dev/null && rm -rf /var/lib/apt/lists/* || true; \
+    set +e; strace -f -o /tmp/strace.log /out-varta-watch --help >/dev/null 2>&1; set -e; \
+    tail -n 80 /tmp/strace.log || true
 
 # ---------- runtime ----------
 FROM gcr.io/distroless/static-debian12@${DISTROLESS_DIGEST}
