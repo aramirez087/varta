@@ -43,6 +43,7 @@ RUN apt-get update \
 # Map docker $TARGETPLATFORM → rustup target triple + linker.
 RUN set -eux; \
     rustup update stable; \
+    rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl; \
     case "$TARGETPLATFORM" in \
       linux/amd64) \
         RUST_TARGET=x86_64-unknown-linux-musl; \
@@ -60,8 +61,7 @@ RUN set -eux; \
       *) echo "unsupported TARGETPLATFORM=$TARGETPLATFORM" >&2; exit 1 ;; \
     esac; \
     echo "RUST_TARGET=$RUST_TARGET" > /tmp/build.env; \
-    echo "LINKER=$LINKER" >> /tmp/build.env; \
-    rustup target add "$RUST_TARGET"
+    echo "LINKER=$LINKER" >> /tmp/build.env
 
 ENV PATH="/opt/aarch64-linux-musl-cross/bin:${PATH}"
 ENV CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=aarch64-linux-musl-gcc
