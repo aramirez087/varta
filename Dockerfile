@@ -34,7 +34,9 @@ ARG BUILDPLATFORM
 # the build graph in plain docker buildx — fewer moving parts in CI.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
+       binutils \
        ca-certificates \
+       file \
        musl-tools \
        wget \
        xz-utils \
@@ -103,7 +105,10 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
         --features json-log \
         -p varta-watch; \
     cp "target/$RUST_TARGET/release/varta-watch" /out-varta-watch; \
-    strip /out-varta-watch || true
+    strip /out-varta-watch || true; \
+    echo '=== file ==='; file /out-varta-watch; \
+    echo '=== readelf -d ==='; readelf -d /out-varta-watch | head -40 || true; \
+    echo '=== readelf -l (PT_INTERP) ==='; readelf -l /out-varta-watch | grep -A1 INTERP || echo 'no PT_INTERP (static)'
 
 # ---------- runtime ----------
 FROM gcr.io/distroless/static-debian12@${DISTROLESS_DIGEST}
