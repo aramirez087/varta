@@ -91,11 +91,13 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/build/target,id=varta-target-${TARGETPLATFORM} \
     set -eux; \
     . /tmp/build.env; \
+    echo '=== rustc cfg for target ==='; \
+    rustc --print cfg --target "$RUST_TARGET" | grep -E 'target_feature|target_env' || true; \
     CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER="$LINKER" \
     CC_x86_64_unknown_linux_musl="$LINKER" \
     CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER="$LINKER" \
     CC_aarch64_unknown_linux_musl="$LINKER" \
-    RUSTFLAGS='-C target-feature=+crt-static' \
+    RUSTFLAGS='-C target-feature=+crt-static -C link-self-contained=yes' \
       cargo build \
         --locked \
         --release \
@@ -107,7 +109,6 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     cp "target/$RUST_TARGET/release/varta-watch" /out-varta-watch; \
     strip /out-varta-watch || true; \
     echo '=== file ==='; file /out-varta-watch; \
-    echo '=== readelf -d ==='; readelf -d /out-varta-watch | head -40 || true; \
     echo '=== readelf -l (PT_INTERP) ==='; readelf -l /out-varta-watch | grep -A1 INTERP || echo 'no PT_INTERP (static)'
 
 # ---------- runtime ----------
