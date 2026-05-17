@@ -1,0 +1,14 @@
+<Solution>
+  <Folder Name="/examples/">
+    <Project Path="examples/Varta.Examples.BasicUds/Varta.Examples.BasicUds.csproj" />
+    <Project Path="examples/Varta.Examples.SecureUdp/Varta.Examples.SecureUdp.csproj" />
+    <Project Path="examples/Varta.Examples.WithPayload/Varta.Examples.WithPayload.csproj" />
+    <Project Path="examples/Varta.Examples.WithSignalHandler/Varta.Examples.WithSignalHandler.csproj" />
+  </Folder>
+  <Folder Name="/src/">
+    <Project Path="src/Varta.Client/Varta.Client.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/Varta.Client.Tests/Varta.Client.Tests.csproj" />
+  </Folder>
+</Solution>

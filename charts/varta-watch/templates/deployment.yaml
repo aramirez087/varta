@@ -30,6 +30,8 @@ spec:
       {{- end }}
       securityContext:
         {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      initContainers:
+        {{- include "varta-watch.tokenInitContainer" . | nindent 8 }}
       containers:
         - name: varta-watch
           image: {{ include "varta-watch.image" . | quote }}
@@ -63,13 +65,17 @@ spec:
       volumes:
         - name: uds
           emptyDir: {}
-        - name: token
+        - name: token-source
           secret:
             secretName: {{ include "varta-watch.tokenSecretName" . }}
             items:
               - key: {{ include "varta-watch.tokenSecretKey" . }}
                 path: prom.token
             defaultMode: 0400
+        - name: token
+          emptyDir:
+            medium: Memory
+            sizeLimit: 4Ki
         - name: tmp
           emptyDir: {}
       {{- with .Values.nodeSelector }}

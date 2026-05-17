@@ -1,0 +1,12 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <IsPackable>false</IsPackable>
+    <RootNamespace>Varta.Examples.WithSignalHandler</RootNamespace>
+    <AssemblyName>varta-example-with-signal-handler</AssemblyName>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\Varta.Client\Varta.Client.csproj" />
+  </ItemGroup>
+</Project>

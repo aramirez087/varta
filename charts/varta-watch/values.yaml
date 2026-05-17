@@ -21,6 +21,26 @@ image:
   # public GHCR image.
   pullSecrets: []
 
+# --- Token-stage init container ----------------------------------------
+#
+# Init container that copies the K8s Secret-mounted bearer token from
+# `/token-source/prom.token` (root-owned, mode 0400 — what K8s gives us)
+# to an emptyDir at `/token/prom.token` owned by the observer UID with
+# mode 0o400, so varta-watch's validate_secret_file() check passes.
+# See charts/varta-watch/templates/_helpers.tpl for the full rationale.
+tokenInit:
+  image:
+    repository: busybox
+    tag: "1.36"
+    pullPolicy: IfNotPresent
+  resources:
+    requests:
+      cpu: 5m
+      memory: 8Mi
+    limits:
+      cpu: 50m
+      memory: 16Mi
+
 # --- Bearer token for /metrics -----------------------------------------
 #
 # Two paths:
@@ -46,6 +66,11 @@ uds:
 
 # --- varta-watch process flags ------------------------------------------
 #
+# `--threshold-ms` is required by the binary's argv parser (no default).
+# 2000 ms matches the value in observability/examples/varta-watch.service
+# and the canonical examples under design.md / clients/*/README.md.
+thresholdMs: 2000
+
 # `--self-watchdog-secs` matches the systemd unit's default (4s, half of
 # the kernel's typical WatchdogSec=8s).
 selfWatchdogSecs: 4
@@ -114,10 +139,16 @@ affinity: {}
 priorityClassName: ""
 
 # --- Pod-level security context ----------------------------------------
+#
+# `fsGroup` is what lets the non-root main container write to the
+# emptyDir UDS volume (`mode=sidecar`) — kubelet chowns supported
+# volumes to root:fsGroup and adds group-write at mount time. Match it
+# to `runAsGroup` so the container's primary GID owns the dir.
 podSecurityContext:
   runAsNonRoot: true
   runAsUser: 65532
   runAsGroup: 65532
+  fsGroup: 65532
   seccompProfile:
     type: RuntimeDefault
 

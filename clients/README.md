@@ -9,6 +9,7 @@ gets its own subdirectory with independent semver, packaging, and CI.
 | Python   | `pip install varta`                                    | Beta   | [`python/`](python/) |
 | Go       | `go get github.com/aramirez087/Varta/clients/go`       | Beta   | [`go/`](go/)       |
 | Node.js  | `npm install @varta-health/client`                     | Beta   | [`node/`](node/)   |
+| .NET     | `dotnet add package Varta.Client`                      | Beta   | [`dotnet/`](dotnet/) |
 | JVM      | (planned)                                              |        |                    |
 
 ## Stability model

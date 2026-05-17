@@ -18,6 +18,7 @@
 - [Go](clients/go.md)
 - [Python](clients/python.md)
 - [Node.js](clients/node.md)
+- [.NET](clients/dotnet.md)
 
 ---
 

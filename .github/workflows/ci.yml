@@ -764,6 +764,67 @@ jobs:
         timeout-minutes: 2
         run: npm run test:interop
 
+  dotnet-client:
+    name: dotnet-client (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: checkout
+        uses: actions/checkout@v4
+
+      - name: setup dotnet
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: |
+            8.0.x
+            10.0.x
+
+      - name: rust toolchain (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: cargo cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: build varta-watch (release, prometheus-exporter)
+        run: cargo build --locked --release -p varta-watch --features prometheus-exporter
+
+      - name: restore + build
+        working-directory: clients/dotnet
+        run: |
+          dotnet restore Varta.slnx
+          dotnet build Varta.slnx -c Release --no-restore
+
+      - name: conformance vectors
+        working-directory: clients/dotnet
+        run: >
+          dotnet test tests/Varta.Client.Tests/Varta.Client.Tests.csproj
+          -c Release --no-build --logger "console;verbosity=minimal"
+          --filter "FullyQualifiedName~Conformance"
+
+      - name: unit tests (codec + agent + panic + errno)
+        working-directory: clients/dotnet
+        run: >
+          dotnet test tests/Varta.Client.Tests/Varta.Client.Tests.csproj
+          -c Release --no-build --logger "console;verbosity=minimal"
+          --filter "FullyQualifiedName!~Interop&FullyQualifiedName!~Conformance"
+
+      - name: interop with varta-watch
+        working-directory: clients/dotnet
+        env:
+          VARTA_WATCH_BIN: ${{ github.workspace }}/target/release/varta-watch
+        timeout-minutes: 2
+        run: >
+          dotnet test tests/Varta.Client.Tests/Varta.Client.Tests.csproj
+          -c Release --no-build --logger "console;verbosity=minimal"
+          --filter "FullyQualifiedName~Interop"
+
+      - name: nuget pack (smoke)
+        working-directory: clients/dotnet
+        run: dotnet pack src/Varta.Client/Varta.Client.csproj -c Release -o ./nupkgs
+
   book:
     name: build-book
     runs-on: ubuntu-latest

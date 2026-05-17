@@ -109,17 +109,71 @@ Resolve image tag — values.image.tag wins; otherwise Chart.appVersion.
 {{- end -}}
 
 {{/*
+Init-container that stages the bearer token from the K8s Secret mount
+(root-owned, mode 0400, immutable) into an in-memory emptyDir owned by
+the runtime UID, so validate_secret_file() in varta-watch passes its
+"file uid == observer uid" check.
+
+Why: Kubernetes mounts Secret/ConfigMap/Projected volumes as root:root.
+fsGroup can rewrite GID but never UID; defaultMode loose enough for a
+non-root reader (0o4xx) gets rejected by validate_secret_file's
+`mode & 0o077 != 0` check. The stage-then-chown init is the standard
+escape hatch — see book/src/operations/helm.md for the full rationale.
+*/}}
+{{- define "varta-watch.tokenInitContainer" -}}
+- name: token-stage
+  image: {{ printf "%s:%s" .Values.tokenInit.image.repository .Values.tokenInit.image.tag | quote }}
+  imagePullPolicy: {{ .Values.tokenInit.image.pullPolicy }}
+  command: ["/bin/sh", "-c"]
+  args:
+    - |
+      set -eu
+      cp /token-source/prom.token /token/prom.token
+      chown {{ .Values.podSecurityContext.runAsUser }}:{{ .Values.podSecurityContext.runAsGroup }} /token/prom.token
+      chmod 0400 /token/prom.token
+  securityContext:
+    runAsUser: 0
+    runAsGroup: 0
+    runAsNonRoot: false
+    allowPrivilegeEscalation: false
+    readOnlyRootFilesystem: true
+    capabilities:
+      drop: ["ALL"]
+      add: ["CHOWN", "FOWNER", "DAC_OVERRIDE"]
+    seccompProfile:
+      type: RuntimeDefault
+  resources:
+    {{- toYaml .Values.tokenInit.resources | nindent 4 }}
+  volumeMounts:
+    - name: token-source
+      mountPath: /token-source
+      readOnly: true
+    - name: token
+      mountPath: /token
+{{- end -}}
+
+{{/*
 ExecStart-equivalent argv block — shared by daemonset and deployment
 templates. Emitted as a YAML list under `args:`.
+
+The varta-watch argv parser is whitespace-separated only ("--flag value");
+it does NOT accept "--flag=value". Each flag and its value therefore
+become two distinct list items so they land in argv as separate tokens.
 */}}
 {{- define "varta-watch.args" -}}
-- --socket={{ .Values.uds.path }}
+- --socket
+- {{ .Values.uds.path | quote }}
+- --threshold-ms
+- {{ .Values.thresholdMs | int | quote }}
 {{- if .Values.prometheus.bindAddr }}
-- --prom-addr={{ .Values.prometheus.bindAddr }}
-- --prom-token-file=/etc/varta/prom.token
+- --prom-addr
+- {{ .Values.prometheus.bindAddr | quote }}
+- --prom-token-file
+- /etc/varta/prom.token
 {{- end }}
 {{- if .Values.selfWatchdogSecs }}
-- --self-watchdog-secs={{ .Values.selfWatchdogSecs }}
+- --self-watchdog-secs
+- {{ .Values.selfWatchdogSecs | int | quote }}
 {{- end }}
 {{- range .Values.extraArgs }}
 - {{ . | quote }}

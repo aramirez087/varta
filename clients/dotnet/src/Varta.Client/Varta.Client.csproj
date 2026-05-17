@@ -1,0 +1,53 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFrameworks>net8.0;net10.0</TargetFrameworks>
+    <RootNamespace>Varta</RootNamespace>
+    <AssemblyName>Varta.Client</AssemblyName>
+
+    <!-- Package metadata -->
+    <PackageId>Varta.Client</PackageId>
+    <Version>0.1.0</Version>
+    <Authors>Varta authors</Authors>
+    <Description>Zero-overhead health protocol client for distributed local agents (Varta VLP v0.2). Emits 32-byte heartbeats over Unix domain sockets, plaintext UDP, or ChaCha20-Poly1305 secure UDP.</Description>
+    <PackageProjectUrl>https://github.com/aramirez087/Varta</PackageProjectUrl>
+    <RepositoryUrl>https://github.com/aramirez087/Varta</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
+    <PackageLicenseExpression>MIT OR Apache-2.0</PackageLicenseExpression>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+    <PackageTags>varta;health;observability;vlp;heartbeat;monitoring</PackageTags>
+    <PackageReleaseNotes>See CHANGELOG.md</PackageReleaseNotes>
+
+    <!-- Source link + symbols -->
+    <IncludeSymbols>true</IncludeSymbols>
+    <SymbolPackageFormat>snupkg</SymbolPackageFormat>
+    <EmbedUntrackedSources>true</EmbedUntrackedSources>
+    <PublishRepositoryUrl>true</PublishRepositoryUrl>
+    <ContinuousIntegrationBuild Condition="'$(CI)' == 'true'">true</ContinuousIntegrationBuild>
+
+    <!-- Output -->
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <!--
+      CS1591: skip "missing XML doc" on public members — we document
+              the surface in the public-API files and don't want to
+              force docstrings on every internal/derived item.
+      CA1710: 'DecodeError' is the agreed cross-language type name
+              (matches Rust/Go/Python/Node peers). Suffixing with
+              'Exception' would break the public-surface parity table.
+    -->
+    <NoWarn>$(NoWarn);CS1591;CA1710</NoWarn>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.SourceLink.GitHub" Version="8.0.0" PrivateAssets="All" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <None Include="../../README.md" Pack="true" PackagePath="\" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="Varta.Client.Tests" />
+  </ItemGroup>
+
+</Project>

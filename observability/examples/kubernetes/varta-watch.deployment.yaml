@@ -75,6 +75,10 @@ spec:
         runAsNonRoot: true
         runAsUser: 65532
         runAsGroup: 65532
+        # fsGroup lets the non-root main container write to the
+        # emptyDir UDS volume — kubelet chowns supported volumes to
+        # root:fsGroup at mount time. Match to runAsGroup.
+        fsGroup: 65532
         seccompProfile:
           type: RuntimeDefault
       containers:
@@ -82,10 +86,20 @@ spec:
           image: ghcr.io/aramirez087/varta-watch:0.2.0
           imagePullPolicy: IfNotPresent
           args:
-            - --socket=/run/varta/varta.sock
-            - --prom-addr=0.0.0.0:9100
-            - --prom-token-file=/etc/varta/prom.token
-            - --self-watchdog-secs=4
+            # The argv parser is whitespace-separated only ("--flag value");
+            # it does NOT accept "--flag=value". Keep each flag and its
+            # value as separate YAML list items so they land in argv as
+            # distinct tokens. The Helm chart's args helper mirrors this.
+            - --socket
+            - /run/varta/varta.sock
+            - --threshold-ms
+            - "2000"
+            - --prom-addr
+            - 0.0.0.0:9100
+            - --prom-token-file
+            - /etc/varta/prom.token
+            - --self-watchdog-secs
+            - "4"
           ports:
             - name: metrics
               containerPort: 9100
