@@ -1,5 +1,12 @@
 # VLP Frame — Wire Layout (v0.2)
 
+> **Audience: Rust contributors.** This page documents the *Rust
+> implementation* of the Varta Lifeline Protocol — design rationale,
+> type-system choices, performance characteristics. If you are building a
+> client in another language, start at the
+> [normative VLP specification](../spec/vlp.md) — it is language-neutral
+> and carries a published conformance-vector suite.
+
 The Varta Lifeline Protocol carries a single message type: a 32-byte
 fixed-layout health frame. Every byte position is pinned at the protocol level
 so encode/decode is a handful of `from_le_bytes` / `to_le_bytes` calls and a

@@ -42,3 +42,12 @@ chacha20poly1305 = { version = "=0.10.1", default-features = false, optional = t
 hkdf             = { version = "=0.12.4", default-features = false, optional = true }
 sha2             = { version = "=0.10.9", default-features = false, optional = true }
 zeroize          = { version = "=1.8.2",  default-features = false, optional = true, features = ["derive"] }
+
+# Generator binary for `tools/vlp-test-vectors.json`. Requires `std` (it
+# writes a file) and `crypto` (it produces secure-frame and HKDF goldens).
+# Run with:
+#   cargo run -p varta-vlp --example gen_test_vectors --features "std crypto"
+# The generated file is the source of truth for cross-language conformance.
+[[example]]
+name = "gen_test_vectors"
+required-features = ["std", "crypto"]

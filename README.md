@@ -49,6 +49,15 @@ path = "path/to/varta/crates/varta-client"
 features = ["panic-handler", "udp"]
 ```
 
+> **Building a client in another language?** The VLP wire format is
+> documented as a language-neutral specification at
+> [`book/src/spec/vlp.md`](book/src/spec/vlp.md) (plus
+> [`vlp-secure.md`](book/src/spec/vlp-secure.md) for the AEAD-wrapped
+> transport). A cross-language conformance vector suite ships at
+> [`tools/vlp-test-vectors.json`](tools/vlp-test-vectors.json); Python,
+> C99, and Go reference implementations live in
+> [`tools/reference-implementations/`](tools/reference-implementations/).
+
 ## Quickstart
 
 ```rust,no_run

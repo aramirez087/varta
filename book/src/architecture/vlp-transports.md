@@ -1,5 +1,12 @@
 # VLP Transports
 
+> **Audience: Rust contributors.** This page documents the *Rust
+> implementation* of the VLP transport layer — trait shapes, feature-flag
+> matrix, operational guidance. For the normative wire format of the base
+> frame and the AEAD-wrapped secure frames, see the
+> [VLP specification](../spec/vlp.md) and
+> [VLP secure-transport specification](../spec/vlp-secure.md).
+
 The Varta Lifeline Protocol (VLP) wire format is entirely transport-agnostic — a 32-byte,
 8-byte-aligned `#[repr(C)]` frame. The transport layer is abstracted via traits that
 allow swapping out the underlying socket type without modifying the protocol core.

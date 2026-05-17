@@ -5,6 +5,14 @@
 
 ---
 
+# Specification
+
+- [VLP — Base Frame](spec/vlp.md)
+- [VLP — Secure Transport](spec/vlp-secure.md)
+- [Conformance & Test Vectors](spec/conformance.md)
+
+---
+
 # Architecture
 
 - [The VLP Frame](architecture/vlp-frame.md)
