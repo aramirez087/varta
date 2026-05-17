@@ -48,7 +48,19 @@ RUN set -eux; \
     case "$TARGETPLATFORM" in \
       linux/amd64) \
         RUST_TARGET=x86_64-unknown-linux-musl; \
-        LINKER=musl-gcc; \
+        case "$BUILDPLATFORM" in \
+          linux/amd64) \
+            LINKER=musl-gcc; \
+            ;; \
+          linux/arm64) \
+            LINKER=x86_64-linux-musl-gcc; \
+            wget -qO /tmp/x86_64-musl.tgz \
+              https://musl.cc/x86_64-linux-musl-cross.tgz; \
+            tar -C /opt -xzf /tmp/x86_64-musl.tgz; \
+            rm /tmp/x86_64-musl.tgz; \
+            ;; \
+          *) echo "unsupported cross: $BUILDPLATFORM -> $TARGETPLATFORM" >&2; exit 1 ;; \
+        esac; \
         ;; \
       linux/arm64) \
         RUST_TARGET=aarch64-unknown-linux-musl; \
@@ -64,11 +76,7 @@ RUN set -eux; \
     echo "RUST_TARGET=$RUST_TARGET" > /tmp/build.env; \
     echo "LINKER=$LINKER" >> /tmp/build.env
 
-ENV PATH="/opt/aarch64-linux-musl-cross/bin:${PATH}"
-ENV CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=aarch64-linux-musl-gcc
-ENV CC_aarch64_unknown_linux_musl=aarch64-linux-musl-gcc
-ENV CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=musl-gcc
-ENV CC_x86_64_unknown_linux_musl=musl-gcc
+ENV PATH="/opt/aarch64-linux-musl-cross/bin:/opt/x86_64-linux-musl-cross/bin:${PATH}"
 
 WORKDIR /build
 COPY . .
@@ -81,6 +89,10 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/build/target,id=varta-target-${TARGETPLATFORM} \
     set -eux; \
     . /tmp/build.env; \
+    CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER="$LINKER" \
+    CC_x86_64_unknown_linux_musl="$LINKER" \
+    CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER="$LINKER" \
+    CC_aarch64_unknown_linux_musl="$LINKER" \
     RUSTFLAGS='-C target-feature=+crt-static' \
       cargo build \
         --locked \
