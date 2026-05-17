@@ -32,6 +32,23 @@ A 32-byte heartbeat protocol for distributed local agents and networked clusters
   connect time. A missing or busy observer surfaces as `BeatOutcome::Dropped`
   — never a stall in your hot path.
 
+## Official clients
+
+| Language | Package                | Status | Source                       |
+| -------- | ---------------------- | ------ | ---------------------------- |
+| Rust     | `varta-client` (path)  | Stable | [`crates/varta-client/`](crates/varta-client/) |
+| Python   | `pip install varta`    | Beta   | [`clients/python/`](clients/python/) |
+| Go       | _planned_              |        |                              |
+| Node.js  | _planned_              |        |                              |
+
+The wire protocol (`VLP v0.2`) is governed by
+[`book/src/spec/`](book/src/spec/) and the cross-language conformance
+suite at
+[`tools/vlp-test-vectors.json`](tools/vlp-test-vectors.json). Every
+official client is verified against the same vectors. See
+[`clients/README.md`](clients/README.md) for the multi-language
+adoption pattern.
+
 ## Install
 
 Varta is not yet published to crates.io (post-v0.1.0). Use a path dependency:
@@ -55,8 +72,10 @@ features = ["panic-handler", "udp"]
 > [`vlp-secure.md`](book/src/spec/vlp-secure.md) for the AEAD-wrapped
 > transport). A cross-language conformance vector suite ships at
 > [`tools/vlp-test-vectors.json`](tools/vlp-test-vectors.json); Python,
-> C99, and Go reference implementations live in
+> C99, and Go reference verifiers live in
 > [`tools/reference-implementations/`](tools/reference-implementations/).
+> Production-grade client libraries live in
+> [`clients/`](clients/).
 
 ## Quickstart
 

@@ -1,5 +1,12 @@
 # Python reference implementation — VLP v0.2
 
+> **Not a client.** This directory holds a verifier-grade reference
+> that round-trips fixtures against
+> [`tools/vlp-test-vectors.json`](../../vlp-test-vectors.json). For the
+> production Python client (with sockets, fork-safety, panic hooks,
+> auto-reconnect) see
+> [`clients/python/`](../../../clients/python/) — `pip install varta`.
+
 Non-normative. The authoritative specification is at
 [`book/src/spec/vlp.md`](../../../book/src/spec/vlp.md) and
 [`book/src/spec/vlp-secure.md`](../../../book/src/spec/vlp-secure.md).

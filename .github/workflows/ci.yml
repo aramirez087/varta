@@ -599,6 +599,65 @@ jobs:
       - name: cargo deny check
         run: cargo deny --all-features check advisories bans sources licenses
 
+  python-client:
+    name: python-client (${{ matrix.os }}, py${{ matrix.python-version }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        python-version: ["3.8", "3.12"]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: checkout
+        uses: actions/checkout@v4
+
+      - name: setup python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: rust toolchain (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: cargo cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: build varta-watch (release, prometheus-exporter)
+        run: cargo build --locked --release -p varta-watch --features prometheus-exporter
+
+      - name: install Python client + dev extras
+        working-directory: clients/python
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: conformance vectors
+        working-directory: clients/python
+        run: pytest tests/test_conformance_vectors.py -v
+
+      - name: unit tests
+        working-directory: clients/python
+        run: pytest tests/test_client_unit.py tests/test_panic_hook.py -v
+
+      - name: interop with varta-watch
+        working-directory: clients/python
+        env:
+          VARTA_WATCH_BIN: ${{ github.workspace }}/target/release/varta-watch
+        run: pytest tests/test_interop_observer.py -v --timeout=60
+
+      - name: build sdist + wheel
+        working-directory: clients/python
+        run: |
+          pip install build
+          python -m build
+
+      - name: install built wheel into a fresh venv (smoke)
+        working-directory: clients/python
+        run: |
+          python -m venv /tmp/varta-smoke-venv
+          /tmp/varta-smoke-venv/bin/pip install dist/varta-*.whl
+          /tmp/varta-smoke-venv/bin/python -c "import varta; print(varta.__version__)"
+
   book:
     name: build-book
     runs-on: ubuntu-latest

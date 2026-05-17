@@ -164,3 +164,12 @@ secure-UDP and the plaintext transports do not key on continuity.
 - Protocol crate: [`crates/varta-vlp/README.md`](../varta-vlp/README.md)
 - Examples: [`crates/varta-client/examples/`](examples/)
 - Architecture: [`book/src/architecture/vlp-frame.md`](../../book/src/architecture/vlp-frame.md)
+
+## Other languages
+
+Official clients in non-Rust languages live under
+[`clients/`](../../clients/). Today: Python
+([`clients/python/`](../../clients/python/), `pip install varta`).
+Each port preserves the same wire-level contract and is verified
+against the same `tools/vlp-test-vectors.json` conformance suite as
+this crate.

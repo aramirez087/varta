@@ -301,7 +301,10 @@ fn every_frame_vector_round_trips_or_errors() {
             other => panic!("{id}: unknown frame_vector kind: {other}"),
         }
     }
-    assert!(success >= 6, "expected ≥6 encode/decode goldens, got {success}");
+    assert!(
+        success >= 6,
+        "expected ≥6 encode/decode goldens, got {success}"
+    );
     assert!(error >= 8, "expected ≥8 decode-error goldens, got {error}");
 }
 
@@ -384,8 +387,7 @@ fn every_secure_frame_vector_round_trips() {
                 nonce[..8].copy_from_slice(&iv_random);
                 nonce[8..].copy_from_slice(&iv_counter.to_le_bytes());
                 let aad = agent_pid.to_le_bytes();
-                let (ct, tag) =
-                    seal(agent_key.as_bytes(), &nonce, &aad, &plaintext).expect("seal");
+                let (ct, tag) = seal(agent_key.as_bytes(), &nonce, &aad, &plaintext).expect("seal");
 
                 let mut wire = Vec::with_capacity(64);
                 wire.extend_from_slice(&aad);
@@ -425,11 +427,7 @@ fn every_secure_frame_vector_round_trips() {
                 agent_array.copy_from_slice(&agent_bytes);
                 let agent_key = Key::from_bytes(agent_array);
                 let derived = kdf::derive_epoch_key(&agent_key, epoch).expect("derive");
-                assert_eq!(
-                    derived.as_bytes().as_slice(),
-                    expected.as_slice(),
-                    "{id}"
-                );
+                assert_eq!(derived.as_bytes().as_slice(), expected.as_slice(), "{id}");
                 count += 1;
             }
             other => panic!("{id}: unknown secure_frame kind: {other}"),

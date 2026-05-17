@@ -53,7 +53,11 @@ fn patch_with_valid_crc(mut buf: [u8; 32], offset: usize, value: u8) -> [u8; 32]
     buf
 }
 
-fn patch_range_with_valid_crc(mut buf: [u8; 32], range: std::ops::Range<usize>, src: &[u8]) -> [u8; 32] {
+fn patch_range_with_valid_crc(
+    mut buf: [u8; 32],
+    range: std::ops::Range<usize>,
+    src: &[u8],
+) -> [u8; 32] {
     buf[range].copy_from_slice(src);
     let crc = crc32c::compute(&buf[0..28]);
     buf[28..32].copy_from_slice(&crc.to_le_bytes());
@@ -183,7 +187,12 @@ fn main() {
     );
     j.raw_field(1, "magic_hex", &format!("\"{}\"", hex(&MAGIC)), true);
     j.raw_field(1, "version_byte", &format!("{}", VERSION), true);
-    j.raw_field(1, "nonce_terminal_hex", &format!("\"{:016x}\"", NONCE_TERMINAL), true);
+    j.raw_field(
+        1,
+        "nonce_terminal_hex",
+        &format!("\"{:016x}\"", NONCE_TERMINAL),
+        true,
+    );
 
     // -----------------------------------------------------------------------
     // CRC-32C vectors — Castagnoli reference values.
@@ -199,14 +208,23 @@ fn main() {
             b"123456789",
         ),
         ("crc-thirty-two-zeros", "Thirty-two zero bytes.", &[0u8; 32]),
-        ("crc-thirty-two-ffs", "Thirty-two 0xFF bytes.", &[0xffu8; 32]),
+        (
+            "crc-thirty-two-ffs",
+            "Thirty-two 0xFF bytes.",
+            &[0xffu8; 32],
+        ),
     ];
     for (id, desc, input) in crc_cases {
         j.open_object(2);
         j.string_field(3, "id", id, true);
         j.string_field(3, "description", desc, true);
         j.string_field(3, "input_hex", &hex(input), true);
-        j.string_field(3, "expected_crc_hex", &format!("{:08x}", crc32c::compute(input)), false);
+        j.string_field(
+            3,
+            "expected_crc_hex",
+            &format!("{:08x}", crc32c::compute(input)),
+            false,
+        );
         j.close_object(2, true);
     }
     j.close_array(1, true);
@@ -240,7 +258,13 @@ fn main() {
         (
             "frame-ok-large-fields",
             "Status::Ok with maximum-width fields, exercises every LE byte position.",
-            Frame::new(Status::Ok, 0xDEAD_BEEF, 0x0123_4567_89AB_CDEF, 1, 0x0000_0042),
+            Frame::new(
+                Status::Ok,
+                0xDEAD_BEEF,
+                0x0123_4567_89AB_CDEF,
+                1,
+                0x0000_0042,
+            ),
         ),
         (
             "frame-ok-nonce-wrapped-to-zero",
@@ -281,9 +305,13 @@ fn main() {
         b[28..32].copy_from_slice(&crc.to_le_bytes());
         b
     };
-    emit_error_case(&mut j, "frame-error-bad-magic",
+    emit_error_case(
+        &mut j,
+        "frame-error-bad-magic",
         "First byte 0x00 instead of 'V'. Decoder rejects before CRC check.",
-        &bad_magic, "BadMagic");
+        &bad_magic,
+        "BadMagic",
+    );
 
     // BadVersion: version byte 0x01 (legacy).
     let bad_version = {
@@ -293,51 +321,83 @@ fn main() {
         b[28..32].copy_from_slice(&crc.to_le_bytes());
         b
     };
-    emit_error_case(&mut j, "frame-error-bad-version",
+    emit_error_case(
+        &mut j,
+        "frame-error-bad-version",
         "VLP v0.1 frames are rejected: version byte must equal 0x02.",
-        &bad_version, "BadVersion");
+        &bad_version,
+        "BadVersion",
+    );
 
     // BadCrc: corrupt last byte of CRC trailer (without re-stamp).
     let bad_crc = corrupt_at(base, 31, base[31] ^ 0x01);
-    emit_error_case(&mut j, "frame-error-bad-crc",
+    emit_error_case(
+        &mut j,
+        "frame-error-bad-crc",
         "Final CRC byte flipped. Decoder rejects before any field-range check.",
-        &bad_crc, "BadCrc");
+        &bad_crc,
+        "BadCrc",
+    );
 
     // BadStatus: byte 0xFF at status position.
     let bad_status = patch_with_valid_crc(base, 3, 0xFF);
-    emit_error_case(&mut j, "frame-error-bad-status",
+    emit_error_case(
+        &mut j,
+        "frame-error-bad-status",
         "Status byte 0xFF is not a known variant.",
-        &bad_status, "BadStatus");
+        &bad_status,
+        "BadStatus",
+    );
 
     // StallOnWire: status = 3 (Stall). Observer-synthesized only.
     let stall_on_wire = patch_with_valid_crc(base, 3, 0x03);
-    emit_error_case(&mut j, "frame-error-stall-on-wire",
+    emit_error_case(
+        &mut j,
+        "frame-error-stall-on-wire",
         "Status::Stall (byte 0x03) is observer-synthesized; agents MUST NOT emit it.",
-        &stall_on_wire, "StallOnWire");
+        &stall_on_wire,
+        "StallOnWire",
+    );
 
     // BadPid(0): pid bytes all zero.
     let bad_pid_zero = patch_range_with_valid_crc(base, 4..8, &[0u8; 4]);
-    emit_error_case(&mut j, "frame-error-bad-pid-zero",
+    emit_error_case(
+        &mut j,
+        "frame-error-bad-pid-zero",
         "pid=0 (kernel/scheduler) is a reserved value.",
-        &bad_pid_zero, "BadPid");
+        &bad_pid_zero,
+        "BadPid",
+    );
 
     // BadPid(1): pid bytes = 1.
     let bad_pid_one = patch_range_with_valid_crc(base, 4..8, &1u32.to_le_bytes());
-    emit_error_case(&mut j, "frame-error-bad-pid-init",
+    emit_error_case(
+        &mut j,
+        "frame-error-bad-pid-init",
         "pid=1 (init/systemd) is a reserved value.",
-        &bad_pid_one, "BadPid");
+        &bad_pid_one,
+        "BadPid",
+    );
 
     // BadTimestamp: timestamp = u64::MAX.
     let bad_timestamp = patch_range_with_valid_crc(base, 8..16, &u64::MAX.to_le_bytes());
-    emit_error_case(&mut j, "frame-error-bad-timestamp",
+    emit_error_case(
+        &mut j,
+        "frame-error-bad-timestamp",
         "timestamp = u64::MAX is the reserved saturation sentinel.",
-        &bad_timestamp, "BadTimestamp");
+        &bad_timestamp,
+        "BadTimestamp",
+    );
 
     // BadNonce: nonce = NONCE_TERMINAL with status Ok (must pair with Critical).
     let bad_nonce = patch_range_with_valid_crc(base, 16..24, &NONCE_TERMINAL.to_le_bytes());
-    emit_error_case(&mut j, "frame-error-bad-nonce-terminal-with-non-critical",
+    emit_error_case(
+        &mut j,
+        "frame-error-bad-nonce-terminal-with-non-critical",
         "nonce = 0xFFFFFFFFFFFFFFFF is permitted only with Status::Critical.",
-        &bad_nonce, "BadNonce");
+        &bad_nonce,
+        "BadNonce",
+    );
 
     j.close_array(1, true);
 
@@ -460,8 +520,8 @@ fn main() {
     // --- HKDF: IV prefix derivation ---
     {
         let salt: [u8; 16] = [
-            0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
-            0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10,
+            0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e,
+            0x0f, 0x10,
         ];
         let prefix_index: u32 = 7;
         let iv = kdf::derive_iv_prefix(&salt, prefix_index).expect("derive_iv_prefix");

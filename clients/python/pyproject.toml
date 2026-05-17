@@ -1,0 +1,73 @@
+[build-system]
+requires = ["hatchling>=1.18"]
+build-backend = "hatchling.build"
+
+[project]
+name = "varta"
+version = "0.1.0"
+description = "Health protocol client for distributed local agents (Varta VLP v0.2)."
+readme = "README.md"
+license = "MIT OR Apache-2.0"
+license-files = ["LICENSE"]
+requires-python = ">=3.8"
+authors = [{ name = "Varta Maintainers" }]
+keywords = [
+    "varta",
+    "vlp",
+    "heartbeat",
+    "monitoring",
+    "observability",
+    "prometheus",
+    "agent",
+    "watchdog",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: System Administrators",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: MacOS",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: System :: Monitoring",
+    "Topic :: System :: Networking :: Monitoring",
+    "Typing :: Typed",
+]
+dependencies = []
+
+[project.optional-dependencies]
+secure = ["cryptography>=41.0"]
+dev = [
+    "pytest>=7",
+    "pytest-timeout>=2",
+    "cryptography>=41.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/aramirez087/Varta"
+Documentation = "https://github.com/aramirez087/Varta/tree/main/book/src/spec"
+Source = "https://github.com/aramirez087/Varta/tree/main/clients/python"
+Issues = "https://github.com/aramirez087/Varta/issues"
+Changelog = "https://github.com/aramirez087/Varta/blob/main/clients/python/CHANGELOG.md"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/varta"]
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "src/",
+    "tests/",
+    "examples/",
+    "README.md",
+    "LICENSE",
+    "CHANGELOG.md",
+    "pyproject.toml",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"

@@ -13,6 +13,12 @@
 
 ---
 
+# Clients
+
+- [Python](clients/python.md)
+
+---
+
 # Architecture
 
 - [The VLP Frame](architecture/vlp-frame.md)

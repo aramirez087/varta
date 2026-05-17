@@ -45,6 +45,29 @@ cargo run -p varta-client --example with_payload
 cargo run -p varta-client --example with_panic_handler
 ```
 
+## Clients
+
+Official client libraries in non-Rust languages live under
+`clients/<lang>/`. Today the canonical entry is `clients/python/`
+(`pip install varta`). Each language client is a **first-class peer**
+of `crates/varta-client`, not reference material:
+
+- Independent semver, tracked in `clients/<lang>/CHANGELOG.md`. Wire
+  format is governed by `book/src/spec/` and frozen at VLP v0.2.
+- Mandatory CI: every PR runs the language's conformance suite against
+  `tools/vlp-test-vectors.json` plus a live interop test that spawns
+  the built `varta-watch` and asserts beats reach `/metrics`. Both
+  block PRs.
+- PyPI publishing for the Python client uses GitHub OIDC Trusted
+  Publisher (no stored secret); tag-driven via
+  `.github/workflows/python-publish.yml` on `python-v*` tags.
+
+The verifier-grade JSON-vector implementations at
+`tools/reference-implementations/{python,c,go}/` are NOT clients. They
+exist to prove the spec round-trips in each language; they have no
+`connect()`, no `beat()` loop, and a different (spec-pinned) stability
+contract. Do not confuse the two.
+
 ## Architecture
 
 The workspace has five crates with a strict layering:
