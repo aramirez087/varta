@@ -82,7 +82,7 @@ spec:
           image: ghcr.io/aramirez087/varta-watch:0.2.0
           imagePullPolicy: IfNotPresent
           args:
-            - --uds-path=/run/varta/varta.sock
+            - --socket=/run/varta/varta.sock
             - --prom-addr=0.0.0.0:9100
             - --prom-token-file=/etc/varta/prom.token
             - --self-watchdog-secs=4

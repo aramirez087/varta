@@ -6,7 +6,7 @@ First, thank you for contributing! Varta is a high-assurance health protocol, an
 
 Every contribution must adhere to these load-bearing invariants:
 
-1.  **Zero Registry Dependencies**: Production crates (`varta-vlp`, `varta-client`, `varta-watch`) must have empty `[dependencies]` sections (other than internal path dependencies).
+1.  **Zero Registry Dependencies**: Production crates (`varta-client`, `varta-watch`) must have empty `[dependencies]` sections (other than internal path dependencies). `varta-vlp` may carry **optional, feature-gated** registry deps under the `crypto` feature (`chacha20poly1305`, `hkdf`, `sha2`, `zeroize`) — non-optional deps and any deps in `varta-client`/`varta-watch` remain forbidden. The CI zero-dep audit permits `optional = true` lines in `varta-vlp/Cargo.toml`.
 2.  **Zero Heap Allocation**: No heap allocation is permitted on the `beat()` path after connection. We verify this with `zero_alloc` tests using a guard allocator.
 3.  **Non-Blocking I/O**: The beat path must never block. `WouldBlock` is handled as `Dropped(DropReason::KernelQueueFull)`.
 4.  **ABI Stability**: Any change to the 32-byte `Frame` layout is a breaking change and requires a VLP version bump.
@@ -44,9 +44,9 @@ cargo miri test -p varta-vlp
 ## Pull Request Process
 
 1.  **Benchmarks**: If your change touches the `beat()` path, you must run `cargo run -p varta-bench --release -- latency` and include the results in your PR description.
-2.  **Documentation**: Update `design.md` or crate READMEs if logic changes.
+2.  **Documentation**: Update the relevant book chapter under `book/src/` (architecture, operations, or spec) and the affected crate README if logic changes.
 3.  **Zero-Alloc Verification**: Ensure `cargo test -p varta-tests --test zero_alloc` still passes.
 
 ## Code of Conduct
 
-We follow the [Contributor Covenant](../../CODE_OF_CONDUCT.md). Please be respectful and professional.
+We follow the [Contributor Covenant](https://github.com/aramirez087/Varta/blob/main/CODE_OF_CONDUCT.md). Please be respectful and professional.

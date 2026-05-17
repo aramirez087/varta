@@ -8,7 +8,7 @@ type: application
 # v* tag; the chart's own `version` follows SemVer for the chart
 # itself and bumps on chart-shape changes.
 version: 0.1.0
-appVersion: "0.1.0"
+appVersion: "0.2.0"
 
 home: https://varta.sh
 icon: https://varta.sh/assets/varta-icon.svg

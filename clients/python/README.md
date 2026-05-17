@@ -19,7 +19,7 @@ pip install 'varta[secure]'      # adds secure-UDP via `cryptography`
 import time
 from varta import Varta, Status
 
-with Varta.connect("/run/varta/observer.sock") as agent:
+with Varta.connect("/run/varta/varta.sock") as agent:
     while True:
         outcome = agent.beat(Status.OK)
         if outcome.is_dropped:
@@ -85,7 +85,7 @@ encode/decode and the panic-hook UDS/UDP variants remain stdlib-only.
 ```python
 from varta.panic import install_excepthook_uds
 
-install_excepthook_uds("/run/varta/observer.sock")
+install_excepthook_uds("/run/varta/varta.sock")
 # any uncaught exception now emits a Status.CRITICAL beat
 ```
 

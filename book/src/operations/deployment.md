@@ -69,7 +69,7 @@ docker run -d --name varta-watch \
   -v /etc/varta/prom.token:/etc/varta/prom.token:ro \
   -p 127.0.0.1:9100:9100 \
   ghcr.io/aramirez087/varta-watch:0.2.0 \
-  --uds-path=/run/varta/varta.sock \
+  --socket=/run/varta/varta.sock \
   --prom-addr=0.0.0.0:9100 \
   --prom-token-file=/etc/varta/prom.token \
   --self-watchdog-secs=4
@@ -159,7 +159,7 @@ deploying a Class-A profile:
 - The deployment recipes on this page do **not** apply — `--prom-*`
   flags are not recognised by the binary, and the CI strings audit
   rejects `GET /metrics` literals in the artifact.
-- Use the file exporter (`--metrics-file <path>`) instead. The TSV
+- Use the file exporter (`--export-file <path>`) instead. The TSV
   schema is documented in `crates/varta-watch/README.md`.
 - For audit-log integrity, treat the on-disk audit log as the source of
   truth; there is no `/metrics` endpoint to scrape.

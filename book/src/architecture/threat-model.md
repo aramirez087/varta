@@ -48,7 +48,7 @@ Varta operates across several trust boundaries:
 
 ### R: Repudiation (Audit Log Evasion)
 - **Threat**: A recovery action occurs, but there is no record of why or which agent triggered it.
-- **Mitigation**: **Mandatory Recovery Auditing**. All recovery actions, including refusals, are logged to a structured audit file (`--recovery-audit-file`) with kernel-attested PIDs where available.
+- **Mitigation**: **Opt-in Recovery Auditing**. When `--recovery-audit-file <PATH>` is configured, all recovery actions — including refusals, kills, and reaps — are logged to a structured TSV with kernel-attested PIDs where available. The `audit-chain` feature adds SHA-256 hash chaining for tamper evidence. Without the flag, recovery actions are visible only via the Prometheus `varta_recovery_outcomes_total` / `varta_recovery_refused_total` counters. For high-assurance deployments the audit file is **strongly recommended** and is required for IEC 62304 / DO-178C-grade installations.
 
 ### I: Information Disclosure (Leaking Secrets)
 - **Threat**: Cryptographic keys or Prometheus tokens are leaked via environment variables or insecure file permissions.
@@ -75,7 +75,7 @@ For local IPC, Varta trusts the kernel over the wire format. A frame's `pid` fie
 
 ### Cryptographic Identity (Secure UDP)
 For network communication, Varta uses a 256-bit key-based identity.
-- **Forward Secrecy**: Not provided (inherent to one-way connectionless heartbeats). Key rotation via `--accepted-key-file` is the recommended mitigation.
+- **Forward Secrecy**: Deliberately not provided. A one-way unauthenticated-receiver heartbeat protocol has no handshake in which to negotiate ephemeral keys; adding a DH ratchet would require multi-round-trip session establishment, which contradicts Varta's connectionless beat-and-forget model. Key rotation via `--accepted-key-file` (multiple accepted keys, time-bounded rollover) is the recommended mitigation; see [Peer Authentication](peer-authentication.md) for the full key-loading model and rotation procedure.
 - **Replay Protection**: Enforced via monotonic IV counters per sender.
 
 ### Recovery Safety Gates
@@ -91,5 +91,5 @@ Recovery is the most privileged action Varta performs. It is guarded by:
 1. **Compromised UID (Local)**: If an attacker gains the same UID as the observer, they can read the secret keys and potentially bypass socket-mode permissions.
 2. **Master Key Leak**: A leak of the master key allows an attacker to derive all agent keys and spoof any agent on the network.
 3. **Clock Skew (UDP)**: Varta uses monotonic timestamps, but significant clock drift or resets on the agent side can lead to rejected heartbeats or false stall detections.
-4. **Namespace Mapping**: In complex container environments, PID 1 in a container may map to a different host PID. `varta-watch` provides namespace gating but requires `--pid=host` or manual translation for multi-container recovery.
+4. **Namespace Mapping**: In complex container environments, PID 1 in a container may map to a different host PID. `varta-watch` provides PID-namespace gating via its own `--allow-cross-namespace-agents` and `--strict-namespace-check` flags. For multi-container recovery the observer container typically needs the runtime's host-PID share (e.g. Docker/podman `--pid=host`, Kubernetes `hostPID: true`) so that recovery targets and the observed PID namespace agree; otherwise namespace mismatches cause beats and recovery to be refused. See [Namespacing](namespaces.md).
 5. **No Forward Secrecy**: As a one-way protocol, Varta does not provide forward secrecy. If a key is compromised, all past traffic encrypted with that key can be decrypted if captured.

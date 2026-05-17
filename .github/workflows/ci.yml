@@ -891,3 +891,75 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y shellcheck
           shellcheck -s sh scripts/install.sh
+
+  # End-to-end smoke for the published deployment surface: spin up a
+  # local kind cluster, helm-install the chart against a freshly-built
+  # image, wait for the rollout to become Ready, then run the chart's
+  # bundled `helm test` hook which scrapes /metrics with the bearer
+  # token. Catches regressions that helm-lint and helm-parity miss —
+  # most importantly any argv string the chart emits that the
+  # varta-watch binary's parser does not recognise (those crash on
+  # container start with ConfigError::UnknownFlag and would otherwise
+  # only surface in production).
+  helm-deploy-smoke:
+    name: helm-deploy-smoke (kind)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: build varta-watch:ci image (linux/amd64, load locally)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64
+          push: false
+          load: true
+          tags: varta-watch:ci
+          build-args: |
+            VERSION=ci
+            GIT_SHA=${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: create kind cluster
+        uses: helm/kind-action@v1
+        with:
+          version: v0.24.0
+          cluster_name: varta-helm-smoke
+
+      - name: load image into kind
+        run: kind load docker-image varta-watch:ci --name varta-helm-smoke
+
+      - uses: azure/setup-helm@v4
+        with:
+          version: v3.16.1
+
+      - name: helm install (sidecar mode, no hostPath required on kind)
+        run: |
+          set -euxo pipefail
+          token=$(openssl rand -hex 32)
+          helm install varta-watch charts/varta-watch \
+            --create-namespace --namespace varta \
+            --set mode=sidecar \
+            --set image.repository=varta-watch \
+            --set image.tag=ci \
+            --set image.pullPolicy=Never \
+            --set prometheusToken.token="$token" \
+            --set dashboard.enabled=false \
+            --set prometheus.serviceMonitor.enabled=false \
+            --set prometheus.podMonitor.enabled=false
+
+      - name: wait for rollout
+        run: |
+          kubectl -n varta rollout status deployment/varta-watch --timeout=120s
+
+      - name: helm test (scrapes /metrics with bearer token)
+        run: helm test varta-watch -n varta --logs
+
+      - name: dump observer logs on failure
+        if: failure()
+        run: |
+          kubectl -n varta describe pods
+          kubectl -n varta logs -l app.kubernetes.io/name=varta-watch --all-containers --tail=200 || true

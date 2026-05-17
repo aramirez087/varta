@@ -19,7 +19,7 @@ Come back here for the **why** behind each alert and dashboard panel.
    openssl rand -hex 32 > /etc/varta/prom.token
    chmod 0400 /etc/varta/prom.token
    varta-watch \
-     --uds-path /run/varta/varta.sock \
+     --socket /run/varta/varta.sock \
      --prom-addr 127.0.0.1:9100 \
      --prom-token-file /etc/varta/prom.token \
      --self-watchdog-secs 4
@@ -65,7 +65,7 @@ that earlier action is needed (auth-failure clustering ⇒ rotate token,
 namespace-conflict spikes ⇒ review `--allow-cross-namespace-agents`
 policy).
 
-## The 58 metrics, by subsystem
+## Metrics by subsystem
 
 Every `varta-watch` metric is in one of nine subsystems. Stable label
 sets are emitted from the first scrape (every label value present at
@@ -77,7 +77,7 @@ zero), so `by (label)` queries and `absent()` rules are safe day-one.
 |---------------------------------|---------|----------|------------------------------------------------------------------|
 | `varta_beats_total`             | counter | `pid`    | Accepted beats per agent. Drops to 0 ⇒ silent agent.             |
 | `varta_stalls_total`            | counter | `pid`    | Observer-detected stalls per agent.                              |
-| `varta_status`                  | gauge   | `pid`    | Last-reported status (0=Ok, 1=Degraded, 2=Critical, 3=Stall).    |
+| `varta_status`                  | gauge   | `pid`    | Last classification (0=Ok, 1=Degraded, 2=Critical, 3=Stall). Stall is **observer-synthesised** when the silence threshold is crossed — it is never on the wire (see [VLP — Base Frame](../spec/vlp.md) §3.7). |
 | `varta_nonce_wrap_total`        | counter |          | Agent exhausted its u64 nonce — must be unreachable in practice. |
 | `varta_rate_limited_total`      | counter | `reason` | Beats dropped by per-pid or global token bucket.                 |
 

@@ -38,7 +38,7 @@ docker run -d --name varta-watch \
   -v /etc/varta/prom.token:/etc/varta/prom.token:ro \
   -p 127.0.0.1:9100:9100 \
   ghcr.io/aramirez087/varta-watch:0.2.0 \
-  --uds-path=/run/varta/varta.sock \
+  --socket=/run/varta/varta.sock \
   --prom-addr=0.0.0.0:9100 \
   --prom-token-file=/etc/varta/prom.token \
   --self-watchdog-secs=4

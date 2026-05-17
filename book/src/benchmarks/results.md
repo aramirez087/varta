@@ -1,8 +1,13 @@
-# Varta v0.1.0 — Bench Harness Results
+# Bench Harness Results
 
 Per-metric measurements captured by the dependency-free `varta-bench`
-harness (Session 06). Each row corresponds to one acceptance contract
-assertion in `docs/acceptance/varta-v0-1-0.md`.
+harness. Each row corresponds to one acceptance contract assertion in
+[`docs/acceptance/varta-v0-1-0.md`](https://github.com/aramirez087/Varta/blob/main/docs/acceptance/varta-v0-1-0.md).
+
+> Snapshot date: **2026-02-11**. `rust-toolchain.toml` pins the stable
+> channel rather than a specific version, so the exact compiler will
+> drift as stable advances. Re-run the harness on your own host before
+> citing numbers in production decisions.
 
 ## Host
 
@@ -10,7 +15,7 @@ assertion in `docs/acceptance/varta-v0-1-0.md`.
 |----------------|--------------------------------------------------------------------|
 | OS             | Darwin 25.4.0 (xnu-12377.101.15) arm64                             |
 | Hardware       | Apple Silicon (Mac, T6050 series)                                  |
-| Rust toolchain | rustc 1.93.1 (01f6ddf75 2026-02-11) — pinned via `rust-toolchain.toml` |
+| Rust toolchain | rustc 1.93.1 (01f6ddf75 2026-02-11) — stable channel pinned via `rust-toolchain.toml` |
 | Working tree   | `epic/varta-v0-1-0--s06-integration-and-bench` clean at run time   |
 
 ## Results

@@ -91,7 +91,7 @@ docker run -d --name prom -p 9090:9090 \
 # 3. Launch varta-watch with a known token.
 echo "$(openssl rand -hex 32)" > /tmp/varta.token
 ./target/release/varta-watch \
-  --uds-path /tmp/varta.sock \
+  --socket /tmp/varta.sock \
   --prom-addr 127.0.0.1:9100 \
   --prom-token-file /tmp/varta.token &
 

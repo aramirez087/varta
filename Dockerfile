@@ -42,6 +42,7 @@ RUN apt-get update \
 
 # Map docker $TARGETPLATFORM → rustup target triple + linker.
 RUN set -eux; \
+    rustup update stable; \
     case "$TARGETPLATFORM" in \
       linux/amd64) \
         RUST_TARGET=x86_64-unknown-linux-musl; \

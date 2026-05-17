@@ -356,7 +356,7 @@ The fix is on the agent side. The recommended pattern is to emit a final
 `Status::Critical` beat from the parent immediately before its terminal
 `exit()` — the observer records the critical frame and treats subsequent
 silence as expected closure rather than as a stall. See
-[`crates/varta-client/README.md` — *Fork recovery & tracker semantics*](../../crates/varta-client/README.md#fork-recovery--tracker-semantics)
+[`crates/varta-client/README.md` — *Fork recovery & tracker semantics*](https://github.com/aramirez087/Varta/blob/main/crates/varta-client/README.md#fork-recovery--tracker-semantics)
 for the operator-side patterns and the alternative `--threshold-ms`
 widening approach.
 

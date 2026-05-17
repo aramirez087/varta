@@ -162,6 +162,6 @@ runtime.
 
 ## Cross-references
 
-* Acceptance contract: [`docs/acceptance/varta-v0-1-0.md`](../acceptance/varta-v0-1-0.md)
-* Crate root: [`crates/varta-vlp/src/lib.rs`](../../crates/varta-vlp/src/lib.rs)
-* Integration tests: [`crates/varta-vlp/tests/frame.rs`](../../crates/varta-vlp/tests/frame.rs)
+* Acceptance contract: [`docs/acceptance/varta-v0-1-0.md`](https://github.com/aramirez087/Varta/blob/main/docs/acceptance/varta-v0-1-0.md)
+* Crate root: [`crates/varta-vlp/src/lib.rs`](https://github.com/aramirez087/Varta/blob/main/crates/varta-vlp/src/lib.rs)
+* Integration tests: [`crates/varta-vlp/tests/frame.rs`](https://github.com/aramirez087/Varta/blob/main/crates/varta-vlp/tests/frame.rs)

@@ -14,7 +14,7 @@ tune to your latency budget and audit-durability needs.
 - **Error budget:** 1% of 30 days = ~7.2 h above 100 ms.
 - **Polices it:** `VartaIterationBudgetOverruns` (warn at 10% of
   iterations >budget), `VartaIterationP99High` (page at p99 >500 ms).
-- **Why 100 ms:** the documented worst-case iteration is ~320 ms
+- **Why 100 ms:** the documented worst-case iteration is ~310 ms
   (see [Observer Liveness](../architecture/observer-liveness.md)
   latency-budget table). 100 ms is well within that bound and leaves
   headroom for occasional fsync stalls.

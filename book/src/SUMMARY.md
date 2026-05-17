@@ -1,7 +1,7 @@
 # Summary
 
 [Introduction](introduction.md)
-[Installation](installation.md)
+[Install (Quickstart)](operations/install.md)
 
 ---
 
@@ -16,6 +16,18 @@
 # Clients
 
 - [Python](clients/python.md)
+
+---
+
+# Operations
+
+- [Container Image](operations/container.md)
+- [Helm Chart](operations/helm.md)
+- [Deployment Patterns](operations/deployment.md)
+- [Monitoring & Alerting](operations/monitoring.md)
+- [SLOs & Tuning](operations/slos.md)
+- [Troubleshooting](operations/troubleshooting.md)
+- [Upgrade Guide](operations/upgrade.md)
 
 ---
 
@@ -34,26 +46,22 @@
 - [Safety Profiles](architecture/safety-profiles.md)
 - [Supply-Chain Posture](architecture/supply-chain.md)
 - [Bounded Collections](architecture/bounded-collections.md)
+- [Symbolic Verification](architecture/verification.md)
 - [Deployment Ceiling & Sharding](architecture/deployment-ceiling-and-sharding.md)
 - [Signal-Handler Installation](architecture/signal-install.md)
 - [Graceful Shutdown](architecture/graceful-shutdown.md)
 
 ---
 
-# Operations
-
-- [Install (Quickstart)](operations/install.md)
-- [Container Image](operations/container.md)
-- [Helm Chart](operations/helm.md)
-- [Deployment Patterns](operations/deployment.md)
-- [Monitoring & Alerting](operations/monitoring.md)
-- [SLOs & Tuning](operations/slos.md)
-
----
-
 # Performance
 
 - [Benchmark Results](benchmarks/results.md)
+
+---
+
+# Reference
+
+- [Glossary](reference/glossary.md)
 
 ---
 

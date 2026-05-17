@@ -247,7 +247,7 @@ upper-bound source for each:
 | 4. `Recovery::try_reap`                | ~64 µs            | ≤64 `waitpid(2, WNOHANG)` syscalls; rotating cursor (bounded outstanding-pids fan)                                | `varta_observer_stage_seconds{stage="recovery_reap"}`      |
 | 5. `PromExporter::serve_pending`       | ≤200 ms           | 100 ms serve deadline + 100 ms drain deadline (see `exporter.rs`)                                                 | `varta_observer_stage_seconds{stage="serve_pending"}` + independent `varta_observer_serve_pending_seconds` histo |
 | 6. Heartbeat-file write + watchdog kicks | <6 ms           | `write_heartbeat_atomic` (rename) + one `sendmsg(2)` + one `write(2)`                                            | `varta_observer_stage_seconds{stage="housekeeping"}`       |
-| **Iteration total (worst case)**       | **~320 ms**       | UDS read_timeout (100 ms) + serve_pending (≤200 ms) + maintenance ≤10 ms + small fixed work                       | `varta_observer_iteration_seconds`                         |
+| **Iteration total (worst case)**       | **~310 ms**       | UDS read_timeout (100 ms) + serve_pending (≤200 ms) + maintenance ≤10 ms + small fixed work                       | `varta_observer_iteration_seconds`                         |
 
 Two observations the table makes explicit:
 

@@ -1,39 +1,41 @@
 # Recovery — Non-Blocking Spawn / Async Reap
 
-> Status: implemented (Sessions 01–03 completed). The `--recovery-timeout-ms` flag is live in `varta-watch`; see `crates/varta-watch/src/config/` and `crates/varta-watch/src/recovery/`.
+This page documents how `varta-watch` keeps the observer loop responsive
+while still firing recovery commands on stalled agents.
 
-## 1. Problem
+Implementation lives in
+[`crates/varta-watch/src/recovery/`](https://github.com/aramirez087/Varta/tree/main/crates/varta-watch/src/recovery)
+and is wired into the poll loop from
+[`crates/varta-watch/src/main.rs`](https://github.com/aramirez087/Varta/blob/main/crates/varta-watch/src/main.rs).
+
+## Why this exists
 
 `varta-watch` runs a single thread driving `Observer::poll` on a 100 ms
-read-timeout cadence. When a stalled pid crosses its silence threshold,
-the observer surfaces `Event::Stall` and the binary calls
+read-timeout cadence. When a pid crosses its silence threshold the
+observer surfaces `Event::Stall` and the binary calls
 `Recovery::on_stall(pid)`.
 
-Previously `Recovery::on_stall` blocked the calling thread until the child
-exited, which meant the entire poll loop — beat decoding, exporter pumping,
-Prometheus serving, stall surfacing for *other* pids — froze for the duration
-of the recovery command. A slow recovery script effectively took the observer
-offline.
+A naive implementation would block the calling thread on the recovery
+child until it exits. That would freeze the entire poll loop — beat
+decoding, exporter pumping, Prometheus serving, and stall detection for
+every *other* pid — for the duration of one recovery command. A slow
+recovery template would take the observer offline.
 
-This is blocker **B1** for v0.1.0.
+Instead, `Recovery::on_stall` performs a non-blocking spawn and returns
+immediately. Outstanding children are reaped (or killed past their
+deadline) on subsequent observer ticks.
 
-## 2. Goal
+## Constraints
 
-Replace the blocking shell-out with a non-blocking spawn followed by an
-asynchronous reap on subsequent observer ticks, and add an optional
-kill-after deadline so a runaway template cannot consume an unbounded
-recovery slot. All within the project's hard constraints:
+These follow from the workspace-wide hard rules (see
+[CLAUDE.md](https://github.com/aramirez087/Varta/blob/main/CLAUDE.md)):
 
-- Zero registry dependencies in `varta-watch` (path-only deps).
+- Zero registry dependencies in `varta-watch` (path-only).
 - No new threads. No `tokio`, no executors.
-- No `unsafe`. The crate already declares
-  `#![deny(unsafe_op_in_unsafe_fn, rust_2018_idioms)]`.
-- Library code does not print; diagnostics live in
-  `crates/varta-watch/src/main.rs` only.
+- No `unsafe`.
+- Library code does not print; diagnostics live in `main.rs` only.
 
-## 3. API surface (Session 01 lock-in)
-
-The public surface in `varta_watch::recovery` becomes:
+## Public API
 
 ```rust
 use std::process::ExitStatus;
@@ -45,12 +47,11 @@ pub enum RecoveryOutcome {
     /// has NOT waited on it. Reap on a later tick via `try_reap`.
     Spawned { child_pid: u32 },
 
-    /// The previous invocation for this pid is still inside the per-pid
+    /// Previous invocation for this pid is still inside the per-pid
     /// debounce window; nothing was spawned.
     Debounced,
 
     /// `Command::spawn` failed (e.g. fork failure, program not found).
-    /// Surfaced verbatim.
     SpawnFailed(std::io::Error),
 
     /// A previously-`Spawned` child has exited and was reaped on this
@@ -66,14 +67,7 @@ pub enum RecoveryOutcome {
     ReapFailed(std::io::Error),
 }
 
-pub struct Recovery { /* private */ }
-
 impl Recovery {
-    /// Construct an exec-mode runner with optional per-child deadline.
-    ///
-    /// `timeout = None` ⇒ children are reaped but never killed
-    /// (preserves v0.1.0 semantics for users who tolerate long-running
-    /// recovery commands).
     pub fn with_exec_and_timeout(
         program: String,
         args: Vec<String>,
@@ -81,33 +75,18 @@ impl Recovery {
         timeout: Option<Duration>,
     ) -> Self;
 
-    /// Spawn the configured program with the stalled pid appended as the
-    /// final argument, non-blockingly.
-    /// Returns `Spawned`, `Debounced`, or `SpawnFailed` — never blocks.
+    /// Spawn the configured program with the stalled pid appended as
+    /// the final argument. Returns immediately; never blocks.
     pub fn on_stall(&mut self, pid: u32) -> RecoveryOutcome;
 
-    /// Drain completed (or deadline-exceeded) children for one observer
-    /// tick. Returns one outcome per state transition observed:
-    /// `Reaped`, `Killed`, or `ReapFailed`. Never blocks; returns an
-    /// empty vector when no children have transitioned since the last
-    /// tick.
+    /// Drain completed (or deadline-exceeded) children for one tick.
+    /// Returns one outcome per state transition; empty when no children
+    /// have transitioned since the last call.
     pub fn try_reap(&mut self) -> Vec<RecoveryOutcome>;
 }
 ```
 
-`Config` gains:
-
-```rust
-pub struct Config {
-    /* existing fields */
-    pub recovery_timeout: Option<Duration>,
-}
-```
-
-The `--recovery-timeout-ms <MS>` flag is **not** parsed in Session 01 —
-that is Session 03's deliverable. Session 01 only widens the type.
-
-## 4. Lifecycle of one recovery
+## Lifecycle of one recovery
 
 ```
                     debounce-suppressed
@@ -130,16 +109,33 @@ that is Session 03's deliverable. Session 01 only widens the type.
          └─► try_wait/kill errno ─► ReapFailed(io::Error)        (retry)
 ```
 
-`Outstanding` lives in a `HashMap<u32, _>` keyed by stalled pid (cold
-path; allocation acceptable per the operator rules). One outstanding
-child per stalled pid; if the pid stalls again while a child is still
-outstanding, the per-pid debounce window suppresses a duplicate spawn.
+## Outstanding-child storage
 
-## 5. Tick budget
+`Outstanding` records live in
+[`OutstandingTable`](https://github.com/aramirez087/Varta/blob/main/crates/varta-watch/src/outstanding_table.rs),
+a `BoundedIndex`-backed slab keyed by stalled pid. The table is sized to
+`tracker::MAX_CAPACITY = 4096` at construction
+(`recovery/mod.rs:436`), so the recovery system can never hold more
+outstanding children than the tracker can hold pids — both bounded
+collections share the same ceiling. Operators raise the cap with
+`--tracker-capacity`; see
+[Deployment Ceiling & Sharding](deployment-ceiling-and-sharding.md).
 
-The observer's `READ_TIMEOUT` is 100 ms. `try_reap` is invoked once
-per `Observer::poll` iteration (Session 02 owns the wiring). Worst-case
-latencies:
+When the table is full a fresh `on_stall` returns the bounded equivalent
+of `Debounced` and increments
+`varta_recovery_refused_total{reason="outstanding_capacity"}`
+(`recovery/mod.rs:786`). See
+[Bounded Collections](bounded-collections.md) for the table's allocation
+proof and the static-allocation rationale.
+
+One outstanding child per stalled pid; if the pid stalls again while a
+child is still outstanding, the per-pid debounce window suppresses a
+duplicate spawn regardless of the table state.
+
+## Tick budget
+
+Observer `READ_TIMEOUT` is 100 ms. `try_reap` is invoked once per
+`Observer::poll` iteration. Worst-case latencies:
 
 | Event | Latency upper bound |
 |---|---|
@@ -147,48 +143,43 @@ latencies:
 | Deadline exceeded → `Killed` surfaces | one tick (≤ 100 ms) after deadline |
 | `kill(2)` → `Reaped` of killed child  | one further tick (≤ 100 ms) |
 
-These are *additive* with the observer's normal stall-detection
-latency; they do not affect beat decoding or exporter throughput on
-the critical path.
+These are *additive* with the observer's normal stall-detection latency;
+they do not affect beat decoding or exporter throughput on the critical
+path.
 
-## 6. Default behaviour when `--recovery-timeout-ms` is omitted
+## Default behaviour when `--recovery-timeout-ms` is omitted
 
-`Config::recovery_timeout = None` is the default. In that mode,
-`Recovery::with_timeout` stores no deadline; outstanding children are
-reaped on completion but are **never killed**. This preserves v0.1.0
-semantics for operators whose recovery templates are intentionally
-long-running (e.g. service restarts that block on health checks).
+`Config::recovery_timeout = None` is the default. In that mode
+outstanding children are reaped on completion but **never killed**.
+This preserves long-running-recovery semantics (e.g. a restart that
+blocks on health checks).
 
 Operators who want the kill-after behaviour set
 `--recovery-timeout-ms <MS>` explicitly. Sub-100 ms values still work
 but the kill is surfaced no faster than one tick after the deadline.
 
-## 7. Concurrency model
+## Concurrency model
 
-- Children are pid-indexed in `HashMap<u32, Outstanding>`. The
-  observer's `Tracker` is bounded to 64 distinct pids, so the map
-  caps at 64 outstanding children in steady state.
-- Debounce is per-pid and unchanged. A repeat stall for the same pid
-  inside the debounce window returns `Debounced` regardless of whether
-  a child is still outstanding.
-- No locks; the `Recovery` struct is owned exclusively by the binary's
-  poll loop and is `!Send` by virtue of holding `std::process::Child`
-  values, which is fine since the observer is single-threaded.
+- The `Recovery` struct is owned exclusively by the binary's poll loop.
+  It is `!Send` by virtue of holding `std::process::Child` values, which
+  is fine since the observer is single-threaded.
+- No locks anywhere on the recovery path.
+- Debounce is per-pid; a repeat stall inside the debounce window
+  returns `Debounced` regardless of whether a child is still outstanding.
 
-## 7a. Recovery child environment policy
+## Recovery child environment policy
 
-Recovery subprocesses run with an **isolated environment by default**: the
-inherited observer environment is wiped, and the child only sees
-`PATH=/usr/bin:/bin` plus any explicit `--recovery-env KEY=VALUE` entries.
-This is the secure default since 2026-05-14 (cerebrum supersedes the prior
-"inherit by default" rationale).
+Recovery subprocesses run with an **isolated environment by default**:
+the inherited observer environment is wiped, and the child only sees
+`PATH=/usr/bin:/bin` plus any explicit `--recovery-env KEY=VALUE`
+entries.
 
 Rationale: observers typically run with secrets in their process
 environment — `AWS_*`, `GOOGLE_APPLICATION_CREDENTIALS`, OAuth bearer
-tokens, database URLs, Vault tokens. Inheriting that environment into a
-recovery child means any recovery template (or any binary on the recovery
-allowlist) becomes a credential-exfiltration vector. The blast radius is
-catastrophic and silent. We therefore default-clear.
+tokens, database URLs, Vault tokens. Inheriting that environment into
+a recovery child means any recovery template (or any binary on the
+recovery allowlist) becomes a credential-exfiltration vector. The blast
+radius is catastrophic and silent. The observer default-clears.
 
 Configuration matrix:
 
@@ -199,49 +190,33 @@ Configuration matrix:
 | `--recovery-inherit-env` | Full observer env inherited |
 | `--recovery-inherit-env --recovery-env KEY=VAL` | Inherited env + explicit overrides |
 
-**Migration from pre-2026-05-14 behaviour.** Operators whose recovery
-templates relied on inherited variables (e.g. `$HOME` for log paths) have
-two options:
+Operators whose recovery templates relied on inherited variables
+(e.g. `$HOME` for log paths) have two options:
 
 1. Preferred — allowlist explicitly: `--recovery-env HOME=/var/log/varta`.
 2. Escape hatch — full inheritance: pass `--recovery-inherit-env`. The
-   observer emits a one-shot stderr warning at startup naming the risk so
-   the choice is visible in SIEM/syslog audit trails alongside other
-   safety banners (shell-recovery, plaintext UDP, etc.).
+   observer emits a one-shot stderr warning at startup naming the risk
+   so the choice is visible in SIEM/syslog audit trails.
 
-Enforcement is centralised in `Recovery::apply_env` (`recovery.rs`); all
-exec-mode children flow through it.
+Enforcement is centralised in `Recovery::apply_env`
+([`recovery/mod.rs`](https://github.com/aramirez087/Varta/blob/main/crates/varta-watch/src/recovery/mod.rs));
+all exec-mode children flow through it.
 
-## 8. Out of scope for this epic
+## Out of scope
 
-- `varta-vlp` (frame ABI is frozen).
-- `varta-client` (no agent-side change).
-- Observer poll cadence (still 100 ms read timeout).
+- `varta-vlp` — frame ABI is frozen.
+- `varta-client` — no agent-side change.
+- Observer poll cadence — still 100 ms read timeout.
 - Exporter line schema.
 - Panic-handler feature.
 
-## 9. Cross-references
+## See also
 
-- Session 02 (`docs/claude-sessions/recovery-async-spawn/session-02-recovery-impl.md`)
-  owns the green-phase implementation in `crates/varta-watch/src/recovery/`
-  and the `try_reap` wiring in `crates/varta-watch/src/main.rs` /
-  `observer.rs`.
-- Session 03 (`docs/claude-sessions/recovery-async-spawn/session-03-cli-and-loop-integration.md`)
-  owns the `--recovery-timeout-ms` parser, the HELP-text update, and
-  threading `cfg.recovery_timeout` into `Recovery::with_timeout` at
-  the binary call site.
-- Acceptance contract: `docs/acceptance/varta-v0-1-0.md`, subsection
-  *Recovery — non-blocking*.
-
-## 10. Failing tests gating Sessions 02 and 03
-
-Session 01 lands these as **red-phase** acceptance tests:
-
-| Test | File | Owned by |
-|---|---|---|
-| `recovery_spawn_returns_within_50ms_for_slow_template` | `crates/varta-watch/tests/recovery_e2e.rs` | Session 02 |
-| `recovery_try_reap_yields_reaped_for_completed_child`  | `crates/varta-watch/tests/recovery_e2e.rs` | Session 02 |
-| `recovery_try_reap_kills_after_timeout`                | `crates/varta-watch/tests/recovery_e2e.rs` | Session 02 |
-| `recovery_concurrent_pids_run_in_parallel`             | `crates/varta-watch/tests/recovery_e2e.rs` | Session 02 |
-| `cli_help_lists_recovery_timeout_ms_flag`              | `crates/varta-watch/tests/cli_smoke.rs`    | Session 03 |
-| `cli_parses_recovery_timeout_ms`                       | `crates/varta-watch/tests/cli_smoke.rs`    | Session 03 |
+- [Stall Detection & Liveness](observer-liveness.md) — how the observer
+  surfaces `Event::Stall` in the first place.
+- [Bounded Collections](bounded-collections.md) — the static-allocation
+  proof for `OutstandingTable` and `Tracker`.
+- [Deployment Ceiling & Sharding](deployment-ceiling-and-sharding.md) —
+  what 4096 means in practice and how to scale past it.
+- [Audit Logging](audit-log.md) — every recovery decision (Spawned /
+  Debounced / Refused / Reaped / Killed) emits a TSV record.

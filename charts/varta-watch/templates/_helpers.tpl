@@ -113,7 +113,7 @@ ExecStart-equivalent argv block — shared by daemonset and deployment
 templates. Emitted as a YAML list under `args:`.
 */}}
 {{- define "varta-watch.args" -}}
-- --uds-path={{ .Values.uds.path }}
+- --socket={{ .Values.uds.path }}
 {{- if .Values.prometheus.bindAddr }}
 - --prom-addr={{ .Values.prometheus.bindAddr }}
 - --prom-token-file=/etc/varta/prom.token

@@ -175,4 +175,4 @@ Varta is built for high-assurance environments.
 - **No blocking** — `WouldBlock` is treated as `Dropped`, never as an error
   that stalls the caller.
 - **MSRV** — Minimum Supported Rust Version is **1.70.0**.
-- **Edition 2021**, pinned toolchain via `rust-toolchain.toml`.
+- **Edition 2021**, stable channel pinned via `rust-toolchain.toml` (channel pin, not a version pin — any current stable ≥ MSRV builds).

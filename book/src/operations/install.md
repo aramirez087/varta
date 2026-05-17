@@ -16,7 +16,10 @@ regardless of how you fetch it.
 
 > Kubernetes adopters who want raw manifests over Helm: keep using
 > [`observability/examples/kubernetes/`](https://github.com/aramirez087/Varta/tree/main/observability/examples/kubernetes).
-> The Helm chart's default render is CI-asserted to match those files.
+> The Helm chart's default render matches those files for container
+> args, mounts, security context, ports, and probes — asserted by the
+> `helm-parity` CI gate. Helm-standard labels (`helm.sh/chart`,
+> `app.kubernetes.io/managed-by`) are the only deltas.
 
 ## Bare metal / VM — `install.sh`
 
@@ -67,7 +70,7 @@ docker run -d --name varta-watch \
   -v /etc/varta/prom.token:/etc/varta/prom.token:ro \
   -p 127.0.0.1:9100:9100 \
   ghcr.io/aramirez087/varta-watch:0.2.0 \
-  --uds-path=/run/varta/varta.sock \
+  --socket=/run/varta/varta.sock \
   --prom-addr=0.0.0.0:9100 \
   --prom-token-file=/etc/varta/prom.token \
   --self-watchdog-secs=4

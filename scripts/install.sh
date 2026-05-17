@@ -248,7 +248,7 @@ print_next_steps_manual() {
 Next steps:
 
   # Run varta-watch in the foreground for a smoke test:
-  ${install_bin} --uds-path /tmp/varta.sock \\
+  ${install_bin} --socket /tmp/varta.sock \\
                  --prom-addr 127.0.0.1:9100 \\
                  --prom-token-file /tmp/prom.token
 

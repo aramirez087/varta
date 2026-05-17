@@ -42,8 +42,9 @@ observer poll loop. Each step is deterministic and bounded.
    two points per iteration (`crates/varta-watch/src/main.rs:784, 877`).
    The current iteration finishes — heartbeat write, iteration histogram,
    serve-pending drain — so partial-tick state is never lost.
-2. **`STOPPING=1` to systemd.** If `--sd-notify` is wired (or
-   `$NOTIFY_SOCKET` is in the environment), the main thread emits
+2. **`STOPPING=1` to systemd.** If `$NOTIFY_SOCKET` is set in the
+   environment (systemd `Type=notify` injects it automatically — there
+   is no CLI flag), the main thread emits
    `STOPPING=1\n` to the service manager so `systemctl status` reflects the
    stop transitionally rather than as an unexpected exit
    (`crates/varta-watch/src/main.rs:1559`). The watchdog thread, which is
@@ -113,7 +114,7 @@ above the sum of the bounded budgets so systemd does not have to escalate."
 ```ini
 [Service]
 Type=notify
-ExecStart=/usr/bin/varta-watch --uds-path /run/varta.sock \
+ExecStart=/usr/bin/varta-watch --socket /run/varta.sock \
                                --shutdown-grace-ms 5000 \
                                --audit-fsync-budget-ms 50 \
                                --recovery-audit-file /var/log/varta-audit.tsv

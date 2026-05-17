@@ -25,7 +25,7 @@ ChaCha20-Poly1305 AEAD primitive.
 import time
 from varta import Varta, Status, DropReason
 
-with Varta.connect("/run/varta/observer.sock") as agent:
+with Varta.connect("/run/varta/varta.sock") as agent:
     while True:
         outcome = agent.beat(Status.OK)
         if outcome.is_dropped:

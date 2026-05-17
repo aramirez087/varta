@@ -115,13 +115,13 @@ The pattern is:
 
    ```bash
    varta-watch --socket /run/varta/0.sock --prom-addr 127.0.0.1:9100 \
-       --prom-token-file /etc/varta/token --audit-log /var/log/varta/0.tsv
+       --prom-token-file /etc/varta/token --recovery-audit-file /var/log/varta/0.tsv
    varta-watch --socket /run/varta/1.sock --prom-addr 127.0.0.1:9101 \
-       --prom-token-file /etc/varta/token --audit-log /var/log/varta/1.tsv
+       --prom-token-file /etc/varta/token --recovery-audit-file /var/log/varta/1.tsv
    ```
 
    Each instance carries its own 4096-slot ceiling and its own recovery
-   audit log. Audit log paths (`--audit-log`) **must** be distinct per
+   audit log. Audit log paths (`--recovery-audit-file`) **must** be distinct per
    instance — the file is mode-`0600` and not designed for cross-process
    sharing.
 
