@@ -169,8 +169,10 @@ secure-UDP and the plaintext transports do not key on continuity.
 
 Official clients in non-Rust languages live under
 [`clients/`](../../clients/). Today: Python
-([`clients/python/`](../../clients/python/), `pip install varta`) and
-Go ([`clients/go/`](../../clients/go/),
-`go get github.com/aramirez087/Varta/clients/go`). Each port preserves
-the same wire-level contract and is verified against the same
+([`clients/python/`](../../clients/python/), `pip install varta`), Go
+([`clients/go/`](../../clients/go/),
+`go get github.com/aramirez087/Varta/clients/go`), and Node.js
+([`clients/node/`](../../clients/node/),
+`npm install @varta/client`). Each port preserves the same wire-level
+contract and is verified against the same
 `tools/vlp-test-vectors.json` conformance suite as this crate.

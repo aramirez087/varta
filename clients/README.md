@@ -8,7 +8,7 @@ gets its own subdirectory with independent semver, packaging, and CI.
 | -------- | ------------------------------------------------------ | ------ | ------------------ |
 | Python   | `pip install varta`                                    | Beta   | [`python/`](python/) |
 | Go       | `go get github.com/aramirez087/Varta/clients/go`       | Beta   | [`go/`](go/)       |
-| Node.js  | (planned)                                              |        |                    |
+| Node.js  | `npm install @varta/client`                            | Beta   | [`node/`](node/)   |
 | JVM      | (planned)                                              |        |                    |
 
 ## Stability model

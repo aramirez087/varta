@@ -1,0 +1,43 @@
+name: publish-node-client
+
+on:
+  push:
+    tags: ["node-v*"]
+
+# Pinned to the `npm-publish` GitHub environment so the workflow
+# inherits the Trusted Publisher binding configured at
+# https://www.npmjs.com/settings/varta/packages (you must register the
+# binding once on npmjs.com before the first publish — see the
+# repository's plan file for the full setup checklist).
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  build-and-publish:
+    name: build & publish to npm
+    runs-on: ubuntu-latest
+    environment:
+      name: npm-publish
+      url: https://www.npmjs.com/package/@varta-health/client
+    steps:
+      - name: checkout
+        uses: actions/checkout@v4
+
+      - name: setup node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          registry-url: "https://registry.npmjs.org"
+
+      - name: install deps
+        working-directory: clients/node
+        run: npm ci || npm install
+
+      - name: build
+        working-directory: clients/node
+        run: npm run build
+
+      - name: publish to npm (OIDC, no token, with provenance)
+        working-directory: clients/node
+        run: npm publish --provenance --access public

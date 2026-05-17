@@ -708,6 +708,61 @@ jobs:
           VARTA_WATCH_BIN: ${{ github.workspace }}/target/release/varta-watch
         run: go test -v -count=1 -timeout=90s ./tests -run TestInterop
 
+  node-client:
+    name: node-client (${{ matrix.os }}, node-${{ matrix.node }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        node: ['18', '20', '22']
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: checkout
+        uses: actions/checkout@v4
+
+      - name: setup node
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: 'npm'
+          cache-dependency-path: 'clients/node/package-lock.json'
+
+      - name: rust toolchain (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: cargo cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: build varta-watch (release, prometheus-exporter + plaintext-udp)
+        # Node has no UDS-datagram path in stdlib, so the interop test
+        # speaks plaintext UDP. The `unsafe-plaintext-udp` feature gate
+        # is required for the observer to accept that listener. Loopback
+        # only — the test binds 127.0.0.1.
+        run: cargo build --locked --release -p varta-watch --features "prometheus-exporter unsafe-plaintext-udp"
+
+      - name: install deps
+        working-directory: clients/node
+        run: npm ci || npm install
+
+      - name: type-check + build
+        working-directory: clients/node
+        run: npm run build
+
+      - name: conformance vectors
+        working-directory: clients/node
+        run: npm run test:conformance
+
+      - name: unit tests (client + transport + fork + panic)
+        working-directory: clients/node
+        run: npm run test:unit
+
+      - name: interop with varta-watch
+        working-directory: clients/node
+        env:
+          VARTA_WATCH_BIN: ${{ github.workspace }}/target/release/varta-watch
+        timeout-minutes: 2
+        run: npm run test:interop
+
   book:
     name: build-book
     runs-on: ubuntu-latest
