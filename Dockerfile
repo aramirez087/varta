@@ -29,56 +29,30 @@ FROM --platform=$BUILDPLATFORM rust:${RUST_VERSION}-bookworm AS builder
 ARG TARGETPLATFORM
 ARG BUILDPLATFORM
 
-# musl-tools provides the static-linker for x86_64; aarch64-linux-musl-gcc
-# comes from the cross-compiler tarball below. We avoid `cross` to keep
-# the build graph in plain docker buildx — fewer moving parts in CI.
+# Static-musl link uses rust-lld + rust-shipped self-contained libs
+# (`-C link-self-contained=yes`). No musl-gcc, no musl.cc cross
+# tarball, no C toolchain at all — varta-watch has zero C deps, and
+# the gcc wrapper was the source of a PT_INTERP regression that made
+# the "static" binary still request `/lib/ld-musl-x86_64.so.1` on
+# distroless. Keep `binutils` + `file` for the post-link audit step.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
        binutils \
        ca-certificates \
        file \
-       musl-tools \
-       wget \
-       xz-utils \
     && rm -rf /var/lib/apt/lists/*
 
-# Map docker $TARGETPLATFORM → rustup target triple + linker.
+# Map docker $TARGETPLATFORM → rustup target triple.
 RUN set -eux; \
     rustup default stable; \
     rustup update stable; \
     rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl; \
     case "$TARGETPLATFORM" in \
-      linux/amd64) \
-        RUST_TARGET=x86_64-unknown-linux-musl; \
-        case "$BUILDPLATFORM" in \
-          linux/amd64) \
-            LINKER=musl-gcc; \
-            ;; \
-          linux/arm64) \
-            LINKER=x86_64-linux-musl-gcc; \
-            wget -qO /tmp/x86_64-musl.tgz \
-              https://musl.cc/x86_64-linux-musl-cross.tgz; \
-            tar -C /opt -xzf /tmp/x86_64-musl.tgz; \
-            rm /tmp/x86_64-musl.tgz; \
-            ;; \
-          *) echo "unsupported cross: $BUILDPLATFORM -> $TARGETPLATFORM" >&2; exit 1 ;; \
-        esac; \
-        ;; \
-      linux/arm64) \
-        RUST_TARGET=aarch64-unknown-linux-musl; \
-        LINKER=aarch64-linux-musl-gcc; \
-        # musl.cc cross-toolchain (static binaries, no GLIBC dependency).
-        wget -qO /tmp/aarch64-musl.tgz \
-          https://musl.cc/aarch64-linux-musl-cross.tgz; \
-        tar -C /opt -xzf /tmp/aarch64-musl.tgz; \
-        rm /tmp/aarch64-musl.tgz; \
-        ;; \
+      linux/amd64) RUST_TARGET=x86_64-unknown-linux-musl ;; \
+      linux/arm64) RUST_TARGET=aarch64-unknown-linux-musl ;; \
       *) echo "unsupported TARGETPLATFORM=$TARGETPLATFORM" >&2; exit 1 ;; \
     esac; \
-    echo "RUST_TARGET=$RUST_TARGET" > /tmp/build.env; \
-    echo "LINKER=$LINKER" >> /tmp/build.env
-
-ENV PATH="/opt/aarch64-linux-musl-cross/bin:/opt/x86_64-linux-musl-cross/bin:${PATH}"
+    echo "RUST_TARGET=$RUST_TARGET" > /tmp/build.env
 
 WORKDIR /build
 COPY . .
@@ -87,17 +61,32 @@ COPY . .
 # rather than silently re-resolving versions. Default features only —
 # never compile-time-config (Class-A binary is excluded from public
 # image per book/src/architecture/safety-profiles.md).
+#
+# Linker flags:
+#   -C target-feature=+crt-static  → static libc (Rust 1.71+ defaults
+#                                    musl to dynamic without this).
+#   -C linker=rust-lld             → skip the gcc wrapper that injects
+#                                    PT_INTERP into otherwise-static ELFs.
+#   -C link-self-contained=yes     → use the static libs rustup ships in
+#                                    rust-std-$TARGET; no system musl
+#                                    package required.
+#   -C relocation-model=static     → emit ET_EXEC (non-PIE). The Rust
+#                                    musl target defaults to static-PIE,
+#                                    which on this stack produced a PIE
+#                                    that still carried PT_INTERP and
+#                                    SIGSEGV'd at entry (null-deref in
+#                                    SI_KERNEL — unrelocated pointer used
+#                                    before crt self-reloc). Disabling
+#                                    PIE removes both the interpreter
+#                                    header and the broken relocation
+#                                    pre-amble. See bug-370.
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/build/target,id=varta-target-${TARGETPLATFORM} \
     set -eux; \
     . /tmp/build.env; \
     echo '=== rustc cfg for target ==='; \
     rustc --print cfg --target "$RUST_TARGET" | grep -E 'target_feature|target_env' || true; \
-    CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER="$LINKER" \
-    CC_x86_64_unknown_linux_musl="$LINKER" \
-    CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER="$LINKER" \
-    CC_aarch64_unknown_linux_musl="$LINKER" \
-    RUSTFLAGS='-C target-feature=+crt-static' \
+    RUSTFLAGS='-C target-feature=+crt-static -C linker=rust-lld -C link-self-contained=yes -C relocation-model=static' \
       cargo build \
         --locked \
         --release \
@@ -107,15 +96,30 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
         --features json-log \
         -p varta-watch; \
     cp "target/$RUST_TARGET/release/varta-watch" /out-varta-watch; \
-    echo '=== file (pre-strip) ==='; file /out-varta-watch; \
+    echo '=== file ==='; file /out-varta-watch; \
     echo '=== ldd ==='; ldd /out-varta-watch 2>&1 || true; \
-    echo '=== --help raw stderr ==='; \
-    set +e; /out-varta-watch --help; rc=$?; set -e; \
-    echo "rc=$rc"; \
-    echo '=== --help via strace (first 80 lines) ==='; \
-    apt-get update >/dev/null && apt-get install -y --no-install-recommends strace >/dev/null && rm -rf /var/lib/apt/lists/* || true; \
-    set +e; strace -f -o /tmp/strace.log /out-varta-watch --help >/dev/null 2>&1; set -e; \
-    tail -n 80 /tmp/strace.log || true
+    echo '=== readelf -l (program headers) ==='; readelf -l /out-varta-watch; \
+    # Hard guards:
+    #   1. distroless-static has no ELF interpreter — any PT_INTERP makes
+    #      `docker run` fail with `exec: no such file or directory`.
+    #   2. The Rust musl static-PIE output crashes at entry on this
+    #      stack — reject ET_DYN ("pie executable") and require ET_EXEC.
+    #   3. file(1) must report 'statically linked' (belt-and-suspenders
+    #      against future regressions to dynamic-musl crt-static=false).
+    if readelf -l /out-varta-watch | grep -q 'INTERP'; then \
+      echo "FATAL: varta-watch has PT_INTERP — not statically linked" >&2; \
+      exit 1; \
+    fi; \
+    if file /out-varta-watch | grep -q 'pie executable'; then \
+      echo "FATAL: varta-watch is PIE — static-PIE crashes on this target; rebuild with -C relocation-model=static" >&2; \
+      exit 1; \
+    fi; \
+    if ! file /out-varta-watch | grep -q 'statically linked'; then \
+      echo "FATAL: file(1) does not report statically linked" >&2; \
+      exit 1; \
+    fi; \
+    echo '=== runtime smoke (--help) ==='; \
+    /out-varta-watch --help >/dev/null
 
 # ---------- runtime ----------
 FROM gcr.io/distroless/static-debian12@${DISTROLESS_DIGEST}
