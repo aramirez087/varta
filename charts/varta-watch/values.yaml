@@ -169,6 +169,24 @@ podAnnotations:
   prometheus.io/port: "9100"
   prometheus.io/path: "/metrics"
 
+# --- Alertmanager Slack integration ------------------------------------
+#
+# Two paths (mirrors prometheusToken):
+#   1. Set `webhookUrl` here. Chart creates a Secret named
+#      `<release>-alertmanager-slack`. Suitable for dev / quick start.
+#   2. Provision the Secret out-of-band (SOPS, ESO, Vault Secrets
+#      Operator, …) and set `existingSecret.name`. Chart never touches `webhookUrl`.
+#
+# The Secret key is mounted as SLACK_WEBHOOK_URL in the Alertmanager pod.
+# Requires Alertmanager flag: --config.expand-env
+# See observability/examples/alertmanager.yml for the matching config.
+alertmanager:
+  slack:
+    webhookUrl: ""
+    existingSecret:
+      name: ""
+      key: slack-webhook-url
+
 # --- Update strategy ----------------------------------------------------
 updateStrategy:
   type: RollingUpdate

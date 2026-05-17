@@ -12,10 +12,20 @@
 # drops, audit ring pressure) are noise.
 #
 # Replace placeholder routing keys / webhook URLs before deploying.
+#
+# Slack webhook URL: never commit the real URL to git. Two production paths:
+#   Helm chart — helm install … --set alertmanager.slack.webhookUrl=<url>
+#                The chart creates a K8s Secret named <release>-alertmanager-slack.
+#                Mount it as env var SLACK_WEBHOOK_URL, replace the placeholder
+#                below with '$SLACK_WEBHOOK_URL', and run Alertmanager with
+#                --config.expand-env. CI validates the placeholder; Alertmanager
+#                expands the real value at runtime.
+#   Manual     — provision the Secret out-of-band (SOPS, ESO, Vault) and set
+#                alertmanager.slack.existingSecret.name in values.yaml.
 
 global:
   resolve_timeout: 5m
-  # slack_api_url: 'https://hooks.slack.com/services/REPLACE/ME/REPLACE'
+  slack_api_url: 'https://hooks.slack.com/services/REPLACE/ME/REPLACE'
 
 route:
   receiver: default-slack

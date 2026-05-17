@@ -83,6 +83,24 @@ Resolve the bearer-token Secret key.
 {{- end -}}
 
 {{/*
+Resolve the Secret name that holds the Alertmanager Slack webhook URL.
+*/}}
+{{- define "varta-watch.slackSecretName" -}}
+{{- if .Values.alertmanager.slack.existingSecret.name -}}
+{{- .Values.alertmanager.slack.existingSecret.name -}}
+{{- else -}}
+{{- printf "%s-alertmanager-slack" (include "varta-watch.fullname" .) -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
+Resolve the Slack Secret key.
+*/}}
+{{- define "varta-watch.slackSecretKey" -}}
+{{- default "slack-webhook-url" .Values.alertmanager.slack.existingSecret.key -}}
+{{- end -}}
+
+{{/*
 Resolve image tag — values.image.tag wins; otherwise Chart.appVersion.
 */}}
 {{- define "varta-watch.image" -}}
