@@ -33,15 +33,20 @@ helm template fixture charts/varta-watch \
     --set 'prometheus.serviceMonitor.release=kube-prometheus-stack' \
     > "$out/chart.rendered.yaml"
 
-# 2. Extract the daemonset's container spec from both sides.
-chart_image=$(yq 'select(.kind == "DaemonSet") | .spec.template.spec.containers[0].image' "$out/chart.rendered.yaml" \
-              | head -n1)
-chart_args=$(yq -o=json 'select(.kind == "DaemonSet") | .spec.template.spec.containers[0].args' "$out/chart.rendered.yaml")
-chart_mounts=$(yq -o=json 'select(.kind == "DaemonSet") | .spec.template.spec.containers[0].volumeMounts' "$out/chart.rendered.yaml")
+# 2. Extract the daemonset's container spec from both sides. Use `yq ea`
+#    (eval-all) so multi-doc inputs collapse into a single array we can
+#    index — default per-doc eval emits a `null` value for every doc that
+#    doesn't match `select(...)`, which polluted the diff with phantom
+#    `null` lines on both sides.
+ds='[.[] | select(.kind == "DaemonSet")] | .[0].spec.template.spec.containers[0]'
 
-raw_image=$(yq '.spec.template.spec.containers[0].image' observability/examples/kubernetes/varta-watch.deployment.yaml)
-raw_args=$(yq -o=json '.spec.template.spec.containers[0].args' observability/examples/kubernetes/varta-watch.deployment.yaml)
-raw_mounts=$(yq -o=json '.spec.template.spec.containers[0].volumeMounts' observability/examples/kubernetes/varta-watch.deployment.yaml)
+chart_image=$(yq  ea            "$ds.image"        "$out/chart.rendered.yaml")
+chart_args=$(yq   ea -o=json    "$ds.args"         "$out/chart.rendered.yaml")
+chart_mounts=$(yq ea -o=json    "$ds.volumeMounts" "$out/chart.rendered.yaml")
+
+raw_image=$(yq  ea            "$ds.image"        observability/examples/kubernetes/varta-watch.deployment.yaml)
+raw_args=$(yq   ea -o=json    "$ds.args"         observability/examples/kubernetes/varta-watch.deployment.yaml)
+raw_mounts=$(yq ea -o=json    "$ds.volumeMounts" observability/examples/kubernetes/varta-watch.deployment.yaml)
 
 fail=0
 
