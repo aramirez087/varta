@@ -1,0 +1,36 @@
+# Keep the docker build context lean — the multi-stage build only needs
+# Cargo manifests, sources, and rust-toolchain.toml. Everything else
+# either bloats the context or is rebuild-derived.
+
+# Build outputs and IDE state.
+target/
+**/*.rs.bk
+.idea/
+.vscode/
+
+# Git history is not needed inside the builder; CI passes the git SHA
+# in via a build-arg.
+.git/
+.github/
+.gitignore
+.gitattributes
+
+# Bench artifacts and large fixtures.
+fuzz/
+docs/
+book/book/
+_site/
+.wolf/
+.claude/
+.epic-worktrees/
+
+# Reference impls — not needed to build varta-watch.
+tools/reference-implementations/
+clients/
+
+# Misc.
+*.log
+*.tmp
+*.swp
+.DS_Store
+node_modules/

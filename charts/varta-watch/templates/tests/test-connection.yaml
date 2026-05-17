@@ -1,0 +1,48 @@
+{{- if .Values.prometheus.bindAddr -}}
+apiVersion: v1
+kind: Pod
+metadata:
+  name: "{{ include "varta-watch.fullname" . }}-test-connection"
+  namespace: {{ include "varta-watch.namespace" . }}
+  labels:
+    {{- include "varta-watch.labels" . | nindent 4 }}
+  annotations:
+    "helm.sh/hook": test
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+spec:
+  restartPolicy: Never
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 65532
+    runAsGroup: 65532
+    seccompProfile:
+      type: RuntimeDefault
+  containers:
+    - name: curl
+      image: curlimages/curl:8.10.1
+      command: ["/bin/sh", "-c"]
+      args:
+        - |
+          set -eu
+          token=$(cat /etc/varta/prom.token)
+          body=$(curl -fsS -H "Authorization: Bearer $token" \
+            "http://{{ include "varta-watch.fullname" . }}.{{ include "varta-watch.namespace" . }}.svc:{{ .Values.service.port }}/metrics")
+          echo "$body" | grep -q '^varta_iterations_total ' && echo OK
+      securityContext:
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        capabilities:
+          drop: ["ALL"]
+      volumeMounts:
+        - name: token
+          mountPath: /etc/varta
+          readOnly: true
+  volumes:
+    - name: token
+      secret:
+        secretName: {{ include "varta-watch.tokenSecretName" . }}
+        items:
+          - key: {{ include "varta-watch.tokenSecretKey" . }}
+            path: prom.token
+        defaultMode: 0400
+{{- end -}}

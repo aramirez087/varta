@@ -3,6 +3,11 @@
 # observer. Pairs with the matching ServiceMonitor / PodMonitor manifest
 # for kube-prometheus integration.
 #
+# This file is retained for non-Helm operators; the Helm chart at
+# charts/varta-watch/ is the supported path. CI (`helm-parity`) asserts
+# that the chart's default render matches this manifest field-for-field
+# so the two paths cannot silently drift.
+#
 # Replace placeholders:
 #   - image:        registry path for your built varta-watch image
 #   - varta-token   Secret pre-populated with the bearer token
@@ -74,7 +79,7 @@ spec:
           type: RuntimeDefault
       containers:
         - name: varta-watch
-          image: ghcr.io/aramirez087/varta-watch:latest
+          image: ghcr.io/aramirez087/varta-watch:0.2.0
           imagePullPolicy: IfNotPresent
           args:
             - --uds-path=/run/varta/varta.sock

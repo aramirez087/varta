@@ -111,3 +111,37 @@ path = "src/lib.rs"
 [[bin]]
 name = "varta-watch"
 path = "src/main.rs"
+
+# cargo-binstall metadata — adopters with a Rust toolchain skip the
+# `curl | sh` path and run `cargo binstall varta-watch`. Same signed
+# tarball, same SBOM, same SLSA provenance as the GitHub Release
+# artifact; binstall just resolves the platform triple, downloads, and
+# verifies the sha256 sidecar. See book/src/operations/install.md.
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/varta-watch-v{ version }-{ target-family }-{ target-arch }{ archive-suffix }"
+bin-dir = "varta-watch-v{ version }-{ target-family }-{ target-arch }/{ bin }{ binary-ext }"
+pkg-fmt = "tgz"
+
+[package.metadata.binstall.overrides.x86_64-unknown-linux-musl]
+pkg-url = "{ repo }/releases/download/v{ version }/varta-watch-v{ version }-linux-amd64-musl.tar.gz"
+bin-dir = "varta-watch-v{ version }-linux-amd64-musl/{ bin }"
+
+[package.metadata.binstall.overrides.aarch64-unknown-linux-musl]
+pkg-url = "{ repo }/releases/download/v{ version }/varta-watch-v{ version }-linux-arm64-musl.tar.gz"
+bin-dir = "varta-watch-v{ version }-linux-arm64-musl/{ bin }"
+
+[package.metadata.binstall.overrides.x86_64-unknown-linux-gnu]
+pkg-url = "{ repo }/releases/download/v{ version }/varta-watch-v{ version }-linux-amd64.tar.gz"
+bin-dir = "varta-watch-v{ version }-linux-amd64/{ bin }"
+
+[package.metadata.binstall.overrides.aarch64-unknown-linux-gnu]
+pkg-url = "{ repo }/releases/download/v{ version }/varta-watch-v{ version }-linux-arm64.tar.gz"
+bin-dir = "varta-watch-v{ version }-linux-arm64/{ bin }"
+
+[package.metadata.binstall.overrides.x86_64-apple-darwin]
+pkg-url = "{ repo }/releases/download/v{ version }/varta-watch-v{ version }-darwin-amd64.tar.gz"
+bin-dir = "varta-watch-v{ version }-darwin-amd64/{ bin }"
+
+[package.metadata.binstall.overrides.aarch64-apple-darwin]
+pkg-url = "{ repo }/releases/download/v{ version }/varta-watch-v{ version }-darwin-arm64.tar.gz"
+bin-dir = "varta-watch-v{ version }-darwin-arm64/{ bin }"

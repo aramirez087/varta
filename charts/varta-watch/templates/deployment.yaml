@@ -1,0 +1,87 @@
+{{- if eq .Values.mode "sidecar" -}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "varta-watch.fullname" . }}
+  namespace: {{ include "varta-watch.namespace" . }}
+  labels:
+    {{- include "varta-watch.labels" . | nindent 4 }}
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "varta-watch.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "varta-watch.labels" . | nindent 8 }}
+      {{- with .Values.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      serviceAccountName: {{ include "varta-watch.serviceAccountName" . }}
+      hostPID: false
+      hostNetwork: false
+      automountServiceAccountToken: false
+      {{- with .Values.image.pullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: varta-watch
+          image: {{ include "varta-watch.image" . | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args:
+            {{- include "varta-watch.args" . | nindent 12 }}
+          ports:
+            - name: metrics
+              containerPort: {{ .Values.prometheus.port }}
+              protocol: TCP
+          {{- with .Values.readinessProbe }}
+          readinessProbe:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.livenessProbe }}
+          livenessProbe:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          volumeMounts:
+            - name: uds
+              mountPath: {{ dir .Values.uds.path }}
+            - name: token
+              mountPath: /etc/varta
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: uds
+          emptyDir: {}
+        - name: token
+          secret:
+            secretName: {{ include "varta-watch.tokenSecretName" . }}
+            items:
+              - key: {{ include "varta-watch.tokenSecretKey" . }}
+                path: prom.token
+            defaultMode: 0400
+        - name: tmp
+          emptyDir: {}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+{{- end -}}

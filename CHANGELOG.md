@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Turnkey deployment surface for `varta-watch`.** Five one-paste install
+  paths now cover the mainstream operator audiences — `curl |
+  sh` installer, multi-arch GHCR container image, Helm chart, `cargo
+  binstall`, and a tagged GitHub Release with signed binary tarballs.
+  Every artifact is built and signed by the same workflow
+  (`.github/workflows/release.yml`): tag-driven, OIDC-only credentials,
+  multi-arch buildx, CycloneDX SBOMs via syft, cosign keyless signing,
+  SLSA L3 build provenance via `actions/attest-build-provenance`, and
+  Helm chart push to `oci://ghcr.io/aramirez087/charts/varta-watch`. New
+  CI gates (`docker-build`, `helm-lint`, `helm-parity`,
+  `installer-syntax`) keep the deployment surface from rotting between
+  releases — `helm-parity` in particular fails the build if the chart's
+  default render drifts from the raw manifests under
+  `observability/examples/kubernetes/`. New book pages:
+  `operations/install.md`, `operations/container.md`,
+  `operations/helm.md`. The `RELEASES/` directory hosts a hand-written
+  release-notes file per tag; the workflow refuses to publish without
+  one (no auto-generated release notes).
+
 ### Changed
 
 - **Breaking: `BeatOutcome::Dropped` now carries a `DropReason` payload.**

@@ -1,0 +1,37 @@
+apiVersion: v2
+name: varta-watch
+description: Zero-overhead health-protocol observer for distributed local agents.
+type: application
+
+# Chart version is independent from the varta-watch app version. The
+# release.yml workflow keeps `appVersion` synced with the released
+# v* tag; the chart's own `version` follows SemVer for the chart
+# itself and bumps on chart-shape changes.
+version: 0.1.0
+appVersion: "0.1.0"
+
+home: https://varta.sh
+icon: https://varta.sh/assets/varta-icon.svg
+sources:
+  - https://github.com/aramirez087/Varta
+maintainers:
+  - name: Alexander Ramirez
+    url: https://github.com/aramirez087
+
+keywords:
+  - monitoring
+  - healthcheck
+  - watchdog
+  - prometheus
+  - safety-critical
+
+annotations:
+  artifacthub.io/license: MIT OR Apache-2.0
+  artifacthub.io/category: monitoring-logging
+  artifacthub.io/prerelease: "false"
+  # Surface upstream docs from the artifacthub package page.
+  artifacthub.io/links: |
+    - name: Operator guide
+      url: https://varta.sh/book/operations/helm.html
+    - name: Threat model
+      url: https://varta.sh/book/architecture/threat-model.html

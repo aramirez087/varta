@@ -1,0 +1,16 @@
+{{- if .Values.dashboard.enabled -}}
+{{- $dashboard := .Files.Get "files/varta-health.json" -}}
+{{- if $dashboard -}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "varta-watch.fullname" . }}-dashboard
+  namespace: {{ default (include "varta-watch.namespace" .) .Values.dashboard.namespace }}
+  labels:
+    {{- include "varta-watch.labels" . | nindent 4 }}
+    {{ .Values.dashboard.label }}: {{ .Values.dashboard.labelValue | quote }}
+data:
+  varta-health.json: |-
+{{ $dashboard | indent 4 }}
+{{- end -}}
+{{- end -}}

@@ -1,0 +1,451 @@
+name: release
+
+# Tag-driven release for the varta-watch binary, the container image, and
+# the Helm chart. The python-v* tag namespace is owned by
+# .github/workflows/python-publish.yml; this workflow ignores it.
+#
+# Per release:
+#   - linux/{amd64,arm64} static-musl binaries
+#   - linux/{amd64,arm64} gnu binaries (for distros that hate musl)
+#   - macOS {x86_64,aarch64} binaries
+#   - GHCR multi-arch image  ghcr.io/aramirez087/varta-watch:vX.Y.Z
+#   - CycloneDX SBOM (per binary + per image)
+#   - cosign keyless signatures + cosign attestations
+#   - SLSA L3 build provenance via actions/attest-build-provenance
+#   - Helm chart pushed to oci://ghcr.io/aramirez087/charts/varta-watch
+
+on:
+  push:
+    tags:
+      - 'v[0-9]+.[0-9]+.[0-9]+'
+      - 'v[0-9]+.[0-9]+.[0-9]+-*'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Dry-run: build everything, push nothing"
+        required: false
+        type: boolean
+        default: true
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write       # upload to GH Releases
+  packages: write       # push to GHCR
+  id-token: write       # cosign keyless + SLSA OIDC
+  attestations: write   # actions/attest-build-provenance
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: aramirez087/varta-watch
+  CHART_REGISTRY: oci://ghcr.io/aramirez087/charts
+
+jobs:
+  # ---------- 1. Build binaries (matrix) -------------------------------
+  build-bin:
+    name: build-bin (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+            archive: linux-amd64-musl
+            cross: false
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-latest
+            archive: linux-arm64-musl
+            cross: true
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            archive: linux-amd64
+            cross: false
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-22.04
+            archive: linux-arm64
+            cross: true
+          - target: x86_64-apple-darwin
+            os: macos-13
+            archive: darwin-amd64
+            cross: false
+          - target: aarch64-apple-darwin
+            os: macos-14
+            archive: darwin-arm64
+            cross: false
+    steps:
+      - name: checkout
+        uses: actions/checkout@v4
+
+      - name: install rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustup target add ${{ matrix.target }}
+
+      - name: install musl-tools (linux musl)
+        if: contains(matrix.target, 'linux-musl')
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - name: install aarch64 musl cross (linux-arm64-musl)
+        if: matrix.target == 'aarch64-unknown-linux-musl'
+        run: |
+          curl -fsSL https://musl.cc/aarch64-linux-musl-cross.tgz | sudo tar -xz -C /opt
+          echo "/opt/aarch64-linux-musl-cross/bin" >> "$GITHUB_PATH"
+          echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=aarch64-linux-musl-gcc" >> "$GITHUB_ENV"
+          echo "CC_aarch64_unknown_linux_musl=aarch64-linux-musl-gcc" >> "$GITHUB_ENV"
+
+      - name: install aarch64 gnu cross (linux-arm64)
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+          echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc" >> "$GITHUB_ENV"
+          echo "CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc" >> "$GITHUB_ENV"
+
+      - name: build
+        env:
+          RUSTFLAGS: ${{ contains(matrix.target, 'musl') && '-C target-feature=+crt-static' || '' }}
+        run: |
+          cargo build --locked --release \
+            --target ${{ matrix.target }} \
+            -p varta-watch \
+            --no-default-features \
+            --features 'json-log prometheus-exporter'
+
+      - name: stage release tree
+        env:
+          VERSION: ${{ github.ref_name }}
+        run: |
+          set -eux
+          stage="varta-watch-${VERSION}-${{ matrix.archive }}"
+          mkdir -p "$stage"
+          cp "target/${{ matrix.target }}/release/varta-watch" "$stage/"
+          cp LICENSE-MIT "$stage/" 2>/dev/null || true
+          cp LICENSE-APACHE "$stage/" 2>/dev/null || true
+          cp LICENSE "$stage/" 2>/dev/null || true
+          cp README.md "$stage/"
+          cp observability/examples/varta-watch.service "$stage/"
+          # Linux: strip in place. macOS: ld already stripped.
+          if [ "${{ runner.os }}" = "Linux" ]; then
+            strip "$stage/varta-watch" || true
+          fi
+          tar -czf "$stage.tar.gz" "$stage"
+          if command -v sha256sum >/dev/null; then
+            sha256sum "$stage.tar.gz" > "$stage.tar.gz.sha256"
+          else
+            shasum -a 256 "$stage.tar.gz" > "$stage.tar.gz.sha256"
+          fi
+          ls -la "$stage.tar.gz"*
+
+      - name: upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: bin-${{ matrix.archive }}
+          path: varta-watch-*-${{ matrix.archive }}.tar.gz*
+          if-no-files-found: error
+          retention-days: 7
+
+  # ---------- 2. Build + push multi-arch image -------------------------
+  build-image:
+    name: build-image
+    needs: build-bin
+    runs-on: ubuntu-latest
+    outputs:
+      image-digest: ${{ steps.push.outputs.digest }}
+      image-ref:    ${{ steps.meta.outputs.tags }}
+    steps:
+      - name: checkout
+        uses: actions/checkout@v4
+
+      - name: set up qemu
+        uses: docker/setup-qemu-action@v3
+
+      - name: set up buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: log in to GHCR
+        if: ${{ !inputs.dry_run }}
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=ref,event=tag
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=latest,enable=${{ !contains(github.ref_name, '-') }}
+
+      - name: build & push
+        id: push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: ${{ !inputs.dry_run }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            VERSION=${{ github.ref_name }}
+            GIT_SHA=${{ github.sha }}
+          provenance: true
+          sbom: true
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # ---------- 3. SBOMs (binaries + image) ------------------------------
+  sbom:
+    name: sbom
+    needs: [build-bin, build-image]
+    runs-on: ubuntu-latest
+    steps:
+      - name: download binaries
+        uses: actions/download-artifact@v4
+        with:
+          pattern: bin-*
+          path: ./dist
+          merge-multiple: true
+
+      - name: install syft
+        uses: anchore/sbom-action/download-syft@v0
+        with:
+          syft-version: v1.18.1
+
+      - name: sbom — image
+        if: ${{ !inputs.dry_run }}
+        env:
+          VERSION: ${{ github.ref_name }}
+          IMAGE_REF: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ needs.build-image.outputs.image-digest }}
+        run: |
+          syft "registry:${IMAGE_REF}" -o cyclonedx-json="varta-watch-${VERSION}.image.sbom.cdx.json"
+
+      - name: sbom — binaries
+        env:
+          VERSION: ${{ github.ref_name }}
+        run: |
+          set -eux
+          for archive in dist/*.tar.gz; do
+            name=$(basename "$archive" .tar.gz)
+            syft "file:${archive}" -o cyclonedx-json="${name}.sbom.cdx.json"
+          done
+
+      - name: upload SBOMs
+        uses: actions/upload-artifact@v4
+        with:
+          name: sboms
+          path: |
+            *.sbom.cdx.json
+          if-no-files-found: error
+
+  # ---------- 4. Sign binaries + image with cosign (keyless) -----------
+  sign:
+    name: sign
+    needs: [build-bin, build-image, sbom]
+    if: ${{ !inputs.dry_run }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: download binaries
+        uses: actions/download-artifact@v4
+        with:
+          pattern: bin-*
+          path: ./dist
+          merge-multiple: true
+
+      - name: download sboms
+        uses: actions/download-artifact@v4
+        with:
+          name: sboms
+          path: ./sboms
+
+      - name: install cosign
+        uses: sigstore/cosign-installer@v3
+        with:
+          cosign-release: v2.4.1
+
+      - name: cosign sign — image
+        env:
+          IMAGE_REF: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ needs.build-image.outputs.image-digest }}
+          VERSION: ${{ github.ref_name }}
+        run: |
+          cosign sign --yes "${IMAGE_REF}"
+          cosign attest --yes \
+            --type cyclonedx \
+            --predicate "sboms/varta-watch-${VERSION}.image.sbom.cdx.json" \
+            "${IMAGE_REF}"
+
+      - name: cosign sign-blob — binaries
+        run: |
+          set -eux
+          for archive in dist/*.tar.gz; do
+            cosign sign-blob --yes \
+              --bundle "${archive}.cosign.bundle" \
+              "${archive}"
+          done
+
+      - name: upload signed binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: signed-binaries
+          path: |
+            dist/*.tar.gz
+            dist/*.tar.gz.sha256
+            dist/*.cosign.bundle
+          if-no-files-found: error
+
+  # ---------- 5. SLSA L3 provenance ------------------------------------
+  provenance-bin:
+    name: provenance (binaries)
+    needs: [build-bin, sign]
+    if: ${{ !inputs.dry_run }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: download signed
+        uses: actions/download-artifact@v4
+        with:
+          name: signed-binaries
+          path: ./dist
+
+      - name: hash binaries
+        id: hash
+        run: |
+          set -eux
+          (
+            cd dist
+            for f in *.tar.gz; do
+              sha256sum "$f"
+            done
+          ) > subjects.txt
+          echo "subjects=$(base64 -w0 subjects.txt)" >> "$GITHUB_OUTPUT"
+
+      - name: attest provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: dist/*.tar.gz
+
+  provenance-image:
+    name: provenance (image)
+    needs: build-image
+    if: ${{ !inputs.dry_run }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: attest provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-name: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          subject-digest: ${{ needs.build-image.outputs.image-digest }}
+          push-to-registry: true
+
+  # ---------- 6. Publish GH Release ------------------------------------
+  release:
+    name: release
+    needs: [build-bin, build-image, sbom, sign, provenance-bin, provenance-image]
+    if: ${{ !inputs.dry_run }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: checkout
+        uses: actions/checkout@v4
+
+      - name: download signed binaries
+        uses: actions/download-artifact@v4
+        with:
+          name: signed-binaries
+          path: ./dist
+
+      - name: download sboms
+        uses: actions/download-artifact@v4
+        with:
+          name: sboms
+          path: ./dist
+
+      - name: locate release notes
+        id: notes
+        env:
+          VERSION: ${{ github.ref_name }}
+        run: |
+          notes_file="RELEASES/${VERSION}.md"
+          if [ ! -f "$notes_file" ]; then
+            echo "Missing release notes at $notes_file" >&2
+            echo "Create one before tagging — release-notes drift breaks the audit trail." >&2
+            exit 1
+          fi
+          {
+            echo "notes_file=$notes_file"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: ${{ github.ref_name }}
+          body_path: ${{ steps.notes.outputs.notes_file }}
+          files: |
+            dist/*.tar.gz
+            dist/*.tar.gz.sha256
+            dist/*.cosign.bundle
+            dist/*.sbom.cdx.json
+            scripts/install.sh
+
+  # ---------- 7. Helm chart push --------------------------------------
+  chart-release:
+    name: chart-release
+    needs: release
+    if: ${{ !inputs.dry_run }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: checkout
+        uses: actions/checkout@v4
+
+      - name: install helm
+        uses: azure/setup-helm@v4
+        with:
+          version: v3.16.1
+
+      - name: install cosign
+        uses: sigstore/cosign-installer@v3
+        with:
+          cosign-release: v2.4.1
+
+      - name: sync chart appVersion to release tag
+        env:
+          VERSION: ${{ github.ref_name }}
+        run: |
+          # Strip leading 'v' from the tag for the chart appVersion field.
+          app="${VERSION#v}"
+          sed -i "s/^appVersion: .*/appVersion: \"${app}\"/" charts/varta-watch/Chart.yaml
+          grep '^appVersion:' charts/varta-watch/Chart.yaml
+
+      - name: helm lint
+        run: helm lint charts/varta-watch
+
+      - name: helm package
+        run: helm package charts/varta-watch -d ./dist-chart
+
+      - name: ghcr login (helm)
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" | \
+            helm registry login ghcr.io -u ${{ github.actor }} --password-stdin
+
+      - name: helm push
+        run: |
+          set -eux
+          pkg=$(ls ./dist-chart/varta-watch-*.tgz | head -n1)
+          helm push "$pkg" ${{ env.CHART_REGISTRY }} 2>&1 | tee push.out
+          digest=$(awk -F': ' '/Digest:/{print $2}' push.out)
+          echo "CHART_DIGEST=$digest" >> "$GITHUB_ENV"
+
+      - name: cosign sign chart
+        env:
+          CHART_REF: ${{ env.CHART_REGISTRY }}/varta-watch@${{ env.CHART_DIGEST }}
+        run: |
+          # cosign needs a registry-style ref (no oci:// prefix).
+          ref="${CHART_REF#oci://}"
+          cosign sign --yes "$ref"

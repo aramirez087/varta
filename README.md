@@ -49,7 +49,24 @@ official client is verified against the same vectors. See
 [`clients/README.md`](clients/README.md) for the multi-language
 adoption pattern.
 
-## Install
+## Deploy `varta-watch`
+
+The observer (`varta-watch`) ships as a multi-arch container, a signed
+binary tarball, a Helm chart, and a one-liner install script. Pick the
+paste-path that matches your runtime — every artifact is built and
+signed by the same release workflow.
+
+| Audience            | One-paste install                                                                                                            |
+| ------------------- | ---------------------------------------------------------------------------------------------------------------------------- |
+| Bare metal / VM     | `curl -fsSL https://varta.sh/install.sh \| sh`                                                                               |
+| Docker host         | `docker run … ghcr.io/aramirez087/varta-watch:0.2.0 …`                                                                       |
+| Kubernetes (Helm)   | `helm install varta-watch oci://ghcr.io/aramirez087/charts/varta-watch --version 0.1.0 -n varta --create-namespace`          |
+| Rust developer      | `cargo binstall varta-watch`                                                                                                 |
+| Security reviewer   | `cosign verify ghcr.io/aramirez087/varta-watch:0.2.0 --certificate-oidc-issuer https://token.actions.githubusercontent.com …` |
+
+Full operator guide: [`book/src/operations/install.md`](book/src/operations/install.md).
+
+## Install (Rust client)
 
 Varta is not yet published to crates.io (post-v0.1.0). Use a path dependency:
 

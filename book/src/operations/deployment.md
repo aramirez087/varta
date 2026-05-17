@@ -5,6 +5,11 @@ targets. All three files referenced live under
 [`observability/examples/`](https://github.com/aramirez087/Varta/tree/main/observability/examples)
 and are CI-linted on every push.
 
+> **Looking for the one-paste install paths?** See
+> [Install (Quickstart)](install.md) for `curl | sh`, `cargo
+> binstall`, Helm, and Docker one-liners. This page is the reference
+> on the underlying recipes those paths assemble.
+
 ## Pre-flight: the bearer token
 
 `varta-watch` requires `--prom-token-file` whenever `--prom-addr` is
@@ -63,11 +68,19 @@ docker run -d --name varta-watch \
   -v /run/varta:/run/varta \
   -v /etc/varta/prom.token:/etc/varta/prom.token:ro \
   -p 127.0.0.1:9100:9100 \
-  ghcr.io/aramirez087/varta-watch:latest \
+  ghcr.io/aramirez087/varta-watch:0.2.0 \
   --uds-path=/run/varta/varta.sock \
   --prom-addr=0.0.0.0:9100 \
   --prom-token-file=/etc/varta/prom.token \
   --self-watchdog-secs=4
+```
+
+Verify the image before pulling it into production:
+
+```bash
+cosign verify ghcr.io/aramirez087/varta-watch:0.2.0 \
+  --certificate-identity-regexp '^https://github.com/aramirez087/Varta' \
+  --certificate-oidc-issuer 'https://token.actions.githubusercontent.com'
 ```
 
 The `--self-watchdog-secs 4` flag stays useful even without systemd —
@@ -76,7 +89,19 @@ the in-process watchdog still aborts on wedge, and Docker's
 
 ## Kubernetes (kube-prometheus)
 
+The supported path is the [Helm chart](helm.md); the raw manifests
+remain for adopters who don't want Helm and are CI-asserted to match
+the chart's default render.
+
 ```bash
+# Helm (recommended)
+helm install varta-watch \
+  oci://ghcr.io/aramirez087/charts/varta-watch \
+  --version 0.1.0 \
+  --namespace varta --create-namespace \
+  --set prometheusToken.token=$(openssl rand -hex 32)
+
+# Or raw manifests
 kubectl apply -f observability/examples/kubernetes/varta-watch.deployment.yaml
 kubectl apply -f observability/examples/kubernetes/varta-watch.servicemonitor.yaml
 ```

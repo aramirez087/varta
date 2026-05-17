@@ -763,3 +763,131 @@ jobs:
 
       - name: cross-check alert / dashboard refs against exporter source
         run: python3 tools/check_dashboard_metrics.py
+
+  # ----------------------------------------------------------------------
+  # Deployment-surface gates: keep the Dockerfile, Helm chart, and
+  # installer script honest on every PR so a stale artifact never reaches
+  # adopters silently. Tag-driven release.yml is responsible for the
+  # actual push.
+  # ----------------------------------------------------------------------
+
+  docker-build:
+    name: docker-build (smoke)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-qemu-action@v3
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: buildx — linux/amd64 (load + smoke run)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64
+          push: false
+          load: true
+          tags: varta-watch:ci-smoke
+          build-args: |
+            VERSION=ci
+            GIT_SHA=${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: --help exits zero, names varta-watch
+        run: |
+          out=$(docker run --rm varta-watch:ci-smoke --help 2>&1)
+          printf '%s\n' "$out" | head -n3
+          printf '%s\n' "$out" | grep -qE 'varta-watch'
+
+      - name: buildx — linux/arm64 (build only, no run)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/arm64
+          push: false
+          tags: varta-watch:ci-arm64
+          build-args: |
+            VERSION=ci
+            GIT_SHA=${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  helm-lint:
+    name: helm-lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: azure/setup-helm@v4
+        with:
+          version: v3.16.1
+
+      - name: helm lint
+        run: helm lint charts/varta-watch
+
+      - name: helm template (default values)
+        run: |
+          helm template ci charts/varta-watch \
+            --set 'prometheusToken.token=00000000000000000000000000000000000000000000000000000000deadbeef' \
+            > /tmp/rendered.yaml
+          test -s /tmp/rendered.yaml
+
+      - name: install kubeconform
+        run: |
+          set -euo pipefail
+          KC_VERSION=0.6.7
+          curl -fsSL \
+            "https://github.com/yannh/kubeconform/releases/download/v${KC_VERSION}/kubeconform-linux-amd64.tar.gz" \
+            | tar xz -C /tmp
+          sudo install -m 0755 /tmp/kubeconform /usr/local/bin/kubeconform
+
+      - name: kubeconform — rendered chart
+        run: |
+          kubeconform -strict -ignore-missing-schemas -summary /tmp/rendered.yaml
+
+      - name: helm template — sidecar mode
+        run: |
+          helm template ci charts/varta-watch \
+            --set 'mode=sidecar' \
+            --set 'prometheusToken.token=00000000000000000000000000000000000000000000000000000000deadbeef' \
+            > /tmp/rendered-sidecar.yaml
+          kubeconform -strict -ignore-missing-schemas /tmp/rendered-sidecar.yaml
+
+  helm-parity:
+    name: helm-parity
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: azure/setup-helm@v4
+        with:
+          version: v3.16.1
+
+      - name: install yq
+        run: |
+          set -euo pipefail
+          YQ_VERSION=v4.44.3
+          curl -fsSL \
+            "https://github.com/mikefarah/yq/releases/download/${YQ_VERSION}/yq_linux_amd64" \
+            -o /tmp/yq
+          sudo install -m 0755 /tmp/yq /usr/local/bin/yq
+
+      - name: render fixture + diff
+        run: bash tools/render-helm-fixture.sh
+
+  installer-syntax:
+    name: installer-syntax
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: sh -n
+        run: sh -n scripts/install.sh
+
+      - name: shellcheck (POSIX)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y shellcheck
+          shellcheck -s sh scripts/install.sh

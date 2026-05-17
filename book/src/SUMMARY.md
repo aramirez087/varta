@@ -42,9 +42,12 @@
 
 # Operations
 
+- [Install (Quickstart)](operations/install.md)
+- [Container Image](operations/container.md)
+- [Helm Chart](operations/helm.md)
+- [Deployment Patterns](operations/deployment.md)
 - [Monitoring & Alerting](operations/monitoring.md)
 - [SLOs & Tuning](operations/slos.md)
-- [Deployment Patterns](operations/deployment.md)
 
 ---
 

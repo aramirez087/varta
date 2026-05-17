@@ -1,0 +1,25 @@
+{{- if .Values.prometheus.bindAddr -}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "varta-watch.fullname" . }}
+  namespace: {{ include "varta-watch.namespace" . }}
+  labels:
+    {{- include "varta-watch.labels" . | nindent 4 }}
+  {{- with .Values.service.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ .Values.service.type }}
+  {{- if and (eq .Values.service.type "ClusterIP") (eq .Values.service.clusterIP "None") }}
+  clusterIP: None
+  {{- end }}
+  selector:
+    {{- include "varta-watch.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: metrics
+      port: {{ .Values.service.port }}
+      targetPort: metrics
+      protocol: TCP
+{{- end -}}
