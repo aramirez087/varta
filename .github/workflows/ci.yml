@@ -1055,10 +1055,14 @@ jobs:
       - name: helm install (sidecar mode, no hostPath required on kind)
         run: |
           set -euxo pipefail
+          # Chart template (namespace.yaml) owns namespace creation when
+          # namespace.create=true (default). Do NOT pass --create-namespace
+          # or kubectl create — both produce a non-Helm-managed namespace
+          # that conflicts with the chart's templated Namespace resource
+          # ("namespaces \"varta\" already exists" on install).
           token=$(openssl rand -hex 32)
           helm upgrade --install varta-watch charts/varta-watch \
             --namespace varta \
-            --create-namespace \
             --set mode=sidecar \
             --set image.repository=varta-watch \
             --set image.tag=ci \

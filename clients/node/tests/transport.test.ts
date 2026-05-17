@@ -150,11 +150,11 @@ test("UdsTransport.reconnect rebuilds the socket", async (t) => {
   try {
     const tx = new UdsTransport(listener.path);
     const buf = Buffer.alloc(FRAME_BYTES);
-    encodeInto(buf, Status.Ok, 1, 1n, 1n, 1);
+    encodeInto(buf, Status.Ok, 12345, 1n, 1n, 1);
     tx.send(buf);
     await listener.wait(1);
     tx.reconnect();
-    encodeInto(buf, Status.Ok, 1, 2n, 2n, 2);
+    encodeInto(buf, Status.Ok, 12345, 2n, 2n, 2);
     tx.send(buf);
     await listener.wait(2);
     assert.equal(decode(listener.received[0]!).payload, 1);
