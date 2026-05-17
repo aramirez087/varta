@@ -8,7 +8,12 @@ metadata:
     {{- include "varta-watch.labels" . | nindent 4 }}
   annotations:
     "helm.sh/hook": test
-    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+    # NOTE: do NOT include hook-succeeded here. `helm test --logs` reads pod
+    # logs AFTER the pod terminates; if hook-succeeded deletes the pod on
+    # success, the subsequent log fetch races and fails with
+    # `unable to get pod logs ...: pods "..." not found`. before-hook-creation
+    # cleans up on the NEXT `helm test` run, which is sufficient.
+    "helm.sh/hook-delete-policy": before-hook-creation
 spec:
   restartPolicy: Never
   securityContext:
