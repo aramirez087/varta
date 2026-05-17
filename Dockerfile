@@ -107,8 +107,13 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
         --features json-log \
         -p varta-watch; \
     cp "target/$RUST_TARGET/release/varta-watch" /out-varta-watch; \
+    echo '=== file (pre-strip) ==='; file /out-varta-watch; \
+    echo '=== --help (pre-strip) ==='; \
+    /out-varta-watch --help 2>&1 | head -5; echo "rc=$?"; \
     strip /out-varta-watch || true; \
-    echo '=== file ==='; file /out-varta-watch; \
+    echo '=== file (post-strip) ==='; file /out-varta-watch; \
+    echo '=== --help (post-strip) ==='; \
+    /out-varta-watch --help 2>&1 | head -5; echo "rc=$?"; \
     echo '=== readelf -l (PT_INTERP) ==='; readelf -l /out-varta-watch | grep -A1 INTERP || echo 'no PT_INTERP (static)'
 
 # ---------- runtime ----------
