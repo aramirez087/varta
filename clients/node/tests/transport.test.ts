@@ -1,6 +1,12 @@
 // Unit tests for the UDP / SecureUDP transports.
 
-import { test } from "node:test";
+import { test, after } from "node:test";
+
+// node-unix-socket's DgramSocket has no unref() — the native handle is
+// always referenced. One setImmediate after all tests complete lets
+// libuv drain every pending uv_close() callback so the subprocess can
+// exit cleanly without the test runner's timeout killing it.
+after(() => new Promise<void>((r) => setImmediate(r)));
 import assert from "node:assert/strict";
 import { randomBytes } from "node:crypto";
 

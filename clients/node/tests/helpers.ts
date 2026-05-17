@@ -163,6 +163,9 @@ export async function bindUdsRecorder(): Promise<{
         // Already closed.
       }
       cleanup();
+      // DgramSocket has no unref(); pump one event-loop tick so the
+      // native uv_close() callback fires and the handle is released.
+      await new Promise<void>((r) => setImmediate(r));
     },
   };
 }
