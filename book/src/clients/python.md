@@ -43,6 +43,15 @@ For UDP and secure-UDP transports, fork-safety, the panic-hook family,
 and the full parity matrix see the package README in the repo:
 [`clients/python/README.md`](https://github.com/aramirez087/Varta/blob/main/clients/python/README.md).
 
+## Transports
+
+| Transport | Status | Notes |
+| --------- | ------ | ----- |
+| Unix Domain Sockets | Supported | `Varta.connect(path)`. The only transport classified `BeatOrigin::KernelAttested`, making it the only Python transport eligible for observer-driven recovery. |
+| Plaintext UDP | Supported | `Varta.connect_udp((host, port))`. Connected-mode socket. Beats classified `NetworkUnverified`; recovery refused. |
+| Secure UDP (ChaCha20-Poly1305) | Supported | `Varta.connect_secure_udp((host, port), key)`. Requires `pip install 'varta[secure]'`. |
+| Master-key secure UDP | Supported | `Varta.connect_secure_udp_with_master((host, port), mkey)` |
+
 ## Stability
 
 - **Wire format**: VLP v0.2, governed by [the spec](../spec/vlp.md).

@@ -34,6 +34,7 @@ func main() {
 
     for {
         if outcome := agent.Beat(varta.StatusOK, 0); outcome.IsDropped() {
+            // Four-way taxonomy mirrors the Rust client:
             log.Printf("varta: dropped (%s)", outcome.DropReason())
         }
         time.Sleep(500 * time.Millisecond)
