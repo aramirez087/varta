@@ -19,7 +19,7 @@
 # See book/src/operations/container.md for verification commands.
 
 ARG RUST_VERSION=1.84
-ARG DISTROLESS_DIGEST=sha256:6cd937e9155bdfd805d2f56a17cab02f2acb70e92c1cb4f08e16cd34dc4e10ab
+ARG DISTROLESS_DIGEST=sha256:20bc6c0bc4d625a22a8fde3e55f6515709b32055ef8fb9cfbddaa06d1760f838
 # ^ gcr.io/distroless/static-debian12:nonroot pinned by digest. Refreshed
 # by Renovate. Bump in lock-step with the matching `:debug-nonroot` digest.
 
