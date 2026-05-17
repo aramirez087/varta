@@ -4,12 +4,12 @@ This directory holds official, production-grade client libraries for
 the Varta health protocol in languages other than Rust. Each language
 gets its own subdirectory with independent semver, packaging, and CI.
 
-| Language | Package          | Status | Source                |
-| -------- | ---------------- | ------ | --------------------- |
-| Python   | `pip install varta` | Beta   | [`python/`](python/) |
-| Go       | (planned)        |        |                       |
-| Node.js  | (planned)        |        |                       |
-| JVM      | (planned)        |        |                       |
+| Language | Package                                                | Status | Source             |
+| -------- | ------------------------------------------------------ | ------ | ------------------ |
+| Python   | `pip install varta`                                    | Beta   | [`python/`](python/) |
+| Go       | `go get github.com/aramirez087/Varta/clients/go`       | Beta   | [`go/`](go/)       |
+| Node.js  | (planned)                                              |        |                    |
+| JVM      | (planned)                                              |        |                    |
 
 ## Stability model
 

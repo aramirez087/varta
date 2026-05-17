@@ -658,6 +658,56 @@ jobs:
           /tmp/varta-smoke-venv/bin/pip install dist/varta-*.whl
           /tmp/varta-smoke-venv/bin/python -c "import varta; print(varta.__version__)"
 
+  go-client:
+    name: go-client (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: checkout
+        uses: actions/checkout@v4
+
+      - name: setup go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.21'
+
+      - name: rust toolchain (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: cargo cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: build varta-watch (release, prometheus-exporter)
+        run: cargo build --locked --release -p varta-watch --features prometheus-exporter
+
+      - name: go mod tidy + vet + build
+        working-directory: clients/go
+        run: |
+          go mod tidy
+          go vet ./...
+          go build ./...
+
+      - name: conformance vectors
+        working-directory: clients/go
+        run: go test -v -count=1 ./tests -run TestConformance
+
+      - name: internal package unit tests
+        working-directory: clients/go
+        run: go test -v -count=1 ./internal/...
+
+      - name: client + fork + panic unit tests
+        working-directory: clients/go
+        run: go test -v -count=1 ./tests -run 'TestUnit|TestPanic|TestFork'
+
+      - name: interop with varta-watch
+        working-directory: clients/go
+        env:
+          VARTA_WATCH_BIN: ${{ github.workspace }}/target/release/varta-watch
+        run: go test -v -count=1 -timeout=90s ./tests -run TestInterop
+
   book:
     name: build-book
     runs-on: ubuntu-latest
@@ -949,8 +999,10 @@ jobs:
       - name: helm install (sidecar mode, no hostPath required on kind)
         run: |
           set -euxo pipefail
-          # Create namespace with kubectl (idempotent); avoids helm --create-namespace conflicts
-          kubectl create namespace varta --dry-run=client -o yaml | kubectl apply -f -
+          # Chart template (namespace.yaml) owns namespace creation when
+          # namespace.create=true (default). Do NOT pass --create-namespace
+          # or kubectl-create — both produce a non-Helm-managed namespace
+          # that conflicts with the chart's templated Namespace resource.
           token=$(openssl rand -hex 32)
           helm upgrade --install varta-watch charts/varta-watch \
             --namespace varta \
