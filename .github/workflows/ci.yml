@@ -1148,4 +1148,13 @@ jobs:
         if: failure()
         run: |
           kubectl -n varta describe pods
-          kubectl -n varta logs -l app.kubernetes.io/name=varta-watch --all-containers --tail=200 || true
+          # --tail=-1 (no cap) so config-parse errors at the top of stdout
+          # aren't truncated by Config::HELP output below them.
+          # --previous covers the first crash in a CrashLoopBackOff cycle —
+          # without it, you only ever see the latest (already-crashed) attempt.
+          for pod in $(kubectl -n varta get pods -o name); do
+            echo "===== $pod (current) ====="
+            kubectl -n varta logs "$pod" --all-containers --tail=-1 || true
+            echo "===== $pod (previous, if any) ====="
+            kubectl -n varta logs "$pod" --all-containers --previous --tail=-1 2>/dev/null || true
+          done

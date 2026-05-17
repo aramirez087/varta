@@ -28,9 +28,19 @@ spec:
         - |
           set -eu
           token=$(cat /etc/varta/prom.token)
-          body=$(curl -fsS -H "Authorization: Bearer $token" \
-            "http://{{ include "varta-watch.fullname" . }}.{{ include "varta-watch.namespace" . }}.svc:{{ .Values.service.port }}/metrics")
-          echo "$body" | grep -q '^varta_iterations_total ' && echo OK
+          url="http://{{ include "varta-watch.fullname" . }}.{{ include "varta-watch.namespace" . }}.svc:{{ .Values.service.port }}/metrics"
+          echo "GET $url" >&2
+          if ! body=$(curl -fsS -H "Authorization: Bearer $token" "$url" 2>&1); then
+            echo "curl failed: $body" >&2
+            exit 1
+          fi
+          if printf '%s\n' "$body" | grep -q '^varta_watch_uptime_seconds '; then
+            echo OK
+            exit 0
+          fi
+          echo "metric varta_watch_uptime_seconds missing from /metrics body; first 10 lines follow:" >&2
+          printf '%s\n' "$body" | head -10 >&2
+          exit 1
       securityContext:
         allowPrivilegeEscalation: false
         readOnlyRootFilesystem: true
