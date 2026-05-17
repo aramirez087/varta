@@ -4,7 +4,7 @@ All notable changes to the Python client live here. Versions follow
 [Semantic Versioning](https://semver.org). The wire protocol version is
 governed independently — see `book/src/spec/vlp.md` in the workspace.
 
-## [0.1.0] — Unreleased
+## [0.1.0] — 2026-05-16
 
 Initial release. Production client for the Varta health protocol.
 
