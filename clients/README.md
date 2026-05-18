@@ -10,7 +10,7 @@ gets its own subdirectory with independent semver, packaging, and CI.
 | Go       | `go get github.com/aramirez087/Varta/clients/go`       | Beta   | [`go/`](go/)       |
 | Node.js  | `npm install @varta-health/client`                     | Beta   | [`node/`](node/)   |
 | .NET     | `dotnet add package Varta.Client`                      | Beta   | [`dotnet/`](dotnet/) |
-| JVM      | (planned)                                              |        |                    |
+| JVM      | `implementation("health.varta:varta-client:0.1.0")`    | Beta   | [`java/`](java/)   |
 
 ## Stability model
 

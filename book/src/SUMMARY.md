@@ -19,6 +19,7 @@
 - [Python](clients/python.md)
 - [Node.js](clients/node.md)
 - [.NET](clients/dotnet.md)
+- [JVM (Java)](clients/java.md)
 
 ---
 

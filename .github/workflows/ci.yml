@@ -825,6 +825,91 @@ jobs:
         working-directory: clients/dotnet
         run: dotnet pack src/Varta.Client/Varta.Client.csproj -c Release -o ./nupkgs
 
+  java-client:
+    name: java-client (${{ matrix.os }}, jdk-${{ matrix.jdk }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        jdk: ['17', '21']
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: checkout
+        uses: actions/checkout@v4
+
+      - name: setup jdk
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: ${{ matrix.jdk }}
+
+      - name: setup gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-home-cache-cleanup: true
+
+      - name: rust toolchain (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: cargo cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: build varta-watch (release, prometheus-exporter)
+        run: cargo build --locked --release -p varta-watch --features prometheus-exporter
+
+      - name: assemble
+        working-directory: clients/java
+        run: ./gradlew :lib:assemble --no-daemon --stacktrace
+
+      - name: verify zero runtime deps
+        working-directory: clients/java
+        run: ./gradlew :lib:verifyZeroRuntimeDeps --no-daemon
+
+      - name: conformance vectors
+        working-directory: clients/java
+        run: ./gradlew :lib:test --tests "*Conformance*" --no-daemon
+
+      - name: unit tests (codec + agent + panic + errno + transports)
+        working-directory: clients/java
+        run: >
+          ./gradlew :lib:test
+          --tests "health.varta.VartaAgentTest"
+          --tests "health.varta.ForkSafetyTest"
+          --tests "health.varta.PanicHandlerTest"
+          --tests "health.varta.vlp.VlpCodecUnitTest"
+          --tests "health.varta.vlpsecure.AeadCodecUnitTest"
+          --tests "health.varta.vlpsecure.HkdfTest"
+          --tests "health.varta.transport.UdpTransportTest"
+          --tests "health.varta.transport.UdsTransportTest"
+          --tests "health.varta.transport.SecureUdpTransportTest"
+          --tests "health.varta.transport.ErrnoClassifierTest"
+          --no-daemon
+
+      - name: interop with varta-watch
+        working-directory: clients/java
+        env:
+          VARTA_WATCH_BIN: ${{ github.workspace }}/target/release/varta-watch
+        timeout-minutes: 2
+        run: ./gradlew :lib:test --tests "health.varta.InteropObserverTest" --no-daemon
+
+      - name: build sources + javadoc jars
+        working-directory: clients/java
+        run: ./gradlew :lib:sourcesJar :lib:javadocJar --no-daemon
+
+  java-client-windows:
+    name: java-client (windows compile)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+      - uses: gradle/actions/setup-gradle@v4
+      - name: compile only (UDS interop is POSIX-only)
+        working-directory: clients/java
+        run: ./gradlew.bat :lib:compileJava --no-daemon
+
   book:
     name: build-book
     runs-on: ubuntu-latest

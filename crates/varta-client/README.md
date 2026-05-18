@@ -173,8 +173,10 @@ Official clients in non-Rust languages live under
 ([`clients/go/`](../../clients/go/),
 `go get github.com/aramirez087/Varta/clients/go`), Node.js
 ([`clients/node/`](../../clients/node/),
-`npm install @varta-health/client`), and .NET
+`npm install @varta-health/client`), .NET
 ([`clients/dotnet/`](../../clients/dotnet/),
-`dotnet add package Varta.Client`). Each port preserves the same wire-level
-contract and is verified against the same
+`dotnet add package Varta.Client`), and JVM
+([`clients/java/`](../../clients/java/),
+`implementation("health.varta:varta-client:0.1.0")`). Each port preserves
+the same wire-level contract and is verified against the same
 `tools/vlp-test-vectors.json` conformance suite as this crate.
