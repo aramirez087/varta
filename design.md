@@ -2,31 +2,31 @@
 
 ## Overview
 
-Single-page static site for GitHub Pages. Zero build step — plain HTML + CSS + minimal vanilla JS. Inspired by the autoskills.dev layout: two-column hero, terminal mockup, stacked sections with thin dividers, retro arcade title. Varta's own identity: heartbeat/pulse motif, systems-level confidence, "cooler project" energy.
+Single-page static site for GitHub Pages. Zero build step — plain HTML + CSS + minimal vanilla JS. Inspired by the autoskills.dev layout: two-column hero, terminal mockup, stacked sections with thin dividers. Varta's identity: "The Silent Sentinel (Minimalist & Stoic)" — a dark, high-contrast aesthetic emphasizing Varta as the invisible but ever-present protector.
 
 ## Brand Identity
 
 - **Tagline:** "Zero-overhead health protocol for distributed local agents."
-- **Visual metaphor:** Heartbeat / pulse / ECG. Varta = "battery" in Sanskrit — energy, continuity, uptime.
-- **Personality:** Technical, precise, confident. Not corporate. Built by systems people for systems people. The kind of project that makes you want to read the source.
-- **Differentiation from autoskills:** Varta is a Rust library, not an npm CLI. The terminal mockup shows `varta-watch` output (Prometheus metrics, stall detection) rather than npm install. The pulse/heartbeat visual is unique to Varta.
+- **Visual metaphor:** A single, razor-sharp vertical beam of light cutting through a deep obsidian fog. The beam represents the precise 32-byte VLP frame. Varta = "battery" in Sanskrit — energy, continuity, uptime.
+- **Personality:** Serious, dependable, lightweight, minimalist. Speaks to developers who value performance and zero bloat.
+- **Differentiation from autoskills:** Varta is a Rust library, not an npm CLI. The terminal mockup shows `varta-watch` output, rendered as a frosted glass pane over the striking "Silent Sentinel" laser beam backdrop.
 
 ## Color Palette
 
-Monochrome + neon cyan accent. No other colors except functional status badges.
+Deep charcoal background with a "Rust" orange accent and muted slate text.
 
 | Token | Hex | Usage |
 |-------|-----|-------|
-| `--bg` | `#0a0a0a` | Page background (near-black) |
-| `--bg-surface` | `#111111` | Terminal mockup bg, section alternates |
-| `--bg-elevated` | `#1a1a1a` | Code blocks, hover states |
-| `--border` | `#222222` | Thin section dividers, card borders |
-| `--text-primary` | `#e4e4e4` | Headings, body text (off-white, not pure white) |
-| `--text-secondary` | `#666666` | Captions, metadata, timestamps |
-| `--text-dim` | `#444444` | De-emphasized labels |
-| `--accent` | `#22d3ee` | CTAs, highlights, terminal cursor, links (cyan) |
-| `--accent-dim` | `#0e7490` | Hover states, borders on focus |
-| `--accent-glow` | `rgba(34, 211, 238, 0.15)` | Background glow behind hero terminal |
+| `--bg` | `#121212` | Page background (Deep charcoal) |
+| `--bg-surface` | `#1a1a1a` | Terminal mockup bg, section alternates |
+| `--bg-elevated` | `#242424` | Code blocks, hover states |
+| `--border` | `#2d2d2d` | Thin section dividers, card borders |
+| `--text-primary` | `#e4e4e4` | Headings, body text (off-white) |
+| `--text-secondary` | `#abb2bf` | Captions, metadata (muted slate) |
+| `--text-dim` | `#5c6370` | De-emphasized labels |
+| `--accent` | `#E06C75` | CTAs, highlights, terminal cursor ("Rust" orange) |
+| `--accent-dim` | `#be5046` | Hover states, borders on focus |
+| `--accent-glow` | `rgba(224, 108, 117, 0.12)` | Background glow behind hero terminal |
 | `--success` | `#22c55e` | Status `Ok`, `Pass`, `Sent` |
 | `--danger` | `#ef4444` | Status `Critical`, `Fail` |
 | `--warning` | `#eab308` | Status `Degraded`, `Warn` |
@@ -35,13 +35,13 @@ Monochrome + neon cyan accent. No other colors except functional status badges.
 
 | Element | Font | Weight | Size | Notes |
 |---------|------|--------|------|-------|
-| Title (hero) | `Press Start 2P` (Google Fonts) | 400 | 2.2–3rem | Pixel/retro arcade — only used for "VARTA" wordmark |
-| Headings | `Inter` | 700 | 1.8–2.5rem | Clean, geometric, bold |
-| Body | `Inter` | 400 | 1.05rem | Readable, comfortable line-height (1.7) |
+| Title (hero) | `JetBrains Mono` | 700 | 3.2rem | Tightly set (-0.02em) systems-engineered identity |
+| Headings | `JetBrains Mono` | 700 | 1.8–2.5rem | Clean, structured, bold |
+| Body | `JetBrains Mono` | 400 | 1.05rem | Monospace body for pure technical aesthetic |
 | Code / terminal | `JetBrains Mono` | 400 | 0.85rem | All code, metrics, terminal output |
 | Mono labels | `JetBrains Mono` | 500 | 0.75rem | Badges, section labels, timestamps |
 
-Font strategy: `Press Start 2P` for the hero wordmark only (retro identity). Everything else is Inter + JetBrains Mono — clean, modern, developer-readable. No font variety bloat.
+Font strategy: Uncompromising systems-engineering aesthetic using `JetBrains Mono` exclusively across all elements.
 
 ## Layout
 
@@ -101,18 +101,20 @@ Max-width 1100px, left-aligned content, lots of breathing room. Sections separat
 
 ### 2. Hero — Two Column
 
+**Background:** A backdrop using `assets/varta.webp` displaying the "Silent Sentinel" vertical laser beam, fading softly into the deep charcoal background via linear gradients.
+
 **Left column (60%):**
-- `VARTA` in `Press Start 2P` pixel font, large (2.5–3rem), with a subtle CSS text-shadow glow in cyan
-- Below: tagline in Inter 700: "Zero-overhead health protocol for distributed local agents."
+- `VARTA` wordmark in `JetBrains Mono` (3.2rem, bold), with a subtle Rust orange glow (`--accent-glow`).
+- Below: tagline in JetBrains Mono 700: "Zero-overhead health protocol for distributed local agents."
 - Below: one-line sub: "32-byte heartbeats over Unix Domain Sockets. No dependencies. No allocations. Sub-microsecond."
 - CTA row:
-  - Primary: pill-style button with `cargo add varta-client` (copyable on click) — monospace text, cyan border
-  - Secondary: `View on GitHub →` text link in cyan
+  - Primary: pill-style button with `cargo add varta-client` — monospace text, inner shadows, rust orange glow on hover.
+  - Secondary: `View on GitHub →` text link.
 
 **Right column (40%):**
-- Terminal mockup — a styled `<div>` that looks like a terminal window:
+- Terminal mockup — a frosted-glass `<div>` overlapping the laser backdrop:
   - Title bar: 3 dots (red/yellow/green), centered title `varta-watch`
-  - Body: dark `--bg-surface` background, monospace text showing simulated output:
+  - Body: frosted translucent background (`rgba(26,26,26,0.65)` with `backdrop-filter: blur(16px)`), allowing the vertical beam to shine through.
     ```
     $ varta-watch --socket /tmp/varta.sock --threshold-ms 2000
     ▓ listening on /tmp/varta.sock
@@ -123,7 +125,7 @@ Max-width 1100px, left-aligned content, lots of breathing room. Sections separat
     ▓ metrics → http://127.0.0.1:9100/metrics
     ▓_
     ```
-  - The last line has a blinking cyan cursor (`--accent`)
+  - The last line has a blinking rust orange cursor (`--accent`)
   - Subtle `box-shadow` glow in `--accent-glow` around the terminal
 
 **Mobile:** Stack vertically. Terminal mockup goes below the copy, full-width.

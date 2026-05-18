@@ -562,6 +562,11 @@ code { font-family: var(--font-mono); font-size: 0.88em; }
     gap: 2.5rem;
   }
 
+  .hero::before {
+    opacity: 0.4;
+    background-position: center top;
+  }
+
   .hero-title { font-size: 2rem; }
   .hero-tagline { font-size: 1.05rem; }
 

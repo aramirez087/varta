@@ -7,14 +7,14 @@
         <feMergeNode in="SourceGraphic" />
       </feMerge>
     </filter>
-    <path id="beat" d="M -10 32 L 16 32 L 24 44 L 36 12 L 44 38 L 50 32 L 74 32" />
   </defs>
 
-  <!-- Thick cyan trace (always visible, highly contrasting) -->
-  <use href="#beat" fill="none" stroke="#22d3ee" stroke-width="7" stroke-linecap="round" stroke-linejoin="round" filter="url(#glow)" />
+  <!-- Dark rounded background matching --bg -->
+  <rect width="64" height="64" rx="16" fill="#121212" />
 
-  <!-- Animated bright white pulse moving across the trace -->
-  <use href="#beat" fill="none" stroke="#ffffff" stroke-width="4" stroke-linecap="round" stroke-linejoin="round" stroke-dasharray="25 150">
-    <animate attributeName="stroke-dashoffset" values="25; -150" dur="1.5s" repeatCount="indefinite" />
-  </use>
+  <!-- Glowing vertical beam (Rust Orange) -->
+  <line x1="32" y1="8" x2="32" y2="56" stroke="#E06C75" stroke-width="4" filter="url(#glow)" stroke-linecap="round" />
+  
+  <!-- Core bright light of the beam -->
+  <line x1="32" y1="12" x2="32" y2="52" stroke="#ffffff" stroke-width="1.5" stroke-linecap="round" />
 </svg>
