@@ -231,7 +231,7 @@ Hosted via GitHub Pages from `docs/landing-page/` (configure in repo settings).
 - **CSS custom properties** for the entire palette — easy to tweak later.
 - **Syntax highlighting** for the terminal mockup is just `<span>` elements with color classes — no library.
 - **Copy-to-clipboard** for the `cargo add` command — ~15 lines of vanilla JS.
-- **Favicon:** simple SVG of a heartbeat pulse line in cyan on transparent.
+- **Favicon:** simple SVG of a heartbeat pulse line in red on transparent.
 
 ## Non-Goals
 

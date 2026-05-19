@@ -66,7 +66,6 @@ jobs:
           cp robots.txt _site/ 2>/dev/null || true
           cp llms.txt _site/ 2>/dev/null || true
           cp favicon.svg _site/ 2>/dev/null || true
-          cp favicon.ico _site/ 2>/dev/null || true
           cp CNAME _site/
           cp -r assets _site/assets
           # Place the compiled book at /book
