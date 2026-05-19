@@ -1,19 +1,12 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 64 64">
-  <defs>
-    <filter id="glow" x="-50%" y="-50%" width="200%" height="200%">
-      <feGaussianBlur stdDeviation="3" result="blur" />
-      <feMerge>
-        <feMergeNode in="blur" />
-        <feMergeNode in="SourceGraphic" />
-      </feMerge>
-    </filter>
-  </defs>
-
   <!-- Dark rounded background matching --bg -->
   <rect width="64" height="64" rx="16" fill="#121212" />
 
-  <!-- Glowing vertical beam (Rust Orange) -->
-  <line x1="32" y1="8" x2="32" y2="56" stroke="#E06C75" stroke-width="4" filter="url(#glow)" stroke-linecap="round" />
+  <!-- Outer faint glow (Rust Orange) -->
+  <line x1="32" y1="4" x2="32" y2="60" stroke="#E06C75" stroke-width="10" stroke-opacity="0.25" stroke-linecap="round" />
+  
+  <!-- Inner strong glow (Rust Orange) -->
+  <line x1="32" y1="8" x2="32" y2="56" stroke="#E06C75" stroke-width="4" stroke-opacity="0.8" stroke-linecap="round" />
   
   <!-- Core bright light of the beam -->
   <line x1="32" y1="12" x2="32" y2="52" stroke="#ffffff" stroke-width="1.5" stroke-linecap="round" />
