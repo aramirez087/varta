@@ -559,18 +559,30 @@ impl Tracker {
     fn find_evictable_slot(&mut self, now_ns: u64, threshold_ns: u64) -> Option<usize> {
         let evict_threshold = threshold_ns.saturating_mul(EVICTION_MULTIPLIER as u64);
 
+        // Track whether any windowed scan actually engaged. The
+        // `eviction_scan_truncated` counter exists to tell operators that the
+        // window cap was the limiting factor; ticking it on a fast-bail (no
+        // stalled slots → strict pass skipped) conflates two distinct failure
+        // modes and makes the metric useless for tuning
+        // `--eviction-scan-window`.
+        let mut scanned = false;
+
         // Strict pass — cheap bail when no slots have stalled yet.
         if self.stall_emitted_count > 0 {
+            scanned = true;
             if let Some(idx) = self.scan_window(now_ns, evict_threshold, true) {
                 return Some(idx);
             }
         }
         if self.eviction_policy == EvictionPolicy::Balanced {
+            scanned = true;
             if let Some(idx) = self.scan_window(now_ns, evict_threshold, false) {
                 return Some(idx);
             }
         }
-        self.eviction_scan_truncated = self.eviction_scan_truncated.saturating_add(1);
+        if scanned {
+            self.eviction_scan_truncated = self.eviction_scan_truncated.saturating_add(1);
+        }
         None
     }
 
@@ -854,6 +866,9 @@ mod tests {
         assert_eq!(result, Update::CapacityExceeded);
         // Cursor must NOT have advanced through the table (fast-bail path).
         assert_eq!(t.eviction_scan_cursor, 0);
+        // Fast-bail must NOT increment the truncated counter — the metric is
+        // reserved for "scan ran the full window and still found no victim".
+        assert_eq!(t.take_eviction_scan_truncated(), 0);
     }
 
     /// drain_stalled_slots marks slots; counter must reflect that, and the
@@ -1026,8 +1041,10 @@ mod tests {
         assert_eq!(observed, t.stall_emitted_count);
     }
 
-    /// Acceptance check: scan-truncated counter increments only when we
-    /// run the full window without finding a victim.
+    /// Acceptance check: scan-truncated counter increments only when the
+    /// bounded window scan actually ran and still found no victim. A
+    /// fast-bail (no slots stall_emitted) must NOT tick the counter — see
+    /// `find_evictable_slot_returns_none_when_no_stalls_emitted`.
     #[test]
     fn scan_truncated_counter_increments_on_dry_scan() {
         let mut t = Tracker::new(32, EvictionPolicy::Strict, DEFAULT_EVICTION_SCAN_WINDOW);
@@ -1038,11 +1055,15 @@ mod tests {
                 Update::Inserted
             );
         }
-        // Table full, no stalls emitted → strict bails, balanced not used →
-        // counter still increments since we returned None at capacity.
+        // Mark every slot stall_emitted, but with silence below the 10×
+        // eviction threshold so no slot qualifies as a victim. This forces
+        // the strict scan to engage and exit empty-handed — the only case
+        // where the truncated counter should tick.
+        t.drain_stalled_slots(threshold_ns * 2, threshold_ns, |_, _, _, _, _| {});
+        assert_eq!(t.stall_emitted_count, 32);
         let _ = t.record(
             &frame(99_999, 1),
-            threshold_ns * 100,
+            threshold_ns * 5,
             threshold_ns,
             ORIGIN,
             None,

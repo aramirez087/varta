@@ -249,43 +249,73 @@ impl SecureUdpTransport {
         self.iv_prefix_index = value;
     }
 
-    /// Advance the AEAD nonce state and return the `iv_counter` value the
-    /// next frame should use. Three branches, in order:
+}
+
+/// Speculative result of [`SecureUdpTransport::advance_nonce`]. Carries the
+/// values the next frame should use **without** committing them to `self`.
+/// The caller in [`BeatTransport::send`] commits to `self` only after the
+/// kernel accepts the datagram, preserving the commit-on-success contract
+/// across the wrap boundary.
+///
+/// The `Reconnected` arm is a deliberate exception: `reconnect()` performs
+/// an irreversible socket re-bind and OS entropy read, so its side effects
+/// cannot be deferred to send-success. That arm only fires after `2^64`
+/// beats (~584M years at 1 kHz), so the impact is purely theoretical.
+#[must_use = "NonceAdvance must be committed to self on send-success"]
+enum NonceAdvance {
+    /// Common case — `iv_counter.checked_add(1)` succeeded. Only
+    /// `iv_counter` needs to be committed on send-success.
+    Simple { counter: u32 },
+    /// Counter wrap — `iv_counter` exhausted but `iv_prefix_index` can
+    /// still advance. The HKDF expansion ran into the local `next_prefix`;
+    /// none of `self.iv_prefix_index` / `self.iv_prefix` have been mutated.
+    /// Committing requires writing all three fields.
+    Wrap {
+        counter: u32,
+        next_prefix_index: u32,
+        next_prefix: [u8; 8],
+    },
+    /// Doubly-exhausted — `reconnect()` already mutated `self.sock`,
+    /// `self.iv_session_salt`, `self.iv_prefix`, and zeroed both counters.
+    /// Only the post-reconnect `iv_counter` (1) remains to commit.
+    Reconnected { counter: u32 },
+}
+
+impl SecureUdpTransport {
+    /// Speculatively compute the values the next frame should use, without
+    /// committing them to `self`. Three branches, in order:
     ///
-    /// 1. **Common case** — `iv_counter.checked_add(1)` succeeds; return it.
-    /// 2. **Counter wrap** — `iv_counter` exhausted but `iv_prefix_index`
-    ///    can still advance. Bump the index, re-derive `iv_prefix` via
-    ///    HKDF (no entropy syscall — see module docs), return `1`.
+    /// 1. **Common case** — `iv_counter.checked_add(1)` succeeds.
+    /// 2. **Counter wrap** — derive a fresh prefix via HKDF into a local;
+    ///    `self.iv_prefix_index` / `self.iv_prefix` are **not** mutated.
+    ///    The caller commits on send-success. This is the bug-fix path:
+    ///    a failed `send(2)` at the wrap boundary previously burned a
+    ///    prefix index per retry and ran HKDF on every retry. Now the
+    ///    same `next_index` / `next_prefix` are recomputed on retry —
+    ///    wasteful but no longer burns prefix space.
     /// 3. **Doubly-exhausted** — both `u32`s exhausted (`2^64` nonces,
-    ///    ~584M years at 1 kHz). Fall back to [`Self::reconnect`] — the
-    ///    documented manual escape hatch — which refreshes the salt and
-    ///    zeroes both counters; return `1` for the first beat under the
-    ///    fresh session.
-    ///
-    /// Linear control flow — no recursion into `send`. The `debug_assert`s
-    /// guard against a future regression that breaks `reconnect()`'s
-    /// reset contract.
-    fn advance_nonce(&mut self) -> io::Result<u32> {
+    ///    ~584M years at 1 kHz). Fall back to [`Self::reconnect`]; that
+    ///    side effect *is* committed eagerly because socket re-bind and
+    ///    OS entropy read are irreversible.
+    fn advance_nonce(&mut self) -> io::Result<NonceAdvance> {
         if let Some(n) = self.iv_counter.checked_add(1) {
-            return Ok(n);
+            return Ok(NonceAdvance::Simple { counter: n });
         }
-        // AEAD counter exhausted — rotate the per-session IV prefix via
-        // HKDF derivation. No OS entropy syscall: the session salt was
-        // sampled once at connect() and the KDF gives us cryptographically
-        // independent prefixes.
         if let Some(next_index) = self.iv_prefix_index.checked_add(1) {
-            self.iv_prefix_index = next_index;
-            self.iv_prefix = varta_vlp::crypto::kdf::derive_iv_prefix(
-                &self.iv_session_salt,
-                self.iv_prefix_index,
-            )
-            .map_err(|_| io::Error::new(io::ErrorKind::Other, "key derivation failure"))?;
-            return Ok(1);
+            let next_prefix =
+                varta_vlp::crypto::kdf::derive_iv_prefix(&self.iv_session_salt, next_index)
+                    .map_err(|_| {
+                        io::Error::new(io::ErrorKind::Other, "key derivation failure")
+                    })?;
+            return Ok(NonceAdvance::Wrap {
+                counter: 1,
+                next_prefix_index: next_index,
+                next_prefix,
+            });
         }
-        // Prefix index also exhausted (2^64 nonces — ~584M years at 1
-        // kHz). Fall back to the documented manual escape hatch: refresh
-        // the salt via the entropy chain. Linear control flow — replaces
-        // the prior `return self.send(buf)` recursion.
+        // Prefix index also exhausted. Fall back to the manual escape
+        // hatch; reconnect's side effects are eagerly committed because a
+        // socket re-bind and OS entropy read cannot be deferred.
         self.reconnect()?;
         debug_assert_eq!(
             self.iv_counter, 0,
@@ -295,24 +325,32 @@ impl SecureUdpTransport {
             self.iv_prefix_index, 0,
             "reconnect() must zero iv_prefix_index — see secure_transport module docs"
         );
-        Ok(1)
+        Ok(NonceAdvance::Reconnected { counter: 1 })
     }
 }
 
 impl BeatTransport for SecureUdpTransport {
     fn send(&mut self, buf: &[u8; 32]) -> io::Result<usize> {
-        // Speculatively compute the next counter. `advance_nonce` may still
-        // mutate `self.iv_prefix`/`self.iv_prefix_index` for the wrap path
-        // and re-bind the socket via `reconnect()` for the doubly-exhausted
-        // path — those side effects are structural and cannot be deferred.
-        // The common path (`checked_add` succeeds, > 99.999...% of real
-        // calls) is purely functional here: `pending_counter` lives as a
-        // local until the kernel confirms it accepted the datagram.
-        let pending_counter = self.advance_nonce()?;
+        // Speculatively compute what the next frame should use. For the
+        // common path and the wrap path, no `self.*` IV state has been
+        // mutated yet — those mutations are deferred to send-success
+        // below. Only the doubly-exhausted (`Reconnected`) path eagerly
+        // mutates, because socket re-bind and OS entropy reads cannot be
+        // unwound.
+        let advance = self.advance_nonce()?;
+        let (pending_counter, pending_prefix) = match &advance {
+            NonceAdvance::Simple { counter } => (*counter, self.iv_prefix),
+            NonceAdvance::Wrap {
+                counter,
+                next_prefix,
+                ..
+            } => (*counter, *next_prefix),
+            NonceAdvance::Reconnected { counter } => (*counter, self.iv_prefix),
+        };
 
-        // Build 12-byte nonce: iv_prefix (8) || pending_counter (4) LE
+        // Build 12-byte nonce: pending_prefix (8) || pending_counter (4) LE
         let mut nonce = [0u8; NONCE_BYTES];
-        nonce[..8].copy_from_slice(&self.iv_prefix);
+        nonce[..8].copy_from_slice(&pending_prefix);
         nonce[8..12].copy_from_slice(&pending_counter.to_le_bytes());
 
         let result = if self.is_master_mode {
@@ -320,7 +358,7 @@ impl BeatTransport for SecureUdpTransport {
             // [agent_pid: 4] [iv_random: 8] [iv_counter: 4] [ciphertext: 32] [tag: 16]
             //
             // The on-wire `iv_random` field is now sourced from the
-            // KDF-derived `iv_prefix` cache — byte budget preserved.
+            // KDF-derived prefix — byte budget preserved.
             //
             // agent_pid is read fresh each beat (never cached — see cerebrum
             // 2026-05-11) and bound as AAD so tampering the PID prefix fails
@@ -333,7 +371,7 @@ impl BeatTransport for SecureUdpTransport {
 
             let mut frame = [0u8; SECURE_FRAME_MASTER_LEN];
             frame[0..4].copy_from_slice(&agent_pid_bytes);
-            frame[4..12].copy_from_slice(&self.iv_prefix);
+            frame[4..12].copy_from_slice(&pending_prefix);
             frame[12..16].copy_from_slice(&pending_counter.to_le_bytes());
             frame[16..48].copy_from_slice(&ciphertext);
             frame[48..64].copy_from_slice(&tag);
@@ -346,7 +384,7 @@ impl BeatTransport for SecureUdpTransport {
                 .map_err(|_| io::Error::new(io::ErrorKind::Other, "AEAD seal failure"))?;
 
             let mut frame = [0u8; SECURE_FRAME_LEN];
-            frame[..8].copy_from_slice(&self.iv_prefix);
+            frame[..8].copy_from_slice(&pending_prefix);
             frame[8..12].copy_from_slice(&pending_counter.to_le_bytes());
             frame[12..44].copy_from_slice(&ciphertext);
             frame[44..60].copy_from_slice(&tag);
@@ -354,14 +392,33 @@ impl BeatTransport for SecureUdpTransport {
             self.sock.send(&frame)
         };
 
-        // Commit the counter advance only when the kernel accepted the
-        // datagram. `WouldBlock`/`EAGAIN` means the ciphertext never escaped
-        // the process, so the next call can reuse `pending_counter` with no
-        // observable nonce reuse on the wire. UDP `send(2)` is datagram-
-        // atomic — either the full datagram is queued or nothing is — so
-        // there is no "half-sent under this nonce" state to reason about.
+        // Commit-on-success — for all three branches.
+        //
+        // `WouldBlock` / `ENOBUFS` means the ciphertext never escaped the
+        // process. On the wrap path, the speculative `next_prefix_index` /
+        // `next_prefix` are dropped on failure; the next call re-enters
+        // `advance_nonce`, recomputes the same `next_index` from the
+        // unchanged `iv_session_salt`, and tries again. UDP `send(2)` is
+        // datagram-atomic, so there is no "half-sent under this nonce"
+        // state to reason about.
         if result.is_ok() {
-            self.iv_counter = pending_counter;
+            match advance {
+                NonceAdvance::Simple { counter } => {
+                    self.iv_counter = counter;
+                }
+                NonceAdvance::Wrap {
+                    counter,
+                    next_prefix_index,
+                    next_prefix,
+                } => {
+                    self.iv_prefix_index = next_prefix_index;
+                    self.iv_prefix = next_prefix;
+                    self.iv_counter = counter;
+                }
+                NonceAdvance::Reconnected { counter } => {
+                    self.iv_counter = counter;
+                }
+            }
         }
         result
     }
@@ -722,9 +779,16 @@ mod tests {
     /// wrap must leave the salt unchanged.  Any future regression that
     /// re-introduces an entropy call on `send()` will flip the salt and
     /// fail this assertion.
+    ///
+    /// Sends target a real UDP receiver so the commit-on-success path runs
+    /// deterministically — sending to a closed port can yield async ICMP
+    /// `ECONNREFUSED` on subsequent calls, which after the commit-on-success
+    /// fix would (correctly) hold prefix_index back and confuse this test.
     #[test]
     fn wrap_path_does_not_call_read_iv_session_salt() {
-        let addr = SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::LOCALHOST, 9876, 0, 0));
+        let receiver = std::net::UdpSocket::bind((Ipv6Addr::LOCALHOST, 0)).expect("bind receiver");
+        let port = receiver.local_addr().expect("local_addr").port();
+        let addr = SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::LOCALHOST, port, 0, 0));
         let key = Key::from_bytes([0u8; 32]);
         let mut tx = SecureUdpTransport::connect(addr, key).expect("connect");
 
@@ -733,7 +797,8 @@ mod tests {
         for expected_index in 1..=4 {
             tx.set_iv_counter_for_test(u32::MAX);
             let buf = [0u8; 32];
-            let _ = <SecureUdpTransport as BeatTransport>::send(&mut tx, &buf);
+            let r = <SecureUdpTransport as BeatTransport>::send(&mut tx, &buf);
+            assert!(r.is_ok(), "send #{expected_index} failed: {r:?}");
             assert_eq!(
                 tx.iv_session_salt, salt_snapshot,
                 "salt mutated during wrap rotation (regression)"
@@ -901,6 +966,69 @@ mod tests {
             tx.iv_prefix_index_for_test(),
             prefix_index_before,
             "iv_prefix_index mutated on failed send"
+        );
+    }
+
+    /// Regression: a failed `send(2)` at the AEAD counter-wrap boundary
+    /// must NOT advance `iv_prefix_index` / `iv_prefix`. The previous
+    /// implementation mutated those fields eagerly inside `advance_nonce`,
+    /// so every retry under sustained kernel back-pressure (`ENOBUFS` /
+    /// `WouldBlock` at the wrap moment) burned a fresh prefix index and
+    /// ran HKDF on the beat path — violating both the commit-on-success
+    /// contract and the "no expensive ops on the beat path" invariant.
+    #[test]
+    fn wrap_failed_send_does_not_burn_prefix_index() {
+        use std::mem;
+        use std::net::{Ipv4Addr, UdpSocket};
+
+        let addr = SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::LOCALHOST, 9876, 0, 0));
+        let key = Key::from_bytes([0u8; 32]);
+        let mut tx = SecureUdpTransport::connect(addr, key).expect("connect");
+
+        let prefix_before = tx.iv_prefix_for_test();
+        let prefix_index_before = tx.iv_prefix_index_for_test();
+        let salt_before = tx.iv_session_salt;
+
+        // Stage the wrap: counter at u32::MAX so the next advance_nonce
+        // takes the wrap branch.
+        tx.set_iv_counter_for_test(u32::MAX);
+
+        // Swap the connected socket for an unconnected one so every send
+        // fails with ENOTCONN / EDESTADDRREQ.
+        let unconnected =
+            UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind unconnected UDP socket");
+        unconnected
+            .set_nonblocking(true)
+            .expect("set_nonblocking on unconnected");
+        let _replaced = mem::replace(&mut tx.sock, unconnected);
+
+        let buf = [0u8; 32];
+        for attempt in 0..5 {
+            let r = <SecureUdpTransport as BeatTransport>::send(&mut tx, &buf);
+            assert!(
+                r.is_err(),
+                "send #{attempt} on unconnected socket unexpectedly succeeded: {r:?}"
+            );
+        }
+
+        assert_eq!(
+            tx.iv_counter,
+            u32::MAX,
+            "iv_counter must stay at u32::MAX across failed wrap sends"
+        );
+        assert_eq!(
+            tx.iv_prefix_index_for_test(),
+            prefix_index_before,
+            "iv_prefix_index must NOT advance on failed wrap send (commit-on-success)"
+        );
+        assert_eq!(
+            tx.iv_prefix_for_test(),
+            prefix_before,
+            "iv_prefix must NOT rotate on failed wrap send (commit-on-success)"
+        );
+        assert_eq!(
+            tx.iv_session_salt, salt_before,
+            "iv_session_salt must not change on failed wrap send"
         );
     }
 
