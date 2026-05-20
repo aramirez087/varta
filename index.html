@@ -34,7 +34,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link
-    href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&display=swap"
+    href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap"
     rel="stylesheet">
   <link rel="stylesheet" href="style.css">
 
@@ -86,8 +86,14 @@
         <p class="hero-sub">32-byte heartbeats over Unix Domain Sockets and UDP. No dependencies. No allocations.
           Built for people who care about their p99s.</p>
         <div class="hero-cta">
-          <button class="cta-primary" id="copy-cargo" data-copy="cargo add varta-client">
-            <span class="cta-prompt">$</span> cargo add varta-client
+          <button class="cta-primary" id="copy-cargo" data-copy="cargo add varta-client" aria-label="Copy Cargo Install Command">
+            <span class="cta-prompt">$</span>
+            <span class="cta-code">cargo add varta-client</span>
+            <span class="cta-divider" aria-hidden="true"></span>
+            <span class="cta-icon-wrapper">
+              <svg class="copy-icon" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+              <svg class="check-icon" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"></polyline></svg>
+            </span>
             <span class="cta-hint">click to copy</span>
           </button>
           <div class="hero-buttons">
@@ -111,24 +117,26 @@
           <span class="terminal-title">varta-watch</span>
           <span class="terminal-spacer" aria-hidden="true"></span>
         </div>
-        <div class="terminal-body">
-          <div class="terminal-line"><span class="t-prompt">$</span> <span class="t-cmd">varta-watch</span> <span
-              class="t-flag">--socket</span> /tmp/varta.sock <span class="t-flag">--udp-port</span> <span class="t-num">9000</span> <span class="t-flag">--key-file</span> <span class="t-path">/tmp/varta.key</span></div>
-          <div class="terminal-line"><span class="t-info">&bull;</span> listening on <span
-              class="t-path">/tmp/varta.sock</span> &amp; <span class="t-path">0.0.0.0:9000 (secure UDP)</span></div>
-          <div class="terminal-line"><span class="t-info">&bull;</span> pid <span class="t-num">4821</span> &mdash;
-            status: <span class="t-ok">Ok</span> &mdash; last beat: <span class="t-num">12ms</span> ago</div>
-          <div class="terminal-line"><span class="t-info">&bull;</span> pid <span class="t-num">4821</span> &mdash;
-            status: <span class="t-ok">Ok</span> &mdash; last beat: <span class="t-num">8ms</span> ago</div>
-          <div class="terminal-line"><span class="t-warn">&bull;</span> pid <span class="t-num">4821</span> &mdash;
-            <span class="t-warn">STALL DETECTED</span> &mdash; silence: <span class="t-num">2104ms</span>
+        <div class="terminal-body" id="terminal-body">
+          <div class="terminal-output" id="terminal-output">
+            <div class="terminal-line"><span class="t-prompt">$</span> <span class="t-cmd">varta-watch</span> <span
+                class="t-flag">--socket</span> /tmp/varta.sock <span class="t-flag">--udp-port</span> <span class="t-num">9000</span> <span class="t-flag">--key-file</span> <span class="t-path">/tmp/varta.key</span></div>
+            <div class="terminal-line"><span class="t-info">&bull;</span> listening on <span
+                class="t-path">/tmp/varta.sock</span> &amp; <span class="t-path">0.0.0.0:9000 (secure UDP)</span></div>
+            <div class="terminal-line"><span class="t-info">&bull;</span> pid <span class="t-num">4821</span> &mdash;
+              status: <span class="t-ok">Ok</span> &mdash; last beat: <span class="t-num">12ms</span> ago</div>
+            <div class="terminal-line"><span class="t-info">&bull;</span> pid <span class="t-num">4821</span> &mdash;
+              status: <span class="t-ok">Ok</span> &mdash; last beat: <span class="t-num">8ms</span> ago</div>
+            <div class="terminal-line"><span class="t-warn">&bull;</span> pid <span class="t-num">4821</span> &mdash;
+              <span class="t-warn">STALL DETECTED</span> &mdash; silence: <span class="t-num">2104ms</span>
+            </div>
+            <div class="terminal-line"><span class="t-warn">&rarr;</span> running recovery: <span class="t-cmd">systemctl
+                restart my-agent</span></div>
+            <div class="terminal-line"><span class="t-info">&bull;</span> metrics &rarr; <span
+                class="t-path">http://127.0.0.1:9100/metrics</span></div>
+            <div class="terminal-line terminal-line--cursor"><span class="t-prompt">$</span><span
+                class="t-cursor">_</span></div>
           </div>
-          <div class="terminal-line"><span class="t-warn">&rarr;</span> running recovery: <span class="t-cmd">systemctl
-              restart my-agent</span></div>
-          <div class="terminal-line"><span class="t-info">&bull;</span> metrics &rarr; <span
-              class="t-path">http://127.0.0.1:9100/metrics</span></div>
-          <div class="terminal-line terminal-line--cursor"><span class="t-prompt">$</span><span
-              class="t-cursor">_</span></div>
         </div>
       </div>
     </section>
@@ -202,22 +210,19 @@
       <p class="section-label">03 &mdash; Workspace</p>
       <h2 class="section-title">Three crates. Zero deps.</h2>
       <div class="crate-list">
-        <a href="https://github.com/aramirez087/varta/tree/main/crates/varta-vlp" class="crate-row" target="_blank"
-          rel="noopener">
+        <a href="/book/spec/vlp.html" class="crate-row">
           <span class="crate-name">varta-vlp</span>
           <span class="crate-dots"></span>
           <span class="crate-arrow">&rarr;</span>
           <span class="crate-desc">32-byte wire protocol &mdash; Frame, Status, encode/decode, AEAD crypto</span>
         </a>
-        <a href="https://github.com/aramirez087/varta/tree/main/crates/varta-client" class="crate-row" target="_blank"
-          rel="noopener">
+        <a href="/book/architecture/vlp-transports.html#agent-side-varta-client" class="crate-row">
           <span class="crate-name">varta-client</span>
           <span class="crate-dots"></span>
           <span class="crate-arrow">&rarr;</span>
           <span class="crate-desc">Agent API &mdash; Varta::connect(), beat(), secure UDP, optional panic hook</span>
         </a>
-        <a href="https://github.com/aramirez087/varta/tree/main/crates/varta-watch" class="crate-row" target="_blank"
-          rel="noopener">
+        <a href="/book/operations/install.html" class="crate-row">
           <span class="crate-name">varta-watch</span>
           <span class="crate-dots"></span>
           <span class="crate-arrow">&rarr;</span>
