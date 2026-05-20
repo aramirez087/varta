@@ -486,26 +486,37 @@ pub(super) fn iteration_budget_holds_under_slow_scrape_load() {
     for h in scraper_handles {
         let _ = h.join();
     }
-    // Give the daemon one more tick to drain its accept queue and refresh
-    // the histogram.
-    std::thread::sleep(Duration::from_millis(200));
-
-    let (status, body) = http_get(prom_addr, "/metrics").expect("final /metrics scrape");
-    assert_eq!(
-        status, 200,
-        "final scrape did not return 200; body:\n{body}"
-    );
-
-    // 1. Stall detection MUST have fired despite the scrape storm.
+    // 1. Stall detection MUST have fired despite the scrape storm. Scrapes
+    //    are cached for one second, and the slow-scraper pool can refresh
+    //    that cache immediately before it stops, so poll until a fresh body
+    //    exposes the stall instead of trusting the first assertion scrape.
     let stalls_needle = format!("varta_stalls_total{{pid=\"{agent_pid}\"}} ");
-    let stall_line = body
-        .lines()
-        .find(|l| l.starts_with(&stalls_needle))
+    let stall_count_from = |body: &str| -> Option<u64> {
+        body.lines()
+            .find(|l| l.starts_with(&stalls_needle))
+            .and_then(|line| line[stalls_needle.len()..].trim().parse().ok())
+    };
+    let mut last_body = String::new();
+    let body = wait_until_with_timeout(
+        || match http_get(prom_addr, "/metrics") {
+            Ok((200, body)) => {
+                let stall_count = stall_count_from(&body).unwrap_or(0);
+                last_body = body.clone();
+                (stall_count >= 1).then_some(body)
+            }
+            Ok((_status, body)) => {
+                last_body = body;
+                None
+            }
+            Err(_) => None,
+        },
+        Duration::from_secs(3),
+    )
+    .unwrap_or_else(|| {
+        panic!("stall detection starved under scrape load; last body:\n{last_body}")
+    });
+    let stall_count = stall_count_from(&body)
         .unwrap_or_else(|| panic!("/metrics missing {stalls_needle:?}; body:\n{body}"));
-    let stall_count: u64 = stall_line[stalls_needle.len()..]
-        .trim()
-        .parse()
-        .unwrap_or_else(|_| panic!("could not parse stall count from {stall_line:?}"));
     assert!(
         stall_count >= 1,
         "stall detection starved under scrape load: got {stall_count} stalls; body:\n{body}"
@@ -694,16 +705,23 @@ pub(super) fn serve_pending_seconds_separates_scrape_from_beat_path() {
         "iteration_count ({iter_count}) and serve_pending_count ({sp_count}) drifted by {diff}; body:\n{body}"
     );
 
-    // 4. Scrape-budget exceeded fires under the 50 ms budget. The
-    //    partial-GET pool reliably drives serve_pending to its 200 ms
-    //    structural cap on at least one iteration.
+    // 4. The partial-GET pool exhausts the bounded per-tick serve window.
+    //    The observer-specific soft-budget counter below is advisory wall
+    //    time; with non-blocking accepted sockets it may stay at zero on a
+    //    fast host even while the hard connection budget is doing work.
+    let hard_budget_exhausted = parse_metric_value(&body, "varta_scrape_budget_exhausted_total")
+        .unwrap_or_else(|| panic!("missing varta_scrape_budget_exhausted_total; body:\n{body}"));
+    assert!(
+        hard_budget_exhausted >= 1,
+        "partial-GET pool did not exhaust the serve window; body:\n{body}"
+    );
     let sb_exceeded = parse_metric_value(&body, "varta_observer_scrape_budget_exceeded_total")
         .unwrap_or_else(|| {
             panic!("missing varta_observer_scrape_budget_exceeded_total; body:\n{body}")
         });
     assert!(
-        sb_exceeded >= 1,
-        "scrape_budget_exceeded_total stayed at 0 under partial-GET pool with 50 ms budget; body:\n{body}"
+        sb_exceeded <= hard_budget_exhausted,
+        "soft scrape-budget overrun count ({sb_exceeded}) exceeded hard budget exhaustion count ({hard_budget_exhausted}); body:\n{body}"
     );
 
     // 5. +Inf bucket equals count — sanity for cumulative histogram.
@@ -780,8 +798,22 @@ pub(super) fn alert_rules_match_live_metrics() {
     // tracker / iteration histograms for our beats.
     std::thread::sleep(Duration::from_millis(300));
 
-    let (status, body) = http_get(prom_addr, "/metrics").expect("/metrics scrape");
-    assert_eq!(status, 200, "/metrics returned {status}; body:\n{body}");
+    let mut last_body = String::new();
+    let body = wait_until_with_timeout(
+        || match http_get(prom_addr, "/metrics") {
+            Ok((200, body)) => {
+                last_body = body.clone();
+                body.contains("varta_watch_uptime_seconds").then_some(body)
+            }
+            Ok((_status, body)) => {
+                last_body = body;
+                None
+            }
+            Err(_) => None,
+        },
+        Duration::from_secs(3),
+    )
+    .unwrap_or_else(|| panic!("/metrics did not render observer metrics; last body:\n{last_body}"));
 
     // Load the alert-rules YAML from the repo. CARGO_MANIFEST_DIR is
     // `crates/varta-tests`; the repo root is two parents up.
@@ -854,7 +886,8 @@ pub(super) fn alert_rules_match_live_metrics() {
          Fix: either (a) add the metric to the exporter, (b) remove the alert \
          from observability/alerts/varta.rules.yml, or (c) gate it on a \
          Cargo feature this test does not enable.\n\
-         (Total alert metrics: {}, missing: {}.)",
+         (Total alert metrics: {}, missing: {}.)\n\
+         Last /metrics body:\n{body}",
         missing.len(),
         alert_metrics.len(),
         missing.len(),

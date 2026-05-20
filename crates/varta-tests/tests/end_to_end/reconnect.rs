@@ -1,10 +1,8 @@
 //! Client reconnect and signal handling tests.
 
-use super::{
-    locate_watch_binary, spawn_watch, wait_until, wait_until_with_timeout, ChildGuard, TempDir,
-};
+use super::{spawn_watch, wait_until, wait_until_with_timeout, ChildGuard, TempDir};
 use std::net::TcpStream;
-use std::process::{Command, Stdio};
+use std::process::Command;
 use std::time::Duration;
 use varta_client::{BeatOutcome, Status, Varta};
 
@@ -21,6 +19,8 @@ pub(super) fn client_reconnect_after_observer_restart() {
         socket.to_str().unwrap(),
         "--threshold-ms",
         "5000",
+        "--max-beat-rate",
+        "0",
         "--prom-addr",
         "127.0.0.1:0",
         "--shutdown-after-secs",
@@ -80,6 +80,8 @@ pub(super) fn client_reconnect_after_observer_restart() {
         socket.to_str().unwrap(),
         "--threshold-ms",
         "5000",
+        "--max-beat-rate",
+        "0",
         "--prom-addr",
         "127.0.0.1:0",
         "--shutdown-after-secs",
@@ -209,32 +211,19 @@ pub(super) fn client_auto_reconnect_after_dropped() {
 /// then sends SIGTERM. Asserts the observer exits cleanly (exit code 0)
 /// and the socket file is cleaned up.
 pub(super) fn signal_handling_graceful_shutdown() {
-    use std::io::{BufRead, BufReader};
-
     let tmp = TempDir::new("sigterm");
     let socket = tmp.path().join("varta.sock");
 
     #[cfg(unix)]
     {
-        let mut child = Command::new(locate_watch_binary())
-            .args([
-                "--socket",
-                socket.to_str().unwrap(),
-                "--threshold-ms",
-                "5000",
-                "--prom-addr",
-                "127.0.0.1:0",
-            ])
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("spawn varta-watch without --shutdown-after-secs");
-
-        // Read the prom addr from stdout
-        let stdout = child.stdout.take().expect("stdout was piped");
-        let mut reader = BufReader::new(stdout);
-        let mut line = String::new();
-        let _ = reader.read_line(&mut line).expect("read prom addr");
+        let (mut child, _prom_addr) = spawn_watch(&[
+            "--socket",
+            socket.to_str().unwrap(),
+            "--threshold-ms",
+            "5000",
+            "--prom-addr",
+            "127.0.0.1:0",
+        ]);
 
         assert!(
             wait_until(|| socket.exists(), Duration::from_secs(3)),

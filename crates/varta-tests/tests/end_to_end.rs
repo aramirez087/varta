@@ -78,8 +78,9 @@ fn main() -> ExitCode {
         return ExitCode::SUCCESS;
     }
 
+    let total = expected_test_count();
     let mut failed = 0u32;
-    eprintln!("running 19 tests");
+    eprintln!("running {total} tests");
     failed += run_one(
         "client_to_observer_to_recovery_full_loop",
         basic::client_to_observer_to_recovery_full_loop,
@@ -196,21 +197,6 @@ fn main() -> ExitCode {
         );
     }
 
-    let total = 20u32
-        + if cfg!(feature = "udp") { 1 } else { 0 }
-        + if cfg!(feature = "secure-udp") { 1 } else { 0 }
-        + if cfg!(all(feature = "secure-udp", feature = "test-hooks")) {
-            1
-        } else {
-            0
-        }
-        + if cfg!(all(feature = "secure-udp", target_family = "unix")) {
-            1
-        } else {
-            0
-        }
-        + 1
-        + if cfg!(target_os = "linux") { 1 } else { 0 };
     let passed = total - failed;
     eprintln!(
         "\ntest result: {} {} passed; {} failed; 0 ignored",
@@ -227,17 +213,41 @@ fn main() -> ExitCode {
 
 const PER_TEST_TIMEOUT: Duration = Duration::from_secs(30);
 
+fn expected_test_count() -> u32 {
+    21u32
+        + if cfg!(feature = "udp") { 1 } else { 0 }
+        + if cfg!(feature = "secure-udp") { 1 } else { 0 }
+        + if cfg!(all(feature = "secure-udp", feature = "test-hooks")) {
+            1
+        } else {
+            0
+        }
+        + if cfg!(all(feature = "secure-udp", target_family = "unix")) {
+            1
+        } else {
+            0
+        }
+        + if cfg!(target_os = "linux") { 1 } else { 0 }
+}
+
 fn run_one(name: &str, f: fn()) -> u32 {
     eprintln!("test {name} ... starting");
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
-        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
-        let _ = tx.send(());
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+        let _ = tx.send(result);
     });
     match rx.recv_timeout(PER_TEST_TIMEOUT) {
-        Ok(()) => {
+        Ok(Ok(())) => {
             eprintln!("test {name} ... ok");
             0
+        }
+        Ok(Err(payload)) => {
+            eprintln!(
+                "test {name} ... FAILED ({})",
+                panic_payload_message(payload.as_ref())
+            );
+            1
         }
         Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
             eprintln!(
@@ -250,6 +260,16 @@ fn run_one(name: &str, f: fn()) -> u32 {
             eprintln!("test {name} ... FAILED");
             1
         }
+    }
+}
+
+fn panic_payload_message(payload: &(dyn std::any::Any + Send)) -> &str {
+    if let Some(message) = payload.downcast_ref::<&'static str>() {
+        message
+    } else if let Some(message) = payload.downcast_ref::<String>() {
+        message.as_str()
+    } else {
+        "non-string panic payload"
     }
 }
 

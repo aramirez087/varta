@@ -30,6 +30,8 @@ pub(super) fn client_to_observer_to_recovery_full_loop() {
         &recovery_exec,
         "--recovery-debounce-ms",
         "1000",
+        "--max-beat-rate",
+        "0",
         "--prom-addr",
         "127.0.0.1:0",
         "--shutdown-after-secs",
