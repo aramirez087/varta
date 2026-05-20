@@ -2,10 +2,10 @@
   <!-- Dark rounded background matching --bg -->
   <rect width="64" height="64" rx="16" fill="#121212" />
 
-  <!-- Outer faint glow (Rust Orange) -->
+  <!-- Outer faint glow (Red) -->
   <line x1="32" y1="4" x2="32" y2="60" stroke="#E06C75" stroke-width="10" stroke-opacity="0.25" stroke-linecap="round" />
   
-  <!-- Inner strong glow (Rust Orange) -->
+  <!-- Inner strong glow (Red) -->
   <line x1="32" y1="8" x2="32" y2="56" stroke="#E06C75" stroke-width="4" stroke-opacity="0.8" stroke-linecap="round" />
   
   <!-- Core bright light of the beam -->

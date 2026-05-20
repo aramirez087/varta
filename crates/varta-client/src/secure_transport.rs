@@ -812,9 +812,16 @@ mod tests {
     /// `iv_prefix_index = 0`, `iv_counter = 1`. This exercises the path
     /// that previously recursed into `self.send(buf)`; it must now run
     /// linearly without stack growth and still produce identical state.
+    ///
+    /// Sends target a real UDP receiver so the commit-on-success path runs
+    /// deterministically — sending to a closed port can yield async ICMP
+    /// `ECONNREFUSED` on the post-reconnect send, which would hold
+    /// `iv_counter` at 0 and trip the assertion below.
     #[test]
     fn doubly_exhausted_nonce_falls_back_to_reconnect() {
-        let addr = SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::LOCALHOST, 9876, 0, 0));
+        let receiver = std::net::UdpSocket::bind((Ipv6Addr::LOCALHOST, 0)).expect("bind receiver");
+        let port = receiver.local_addr().expect("local_addr").port();
+        let addr = SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::LOCALHOST, port, 0, 0));
         let key = Key::from_bytes([0u8; 32]);
         let mut tx = SecureUdpTransport::connect(addr, key).expect("connect");
 
@@ -826,7 +833,8 @@ mod tests {
         tx.set_iv_prefix_index_for_test(u32::MAX);
 
         let buf = [0u8; 32];
-        let _ = <SecureUdpTransport as BeatTransport>::send(&mut tx, &buf);
+        let r = <SecureUdpTransport as BeatTransport>::send(&mut tx, &buf);
+        assert!(r.is_ok(), "post-reconnect send failed: {r:?}");
 
         // Salt MUST have rotated — reconnect() is the only way out of
         // doubly-exhausted state.

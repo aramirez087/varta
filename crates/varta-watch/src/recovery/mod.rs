@@ -729,31 +729,38 @@ impl Recovery {
             return RecoveryOutcome::RefusedCrossNamespace { pid };
         }
 
-        // Structural origin gate. Refuse recovery for untrusted transports.
-        if origin == BeatOrigin::NetworkUnverified {
-            self.refused_unauthenticated_source =
-                self.refused_unauthenticated_source.saturating_add(1);
-            if let Some(sink) = self.audit_sink.as_mut() {
-                sink.record_refused(&RefusedRecord {
-                    wallclock_ms: RecoveryAuditLog::wallclock_ms_now(),
-                    observer_ns: 0,
-                    agent_pid: pid,
-                    reason: "unauthenticated_transport",
-                });
+        // Structural origin gate. Default-deny by exhaustive match: any new
+        // `BeatOrigin` variant added without an explicit arm here is a
+        // compile error. CLAUDE.md hard constraint #8 — do not add a
+        // `_ =>` fallthrough; recovery must default to refused for every
+        // future variant.
+        match origin {
+            BeatOrigin::KernelAttested | BeatOrigin::OperatorAttestedTransport => {}
+            BeatOrigin::NetworkUnverified => {
+                self.refused_unauthenticated_source =
+                    self.refused_unauthenticated_source.saturating_add(1);
+                if let Some(sink) = self.audit_sink.as_mut() {
+                    sink.record_refused(&RefusedRecord {
+                        wallclock_ms: RecoveryAuditLog::wallclock_ms_now(),
+                        observer_ns: 0,
+                        agent_pid: pid,
+                        reason: "unauthenticated_transport",
+                    });
+                }
+                return RecoveryOutcome::RefusedUnauthenticatedSource { pid };
             }
-            return RecoveryOutcome::RefusedUnauthenticatedSource { pid };
-        }
-        if origin == BeatOrigin::SocketModeOnly {
-            self.refused_socket_mode_only = self.refused_socket_mode_only.saturating_add(1);
-            if let Some(sink) = self.audit_sink.as_mut() {
-                sink.record_refused(&RefusedRecord {
-                    wallclock_ms: RecoveryAuditLog::wallclock_ms_now(),
-                    observer_ns: 0,
-                    agent_pid: pid,
-                    reason: "socket_mode_only",
-                });
+            BeatOrigin::SocketModeOnly => {
+                self.refused_socket_mode_only = self.refused_socket_mode_only.saturating_add(1);
+                if let Some(sink) = self.audit_sink.as_mut() {
+                    sink.record_refused(&RefusedRecord {
+                        wallclock_ms: RecoveryAuditLog::wallclock_ms_now(),
+                        observer_ns: 0,
+                        agent_pid: pid,
+                        reason: "socket_mode_only",
+                    });
+                }
+                return RecoveryOutcome::RefusedSocketModeOnly { pid };
             }
-            return RecoveryOutcome::RefusedSocketModeOnly { pid };
         }
         // --- SAFETY GATE END ---
 
