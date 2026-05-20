@@ -420,10 +420,14 @@ impl Tracker {
                     // Detect nonce wrap: agent exhausted u64 nonce space
                     // and looped to 0.  last_nonce is near u64::MAX and
                     // the incoming nonce is near 0 — a gap this large
-                    // cannot be a genuine out-of-order beat.
+                    // cannot be a genuine out-of-order beat. Both bounds
+                    // are inclusive so the threshold-boundary case
+                    // (`last_nonce == wrap_hi`, `frame.nonce == wrap_lo`)
+                    // is treated as a wrap rather than dropped as
+                    // out-of-order.
                     let wrap_lo = NONCE_WRAP_THRESHOLD;
                     let wrap_hi = u64::MAX.saturating_sub(NONCE_WRAP_THRESHOLD);
-                    if slot.last_nonce >= wrap_hi && frame.nonce < wrap_lo {
+                    if slot.last_nonce >= wrap_hi && frame.nonce <= wrap_lo {
                         slot.last_nonce = frame.nonce;
                         slot.last_ns = now_ns;
                         slot.status = status;
@@ -482,9 +486,21 @@ impl Tracker {
                     if let Some(slot_mut) = self.entries.get_mut(evict_idx) {
                         *slot_mut = evicted_slot;
                     }
-                    // Best-effort re-pin of the old pid; if even this insert
-                    // fails the slot is logically vacant for the next call.
-                    let _ = self.pid_to_index.insert(evicted_slot.pid, evict_idx);
+                    // Best-effort re-pin of the old pid. If even this insert
+                    // fails (probe budget exhausted twice), the slot data
+                    // remains (`used = true`) but `pid_to_index` no longer
+                    // maps `evicted_slot.pid` to it — the slot is reachable
+                    // only via a future eviction sweep, which silently loses
+                    // the original agent's `last_nonce`/`stall_emitted`
+                    // identity. Tick `invariant_violations` so ops can alert.
+                    if self
+                        .pid_to_index
+                        .insert(evicted_slot.pid, evict_idx)
+                        .is_err()
+                    {
+                        self.invariant_violations =
+                            self.invariant_violations.saturating_add(1);
+                    }
                     self.capacity_exceeded = self.capacity_exceeded.saturating_add(1);
                     return Update::CapacityExceeded;
                 }
