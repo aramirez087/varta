@@ -248,7 +248,6 @@ impl SecureUdpTransport {
     pub fn set_iv_prefix_index_for_test(&mut self, value: u32) {
         self.iv_prefix_index = value;
     }
-
 }
 
 /// Speculative result of [`SecureUdpTransport::advance_nonce`]. Carries the
@@ -304,9 +303,7 @@ impl SecureUdpTransport {
         if let Some(next_index) = self.iv_prefix_index.checked_add(1) {
             let next_prefix =
                 varta_vlp::crypto::kdf::derive_iv_prefix(&self.iv_session_salt, next_index)
-                    .map_err(|_| {
-                        io::Error::new(io::ErrorKind::Other, "key derivation failure")
-                    })?;
+                    .map_err(|_| io::Error::new(io::ErrorKind::Other, "key derivation failure"))?;
             return Ok(NonceAdvance::Wrap {
                 counter: 1,
                 next_prefix_index: next_index,

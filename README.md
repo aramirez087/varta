@@ -34,12 +34,14 @@ A 32-byte heartbeat protocol for distributed local agents and networked clusters
 
 ## Official clients
 
-| Language | Package                | Status | Source                       |
-| -------- | ---------------------- | ------ | ---------------------------- |
-| Rust     | `varta-client` (path)  | Stable | [`crates/varta-client/`](crates/varta-client/) |
-| Python   | `pip install varta`    | Beta   | [`clients/python/`](clients/python/) |
-| Go       | _planned_              |        |                              |
-| Node.js  | _planned_              |        |                              |
+| Language | Package                                             | Status | Source                                         |
+| -------- | --------------------------------------------------- | ------ | ---------------------------------------------- |
+| Rust     | `varta-client` (path)                               | Stable | [`crates/varta-client/`](crates/varta-client/) |
+| Python   | `pip install varta`                                 | Beta   | [`clients/python/`](clients/python/)           |
+| Go       | `go get github.com/aramirez087/Varta/clients/go`    | Beta   | [`clients/go/`](clients/go/)                   |
+| Node.js  | `npm install @varta-health/client`                  | Beta   | [`clients/node/`](clients/node/)               |
+| .NET     | `dotnet add package Varta.Client`                   | Beta   | [`clients/dotnet/`](clients/dotnet/)           |
+| JVM      | `implementation("health.varta:varta-client:0.1.0")` | Beta   | [`clients/java/`](clients/java/)               |
 
 The wire protocol (`VLP v0.2`) is governed by
 [`book/src/spec/`](book/src/spec/) and the cross-language conformance

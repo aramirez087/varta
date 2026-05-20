@@ -52,7 +52,7 @@ Preparing for formal certification standards (IEC 62304 Class C,
 ISO 26262, DO-178C).
 
 - [ ] **`cargo-geiger`** and custom safety-profile auditing in CI.
-- [ ] **Additional language clients** — Go, JVM, Node.
+- [x] **Additional language clients** — Go, JVM, Node, and .NET.
 - [ ] **C bindings** for legacy embedded systems.
 - [x] **Hardware-watchdog integration** — `--hw-watchdog` flag wires
   the in-process watchdog to `/dev/watchdog{,N}` and systemd

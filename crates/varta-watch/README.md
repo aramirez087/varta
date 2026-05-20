@@ -23,6 +23,9 @@ varta-watch \
 
 ## Flags
 
+> [!NOTE]
+> The table below lists the core configuration flags. Run `varta-watch --help` to see the complete list of 30+ options including secure-UDP keys, rate-limiting, audit-logging, namespaces, and safety overrides.
+
 | Flag | Type | Default | Description |
 |------|------|---------|-------------|
 | `--socket <PATH>` | path | **required** | Bind the observer's UDS at this path. |

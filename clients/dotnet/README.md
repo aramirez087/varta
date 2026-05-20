@@ -137,7 +137,7 @@ SignalHandler.Run(() =>
 
 The handler runs on .NET's dedicated signal-handling thread (not the real signal-handler context), so `Socket.Send` is safe inside.
 
-**`.NET 10 caveat:**** The runtime no longer auto-graceful-shuts on SIGTERM ([breaking change](https://learn.microsoft.com/en-us/dotnet/core/compatibility/core-libraries/10.0/sigterm-signal-handler)). This handler emits the beat and returns; the host process is still responsible for orderly shutdown.
+**`.NET 10 Caveat`:** The runtime no longer auto-graceful-shuts on SIGTERM ([breaking change](https://learn.microsoft.com/en-us/dotnet/core/compatibility/core-libraries/10.0/sigterm-signal-handler)). This handler emits the beat and returns; the host process is still responsible for orderly shutdown.
 
 ## Secure UDP
 

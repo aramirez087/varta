@@ -498,8 +498,7 @@ impl Tracker {
                         .insert(evicted_slot.pid, evict_idx)
                         .is_err()
                     {
-                        self.invariant_violations =
-                            self.invariant_violations.saturating_add(1);
+                        self.invariant_violations = self.invariant_violations.saturating_add(1);
                     }
                     self.capacity_exceeded = self.capacity_exceeded.saturating_add(1);
                     return Update::CapacityExceeded;
