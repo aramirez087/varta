@@ -116,6 +116,8 @@ pub(super) fn file_export_writes_tsv() {
             "200",
             "--export-file",
             export.to_str().unwrap(),
+            "--max-beat-rate",
+            "0",
             "--shutdown-after-secs",
             "10",
         ])

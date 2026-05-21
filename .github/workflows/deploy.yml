@@ -29,20 +29,10 @@ jobs:
           fetch-depth: 0
 
       - name: install mdbook
-        run: |
-          tag=$(curl -s https://api.github.com/repos/rust-lang/mdBook/releases/latest \
-            | grep -oP '"tag_name": "\K[^"]+')
-          curl -L "https://github.com/rust-lang/mdBook/releases/download/${tag}/mdbook-${tag}-x86_64-unknown-linux-gnu.tar.gz" \
-            | tar xz
-          mv mdbook /usr/local/bin/
+        run: cargo install --locked mdbook
 
       - name: install mdbook-mermaid
-        run: |
-          tag=$(curl -s https://api.github.com/repos/badboy/mdbook-mermaid/releases/latest \
-            | grep -oP '"tag_name": "\K[^"]+')
-          curl -L "https://github.com/badboy/mdbook-mermaid/releases/download/${tag}/mdbook-mermaid-${tag}-x86_64-unknown-linux-gnu.tar.gz" \
-            | tar xz
-          mv mdbook-mermaid /usr/local/bin/
+        run: cargo install --locked mdbook-mermaid
 
       - name: sync governance docs into book
         run: |
