@@ -1571,6 +1571,15 @@ fn run(cfg: Config) -> std::io::Result<()> {
     }
     sd_notify.stopping();
 
+    // Drain any remaining stall events so they are written to disk before the
+    // file exporter is flushed — stalls queued during the last `poll()` call
+    // would otherwise be lost on clean shutdown.
+    while let Some(ev) = observer.poll_pending() {
+        if let Some(fe) = file_export.as_mut() {
+            let _ = fe.record(&ev);
+        }
+    }
+
     if let Some(fe) = file_export.as_mut() {
         let _ = fe.flush();
     }
