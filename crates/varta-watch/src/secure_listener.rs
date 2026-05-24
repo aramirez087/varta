@@ -570,6 +570,15 @@ impl BeatListener for SecureUdpListener {
                     }
                     let master_attempt =
                         self.try_master_key_decrypt(agent_pid, aad, &nonce, &ciphertext, &tag);
+                    // Count the master-key AEAD attempt even on failure: the KDF
+                    // and open() both ran whenever a master key is configured,
+                    // so the attempt cost was paid regardless of the outcome.
+                    // Without this, varta_secure_aead_attempts_total is
+                    // under-reported by 1 per master-frame, breaking the operator
+                    // invariant: "attempts == frames × (keys.len() + 1)".
+                    if self.master_key.is_some() {
+                        self.aead_attempts = self.aead_attempts.saturating_add(1);
+                    }
                     if decrypted.is_none() {
                         decrypted = master_attempt;
                     }
@@ -954,6 +963,70 @@ mod tests {
             listener.drain_aead_attempts(),
             3,
             "every loaded key must be trialled even when the first one matches"
+        );
+    }
+
+    /// Build a 64-byte master-key wire frame. Mirrors the layout parsed by
+    /// the `SECURE_FRAME_MASTER_LEN` arm in `SecureUdpListener::recv`.
+    fn build_master_frame(
+        master: &Key,
+        agent_pid: u32,
+        iv_random: [u8; 8],
+        iv_counter: u32,
+        plaintext: &[u8; 32],
+    ) -> [u8; 64] {
+        use varta_vlp::crypto::kdf;
+        let agent_key = kdf::derive_agent_key(master, agent_pid).expect("KDF infallible");
+        let mut nonce = [0u8; NONCE_BYTES];
+        nonce[..8].copy_from_slice(&iv_random);
+        nonce[8..12].copy_from_slice(&iv_counter.to_le_bytes());
+        let aad = agent_pid.to_le_bytes();
+        let (ciphertext, tag) = crypto::seal(agent_key.as_bytes(), &nonce, &aad, plaintext)
+            .expect("seal infallible");
+        let mut wire = [0u8; 64];
+        wire[0..4].copy_from_slice(&aad);
+        wire[4..12].copy_from_slice(&iv_random);
+        wire[12..16].copy_from_slice(&iv_counter.to_le_bytes());
+        wire[16..48].copy_from_slice(&ciphertext);
+        wire[48..64].copy_from_slice(&tag);
+        wire
+    }
+
+    /// Master-key frames must count the derived-key AEAD attempt in
+    /// `aead_attempts` — total must equal `shared_keys.len() + 1`.
+    /// Before the fix the master attempt was silently uncounted, making
+    /// the operator invariant "attempts == frames × (keys + 1)" false.
+    #[test]
+    fn aead_attempts_includes_master_key_attempt() {
+        let master_bytes = [0xABu8; 32];
+        let mut listener = SecureUdpListener::bind_with_master(
+            "127.0.0.1:0".parse().unwrap(),
+            vec![Key::from_bytes([0x11u8; 32]), Key::from_bytes([0x22u8; 32])],
+            Key::from_bytes(master_bytes),
+        )
+        .expect("bind");
+        let target = listener.test_local_addr();
+
+        let agent_pid: u32 = 12345;
+        // plaintext pid field (bytes 4..8) must match agent_pid so the inner-PID
+        // defence in try_master_key_decrypt passes.
+        let mut plaintext = [0u8; 32];
+        plaintext[4..8].copy_from_slice(&agent_pid.to_le_bytes());
+
+        let wire = build_master_frame(
+            &Key::from_bytes(master_bytes),
+            agent_pid,
+            test_iv(),
+            1,
+            &plaintext,
+        );
+        send_wire(target, &wire);
+
+        let _ = recv_one(&mut listener);
+        assert_eq!(
+            listener.drain_aead_attempts(),
+            3, // 2 shared keys + 1 master-key derivation
+            "master-key AEAD attempt must be counted: total == keys.len() + 1"
         );
     }
 
