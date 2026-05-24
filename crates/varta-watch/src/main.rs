@@ -932,6 +932,7 @@ fn run(cfg: Config) -> std::io::Result<()> {
                 pid,
                 origin,
                 pid_ns_inode,
+                observer_ns,
                 ..
             } = &ev
             {
@@ -945,7 +946,7 @@ fn run(cfg: Config) -> std::io::Result<()> {
                         (observer_ns_inode, *pid_ns_inode),
                         (Some(a), Some(b)) if a != b
                     );
-                    let outcome = rec.on_stall(*pid, *origin, cross_namespace_agent);
+                    let outcome = rec.on_stall(*pid, *origin, cross_namespace_agent, *observer_ns);
                     #[cfg(feature = "prometheus-exporter")]
                     if let Some(pe) = prom_export.as_mut() {
                         pe.record_recovery_outcome(&outcome, None);

@@ -64,6 +64,7 @@ impl Recovery {
         pid: u32,
         wallclock_ms: u64,
         now: Instant,
+        observer_ns: u64,
     ) -> RecoveryOutcome {
         let capture_on = self.capture_cap > 0;
         match &self.mode {
@@ -91,6 +92,7 @@ impl Recovery {
                         let (out_handle, err_handle) = take_capture_handles(&mut child, capture_on);
                         self.emit_spawn_audit(
                             wallclock_ms,
+                            observer_ns,
                             pid,
                             child_pid,
                             "exec",
@@ -134,9 +136,11 @@ impl Recovery {
     }
 
     /// Emit a recovery-spawn audit record if a sink is configured.
+    #[allow(clippy::too_many_arguments)]
     fn emit_spawn_audit(
         &mut self,
         wallclock_ms: u64,
+        observer_ns: u64,
         agent_pid: u32,
         child_pid: u32,
         mode: &str,
@@ -149,7 +153,7 @@ impl Recovery {
         };
         sink.record_spawn(&SpawnRecord {
             wallclock_ms,
-            observer_ns: 0,
+            observer_ns,
             agent_pid,
             child_pid,
             mode,

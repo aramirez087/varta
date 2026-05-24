@@ -712,6 +712,7 @@ impl Recovery {
         pid: u32,
         origin: BeatOrigin,
         cross_namespace_agent: bool,
+        observer_ns: u64,
     ) -> RecoveryOutcome {
         // --- SAFETY GATE START ---
         // Cross-namespace gate. Default-safe: refuse recovery when the agent's
@@ -721,7 +722,7 @@ impl Recovery {
             if let Some(sink) = self.audit_sink.as_mut() {
                 sink.record_refused(&RefusedRecord {
                     wallclock_ms: RecoveryAuditLog::wallclock_ms_now(),
-                    observer_ns: 0,
+                    observer_ns,
                     agent_pid: pid,
                     reason: "cross_namespace_agent",
                 });
@@ -742,7 +743,7 @@ impl Recovery {
                 if let Some(sink) = self.audit_sink.as_mut() {
                     sink.record_refused(&RefusedRecord {
                         wallclock_ms: RecoveryAuditLog::wallclock_ms_now(),
-                        observer_ns: 0,
+                        observer_ns,
                         agent_pid: pid,
                         reason: "unauthenticated_transport",
                     });
@@ -754,7 +755,7 @@ impl Recovery {
                 if let Some(sink) = self.audit_sink.as_mut() {
                     sink.record_refused(&RefusedRecord {
                         wallclock_ms: RecoveryAuditLog::wallclock_ms_now(),
-                        observer_ns: 0,
+                        observer_ns,
                         agent_pid: pid,
                         reason: "socket_mode_only",
                     });
@@ -788,7 +789,7 @@ impl Recovery {
             if let Some(sink) = self.audit_sink.as_mut() {
                 sink.record_refused(&RefusedRecord {
                     wallclock_ms: RecoveryAuditLog::wallclock_ms_now(),
-                    observer_ns: 0,
+                    observer_ns,
                     agent_pid: pid,
                     reason: "outstanding_capacity",
                 });
@@ -803,7 +804,7 @@ impl Recovery {
                 if let Some(sink) = self.audit_sink.as_mut() {
                     sink.record_refused(&RefusedRecord {
                         wallclock_ms: RecoveryAuditLog::wallclock_ms_now(),
-                        observer_ns: 0,
+                        observer_ns,
                         agent_pid: pid,
                         reason: "debounce_capacity",
                     });
@@ -813,7 +814,7 @@ impl Recovery {
         }
 
         let wallclock_ms = RecoveryAuditLog::wallclock_ms_now();
-        self.spawn_exec_child(pid, wallclock_ms, now)
+        self.spawn_exec_child(pid, wallclock_ms, now, observer_ns)
     }
 
     /// Drain completed or timeout-exceeded children.
@@ -948,7 +949,7 @@ mod tests {
             },
             Duration::ZERO,
         );
-        match rec.on_stall(42, BeatOrigin::KernelAttested, false) {
+        match rec.on_stall(42, BeatOrigin::KernelAttested, false, 0) {
             RecoveryOutcome::Spawned { .. } => {
                 std::thread::sleep(Duration::from_millis(50));
                 let outcomes = rec.try_reap();
@@ -979,7 +980,7 @@ mod tests {
             },
             Duration::ZERO,
         );
-        match rec.on_stall(42, BeatOrigin::KernelAttested, false) {
+        match rec.on_stall(42, BeatOrigin::KernelAttested, false, 0) {
             RecoveryOutcome::Spawned { .. } => {
                 std::thread::sleep(Duration::from_millis(100));
                 let outcomes = rec.try_reap();
@@ -1005,7 +1006,7 @@ mod tests {
             },
             Duration::ZERO,
         );
-        match rec.on_stall(42, BeatOrigin::KernelAttested, false) {
+        match rec.on_stall(42, BeatOrigin::KernelAttested, false, 0) {
             RecoveryOutcome::Spawned { .. } => {
                 std::thread::sleep(Duration::from_millis(50));
                 let outcomes = rec.try_reap();
@@ -1034,7 +1035,7 @@ mod tests {
             None,
         )
         .with_recovery_env(vec!["E1=a".to_string(), "E2=b".to_string()]);
-        match rec.on_stall(1, BeatOrigin::KernelAttested, false) {
+        match rec.on_stall(1, BeatOrigin::KernelAttested, false, 0) {
             RecoveryOutcome::Spawned { .. } => {
                 std::thread::sleep(Duration::from_millis(100));
                 let outcomes = rec.try_reap();
@@ -1085,7 +1086,7 @@ mod tests {
         )
         .with_audit_sink(Some(sink));
 
-        match rec.on_stall(123, BeatOrigin::KernelAttested, false) {
+        match rec.on_stall(123, BeatOrigin::KernelAttested, false, 0) {
             RecoveryOutcome::Spawned { .. } => {}
             other => panic!("expected Spawned, got {other:?}"),
         }
@@ -1147,7 +1148,7 @@ mod tests {
         .with_capture(4096)
         .with_audit_sink(Some(sink));
 
-        match rec.on_stall(77, BeatOrigin::KernelAttested, false) {
+        match rec.on_stall(77, BeatOrigin::KernelAttested, false, 0) {
             RecoveryOutcome::Spawned { .. } => {}
             other => panic!("expected Spawned, got {other:?}"),
         }
@@ -1202,7 +1203,7 @@ mod tests {
         .with_capture(64)
         .with_audit_sink(Some(sink));
 
-        match rec.on_stall(8, BeatOrigin::KernelAttested, false) {
+        match rec.on_stall(8, BeatOrigin::KernelAttested, false, 0) {
             RecoveryOutcome::Spawned { .. } => {}
             other => panic!("expected Spawned, got {other:?}"),
         }
@@ -1245,7 +1246,7 @@ mod tests {
             },
             Duration::ZERO,
         );
-        match rec.on_stall(1, BeatOrigin::KernelAttested, false) {
+        match rec.on_stall(1, BeatOrigin::KernelAttested, false, 0) {
             RecoveryOutcome::Spawned { .. } => {}
             other => panic!("expected Spawned, got {other:?}"),
         }
@@ -1261,7 +1262,7 @@ mod tests {
             Duration::ZERO,
         );
 
-        match rec.on_stall(42, BeatOrigin::NetworkUnverified, false) {
+        match rec.on_stall(42, BeatOrigin::NetworkUnverified, false, 0) {
             RecoveryOutcome::RefusedUnauthenticatedSource { pid } => assert_eq!(pid, 42),
             other => panic!("expected RefusedUnauthenticatedSource, got {other:?}"),
         }
@@ -1279,7 +1280,7 @@ mod tests {
             Duration::ZERO,
         );
 
-        match rec.on_stall(42, BeatOrigin::OperatorAttestedTransport, false) {
+        match rec.on_stall(42, BeatOrigin::OperatorAttestedTransport, false, 0) {
             RecoveryOutcome::Spawned { .. } => {}
             other => panic!("expected Spawned, got {other:?}"),
         }
@@ -1296,9 +1297,9 @@ mod tests {
             Duration::from_secs(60),
         );
 
-        let _ = rec.on_stall(7, BeatOrigin::NetworkUnverified, false);
+        let _ = rec.on_stall(7, BeatOrigin::NetworkUnverified, false, 0);
 
-        match rec.on_stall(7, BeatOrigin::KernelAttested, false) {
+        match rec.on_stall(7, BeatOrigin::KernelAttested, false, 0) {
             RecoveryOutcome::Spawned { .. } => {}
             other => panic!("expected Spawned, got {other:?}"),
         }
@@ -1314,7 +1315,7 @@ mod tests {
             Duration::ZERO,
         );
 
-        match rec.on_stall(42, BeatOrigin::KernelAttested, true) {
+        match rec.on_stall(42, BeatOrigin::KernelAttested, true, 0) {
             RecoveryOutcome::RefusedCrossNamespace { pid } => assert_eq!(pid, 42),
             other => panic!("expected RefusedCrossNamespace, got {other:?}"),
         }
@@ -1333,7 +1334,7 @@ mod tests {
         )
         .with_allow_cross_namespace(true);
 
-        match rec.on_stall(42, BeatOrigin::KernelAttested, true) {
+        match rec.on_stall(42, BeatOrigin::KernelAttested, true, 0) {
             RecoveryOutcome::Spawned { .. } => {}
             other => panic!("expected Spawned with opt-in, got {other:?}"),
         }
@@ -1350,7 +1351,7 @@ mod tests {
             Duration::ZERO,
         );
 
-        match rec.on_stall(42, BeatOrigin::NetworkUnverified, true) {
+        match rec.on_stall(42, BeatOrigin::NetworkUnverified, true, 0) {
             RecoveryOutcome::RefusedCrossNamespace { pid } => assert_eq!(pid, 42),
             other => panic!("expected RefusedCrossNamespace, got {other:?}"),
         }
@@ -1451,13 +1452,13 @@ mod tests {
         rec.shrink_last_fired_for_test(2);
 
         for pid in 10..12u32 {
-            match rec.on_stall(pid, BeatOrigin::KernelAttested, false) {
+            match rec.on_stall(pid, BeatOrigin::KernelAttested, false, 0) {
                 RecoveryOutcome::Spawned { .. } => {}
                 other => panic!("expected Spawned for pid {pid}, got {other:?}"),
             }
         }
 
-        match rec.on_stall(99, BeatOrigin::KernelAttested, false) {
+        match rec.on_stall(99, BeatOrigin::KernelAttested, false, 0) {
             RecoveryOutcome::RefusedDebounceCapacity { pid } => assert_eq!(pid, 99),
             other => panic!("expected RefusedDebounceCapacity, got {other:?}"),
         }
@@ -1471,7 +1472,7 @@ mod tests {
     fn try_reap_no_truncation_within_cap() {
         let mut rec = Recovery::new_exec("true".to_string(), vec![], Duration::from_secs(10));
         for pid in 1u32..=3 {
-            rec.on_stall(pid, BeatOrigin::KernelAttested, false);
+            rec.on_stall(pid, BeatOrigin::KernelAttested, false, 0);
         }
         std::thread::sleep(Duration::from_millis(50));
         let outcomes = rec.try_reap();
@@ -1491,7 +1492,7 @@ mod tests {
     fn try_reap_caps_and_cursor_advances() {
         let mut rec = Recovery::new_exec("true".to_string(), vec![], Duration::from_secs(10));
         for pid in 1u32..=5 {
-            rec.on_stall(pid, BeatOrigin::KernelAttested, false);
+            rec.on_stall(pid, BeatOrigin::KernelAttested, false, 0);
         }
         rec.shrink_reap_max_for_test(2);
         std::thread::sleep(Duration::from_millis(100));
@@ -1518,7 +1519,7 @@ mod tests {
     fn try_reap_truncation_counter_increments_and_resets() {
         let mut rec = Recovery::new_exec("true".to_string(), vec![], Duration::from_secs(10));
         for pid in 1u32..=4 {
-            rec.on_stall(pid, BeatOrigin::KernelAttested, false);
+            rec.on_stall(pid, BeatOrigin::KernelAttested, false, 0);
         }
         rec.shrink_reap_max_for_test(2);
         std::thread::sleep(Duration::from_millis(100));
