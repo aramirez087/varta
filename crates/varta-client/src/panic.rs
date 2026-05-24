@@ -205,6 +205,43 @@ pub fn install_panic_handler_udp(addr: std::net::SocketAddr) -> std::io::Result<
     Ok(())
 }
 
+/// Build the 60-byte shared-key secure panic frame for one `(nonce_prefix,
+/// iv_counter)` pair. Returns `None` only if AEAD seal fails — structurally
+/// unreachable for fixed 32-byte inputs against the pinned RustCrypto
+/// `chacha20poly1305 = "=0.10.1"` crate, but a clean `Option` short-circuit
+/// keeps the panic-hook closure free of any `unwrap`/`expect` that could
+/// abort the process during unwinding.
+#[cfg(all(feature = "panic-handler", feature = "secure-udp"))]
+fn build_secure_panic_frame(
+    key: &Key,
+    nonce_prefix: [u8; 8],
+    iv_counter: u32,
+    panic_pid: u32,
+    timestamp: u64,
+) -> Option<[u8; varta_vlp::crypto::SECURE_FRAME_BYTES]> {
+    use varta_vlp::crypto::{self, NONCE_BYTES};
+
+    let frame = Frame::new(Status::Critical, panic_pid, timestamp, NONCE_TERMINAL, 0);
+    let mut buf = [0u8; 32];
+    frame.encode(&mut buf);
+
+    let mut nonce = [0u8; NONCE_BYTES];
+    nonce[..8].copy_from_slice(&nonce_prefix);
+    nonce[8..12].copy_from_slice(&iv_counter.to_le_bytes());
+
+    // Shared-key panic frame: AAD is empty (matches the
+    // SecureUdpListener shared-key parse at recv time).
+    let (ciphertext, tag) = crypto::seal(key.as_bytes(), &nonce, b"", &buf).ok()?;
+
+    let mut secure_frame = [0u8; crypto::SECURE_FRAME_BYTES];
+    secure_frame[..8].copy_from_slice(&nonce_prefix);
+    secure_frame[8..12].copy_from_slice(&iv_counter.to_le_bytes());
+    secure_frame[12..44].copy_from_slice(&ciphertext);
+    secure_frame[44..60].copy_from_slice(&tag);
+
+    Some(secure_frame)
+}
+
 /// Inner implementation used by both public secure-UDP panic-hook installers.
 ///
 /// `provider` is called once at install time to obtain the 8-byte IV random
@@ -229,7 +266,7 @@ where
     F: FnOnce() -> std::io::Result<[u8; 8]>,
     G: Fn() -> Option<[u8; 8]> + Send + Sync + 'static,
 {
-    use varta_vlp::crypto::{self, NONCE_BYTES};
+    use std::sync::atomic::{AtomicU32, Ordering};
 
     let start = Instant::now();
     // Pre-compute the IV random prefix at install time — /dev/urandom
@@ -241,6 +278,17 @@ where
     // same key — a catastrophic AEAD nonce collision. We detect the fork
     // by PID mismatch and re-run the entropy chain via `refresh`.
     let install_pid = std::process::id();
+    // Per-fire AEAD counter. The hook closure may be invoked more than
+    // once per process: `std::panic::set_hook`'s closure is called for
+    // every panic, and Rust serialises but does not deduplicate multiple
+    // concurrent thread panics. Hardcoding `iv_counter = 1` would reuse
+    // the same `(iv_random, 1)` 12-byte ChaCha20-Poly1305 nonce under
+    // the same key on every fire — catastrophic AEAD nonce reuse
+    // (recovers plaintext, lets attackers forge messages). Atomic
+    // fetch-add guarantees each fire claims a distinct counter value;
+    // the underlying nonce space is 2^32 panics per process, far beyond
+    // any realistic budget.
+    let iv_counter_atom = AtomicU32::new(0);
     // Pre-bind the UDP socket at install time. bind(2)/connect(2)/fcntl(2)
     // are NOT async-signal-safe per POSIX.1-2017 §2.4.3, so the hook
     // closure must never call them. Socket FD is inherited across fork(2);
@@ -266,26 +314,16 @@ where
             };
 
             let timestamp = start.elapsed().as_nanos().min(u64::MAX as u128) as u64;
-            let frame = Frame::new(Status::Critical, panic_pid, timestamp, NONCE_TERMINAL, 0);
-            let mut buf = [0u8; 32];
-            frame.encode(&mut buf);
+            // Claim a unique counter for this fire. `wrapping_add(1)` so
+            // the first emitted counter is 1 (preserving the original
+            // wire value); successive fires use 2, 3, … Wraps at
+            // u32::MAX → 0 → 1 only after 2^32 panics in one process.
+            let iv_counter = iv_counter_atom
+                .fetch_add(1, Ordering::Relaxed)
+                .wrapping_add(1);
 
-            let iv_counter = 1u32;
-
-            let mut nonce = [0u8; NONCE_BYTES];
-            nonce[..8].copy_from_slice(&nonce_prefix);
-            nonce[8..12].copy_from_slice(&iv_counter.to_le_bytes());
-
-            // Shared-key panic frame: AAD is empty (matches the
-            // SecureUdpListener shared-key parse at recv time).
-            let (ciphertext, tag) = crypto::seal(key.as_bytes(), &nonce, b"", &buf).ok()?;
-
-            let mut secure_frame = [0u8; crypto::SECURE_FRAME_BYTES];
-            secure_frame[..8].copy_from_slice(&nonce_prefix);
-            secure_frame[8..12].copy_from_slice(&iv_counter.to_le_bytes());
-            secure_frame[12..44].copy_from_slice(&ciphertext);
-            secure_frame[44..60].copy_from_slice(&tag);
-
+            let secure_frame =
+                build_secure_panic_frame(&key, nonce_prefix, iv_counter, panic_pid, timestamp)?;
             sock.send(&secure_frame).ok()
         })();
         prev(info);
@@ -473,6 +511,83 @@ mod tests {
         assert!(
             std::error::Error::source(&err).is_some(),
             "source() must return the inner io::Error"
+        );
+    }
+
+    /// Regression: the secure panic-hook closure can fire more than once per
+    /// process (multi-thread panic, signal-driven panic). Each fire must
+    /// claim a distinct `iv_counter` so successive frames carry distinct
+    /// 12-byte ChaCha20-Poly1305 nonces under the same key. Asserting via
+    /// the testable `build_secure_panic_frame` helper rather than driving
+    /// `set_hook` keeps the test out of the process-global panic-hook
+    /// pathway (interferes with concurrent tests in the same binary).
+    #[test]
+    fn secure_panic_frame_counter_advances_per_fire() {
+        let key = dummy_key();
+        let nonce_prefix = [0xAAu8; 8];
+        let panic_pid = 1234;
+        let timestamp = 1_000_000u64;
+
+        // Simulate the counter sequence the patched closure would produce
+        // on two successive panic fires (1, then 2).
+        let f1 = build_secure_panic_frame(&key, nonce_prefix, 1, panic_pid, timestamp)
+            .expect("seal must succeed for the pinned 32-byte panic frame");
+        let f2 = build_secure_panic_frame(&key, nonce_prefix, 2, panic_pid, timestamp)
+            .expect("seal must succeed for the pinned 32-byte panic frame");
+
+        // On-wire counter bytes (offset 8..12) must differ.
+        assert_ne!(
+            &f1[8..12],
+            &f2[8..12],
+            "iv_counter must change between fires (regression: was hardcoded to 1)"
+        );
+
+        // And the ciphertext+tag region (offset 12..60) must differ —
+        // proof that the AEAD nonce changed for real, not just the
+        // plaintext counter prefix.
+        assert_ne!(
+            &f1[12..60],
+            &f2[12..60],
+            "AEAD output must reflect the rotated nonce — nonce reuse is catastrophic"
+        );
+    }
+
+    /// The atomic counter must be claimed in a single fetch-add so concurrent
+    /// panics from multiple threads cannot observe the same `iv_counter`
+    /// value. This is a structural guard on the primitive itself; the
+    /// closure body relies on this invariant for AEAD nonce uniqueness.
+    #[test]
+    fn atomic_fetch_add_claims_distinct_counters_under_contention() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        use std::sync::Arc;
+        use std::thread;
+
+        const THREADS: u32 = 8;
+        const PER_THREAD: u32 = 1_000;
+
+        let atom = Arc::new(AtomicU32::new(0));
+        let mut handles = Vec::with_capacity(THREADS as usize);
+        for _ in 0..THREADS {
+            let a = Arc::clone(&atom);
+            handles.push(thread::spawn(move || {
+                let mut seen = Vec::with_capacity(PER_THREAD as usize);
+                for _ in 0..PER_THREAD {
+                    seen.push(a.fetch_add(1, Ordering::Relaxed).wrapping_add(1));
+                }
+                seen
+            }));
+        }
+        let mut all: Vec<u32> = handles
+            .into_iter()
+            .flat_map(|h| h.join().expect("thread"))
+            .collect();
+        let total = all.len();
+        all.sort_unstable();
+        all.dedup();
+        assert_eq!(
+            all.len(),
+            total,
+            "fetch_add must give every concurrent caller a distinct counter"
         );
     }
 
