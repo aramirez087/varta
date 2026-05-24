@@ -142,9 +142,6 @@ public final class Codec {
             throw new DecodeError(DecodeErrorKind.BAD_NONCE,
                 "nonce = NONCE_TERMINAL is permitted only with Status::CRITICAL");
         }
-        if (nonce == 0) {
-            throw new DecodeError(DecodeErrorKind.BAD_NONCE, "nonce must be non-zero (NONCE_MIN = 1)");
-        }
 
         // Advance the source buffer past the consumed frame.
         src.position(basePos + FRAME_BYTES);
