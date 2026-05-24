@@ -214,20 +214,25 @@ pub(super) fn file_export_rotation() {
     let socket = tmp.path().join("varta.sock");
     let export = tmp.path().join("rot.tsv");
 
-    let (mut child, _prom_addr) = spawn_watch(&[
-        "--socket",
-        socket.to_str().unwrap(),
-        "--threshold-ms",
-        "5000", // no stall
-        "--export-file",
-        export.to_str().unwrap(),
-        "--export-file-max-bytes",
-        "200",
-        "--prom-addr",
-        "127.0.0.1:0",
-        "--shutdown-after-secs",
-        "10",
-    ]);
+    let mut child = Command::new(locate_watch_binary())
+        .args([
+            "--socket",
+            socket.to_str().unwrap(),
+            "--threshold-ms",
+            "5000",
+            "--export-file",
+            export.to_str().unwrap(),
+            "--export-file-max-bytes",
+            "200",
+            "--max-beat-rate",
+            "0",
+            "--shutdown-after-secs",
+            "10",
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn varta-watch");
     let _guard = ChildGuard(&mut child);
 
     assert!(
