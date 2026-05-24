@@ -27,7 +27,7 @@ public enum Status {
     /** Wire byte 0x03, reserved for observer-synthesized STALL. Never agent-emitted. */
     public static final byte STALL_WIRE_BYTE = (byte) 0x03;
 
-    static Status fromWireByte(byte b) {
+    public static Status fromWireByte(byte b) {
         return switch (b) {
             case 0x00 -> OK;
             case 0x01 -> DEGRADED;
