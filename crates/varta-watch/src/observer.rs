@@ -606,10 +606,7 @@ impl Observer {
                                         first_event = Some(Event::NamespaceConflict {
                                             claimed_pid: frame.pid,
                                             observed_ns_inode: peer_pid_ns_inode,
-                                            observer_ns_inode: self
-                                                .tracker
-                                                .pid_ns_inode_of(frame.pid)
-                                                .flatten(),
+                                            observer_ns_inode,
                                             observer_ns: now_ns,
                                         });
                                     }
