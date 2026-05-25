@@ -865,7 +865,10 @@ mod tests {
 
         // Force-evict the victim (oldest entry).
         listener.force_evict_oldest_sender();
-        assert!(listener.last_evicted.as_ref().is_some_and(|(a, _)| *a == victim_addr));
+        assert!(listener
+            .last_evicted
+            .as_ref()
+            .is_some_and(|(a, _)| *a == victim_addr));
 
         // Attacker replays an old frame (counter 5) — must be rejected.
         assert!(!listener.try_record_replay_state(victim_addr, iv, 5));
@@ -900,7 +903,10 @@ mod tests {
 
         // Force-evict the victim — it goes to the shadow.
         listener.force_evict_oldest_sender();
-        assert!(listener.last_evicted.as_ref().is_some_and(|(a, _)| *a == victim_addr));
+        assert!(listener
+            .last_evicted
+            .as_ref()
+            .is_some_and(|(a, _)| *a == victim_addr));
 
         // Consume the freed slot with a brand-new sender so the slab is full
         // again. This makes the next allocate_sender_slot call fail.
