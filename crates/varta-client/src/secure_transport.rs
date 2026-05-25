@@ -123,6 +123,9 @@ pub struct SecureUdpTransport {
     /// only on `connect`, `reconnect`, or counter wrap — not per beat.
     iv_prefix: [u8; 8],
     is_master_mode: bool,
+    /// Retained only in master-key mode so `reconnect()` can re-derive
+    /// `self.key` from the forked child's PID.
+    master_key: Option<Key>,
 }
 
 impl SecureUdpTransport {
@@ -156,6 +159,7 @@ impl SecureUdpTransport {
             iv_prefix_index: 0,
             iv_prefix,
             is_master_mode: false,
+            master_key: None,
         })
     }
 
@@ -203,6 +207,10 @@ impl SecureUdpTransport {
         let iv_prefix = kdf::derive_iv_prefix(&iv_session_salt, 0)
             .map_err(|_| io::Error::new(io::ErrorKind::Other, "key derivation failure"))?;
 
+        // Retain master key so reconnect() can re-derive the agent key
+        // from the forked child's PID.
+        let retained_master = Key::from_bytes(*master_key.as_bytes());
+
         Ok(SecureUdpTransport {
             sock,
             addr,
@@ -212,6 +220,7 @@ impl SecureUdpTransport {
             iv_prefix_index: 0,
             iv_prefix,
             is_master_mode: true,
+            master_key: Some(retained_master),
         })
     }
 
@@ -247,6 +256,12 @@ impl SecureUdpTransport {
     #[cfg(any(test, feature = "test-hooks"))]
     pub fn set_iv_prefix_index_for_test(&mut self, value: u32) {
         self.iv_prefix_index = value;
+    }
+
+    /// Test-only accessor for the current agent key bytes.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn key_bytes_for_test(&self) -> [u8; 32] {
+        *self.key.as_bytes()
     }
 }
 
@@ -447,6 +462,19 @@ impl BeatTransport for SecureUdpTransport {
         let new_prefix = kdf::derive_iv_prefix(&new_salt, 0)
             .map_err(|_| io::Error::new(io::ErrorKind::Other, "key derivation failure"))?;
 
+        // In master-key mode, re-derive the agent key from the current
+        // PID. After fork(2) the child has a different PID; the observer
+        // derives the decryption key from the on-wire PID, so the
+        // encryption key must match.
+        let new_key = if let Some(ref mk) = self.master_key {
+            Some(
+                kdf::derive_agent_key(mk, std::process::id())
+                    .map_err(|_| io::Error::new(io::ErrorKind::Other, "key derivation failure"))?,
+            )
+        } else {
+            None
+        };
+
         // --- Commit phase: NO `?` operator below this line.  Any future
         //     change that introduces a fallible call here is a transactional
         //     regression — a partial commit could leave `self.sock` paired
@@ -458,6 +486,9 @@ impl BeatTransport for SecureUdpTransport {
         self.iv_prefix = new_prefix;
         self.iv_prefix_index = 0;
         self.iv_counter = 0;
+        if let Some(k) = new_key {
+            self.key = k;
+        }
         Ok(())
     }
 }
