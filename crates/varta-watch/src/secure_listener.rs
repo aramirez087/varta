@@ -387,28 +387,24 @@ impl SecureUdpListener {
         }
 
         // Vacant in the index — check the force-evict shadow before falling
-        // through to a fresh insert. Matching the shadow consumes it
-        // (`take()`) so a single replayed frame from the evicted sender is
-        // checked exactly once.
-        let shadow_matches = self
-            .last_evicted
-            .as_ref()
-            .is_some_and(|(addr, _)| *addr == sender);
-        if shadow_matches {
-            let (_, evicted_state) = self
-                .last_evicted
-                .take()
-                .expect("shadow_matches implies Some");
-            let valid = Self::validate_replay(&evicted_state, iv_random, counter);
-            if valid {
-                let mut new_state = evicted_state;
-                new_state.addr = sender;
-                Self::apply_replay_update(&mut new_state, iv_random, counter);
-                if !self.allocate_sender_slot(sender, new_state) {
+        // through to a fresh insert. On replay rejection the shadow is
+        // preserved so repeated replays cannot bypass protection by
+        // exhausting the shadow on the first attempt.
+        if let Some((addr, _)) = self.last_evicted.as_ref() {
+            if *addr == sender {
+                let (_, ref evicted_state) = *self.last_evicted.as_ref().unwrap();
+                let valid = Self::validate_replay(evicted_state, iv_random, counter);
+                if !valid {
                     return false;
                 }
+                let (_, mut evicted_state) = self.last_evicted.take().unwrap();
+                evicted_state.addr = sender;
+                Self::apply_replay_update(&mut evicted_state, iv_random, counter);
+                if !self.allocate_sender_slot(sender, evicted_state) {
+                    return false;
+                }
+                return true;
             }
-            return valid;
         }
 
         let new_state = SenderState::new(sender, iv_random, counter);
@@ -848,6 +844,42 @@ mod tests {
         // Force-evict should remove one entry.
         listener.force_evict_oldest_sender();
         assert_eq!(listener.sender_state_len(), MAX_SENDER_STATES - 1);
+    }
+
+    #[test]
+    fn evicted_sender_replay_rejected_repeatedly() {
+        let mut listener = new_listener();
+        let victim_addr = SocketAddr::from(([127, 0, 0, 1], 9000));
+        let iv = test_iv();
+
+        // Victim sends frames up to counter 10.
+        assert!(listener.try_record_replay_state(victim_addr, iv, 10));
+
+        // Fill remaining slots so table is at capacity.
+        for i in 1..MAX_SENDER_STATES {
+            let addr = SocketAddr::from(([127, 0, 0, 1], (10_000 + i as u16)));
+            assert!(listener.try_record_replay_state(addr, test_iv2(), 1));
+        }
+        assert_eq!(listener.sender_state_len(), MAX_SENDER_STATES);
+
+        // Force-evict the victim (oldest entry).
+        listener.force_evict_oldest_sender();
+        assert!(listener.last_evicted.as_ref().is_some_and(|(a, _)| *a == victim_addr));
+
+        // Attacker replays an old frame (counter 5) — must be rejected.
+        assert!(!listener.try_record_replay_state(victim_addr, iv, 5));
+        // Shadow must survive the rejection so the next replay is also caught.
+        assert!(listener.last_evicted.is_some());
+
+        // Second replay of the same frame — must still be rejected, not
+        // treated as a new sender.
+        assert!(!listener.try_record_replay_state(victim_addr, iv, 5));
+        assert!(listener.last_evicted.is_some());
+
+        // A genuinely new frame (counter 11) from the victim should pass.
+        assert!(listener.try_record_replay_state(victim_addr, iv, 11));
+        // Shadow consumed on success.
+        assert!(listener.last_evicted.is_none());
     }
 
     // ----- H3: constant-trial-count AEAD poll -----
