@@ -573,11 +573,11 @@ impl<T: BeatTransport> Varta<T> {
                 self.consecutive_dropped = self.consecutive_dropped.saturating_add(1);
                 if self.reconnect_after > 0
                     && self.consecutive_dropped >= self.reconnect_after
-                    && self.transport.reconnect().is_ok()
                 {
-                    let retry = self.send_frame();
                     self.consecutive_dropped = 0;
-                    return retry;
+                    if self.transport.reconnect().is_ok() {
+                        return self.send_frame();
+                    }
                 }
                 outcome
             }

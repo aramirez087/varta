@@ -172,11 +172,11 @@ public sealed class Varta : IDisposable
                 _consecutiveDropped = SaturatingIncrementU32(_consecutiveDropped);
                 if (allowRetry && _reconnectAfter > 0 && _consecutiveDropped >= _reconnectAfter)
                 {
+                    _consecutiveDropped = 0;
                     try
                     {
                         _transport.Reconnect();
                         _connectPid = Environment.ProcessId;
-                        _consecutiveDropped = 0;
                         return TrySendWithReconnectAfter(allowRetry: false);
                     }
                     catch

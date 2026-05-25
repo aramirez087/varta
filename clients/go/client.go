@@ -129,16 +129,11 @@ func (v *Varta) Beat(status Status, payload uint32) BeatOutcome {
 	if outcome.IsDropped() {
 		v.consecutiveDropped = saturatingAdd32(v.consecutiveDropped, 1)
 		if v.reconnectAfter > 0 && v.consecutiveDropped >= v.reconnectAfter {
+			v.consecutiveDropped = 0
 			if err := v.transport.Reconnect(); err != nil {
 				return outcome
 			}
-			retry := v.sendBuffered()
-			if retry.IsDropped() {
-				v.consecutiveDropped = 0
-			} else {
-				v.consecutiveDropped = 0
-			}
-			return retry
+			return v.sendBuffered()
 		}
 		return outcome
 	}
