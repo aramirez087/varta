@@ -277,13 +277,15 @@ impl SecureUdpTransport {
 /// beats (~584M years at 1 kHz), so the impact is purely theoretical.
 #[must_use = "NonceAdvance must be committed to self on send-success"]
 enum NonceAdvance {
-    /// Common case — `iv_counter.checked_add(1)` succeeded. Only
-    /// `iv_counter` needs to be committed on send-success.
+    /// Common case — `iv_counter` is below `u32::MAX`. The stored
+    /// `counter` is the value to place on the wire; the commit step
+    /// writes `counter + 1` back to `self.iv_counter`.
     Simple { counter: u32 },
     /// Counter wrap — `iv_counter` exhausted but `iv_prefix_index` can
     /// still advance. The HKDF expansion ran into the local `next_prefix`;
     /// none of `self.iv_prefix_index` / `self.iv_prefix` have been mutated.
-    /// Committing requires writing all three fields.
+    /// Committing requires writing all three fields. `counter` is 0
+    /// (first frame under the new prefix).
     Wrap {
         counter: u32,
         next_prefix_index: u32,
@@ -291,36 +293,35 @@ enum NonceAdvance {
     },
     /// Doubly-exhausted — `reconnect()` already mutated `self.sock`,
     /// `self.iv_session_salt`, `self.iv_prefix`, and zeroed both counters.
-    /// Only the post-reconnect `iv_counter` (1) remains to commit.
+    /// `counter` is 0 (first frame of the new session); the commit step
+    /// writes `counter + 1` back to `self.iv_counter`.
     Reconnected { counter: u32 },
 }
 
 impl SecureUdpTransport {
     /// Speculatively compute the values the next frame should use, without
-    /// committing them to `self`. Three branches, in order:
+    /// committing them to `self`. The returned `counter` is the value to
+    /// place on the wire; the commit step in `send()` writes
+    /// `counter + 1` back to `self.iv_counter`. Three branches:
     ///
-    /// 1. **Common case** — `iv_counter.checked_add(1)` succeeds.
+    /// 1. **Common case** — `iv_counter < u32::MAX`. Use it as-is.
     /// 2. **Counter wrap** — derive a fresh prefix via HKDF into a local;
     ///    `self.iv_prefix_index` / `self.iv_prefix` are **not** mutated.
-    ///    The caller commits on send-success. This is the bug-fix path:
-    ///    a failed `send(2)` at the wrap boundary previously burned a
-    ///    prefix index per retry and ran HKDF on every retry. Now the
-    ///    same `next_index` / `next_prefix` are recomputed on retry —
-    ///    wasteful but no longer burns prefix space.
+    ///    The caller commits on send-success. Counter resets to 0.
     /// 3. **Doubly-exhausted** — both `u32`s exhausted (`2^64` nonces,
     ///    ~584M years at 1 kHz). Fall back to [`Self::reconnect`]; that
     ///    side effect *is* committed eagerly because socket re-bind and
-    ///    OS entropy read are irreversible.
+    ///    OS entropy read are irreversible. Counter resets to 0.
     fn advance_nonce(&mut self) -> io::Result<NonceAdvance> {
-        if let Some(n) = self.iv_counter.checked_add(1) {
-            return Ok(NonceAdvance::Simple { counter: n });
+        if self.iv_counter < u32::MAX {
+            return Ok(NonceAdvance::Simple { counter: self.iv_counter });
         }
         if let Some(next_index) = self.iv_prefix_index.checked_add(1) {
             let next_prefix =
                 varta_vlp::crypto::kdf::derive_iv_prefix(&self.iv_session_salt, next_index)
                     .map_err(|_| io::Error::new(io::ErrorKind::Other, "key derivation failure"))?;
             return Ok(NonceAdvance::Wrap {
-                counter: 1,
+                counter: 0,
                 next_prefix_index: next_index,
                 next_prefix,
             });
@@ -337,7 +338,7 @@ impl SecureUdpTransport {
             self.iv_prefix_index, 0,
             "reconnect() must zero iv_prefix_index — see secure_transport module docs"
         );
-        Ok(NonceAdvance::Reconnected { counter: 1 })
+        Ok(NonceAdvance::Reconnected { counter: 0 })
     }
 }
 
@@ -416,7 +417,9 @@ impl BeatTransport for SecureUdpTransport {
         if result.is_ok() {
             match advance {
                 NonceAdvance::Simple { counter } => {
-                    self.iv_counter = counter;
+                    // counter < u32::MAX (guarded by advance_nonce), so + 1
+                    // cannot overflow.
+                    self.iv_counter = counter + 1;
                 }
                 NonceAdvance::Wrap {
                     counter,
@@ -425,10 +428,10 @@ impl BeatTransport for SecureUdpTransport {
                 } => {
                     self.iv_prefix_index = next_prefix_index;
                     self.iv_prefix = next_prefix;
-                    self.iv_counter = counter;
+                    self.iv_counter = counter + 1;
                 }
                 NonceAdvance::Reconnected { counter } => {
-                    self.iv_counter = counter;
+                    self.iv_counter = counter + 1;
                 }
             }
         }
