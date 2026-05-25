@@ -981,8 +981,8 @@ mod tests {
         nonce[..8].copy_from_slice(&iv_random);
         nonce[8..12].copy_from_slice(&iv_counter.to_le_bytes());
         let aad = agent_pid.to_le_bytes();
-        let (ciphertext, tag) = crypto::seal(agent_key.as_bytes(), &nonce, &aad, plaintext)
-            .expect("seal infallible");
+        let (ciphertext, tag) =
+            crypto::seal(agent_key.as_bytes(), &nonce, &aad, plaintext).expect("seal infallible");
         let mut wire = [0u8; 64];
         wire[0..4].copy_from_slice(&aad);
         wire[4..12].copy_from_slice(&iv_random);
