@@ -400,7 +400,8 @@ impl SecureUdpListener {
                 let (_, mut evicted_state) = self.last_evicted.take().unwrap();
                 evicted_state.addr = sender;
                 Self::apply_replay_update(&mut evicted_state, iv_random, counter);
-                if !self.allocate_sender_slot(sender, evicted_state) {
+                if !self.allocate_sender_slot(sender, evicted_state.clone()) {
+                    self.last_evicted = Some((sender, evicted_state));
                     return false;
                 }
                 return true;
@@ -880,6 +881,43 @@ mod tests {
         assert!(listener.try_record_replay_state(victim_addr, iv, 11));
         // Shadow consumed on success.
         assert!(listener.last_evicted.is_none());
+    }
+
+    #[test]
+    fn shadow_restored_when_allocate_fails() {
+        let mut listener = new_listener();
+        let victim_addr = SocketAddr::from(([127, 0, 0, 1], 9000));
+        let iv = test_iv();
+
+        // Victim sends frames up to counter 10.
+        assert!(listener.try_record_replay_state(victim_addr, iv, 10));
+
+        // Fill remaining slots so table is at capacity.
+        for i in 1..MAX_SENDER_STATES {
+            let addr = SocketAddr::from(([127, 0, 0, 1], (10_000 + i as u16)));
+            assert!(listener.try_record_replay_state(addr, test_iv2(), 1));
+        }
+
+        // Force-evict the victim — it goes to the shadow.
+        listener.force_evict_oldest_sender();
+        assert!(listener.last_evicted.as_ref().is_some_and(|(a, _)| *a == victim_addr));
+
+        // Consume the freed slot with a brand-new sender so the slab is full
+        // again. This makes the next allocate_sender_slot call fail.
+        let filler = SocketAddr::from(([127, 0, 0, 1], 60_000));
+        assert!(listener.try_record_replay_state(filler, test_iv2(), 1));
+        assert_eq!(listener.sender_state_len(), MAX_SENDER_STATES);
+
+        // A genuinely new frame from the victim (counter 11) enters the
+        // shadow path, passes validation, but allocate_sender_slot fails
+        // because the slab is full. The shadow must be RESTORED.
+        assert!(!listener.try_record_replay_state(victim_addr, iv, 11));
+        assert!(listener.last_evicted.is_some());
+
+        // A replay of an old counter must still be rejected — the shadow
+        // was restored with the advanced counter (11), so counter ≤ 11 fails.
+        assert!(!listener.try_record_replay_state(victim_addr, iv, 11));
+        assert!(!listener.try_record_replay_state(victim_addr, iv, 5));
     }
 
     // ----- H3: constant-trial-count AEAD poll -----
