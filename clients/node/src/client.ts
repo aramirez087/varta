@@ -178,7 +178,7 @@ export class Varta {
         }
         const retry = this.sendFrame();
         if (retry.kind === "dropped") {
-          this.consecutiveDropped = this.reconnectAfter;
+          this.consecutiveDropped = 0;
         } else {
           this.consecutiveDropped = 0;
         }

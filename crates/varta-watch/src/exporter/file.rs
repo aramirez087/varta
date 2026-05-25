@@ -405,6 +405,14 @@ impl Exporter for FileExporter {
                             "{observer_ns}\tmismatch\t{claimed_pid}\t-\t-\torigin_conflict\n"
                         )
                         .len() as u64,
+                        Event::NamespaceConflict {
+                            claimed_pid,
+                            observer_ns,
+                            ..
+                        } => format!(
+                            "{observer_ns}\tmismatch\t{claimed_pid}\t-\t-\tnamespace_conflict\n"
+                        )
+                        .len() as u64,
                         _ => unreachable!(),
                     }
                 };
@@ -443,5 +451,32 @@ fn status_label(s: Status) -> &'static str {
         Status::Degraded => "degraded",
         Status::Critical => "critical",
         Status::Stall => "stall",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn namespace_conflict_does_not_panic() {
+        let dir = std::env::temp_dir().join("varta-file-export-ns-test");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("export.tsv");
+        let mut fe = FileExporter::create(&path, Some(1_000_000), 0).unwrap();
+        let ev = Event::NamespaceConflict {
+            claimed_pid: 42,
+            observed_ns_inode: Some(111),
+            observer_ns_inode: Some(222),
+            observer_ns: 9999,
+        };
+        fe.record(&ev).expect("NamespaceConflict should not panic");
+        fe.flush().unwrap();
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            content.contains("namespace_conflict"),
+            "expected namespace_conflict in TSV, got: {content}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

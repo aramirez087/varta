@@ -576,11 +576,7 @@ impl<T: BeatTransport> Varta<T> {
                     && self.transport.reconnect().is_ok()
                 {
                     let retry = self.send_frame();
-                    if matches!(&retry, BeatOutcome::Dropped(_)) {
-                        self.consecutive_dropped = self.reconnect_after;
-                    } else {
-                        self.consecutive_dropped = 0;
-                    }
+                    self.consecutive_dropped = 0;
                     return retry;
                 }
                 outcome

@@ -327,7 +327,7 @@ class Varta:
                     return outcome
                 retry = self._send_frame()
                 if retry.is_dropped:
-                    self._consecutive_dropped = self._reconnect_after
+                    self._consecutive_dropped = 0
                 else:
                     self._consecutive_dropped = 0
                 return retry
