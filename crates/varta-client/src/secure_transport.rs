@@ -314,7 +314,9 @@ impl SecureUdpTransport {
     ///    OS entropy read are irreversible. Counter resets to 0.
     fn advance_nonce(&mut self) -> io::Result<NonceAdvance> {
         if self.iv_counter < u32::MAX {
-            return Ok(NonceAdvance::Simple { counter: self.iv_counter });
+            return Ok(NonceAdvance::Simple {
+                counter: self.iv_counter,
+            });
         }
         if let Some(next_index) = self.iv_prefix_index.checked_add(1) {
             let next_prefix =
