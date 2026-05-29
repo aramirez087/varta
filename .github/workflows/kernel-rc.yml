@@ -155,8 +155,19 @@ jobs:
             ls -R kernel-extract >&2
             exit 1
           fi
-          cp "$VMLINUZ" ./vmlinuz
+          # x86_64's vmlinuz is a self-extracting bzImage that qemu -kernel
+          # loads directly. arm64's vmlinuz is a gzip-compressed Image and
+          # qemu-system-aarch64 cannot load it ("could not load kernel") —
+          # decompress to a raw Image first. Detect by magic rather than by
+          # arch so a future format change is obvious.
+          if [ "$(head -c2 "$VMLINUZ" | xxd -p)" = "1f8b" ]; then
+            echo "vmlinuz is gzip-compressed — extracting raw Image"
+            zcat "$VMLINUZ" > ./vmlinuz
+          else
+            cp "$VMLINUZ" ./vmlinuz
+          fi
           ls -lh ./vmlinuz
+          file ./vmlinuz || true
 
       - name: build varta workspace (release)
         # Release matches the production posture; trampoline + readback
@@ -168,45 +179,69 @@ jobs:
       - name: run signal_trampoline test inside VM
         id: vm-test
         # virtme-ng mounts the cwd r/w inside the VM, boots the downloaded
-        # kernel, runs the command, and exits with its exit code.
-        # `--test-threads=1` keeps the three trampoline tests serial so
-        # socket-path / signal-target races stay obvious.
+        # kernel, and runs the command. `--test-threads=1` keeps the three
+        # trampoline tests serial so socket-path / signal-target races stay
+        # obvious.
         #
         # vng CLI (virtme-ng >=1.30): boot a prebuilt image with `--run
         # <kernel>` (NOT `--kernel`) and pass the guest command via
         # `--exec` (the old `-- <cmd>` positional was removed). On runners
         # without /dev/kvm (arm64 hosted), force TCG with `--disable-kvm`.
+        #
+        # IMPORTANT: vng's own exit code conflates "the VM never booted"
+        # (infra) with "the guest command failed" (a real regression). We
+        # disambiguate with a sentinel: the guest echoes
+        # `VNG_TEST_EXIT=<code>` after the test. If the sentinel is absent
+        # the VM didn't run the command (boot/infra failure) and we set
+        # boot_failed — the issue opener below only fires on a genuine
+        # non-zero test exit, never on a boot failure.
         run: |
           ACCEL=""
           [ -e /dev/kvm ] || ACCEL="--disable-kvm"
+          set +e
           vng --run ./vmlinuz --rwdir . $ACCEL \
-              --exec "cargo test --locked -p varta-tests --release --test signal_trampoline -- --test-threads=1 --nocapture"
+              --exec "cargo test --locked -p varta-tests --release --test signal_trampoline -- --test-threads=1 --nocapture; echo VNG_TEST_EXIT=\$?" \
+              2>&1 | tee vng-console.log
+          set -e
+          line=$(grep -oE 'VNG_TEST_EXIT=[0-9]+' vng-console.log | tail -n1)
+          if [ -z "$line" ]; then
+            echo "::error::VM did not run the test (no VNG_TEST_EXIT sentinel) — boot/infra failure, NOT a trampoline regression."
+            echo "boot_failed=true" >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
+          code=${line#VNG_TEST_EXIT=}
+          echo "test_exit=$code" >> "$GITHUB_OUTPUT"
+          echo "guest test exited $code"
+          [ "$code" = "0" ]
 
       - name: capture dmesg on regression
-        # Only the in-VM test step failing means a real trampoline
-        # regression. Earlier infra steps (kernel-URL resolve, apt/pip
-        # install, deb fetch, build) failing is NOT a code regression and
-        # must not trip the issue opener below. The `!cancelled() &&` is
-        # required: a bare `steps.x.outcome` condition is implicitly
-        # `&& success()`, so it would never run after vm-test fails.
-        if: ${{ !cancelled() && steps.vm-test.outcome == 'failure' }}
+        # Only fire when the guest test actually ran and failed
+        # (test_exit set and non-zero) — never on a boot/infra failure.
+        if: ${{ !cancelled() && steps.vm-test.outputs.test_exit != '' && steps.vm-test.outputs.test_exit != '0' }}
         run: |
           ACCEL=""
           [ -e /dev/kvm ] || ACCEL="--disable-kvm"
           vng --run ./vmlinuz --rwdir . $ACCEL --exec dmesg > dmesg.log 2>&1 || true
 
-      - name: upload artifacts (on regression)
+      - name: upload diagnostics (boot failure or regression)
+        # Always upload the vng console on any vm-test failure so boot/infra
+        # failures remain debuggable, even though they don't open an issue.
         if: ${{ !cancelled() && steps.vm-test.outcome == 'failure' }}
         uses: actions/upload-artifact@v4
         with:
           name: kernel-rc-${{ matrix.arch }}-${{ matrix.kernel }}-artifacts
           path: |
+            vng-console.log
             dmesg.log
             vmlinuz
           if-no-files-found: warn
 
       - name: open or update issue (on regression)
-        if: ${{ !cancelled() && steps.vm-test.outcome == 'failure' }}
+        # Genuine regression only: the guest test ran (test_exit is set) and
+        # returned non-zero. Boot/infra failures (boot_failed, empty
+        # test_exit) never reach here — they show red in Actions with the
+        # vng-console.log artifact, but file no bogus regression issue.
+        if: ${{ !cancelled() && steps.vm-test.outputs.test_exit != '' && steps.vm-test.outputs.test_exit != '0' }}
         uses: actions/github-script@v7
         with:
           script: |
