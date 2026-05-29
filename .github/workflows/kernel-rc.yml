@@ -24,6 +24,10 @@ jobs:
   vm-signal:
     name: kernel-rc (${{ matrix.arch }}/${{ matrix.kernel }})
     runs-on: ${{ matrix.runner }}
+    # arm64 runs under TCG software emulation (no nested KVM), which is
+    # markedly slower than the x86_64 KVM path — bound it so a stuck boot
+    # can't burn the default 6h cap.
+    timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
@@ -58,14 +62,23 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: install KVM + qemu
-        # GitHub-hosted runners (both x86_64 and arm64) expose nested KVM.
-        # The qemu package is parameterised by matrix.qemu_pkg.
+        # x86_64 hosted runners expose nested KVM; arm64 hosted runners
+        # (ubuntu-24.04-arm) do NOT — there is no /dev/kvm, so virtme-ng
+        # falls back to TCG software emulation (slower, but functional).
+        # `qemu-kvm` is x86-only; install it best-effort so the arm64 leg
+        # doesn't fail on a missing package.
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            qemu-kvm ${{ matrix.qemu_pkg }} python3-pip
-          # Allow the unprivileged runner to use /dev/kvm.
-          sudo chmod 666 /dev/kvm || true
+            ${{ matrix.qemu_pkg }} python3-pip
+          sudo apt-get install -y --no-install-recommends qemu-kvm || true
+          # Allow the unprivileged runner to use /dev/kvm when present.
+          if [ -e /dev/kvm ]; then
+            sudo chmod 666 /dev/kvm || true
+            echo "KVM available — hardware acceleration enabled."
+          else
+            echo "::notice::/dev/kvm absent (expected on arm64 hosted runners) — virtme-ng will use TCG software emulation."
+          fi
 
       - name: install virtme-ng
         # Pin to a known-good minor: virtme-ng's CLI is stable but the
@@ -87,18 +100,23 @@ jobs:
           ARCH="${{ matrix.arch }}"
           INDEX=https://kernel.ubuntu.com/mainline/
           curl -fsSL "$INDEX" -o index.html
+          # NOTE: index hrefs carry a trailing slash — `href="v7.0.9/"`.
+          # The previous regexes used `[^/"]*`, which excluded the slash and
+          # therefore matched nothing, so $TAG came out empty and the step
+          # exited 1 (the `(unresolved)` in every auto-filed issue title).
           case "${{ matrix.kernel }}" in
             mainline-stable)
-              # Latest tag without `-rc`.
-              TAG=$(grep -oE 'href="v[0-9][^/"]*"' index.html \
-                | sed -E 's/href="(v[^"/]+)"/\1/' \
-                | grep -v -- '-rc' \
+              # Latest pure-version tag: digits and dots only. This naturally
+              # excludes both `-rc` and old distro-suffixed tags (e.g.
+              # v2.6.32.69-precise).
+              TAG=$(grep -oE 'href="v[0-9][0-9.]*/"' index.html \
+                | sed -E 's#href="(v[^"]+)/"#\1#' \
                 | sort -V | tail -n1)
               ;;
             mainline-rc)
-              # Latest -rc tag.
-              TAG=$(grep -oE 'href="v[0-9][^/"]*-rc[0-9]+"' index.html \
-                | sed -E 's/href="([^"]+)"/\1/' \
+              # Latest -rc tag, e.g. v7.1-rc4.
+              TAG=$(grep -oE 'href="v[0-9][0-9.]*-rc[0-9]+/"' index.html \
+                | sed -E 's#href="(v[^"]+)/"#\1#' \
                 | sort -V | tail -n1)
               ;;
           esac
