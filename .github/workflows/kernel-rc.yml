@@ -167,27 +167,36 @@ jobs:
 
       - name: run signal_trampoline test inside VM
         id: vm-test
-        # virtme-ng mounts the host root r/w inside the VM, boots the
-        # downloaded kernel, runs the command, and exits with its exit
-        # code.  `--test-threads=1` keeps the three trampoline tests
-        # serial so socket-path / signal-target races stay obvious.
+        # virtme-ng mounts the cwd r/w inside the VM, boots the downloaded
+        # kernel, runs the command, and exits with its exit code.
+        # `--test-threads=1` keeps the three trampoline tests serial so
+        # socket-path / signal-target races stay obvious.
+        #
+        # vng CLI (virtme-ng >=1.30): boot a prebuilt image with `--run
+        # <kernel>` (NOT `--kernel`) and pass the guest command via
+        # `--exec` (the old `-- <cmd>` positional was removed). On runners
+        # without /dev/kvm (arm64 hosted), force TCG with `--disable-kvm`.
         run: |
-          vng --kernel ./vmlinuz --rwdir . -- \
-              cargo test --locked -p varta-tests --release \
-                  --test signal_trampoline -- --test-threads=1 --nocapture
+          ACCEL=""
+          [ -e /dev/kvm ] || ACCEL="--disable-kvm"
+          vng --run ./vmlinuz --rwdir . $ACCEL \
+              --exec "cargo test --locked -p varta-tests --release --test signal_trampoline -- --test-threads=1 --nocapture"
 
       - name: capture dmesg on regression
         # Only the in-VM test step failing means a real trampoline
         # regression. Earlier infra steps (kernel-URL resolve, apt/pip
         # install, deb fetch, build) failing is NOT a code regression and
-        # must not trip the issue opener below.
-        if: steps.vm-test.outcome == 'failure'
+        # must not trip the issue opener below. The `!cancelled() &&` is
+        # required: a bare `steps.x.outcome` condition is implicitly
+        # `&& success()`, so it would never run after vm-test fails.
+        if: ${{ !cancelled() && steps.vm-test.outcome == 'failure' }}
         run: |
-          vng --kernel ./vmlinuz --rwdir . -- \
-              dmesg > dmesg.log 2>&1 || true
+          ACCEL=""
+          [ -e /dev/kvm ] || ACCEL="--disable-kvm"
+          vng --run ./vmlinuz --rwdir . $ACCEL --exec dmesg > dmesg.log 2>&1 || true
 
       - name: upload artifacts (on regression)
-        if: steps.vm-test.outcome == 'failure'
+        if: ${{ !cancelled() && steps.vm-test.outcome == 'failure' }}
         uses: actions/upload-artifact@v4
         with:
           name: kernel-rc-${{ matrix.arch }}-${{ matrix.kernel }}-artifacts
@@ -197,7 +206,7 @@ jobs:
           if-no-files-found: warn
 
       - name: open or update issue (on regression)
-        if: steps.vm-test.outcome == 'failure'
+        if: ${{ !cancelled() && steps.vm-test.outcome == 'failure' }}
         uses: actions/github-script@v7
         with:
           script: |

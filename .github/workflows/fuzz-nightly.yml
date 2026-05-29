@@ -90,14 +90,17 @@ jobs:
           fi
 
       - name: upload artifacts (on real crash)
-        if: steps.repro.outputs.crashed == 'true'
+        # `!cancelled() &&` is required: a real crash fails the fuzz step,
+        # and a bare `steps.repro.outputs.crashed` condition is implicitly
+        # `&& success()`, so it would be skipped exactly when it matters.
+        if: ${{ !cancelled() && steps.repro.outputs.crashed == 'true' }}
         uses: actions/upload-artifact@v4
         with:
           name: fuzz-artifacts-${{ matrix.target }}
           path: fuzz/artifacts/${{ matrix.target }}
 
       - name: open or update issue (on real crash)
-        if: steps.repro.outputs.crashed == 'true'
+        if: ${{ !cancelled() && steps.repro.outputs.crashed == 'true' }}
         uses: actions/github-script@v7
         with:
           script: |
