@@ -1393,7 +1393,20 @@ impl PromExporter {
                         break;
                     }
                 }
-                Err(e) if e.kind() == ErrorKind::WouldBlock => break,
+                // The request may not have arrived on a just-accepted
+                // non-blocking socket yet. Yield and retry rather than
+                // bailing on the first WouldBlock — the deadline check at
+                // the loop head is the real latency bound (see the
+                // set_nonblocking comment above). Breaking here instead
+                // mis-reads a not-yet-arrived request as empty, replies 405,
+                // and closes; the request bytes then land in the receive
+                // buffer and close(2) emits an RST (macOS/BSD), surfacing as
+                // "Connection reset by peer" on the scraper. Mirrors
+                // write_all_nonblocking's WouldBlock handling.
+                Err(e) if e.kind() == ErrorKind::WouldBlock => {
+                    std::thread::yield_now();
+                    continue;
+                }
                 Err(e) => return Err(e),
             }
         }
