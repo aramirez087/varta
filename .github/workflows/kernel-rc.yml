@@ -158,14 +158,18 @@ jobs:
               cargo test --locked -p varta-tests --release \
                   --test signal_trampoline -- --test-threads=1 --nocapture
 
-      - name: capture dmesg on failure
-        if: failure()
+      - name: capture dmesg on regression
+        # Only the in-VM test step failing means a real trampoline
+        # regression. Earlier infra steps (kernel-URL resolve, apt/pip
+        # install, deb fetch, build) failing is NOT a code regression and
+        # must not trip the issue opener below.
+        if: steps.vm-test.outcome == 'failure'
         run: |
           vng --kernel ./vmlinuz --rwdir . -- \
               dmesg > dmesg.log 2>&1 || true
 
-      - name: upload artifacts (on failure)
-        if: failure()
+      - name: upload artifacts (on regression)
+        if: steps.vm-test.outcome == 'failure'
         uses: actions/upload-artifact@v4
         with:
           name: kernel-rc-${{ matrix.arch }}-${{ matrix.kernel }}-artifacts
@@ -174,8 +178,8 @@ jobs:
             vmlinuz
           if-no-files-found: warn
 
-      - name: open issue on failure
-        if: failure()
+      - name: open or update issue (on regression)
+        if: steps.vm-test.outcome == 'failure'
         uses: actions/github-script@v7
         with:
           script: |
@@ -184,11 +188,10 @@ jobs:
             const tag = '${{ steps.kernel.outputs.tag }}' || '(unresolved)';
             const runId = context.runId;
             const runUrl = `${context.payload.repository.html_url}/actions/runs/${runId}`;
-            await github.rest.issues.create({
-              ...context.repo,
-              title: `kernel-rc: signal_trampoline regression on ${arch}/${kernel} (${tag})`,
-              labels: ['kernel-rc', 'bug'],
-              body: `The weekly kernel-rc job failed on **${arch}/${kernel}** (\`${tag}\`).\n\n` +
+            // Stable title (no kernel tag) so repeat regressions on the same
+            // arch/channel dedup onto one issue instead of one per week.
+            const title = `kernel-rc: signal_trampoline regression on ${arch}/${kernel}`;
+            const body = `The weekly kernel-rc job failed on **${arch}/${kernel}** (\`${tag}\`).\n\n` +
                     `* Run: ${runUrl}\n` +
                     `* Artifacts: download \`kernel-rc-${arch}-${kernel}-artifacts\` from the run page (\`dmesg.log\`).\n\n` +
                     `Most likely failure mode: the signal-handler kernel-ABI in ` +
@@ -207,5 +210,18 @@ jobs:
                     `vng --kernel ./vmlinuz --rwdir . -- \\\n` +
                     `    cargo test --locked -p varta-tests --release \\\n` +
                     `        --test signal_trampoline -- --test-threads=1 --nocapture\n` +
-                    "```\n"
+                    "```\n";
+            const existing = await github.paginate(github.rest.issues.listForRepo, {
+              ...context.repo, state: 'open', labels: 'kernel-rc', per_page: 100,
             });
+            const hit = existing.find(i => i.title === title);
+            if (hit) {
+              await github.rest.issues.createComment({
+                ...context.repo, issue_number: hit.number,
+                body: `Regression reproduced again on \`${tag}\` in ${runUrl}.`,
+              });
+            } else {
+              await github.rest.issues.create({
+                ...context.repo, title, labels: ['kernel-rc', 'bug'], body,
+              });
+            }
