@@ -4,6 +4,15 @@ All notable changes to the Node.js client live here. Versions follow
 [Semantic Versioning](https://semver.org). The wire protocol version is
 governed independently — see `book/src/spec/vlp.md` in the workspace.
 
+## [0.2.2] — 2026-05-29
+
+### Fixed
+
+- First npm publish of `0.2.1` failed with `E404` because the package
+  had never been published and the Trusted Publisher binding was
+  registered under the wrong npm org. No code changes; version bump to
+  republish under the corrected `@varta-health` scope binding.
+
 ## [0.2.1] — 2026-05-17
 
 ### Fixed

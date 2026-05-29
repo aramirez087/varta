@@ -6,9 +6,11 @@ on:
 
 # Pinned to the `npm-publish` GitHub environment so the workflow
 # inherits the Trusted Publisher binding configured at
-# https://www.npmjs.com/settings/varta/packages (you must register the
-# binding once on npmjs.com before the first publish — see the
-# repository's plan file for the full setup checklist).
+# https://www.npmjs.com/settings/varta-health/packages (org/scope must
+# match the package name @varta-health/client). The package must be
+# seed-published once with a granular-access token before OIDC can take
+# over — a Trusted Publisher token cannot create a brand-new package.
+# See the repository's plan file for the full setup checklist.
 permissions:
   id-token: write
   contents: read
