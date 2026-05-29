@@ -32,6 +32,12 @@ jobs:
           node-version: "20"
           registry-url: "https://registry.npmjs.org"
 
+      # OIDC Trusted Publishing requires npm >= 11.5.1; node 20 ships
+      # npm 10.x, which silently falls back to the (empty) NODE_AUTH_TOKEN
+      # and PUTs anonymously -> registry returns E404. Upgrade npm first.
+      - name: upgrade npm for OIDC trusted publishing
+        run: npm install -g npm@latest
+
       - name: install deps
         working-directory: clients/node
         run: npm ci || npm install
