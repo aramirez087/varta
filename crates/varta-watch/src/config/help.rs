@@ -219,8 +219,9 @@ OPTIONAL:
                                      risk of binding an unauthenticated
                                      plaintext UDP listener.  Required
                                      when --udp-port is set and no
-                                     --key-file / --master-key-file is
-                                     configured.  Build must also include
+                                     --key-file / --accepted-key-file /
+                                     --master-key-file is configured.
+                                     Build must also include
                                      --features unsafe-plaintext-udp.  NOT
                                      for production / safety-critical use;
                                      any device with network reach to the

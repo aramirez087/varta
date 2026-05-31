@@ -434,6 +434,48 @@ fn cli_secure_udp_binds_single_listener_for_udp_port() {
     );
 }
 
+#[cfg(feature = "secure-udp")]
+#[cfg_attr(miri, ignore)] // JUSTIFY: miri cannot model process spawning (Command::new)
+#[test]
+fn cli_accepted_key_file_only_binds_secure_udp_without_plaintext_ack() {
+    let path = unique_uds_path("accepted-only-secure-udp");
+    let port = unused_udp_port().to_string();
+    let key = "1111111111111111111111111111111111111111111111111111111111111111";
+    let key_path = write_secret_file("accepted-only-secure-udp", key, 0o600);
+    let _g = scopeguard(key_path.parent().unwrap());
+
+    let out = Command::new(env!("CARGO_BIN_EXE_varta-watch"))
+        .args([
+            "--socket",
+            path.as_str(),
+            "--threshold-ms",
+            "100",
+            "--udp-bind-addr",
+            "127.0.0.1",
+            "--udp-port",
+            &port,
+            "--accepted-key-file",
+            key_path.to_str().expect("utf-8 key path"),
+            "--shutdown-after-secs",
+            "0",
+        ])
+        .output()
+        .expect("spawn varta-watch with accepted-key-only secure UDP");
+
+    assert!(
+        out.status.success(),
+        "--accepted-key-file alone must configure secure UDP, not fall through \
+         to plaintext UDP; got {:?} (stderr: {})",
+        out.status,
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains("WITHOUT authentication"),
+        "accepted-key-only secure UDP must not emit plaintext warning; stderr was: {stderr}"
+    );
+}
+
 #[cfg_attr(miri, ignore)] // JUSTIFY: miri cannot model process spawning (Command::new)
 #[test]
 fn cli_key_env_flag_is_rejected_with_migration_hint() {

@@ -373,11 +373,7 @@ fn run(cfg: Config) -> std::io::Result<()> {
             let has_master = master_key.is_some();
 
             if has_shared_keys || has_master {
-                let mut all_keys: Vec<varta_vlp::crypto::Key> = Vec::new();
-                if let Some((primary, accepted)) = secure_udp_keys {
-                    all_keys.push(primary);
-                    all_keys.extend(accepted);
-                }
+                let all_keys: Vec<varta_vlp::crypto::Key> = secure_udp_keys.unwrap_or_default();
 
                 let secure = if let Some(mk) = master_key {
                     varta_watch::SecureUdpListener::bind_with_master(addr, all_keys, mk).map_err(

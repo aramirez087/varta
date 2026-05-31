@@ -1079,6 +1079,81 @@ fn heartbeat_file_omitted_is_none() {
     assert!(cfg.heartbeat_file.is_none());
 }
 
+#[cfg(feature = "secure-udp")]
+#[test]
+fn load_secure_keys_loads_accepted_key_file_without_primary() {
+    let dir = mk_tmpdir("accepted-only");
+    let accepted = dir.join("accepted.keys");
+    write_mode(
+        &accepted,
+        b"# rotation keys\n1111111111111111111111111111111111111111111111111111111111111111\n2222222222222222222222222222222222222222222222222222222222222222\n",
+        0o600,
+    );
+
+    let cfg = Config::from_args(args(&[
+        "--socket",
+        "/s",
+        "--threshold-ms",
+        "100",
+        "--udp-port",
+        "9000",
+        "--accepted-key-file",
+        accepted.to_str().expect("utf8 path"),
+    ]))
+    .expect("parse");
+    let keys = cfg
+        .load_secure_keys()
+        .expect("accepted key file should load")
+        .expect("accepted key file should configure secure UDP");
+
+    assert_eq!(keys.len(), 2);
+    assert_eq!(keys[0].as_bytes(), &[0x11; 32]);
+    assert_eq!(keys[1].as_bytes(), &[0x22; 32]);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[cfg(feature = "secure-udp")]
+#[test]
+fn load_secure_keys_preserves_primary_then_accepted_order() {
+    let dir = mk_tmpdir("primary-plus-accepted");
+    let primary = dir.join("primary.key");
+    let accepted = dir.join("accepted.keys");
+    write_mode(
+        &primary,
+        b"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n",
+        0o600,
+    );
+    write_mode(
+        &accepted,
+        b"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\ncccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\n",
+        0o600,
+    );
+
+    let cfg = Config::from_args(args(&[
+        "--socket",
+        "/s",
+        "--threshold-ms",
+        "100",
+        "--udp-port",
+        "9000",
+        "--key-file",
+        primary.to_str().expect("utf8 path"),
+        "--accepted-key-file",
+        accepted.to_str().expect("utf8 path"),
+    ]))
+    .expect("parse");
+    let keys = cfg
+        .load_secure_keys()
+        .expect("key files should load")
+        .expect("key files should configure secure UDP");
+
+    assert_eq!(keys.len(), 3);
+    assert_eq!(keys[0].as_bytes(), &[0xaa; 32]);
+    assert_eq!(keys[1].as_bytes(), &[0xbb; 32]);
+    assert_eq!(keys[2].as_bytes(), &[0xcc; 32]);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 // ----- validate_secret_file tests (M2: TOCTOU hardening) -----
 
 /// Mint a unique tempdir under `$TMPDIR` for a single test. Tests cannot

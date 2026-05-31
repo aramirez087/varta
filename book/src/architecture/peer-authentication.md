@@ -152,8 +152,9 @@ hard-errors at startup; there is no warn-and-continue path.
 
 When `--udp-port` is set, the observer chooses exactly one listener:
 
-1. If `--features secure-udp` is compiled in **and** `--key-file` /
-   `--master-key-file` resolve to a usable key, bind `SecureUdpListener`.
+1. If `--features secure-udp` is compiled in **and** `--key-file`,
+   `--accepted-key-file`, or `--master-key-file` resolve to usable key
+   material, bind `SecureUdpListener`.
 2. Otherwise, only the plaintext path remains.  It is bound *only* if
    both `--features unsafe-plaintext-udp` is compiled in **and**
    `--i-accept-plaintext-udp` was passed on the command line.
