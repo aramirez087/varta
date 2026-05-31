@@ -19,6 +19,9 @@ use super::{
 };
 
 #[cfg(feature = "prometheus-exporter")]
+pub(super) const PROM_DRAIN_READ_CAP: usize = 4096;
+
+#[cfg(feature = "prometheus-exporter")]
 impl super::PromExporter {
     /// Returns `true` and consumes one token if the source IP has tokens
     /// available; otherwise returns `false`.  Capacity-evicts stale or
@@ -238,9 +241,9 @@ impl super::PromExporter {
 
         if total < 4 || buf[..4] != *b"GET " {
             let response = b"HTTP/1.0 405 Method Not Allowed\r\nAllow: GET\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
-            let _ =
-                write_all_nonblocking(&mut stream, response, Instant::now() + PROM_WRITE_TIMEOUT);
-            drain_read_to_would_block(&mut stream);
+            let cleanup_deadline = Instant::now() + PROM_WRITE_TIMEOUT;
+            let _ = write_all_nonblocking(&mut stream, response, cleanup_deadline);
+            drain_read_to_would_block(&mut stream, cleanup_deadline);
             let _ = stream.shutdown(Shutdown::Write);
             return Ok(ServeOutcome::Rejected);
         }
@@ -258,9 +261,9 @@ impl super::PromExporter {
         if !authorized {
             self.prom_auth_failures_total = self.prom_auth_failures_total.saturating_add(1);
             let response = b"HTTP/1.0 401 Unauthorized\r\nWWW-Authenticate: Bearer realm=\"varta\"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
-            let _ =
-                write_all_nonblocking(&mut stream, response, Instant::now() + PROM_WRITE_TIMEOUT);
-            drain_read_to_would_block(&mut stream);
+            let cleanup_deadline = Instant::now() + PROM_WRITE_TIMEOUT;
+            let _ = write_all_nonblocking(&mut stream, response, cleanup_deadline);
+            drain_read_to_would_block(&mut stream, cleanup_deadline);
             let _ = stream.shutdown(Shutdown::Write);
             return Ok(ServeOutcome::Rejected);
         }
@@ -274,7 +277,7 @@ impl super::PromExporter {
         // combined response String.
         let _ = write_headers_with_len(&mut stream, body_len, write_deadline);
         let _ = write_all_nonblocking(&mut stream, self.body_buf.as_bytes(), write_deadline);
-        drain_read_to_would_block(&mut stream);
+        drain_read_to_would_block(&mut stream, write_deadline);
         let _ = stream.shutdown(Shutdown::Write);
         // An authorized client was served. `render_fresh` decides whether the
         // body it received was freshly rendered (advances `last_scrape`) or
@@ -381,20 +384,26 @@ pub(super) fn write_all_nonblocking(
     Ok(())
 }
 
-/// Drain any unread data from the peer's send buffer so that
-/// `shutdown(SHUT_WR)` sends a graceful FIN instead of RST.
+/// Drain a bounded amount of unread data from the peer's send buffer so that
+/// `shutdown(SHUT_WR)` usually sends a graceful FIN instead of RST.
 ///
 /// On macOS, calling `shutdown(SHUT_WR)` on a non-blocking socket that has
 /// unread data in the receive buffer triggers an RST rather than a TCP FIN.
-/// This non-blocking drain empties the receive buffer, letting
-/// `shutdown(SHUT_WR)` complete cleanly on all platforms.
+/// This best-effort non-blocking drain handles normal scrape headers while
+/// refusing to spend unbounded poll-loop time on a peer that keeps the socket
+/// readable after the response has already been written.
 #[cfg(feature = "prometheus-exporter")]
-fn drain_read_to_would_block(stream: &mut TcpStream) {
+pub(super) fn drain_read_to_would_block(stream: &mut TcpStream, deadline: Instant) {
     let mut buf = [0u8; 128];
-    loop {
-        match stream.read(&mut buf) {
+    let mut drained = 0usize;
+    while drained < PROM_DRAIN_READ_CAP && Instant::now() < deadline {
+        let remaining = PROM_DRAIN_READ_CAP - drained;
+        let chunk_len = buf.len().min(remaining);
+        match stream.read(&mut buf[..chunk_len]) {
             Ok(0) => break,
-            Ok(_) => continue,
+            Ok(n) => {
+                drained += n;
+            }
             Err(ref e) if e.kind() == ErrorKind::WouldBlock => break,
             Err(_) => break,
         }

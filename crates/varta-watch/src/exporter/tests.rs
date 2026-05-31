@@ -1,5 +1,5 @@
 use std::io::{self, Read, Write as IoWrite};
-use std::net::{SocketAddr, TcpStream};
+use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::time::{Duration, Instant};
 
 use varta_vlp::crypto::BearerToken;
@@ -8,6 +8,7 @@ use varta_vlp::{DecodeError, Status};
 use crate::observer::Event;
 
 use super::bearer_token::parse_authorization_bearer;
+use super::http::{drain_read_to_would_block, PROM_DRAIN_READ_CAP};
 use super::{
     drop_reason_index, DropReason, Exporter, IterStage, PromExporter,
     RECOVERY_REFUSED_REASON_LABELS, STAGE_LABELS,
@@ -132,6 +133,35 @@ fn non_get_request_returns_405() {
         response.contains("Allow: GET"),
         "missing Allow header: {response}"
     );
+}
+
+#[test]
+fn cleanup_drain_is_byte_bounded() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind listener");
+    let addr = listener.local_addr().expect("local_addr");
+    let mut client = TcpStream::connect(addr).expect("connect client");
+    let (mut server, _) = listener.accept().expect("accept");
+    server.set_nonblocking(true).expect("server nonblocking");
+
+    let payload = vec![0xA5; PROM_DRAIN_READ_CAP + 2048];
+    client.write_all(&payload).expect("write payload");
+    std::thread::sleep(Duration::from_millis(5));
+
+    drain_read_to_would_block(&mut server, Instant::now() + Duration::from_secs(1));
+
+    let mut leftover = [0u8; 1];
+    for _ in 0..20 {
+        match server.read(&mut leftover) {
+            Ok(1) => return,
+            Ok(0) => panic!("server unexpectedly reached EOF"),
+            Ok(_) => unreachable!("one-byte read cannot return more than one byte"),
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Err(e) => panic!("unexpected read error after bounded drain: {e}"),
+        }
+    }
+    panic!("bounded cleanup drain consumed all queued excess bytes");
 }
 
 /// Drive a single GET against the exporter with optional Authorization
