@@ -88,10 +88,22 @@ impl RecoveryAuditLog {
             // of `.1`'s last on-disk chain — a non-linear chain that a
             // tamper-evidence verifier cannot distinguish from forgery.
             // `flush_and_sync` only flushes the BufWriter; it does not touch
-            // the ring, so the drain must be explicit (mirrors `Drop`). The
-            // ring is bounded by `AUDIT_RING_CAP`, so this is bounded work.
+            // the ring, so the drain must be explicit (mirrors `Drop`).
+            // The ring is bounded by `AUDIT_RING_CAP`, but the underlying
+            // writes and sync cadence can still take wall-clock time. Honor
+            // the rotation budget while draining so a full ring cannot pin
+            // the single-threaded observer before the state machine reaches
+            // its first explicit budget check.
+            self.deferred_fsync_in_drain = false;
             while let Some(line) = self.pending_lines.pop_front() {
+                if call_start.elapsed() >= budget {
+                    self.pending_lines.push_front(line);
+                    self.audit_rotation_budget_exceeded_total =
+                        self.audit_rotation_budget_exceeded_total.saturating_add(1);
+                    return RotationOutcome::Deferred;
+                }
                 self.direct_write_line(&line);
+                self.refresh_falling_edge_watermarks();
             }
             self.refresh_falling_edge_watermarks();
             let final_chain = self.prev_chain;
@@ -332,9 +344,70 @@ impl RecoveryAuditLog {
 mod tests {
     use super::*;
     use crate::audit::{AuditConfig, RecoveryAuditLog};
-    use std::io::Write;
+    use std::collections::VecDeque;
+    use std::io::{self, Write};
     use std::os::unix::fs::PermissionsExt;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
     use std::time::Duration;
+
+    use super::super::writer::{DurableSink, FSYNC_HISTORY_CAP};
+
+    struct SlowWriteSink {
+        writes: Arc<AtomicUsize>,
+        delay: Duration,
+    }
+
+    impl Write for SlowWriteSink {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.writes.fetch_add(1, Ordering::Relaxed);
+            std::thread::sleep(self.delay);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl DurableSink for SlowWriteSink {
+        fn sync_data(&self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn synthetic_rotation_log(writes: Arc<AtomicUsize>, delay: Duration) -> RecoveryAuditLog {
+        let sink: Box<dyn DurableSink> = Box::new(SlowWriteSink { writes, delay });
+        RecoveryAuditLog {
+            sink: std::io::BufWriter::new(sink),
+            path: PathBuf::from("/dev/null"),
+            max_bytes: None,
+            bytes_written: 0,
+            pending_err: None,
+            next_seq: 1,
+            prev_chain: [0u8; 32],
+            sync_every: 1,
+            writes_since_sync: 0,
+            daemon_pid: 1234,
+            pending_lines: VecDeque::new(),
+            audit_dropped_total: 0,
+            audit_flush_budget_exceeded_total: 0,
+            fsync_budget: Duration::from_secs(1),
+            sync_interval: None,
+            last_sync_at: None,
+            fsync_durations: VecDeque::with_capacity(FSYNC_HISTORY_CAP),
+            audit_fsync_budget_exceeded_total: 0,
+            audit_rotation_budget_exceeded_total: 0,
+            audit_ring_watermark_warn_total: 0,
+            audit_ring_watermark_critical_total: 0,
+            ring_above_warn: false,
+            ring_above_critical: false,
+            deferred_fsync_in_drain: false,
+            needs_rotation: true,
+            rotation_progress: RotationProgress::Idle,
+        }
+    }
 
     fn tmpdir(tag: &str) -> std::path::PathBuf {
         let nanos = std::time::SystemTime::now()
@@ -361,6 +434,43 @@ mod tests {
             sync_interval: None,
             rotation_budget: Duration::from_millis(50),
         }
+    }
+
+    #[test]
+    fn rotation_pre_drain_honors_budget() {
+        let writes = Arc::new(AtomicUsize::new(0));
+        let mut log = synthetic_rotation_log(writes.clone(), Duration::from_millis(10));
+
+        for pid in 1..=3 {
+            log.record_spawn(&crate::audit::SpawnRecord {
+                wallclock_ms: 1,
+                observer_ns: 1,
+                agent_pid: pid,
+                child_pid: pid + 100,
+                mode: "exec",
+                program: "/bin/true",
+                source: "inline",
+                template_len: 9,
+            });
+        }
+        assert_eq!(log.pending_lines.len(), 3);
+
+        let outcome = log.drive_audit_rotation(Duration::from_millis(1));
+
+        assert_eq!(outcome, RotationOutcome::Deferred);
+        assert_eq!(
+            writes.load(Ordering::Relaxed),
+            1,
+            "rotation must stop after the first over-budget drain write"
+        );
+        assert_eq!(
+            log.pending_lines.len(),
+            2,
+            "undrained audit lines must stay queued for the next tick"
+        );
+        assert!(log.needs_rotation);
+        assert!(log.rotation_progress.is_idle());
+        assert_eq!(log.audit_rotation_budget_exceeded_total, 1);
     }
 
     #[test]
