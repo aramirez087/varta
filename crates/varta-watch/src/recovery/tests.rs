@@ -9,6 +9,21 @@ use super::reaper::CAPTURE_DRAIN_BYTES_PER_TICK;
 use super::{Recovery, RecoveryMode, RecoveryOutcome};
 
 #[test]
+fn capacity_builders_cap_untrusted_values() {
+    let rec = Recovery::with_mode(
+        RecoveryMode::Exec {
+            program: "true".to_string(),
+            args: vec![],
+        },
+        Duration::ZERO,
+    )
+    .with_reap_scratch_capacity(usize::MAX)
+    .with_outstanding_capacity(usize::MAX);
+
+    assert_eq!(rec.reap_scratch.capacity(), crate::tracker::MAX_CAPACITY);
+}
+
+#[test]
 fn exec_mode_spawns_command_via_execvp() {
     let mut rec = Recovery::with_mode(
         RecoveryMode::Exec {

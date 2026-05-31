@@ -101,6 +101,7 @@ OPTIONAL:
                                      cannot hold the observer loop indefinitely.
     --tracker-capacity <N>          Maximum number of distinct agent pids
                                       tracked concurrently (default 256).
+                                      Range [1, 4096].
                                       Beats for new pids beyond this limit are
                                       dropped.
     --eviction-scan-window <N>      Maximum slots scanned per eviction

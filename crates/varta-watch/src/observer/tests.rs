@@ -1,7 +1,7 @@
 use super::*;
 use crate::listener::BeatListener;
 use crate::peer_cred::{BeatOrigin, RecvResult};
-use crate::tracker::DEFAULT_EVICTION_SCAN_WINDOW;
+use crate::tracker::{DEFAULT_EVICTION_SCAN_WINDOW, MAX_CAPACITY};
 use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -19,6 +19,23 @@ fn unique_sock_path() -> PathBuf {
     ));
     let _ = std::fs::remove_file(&p);
     p
+}
+
+#[test]
+fn new_caps_untrusted_tracker_capacity_before_auxiliary_allocations() {
+    let obs = Observer::new(
+        Duration::from_secs(1),
+        usize::MAX,
+        EvictionPolicy::Strict,
+        DEFAULT_EVICTION_SCAN_WINDOW,
+        None,
+        0,
+        0,
+        ClockSource::Monotonic,
+    )
+    .expect("observer construction should cap capacity before allocation");
+
+    assert_eq!(obs.stall_queue.capacity(), MAX_CAPACITY);
 }
 
 #[test]

@@ -158,3 +158,25 @@ recovery_audit_sync_every = 0
     let err = parse_kv(bad).expect_err("sync_every=0 must error");
     assert!(err.contains("recovery_audit_sync_every"), "got: {err}");
 }
+
+#[test]
+fn tracker_capacity_zero_is_rejected() {
+    let bad = "\
+socket = /tmp/x.sock
+threshold_ms = 5000
+tracker_capacity = 0
+";
+    let err = parse_kv(bad).expect_err("tracker_capacity=0 must error");
+    assert!(err.contains("tracker_capacity"), "got: {err}");
+}
+
+#[test]
+fn tracker_capacity_above_max_is_rejected() {
+    let bad = "\
+socket = /tmp/x.sock
+threshold_ms = 5000
+tracker_capacity = 4097
+";
+    let err = parse_kv(bad).expect_err("tracker_capacity above max must error");
+    assert!(err.contains("tracker_capacity"), "got: {err}");
+}

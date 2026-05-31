@@ -197,6 +197,14 @@ pub fn parse_kv(input: &str) -> Result<ParsedConfig, String> {
             ));
         }
     }
+    if let Some(v) = out.singletons.get("tracker_capacity") {
+        let n: usize = v
+            .parse()
+            .map_err(|_| format!("tracker_capacity: not a valid usize: {v:?}"))?;
+        if !(1..=4096).contains(&n) {
+            return Err(format!("tracker_capacity: {n} out of range [1, 4096]"));
+        }
+    }
     if let Some(v) = out.singletons.get("shutdown_grace_ms") {
         let n: u64 = v
             .parse()

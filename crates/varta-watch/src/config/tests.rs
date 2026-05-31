@@ -4,6 +4,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use crate::clock::ClockSource;
+use crate::tracker::MAX_CAPACITY;
 
 use super::types::{
     Config, ConfigError, DEFAULT_PROM_RATE_LIMIT_BURST, DEFAULT_PROM_RATE_LIMIT_PER_SEC,
@@ -1356,6 +1357,58 @@ fn rejects_eviction_scan_window_above_max() {
         matches!(
             err,
             ConfigError::EvictionScanWindowOutOfRange { value: 9999, .. }
+        ),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
+fn parses_tracker_capacity_inside_bounds() {
+    let args = [
+        "--socket",
+        "/tmp/t.sock",
+        "--threshold-ms",
+        "100",
+        "--tracker-capacity",
+        "1024",
+    ];
+    let cfg = Config::from_args(args.iter().map(|s| s.to_string())).unwrap();
+    assert_eq!(cfg.tracker_capacity, 1024);
+}
+
+#[test]
+fn rejects_tracker_capacity_zero() {
+    let args = [
+        "--socket",
+        "/tmp/t.sock",
+        "--threshold-ms",
+        "100",
+        "--tracker-capacity",
+        "0",
+    ];
+    let err = Config::from_args(args.iter().map(|s| s.to_string())).unwrap_err();
+    assert!(
+        matches!(err, ConfigError::TrackerCapacityOutOfRange { value: 0, .. }),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
+fn rejects_tracker_capacity_above_max() {
+    let raw = (MAX_CAPACITY + 1).to_string();
+    let args = [
+        "--socket".to_string(),
+        "/tmp/t.sock".to_string(),
+        "--threshold-ms".to_string(),
+        "100".to_string(),
+        "--tracker-capacity".to_string(),
+        raw,
+    ];
+    let err = Config::from_args(args).unwrap_err();
+    assert!(
+        matches!(
+            err,
+            ConfigError::TrackerCapacityOutOfRange { value, .. } if value == MAX_CAPACITY + 1
         ),
         "unexpected error: {err}"
     );

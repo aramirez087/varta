@@ -251,13 +251,14 @@ impl Recovery {
     /// observer's `tracker_capacity`. Optional — the buffer grows on first
     /// use if not pre-sized.
     pub fn with_reap_scratch_capacity(mut self, capacity: usize) -> Self {
-        self.reap_scratch.reserve_exact(capacity);
+        self.reap_scratch
+            .reserve_exact(capacity.min(crate::tracker::MAX_CAPACITY));
         self
     }
 
     /// Bound the outstanding-child table to `capacity` slots.
     pub fn with_outstanding_capacity(mut self, capacity: usize) -> Self {
-        let cap = capacity.max(1);
+        let cap = capacity.clamp(1, crate::tracker::MAX_CAPACITY);
         self.outstanding = OutstandingTable::with_capacity(cap);
         self
     }

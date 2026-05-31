@@ -47,6 +47,13 @@ impl super::types::Config {
                 platform: std::env::consts::OS,
             });
         }
+        if !(1..=crate::tracker::MAX_CAPACITY).contains(&self.tracker_capacity) {
+            return Err(super::types::ConfigError::TrackerCapacityOutOfRange {
+                value: self.tracker_capacity,
+                min: 1,
+                max: crate::tracker::MAX_CAPACITY,
+            });
+        }
         Ok(self)
     }
 }

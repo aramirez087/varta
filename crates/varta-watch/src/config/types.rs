@@ -558,6 +558,16 @@ pub enum ConfigError {
         /// The maximum allowed value.
         max: usize,
     },
+    /// `--tracker-capacity` was outside the accepted range
+    /// (`[1, crate::tracker::MAX_CAPACITY]`).
+    TrackerCapacityOutOfRange {
+        /// The value provided.
+        value: usize,
+        /// The minimum allowed value.
+        min: usize,
+        /// The maximum allowed value.
+        max: usize,
+    },
     /// `--clock-source boottime` was requested but the host kernel has no
     /// equivalent of Linux's `CLOCK_BOOTTIME`. Currently fires on every
     /// non-Linux target (macOS, *BSD).
@@ -689,6 +699,10 @@ impl core::fmt::Display for ConfigError {
                 f,
                 "--eviction-scan-window: {value} is outside the accepted range [{min}, {max}]"
             ),
+            ConfigError::TrackerCapacityOutOfRange { value, min, max } => write!(
+                f,
+                "--tracker-capacity: {value} is outside the accepted range [{min}, {max}]"
+            ),
             ConfigError::ClockSourceUnsupported { source, platform } => {
                 let hint = match source {
                     crate::clock::ClockSource::Boottime => {
@@ -756,6 +770,10 @@ impl core::fmt::Display for ConfigError {
             | ConfigError::EvictionScanWindowOutOfRange { .. } => {
                 write!(f, "configuration error (argv path unreachable; {REF})")
             }
+            ConfigError::TrackerCapacityOutOfRange { value, min, max } => write!(
+                f,
+                "tracker capacity out of range: {value} not in [{min}, {max}] ({REF})"
+            ),
             ConfigError::ThresholdTooLow { value, min } => {
                 write!(f, "threshold below minimum: {value} ms < {min} ms ({REF})")
             }

@@ -19,7 +19,7 @@ use crate::tracker::EvictionPolicy;
 // unused-imports under `-D warnings`.
 #[cfg(not(feature = "compile-time-config"))]
 use crate::tracker::{
-    DEFAULT_CAPACITY, DEFAULT_EVICTION_SCAN_WINDOW, MAX_EVICTION_SCAN_WINDOW,
+    DEFAULT_CAPACITY, DEFAULT_EVICTION_SCAN_WINDOW, MAX_CAPACITY, MAX_EVICTION_SCAN_WINDOW,
     MIN_EVICTION_SCAN_WINDOW,
 };
 
@@ -707,6 +707,19 @@ impl Config {
             }
             None => DEFAULT_EVICTION_SCAN_WINDOW,
         };
+        let tracker_capacity_resolved = match tracker_capacity {
+            Some(v) => {
+                if !(1..=MAX_CAPACITY).contains(&v) {
+                    return Err(ConfigError::TrackerCapacityOutOfRange {
+                        value: v,
+                        min: 1,
+                        max: MAX_CAPACITY,
+                    });
+                }
+                v
+            }
+            None => DEFAULT_CAPACITY,
+        };
 
         // H7: reject platform-restricted clock sources (`boottime` on
         // non-Linux, `monotonic-raw` on non-macOS) before any listener
@@ -738,7 +751,7 @@ impl Config {
             shutdown_grace: Duration::from_millis(shutdown_grace_ms),
             socket_mode: socket_mode.unwrap_or(DEFAULT_SOCKET_MODE),
             read_timeout: Duration::from_millis(read_timeout_ms.unwrap_or(DEFAULT_READ_TIMEOUT_MS)),
-            tracker_capacity: tracker_capacity.unwrap_or(DEFAULT_CAPACITY),
+            tracker_capacity: tracker_capacity_resolved,
             tracker_eviction_policy: tracker_eviction_policy.unwrap_or(EvictionPolicy::Strict),
             eviction_scan_window: eviction_scan_window_resolved,
             udp_port,
