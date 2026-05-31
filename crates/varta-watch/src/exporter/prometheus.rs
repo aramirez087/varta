@@ -518,7 +518,7 @@ impl super::PromExporter {
             self.truncated_total
         );
         self.body_buf.push_str(
-            "# HELP varta_sender_state_full_total Total times the sender-state map was full and an entry was force-evicted.\n",
+            "# HELP varta_sender_state_full_total Total authenticated secure-UDP frames refused because the sender-state table was full.\n",
         );
         self.body_buf
             .push_str("# TYPE varta_sender_state_full_total counter\n");

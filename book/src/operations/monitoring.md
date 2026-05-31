@@ -159,7 +159,7 @@ zero), so `by (label)` queries and `absent()` rules are safe day-one.
 | Metric                                  | Type    | Labels | Meaning                                                                              |
 |-----------------------------------------|---------|--------|--------------------------------------------------------------------------------------|
 | `varta_frame_decrypt_failures_total`    | counter |        | AEAD decrypt/tag failure.                                                            |
-| `varta_sender_state_full_total`         | counter |        | Per-sender replay-shadow table full.                                                 |
+| `varta_sender_state_full_total`         | counter |        | Authenticated secure-UDP frames refused because the sender-state table was full.      |
 | `varta_secure_aead_attempts_total`      | counter |        | Total AEAD trials. Constant `keys.len() + master_key_configured` per accepted beat (closes the key-rotation timing channel). |
 | `varta_log_suppressed_total`            | counter | `kind` | Per-kind rate-limited diagnostic log suppressions.                                   |
 

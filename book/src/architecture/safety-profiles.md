@@ -80,8 +80,8 @@ Even with this feature, the listener **will not bind** unless
 This feature is **structurally unavailable in Class-A builds** —
 `compile-time-config` + `unsafe-plaintext-udp` is rejected by a
 `compile_error!` in `crates/varta-watch/src/lib.rs`.  Mission-critical
-deployments must use `secure-udp` (AEAD-authenticated, per-sender replay
-shadow) for any UDP transport; plaintext UDP has no replay protection and
+deployments must use `secure-udp` (AEAD-authenticated, bounded per-sender
+replay state) for any UDP transport; plaintext UDP has no replay protection and
 can be used by a network attacker to suppress stall detection.
 
 ---

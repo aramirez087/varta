@@ -11,7 +11,10 @@
 //! 2. A 1-deep IV-rotation history (prev_iv_random / prev_last_counter)
 //!    prevents replay of frames from a previously-used IV prefix after the
 //!    sender rotates to a new one.
-//! 3. The observer's [`Tracker`] enforces per-pid nonce monotonicity on
+//! 3. The bounded sender table fails closed at capacity: known senders can
+//!    advance their state, but unknown senders are refused after the stale
+//!    sweep instead of evicting unrelated replay history.
+//! 4. The observer's [`Tracker`] enforces per-pid nonce monotonicity on
 //!    the decrypted frame.
 
 use std::io;
@@ -150,7 +153,6 @@ pub struct SecureUdpListener {
     /// counter is the operational signal that the constant-trial-count
     /// timing-leak fix is active.
     aead_attempts: u64,
-    last_evicted: Option<(ReplayIdentity, SenderState)>,
     recovery_trust: TransportTrust,
 }
 
@@ -206,7 +208,6 @@ impl SecureUdpListener {
             truncated_count: 0,
             sender_state_full: 0,
             aead_attempts: 0,
-            last_evicted: None,
             recovery_trust: TransportTrust::Untrusted,
         })
     }
@@ -240,7 +241,6 @@ impl SecureUdpListener {
             truncated_count: 0,
             sender_state_full: 0,
             aead_attempts: 0,
-            last_evicted: None,
             recovery_trust: TransportTrust::Untrusted,
         })
     }
@@ -275,57 +275,6 @@ impl SecureUdpListener {
                 }
             }
         }
-    }
-
-    /// When the sender-state slab is full after a stale-sender sweep, evict
-    /// the single entry with the oldest `last_seen` to make room for a new
-    /// sender. The evicted sender's replay state is preserved in
-    /// `last_evicted` so that a replayed frame from the evicted sender is
-    /// still rejected.
-    fn force_evict_oldest_sender(&mut self) {
-        let oldest_slot = self
-            .sender_slab
-            .iter()
-            .enumerate()
-            .filter_map(|(i, opt)| opt.as_ref().map(|s| (i, s.last_seen)))
-            .min_by_key(|(_, ls)| *ls)
-            .map(|(i, _)| i);
-        if let Some(slot) = oldest_slot {
-            if let Some(state) = self.sender_slab[slot].take() {
-                self.sender_index.remove(state.identity);
-                self.sender_free_list.push(slot as u32);
-                let identity = state.identity;
-                self.last_evicted = Some((identity, state));
-            }
-        }
-    }
-
-    /// Validate (iv_random, counter) replay against an immutable `SenderState`
-    /// reference. Returns `true` if the combination is not a replay.
-    fn validate_replay(state: &SenderState, iv_random: [u8; 8], counter: u32) -> bool {
-        if state.iv_random == iv_random {
-            return counter > state.last_counter;
-        }
-        if state.prev_iv_random == iv_random {
-            return counter > state.prev_last_counter;
-        }
-        true
-    }
-
-    /// Apply a valid replay update to a `SenderState`, mutating counters
-    /// and rotating IV history as needed.
-    fn apply_replay_update(state: &mut SenderState, iv_random: [u8; 8], counter: u32) {
-        if state.iv_random == iv_random {
-            state.last_counter = counter;
-        } else if state.prev_iv_random == iv_random {
-            state.prev_last_counter = counter;
-        } else {
-            state.prev_iv_random = state.iv_random;
-            state.prev_last_counter = state.last_counter;
-            state.iv_random = iv_random;
-            state.last_counter = counter;
-        }
-        state.last_seen = Instant::now();
     }
 
     /// Derive a per-agent key from the master key using the plaintext
@@ -372,11 +321,6 @@ impl SecureUdpListener {
     /// 3. Neither matches   → accepted as new or rotated IV, current state
     ///    moves to `prev_*` fields
     ///
-    /// If the sender was recently force-evicted, its replay state is
-    /// checked against the `last_evicted` shadow before being accepted
-    /// as new — closing the replay-protection gap that would otherwise
-    /// exist after a capacity-forced eviction.
-    ///
     /// Note: `counter > state.last_counter` would become false after u64
     /// wraparound, but at 1 beat/nanosecond this requires ~585 million
     /// years — not a practical concern.
@@ -422,28 +366,6 @@ impl SecureUdpListener {
             state.last_counter = counter;
             state.last_seen = Instant::now();
             return true;
-        }
-
-        // Vacant in the index — check the force-evict shadow before falling
-        // through to a fresh insert. On replay rejection the shadow is
-        // preserved so repeated replays cannot bypass protection by
-        // exhausting the shadow on the first attempt.
-        if let Some((evicted_identity, _)) = self.last_evicted.as_ref() {
-            if *evicted_identity == identity {
-                let (_, ref evicted_state) = *self.last_evicted.as_ref().unwrap();
-                let valid = Self::validate_replay(evicted_state, iv_random, counter);
-                if !valid {
-                    return false;
-                }
-                let (_, mut evicted_state) = self.last_evicted.take().unwrap();
-                evicted_state.identity = identity;
-                Self::apply_replay_update(&mut evicted_state, iv_random, counter);
-                if !self.allocate_sender_slot(identity, evicted_state.clone()) {
-                    self.last_evicted = Some((identity, evicted_state));
-                    return false;
-                }
-                return true;
-            }
         }
 
         let new_state = SenderState::new(identity, iv_random, counter);
@@ -635,30 +557,30 @@ impl BeatListener for SecureUdpListener {
                 continue;
             };
 
-            // Capacity guard: sweep stale senders before trying to insert
-            if self.sender_index.len() >= MAX_SENDER_STATES {
-                self.evict_stale_senders();
-            }
-            if self.sender_index.len() >= MAX_SENDER_STATES {
-                // Slab is still full after stale-sender sweep — force-evict
-                // the oldest entry to maintain replay protection.
-                self.force_evict_oldest_sender();
-                self.sender_state_full = self.sender_state_full.saturating_add(1);
-                debug_assert!(
-                    self.sender_index.len() < MAX_SENDER_STATES,
-                    "force_evict_oldest_sender should have freed a slot"
-                );
-            }
-
             // Replay identity is authenticated data from the decrypted VLP
             // frame, not the unauthenticated UDP source address. This closes
             // the source-port replay bypass and matches the observer tracker's
             // pid-keyed liveness model.
             let replay_identity = ReplayIdentity::from_frame_bytes(&plaintext);
+            let known_identity = self.sender_index.get(replay_identity).is_some();
+            if !known_identity && self.sender_index.len() >= MAX_SENDER_STATES {
+                self.evict_stale_senders();
+            }
+            if !known_identity && self.sender_index.len() >= MAX_SENDER_STATES {
+                // Fail closed: admitting an unknown sender would require
+                // evicting live replay state. Drop the authenticated frame
+                // and surface capacity pressure instead.
+                self.sender_state_full = self.sender_state_full.saturating_add(1);
+                continue;
+            }
 
             // Atomic replay check + state update after AEAD success.
             if !self.try_record_replay_state(replay_identity, iv_random, iv_counter) {
-                self.decrypt_failures = self.decrypt_failures.wrapping_add(1);
+                if known_identity {
+                    self.decrypt_failures = self.decrypt_failures.wrapping_add(1);
+                } else {
+                    self.sender_state_full = self.sender_state_full.saturating_add(1);
+                }
                 continue;
             }
 

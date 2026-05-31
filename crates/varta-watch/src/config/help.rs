@@ -229,12 +229,11 @@ OPTIONAL:
                                    UNSAFE: explicitly accept the security
                                      risk of binding a secure-UDP listener
                                      to a non-loopback address.  The
-                                     per-sender replay-state map carries a
-                                     1-deep eviction shadow; an attacker
-                                     with ≥1025 spoofable UDP source
-                                     addresses can rotate the shadow and
-                                     replay one captured frame per target
-                                     sender.  Required whenever
+                                     per-sender replay-state table is bounded
+                                     and fails closed when full; a reachable
+                                     network can still deny admission for new
+                                     agents with authenticated high-cardinality
+                                     traffic.  Required whenever
                                      --udp-bind-addr is set to any address
                                      other than 127.0.0.0/8 or ::1 while
                                      secure-UDP keys are configured.

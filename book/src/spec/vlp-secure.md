@@ -324,10 +324,10 @@ rule.
 
 A real observer cannot retain unbounded per-sender state. The Rust
 reference implementation bounds per-sender records to 1024 simultaneous
-senders with a single-slot eviction shadow; see
-[`book/src/architecture/vlp-transports.md` — "Secure UDP — replay-shadow
-threat boundary (H4)"](../architecture/vlp-transports.md#secure-udp--replay-shadow-threat-boundary-h4)
-for the precise eviction rule and the threat-model implication
+senders and refuses unknown senders at capacity after a stale-sender sweep; see
+[`book/src/architecture/vlp-transports.md` — "Secure UDP — replay-state
+capacity boundary (H4)"](../architecture/vlp-transports.md#secure-udp--replay-state-capacity-boundary-h4)
+for the precise capacity rule and the threat-model implication
 (loopback-default binding when secure-UDP is configured).
 
 ---
@@ -427,5 +427,5 @@ and end-to-end recipe.
   document wraps.
 * [Conformance & Test Vectors](./conformance.md) — JSON schema.
 * [Rust transport rationale](../architecture/vlp-transports.md) — design
-  trade-offs in the reference implementation (loopback default, replay
-  shadow, fork-safety auto-recovery). Not normative.
+  trade-offs in the reference implementation (loopback default, bounded
+  replay state, fork-safety auto-recovery). Not normative.

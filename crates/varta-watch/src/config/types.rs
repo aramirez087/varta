@@ -297,15 +297,13 @@ pub struct Config {
     /// Set by `--plaintext-udp-i-accept-recovery-on-unauthenticated-transport`.
     pub i_accept_recovery_on_plaintext_udp: bool,
     /// Operator opt-in to bind the **secure-UDP** listener to a non-loopback
-    /// address (H4).  The per-sender replay protection retains state for up
-    /// to 1024 source addresses plus a 1-deep eviction shadow — an attacker
-    /// who can spoof ≥1025 UDP source addresses (trivial on a routed network)
-    /// can rotate the shadow and replay a captured frame against a target
-    /// sender.  Loopback is safe (only same-host processes can forge loopback
-    /// source addresses, which requires `CAP_NET_RAW`); any reachable network
-    /// must be explicitly acknowledged.  Without this flag, startup refuses
-    /// to proceed when `--udp-bind-addr` resolves to a non-loopback address
-    /// and secure-UDP keys are configured.  Set by
+    /// address (H4). The per-sender replay protection retains state for up
+    /// to 1024 authenticated PIDs and fails closed for unknown senders when
+    /// the table is full. Loopback is the safe default; any reachable network
+    /// can still turn authenticated high-cardinality traffic into admission
+    /// pressure for new agents and must be explicitly acknowledged. Without
+    /// this flag, startup refuses to proceed when `--udp-bind-addr` resolves
+    /// to a non-loopback address and secure-UDP keys are configured. Set by
     /// `--i-accept-secure-udp-non-loopback`.
     pub i_accept_secure_udp_non_loopback: bool,
     /// Permit beats — and, by extension, recovery commands — for agents
@@ -523,11 +521,9 @@ pub enum ConfigError {
     },
     /// A secure-UDP listener was configured with a non-loopback
     /// `--udp-bind-addr`, but `--i-accept-secure-udp-non-loopback` was not
-    /// passed (H4).  The 1-deep replay shadow after capacity-forced eviction
-    /// is acceptable for closed local networks (loopback) but inadequate for
-    /// any reachable network — any spoofable-source attacker with ≥1025
-    /// distinct UDP source addresses can rotate the shadow and replay one
-    /// captured frame per target.
+    /// passed (H4). The replay-state table is bounded and fail-closed, so a
+    /// reachable network can still deny admission for new agents by filling it
+    /// with authenticated high-cardinality traffic.
     SecureUdpRequiresLoopbackBind {
         /// The `IP:PORT` of the UDP listener that would have been bound.
         udp_addr: String,
@@ -674,9 +670,9 @@ impl core::fmt::Display for ConfigError {
             ConfigError::SecureUdpRequiresLoopbackBind { udp_addr } => write!(
                 f,
                 "secure-UDP listener configured with non-loopback --udp-bind-addr ({udp_addr}). \
-                 The per-sender replay-state map holds up to 1024 senders plus a 1-deep \
-                 eviction shadow; an attacker who can spoof ≥1025 UDP source addresses can \
-                 rotate the shadow and replay a captured frame against a target sender. \
+                 The per-sender replay-state table is bounded to 1024 senders and fails \
+                 closed for new senders at capacity. A reachable network can still deny \
+                 new agents by exhausting that table with authenticated traffic. \
                  Either bind to a loopback address (default 127.0.0.1) or pass \
                  --i-accept-secure-udp-non-loopback to explicitly accept this risk. \
                  See book/src/architecture/vlp-transports.md for the threat-boundary derivation."

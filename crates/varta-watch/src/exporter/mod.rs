@@ -802,8 +802,8 @@ impl PromExporter {
         self.truncated_total = self.truncated_total.saturating_add(count);
     }
 
-    /// Record one or more times the sender-state map was at capacity,
-    /// forcing eviction of the oldest entry.
+    /// Record one or more authenticated secure-UDP frames refused because the
+    /// sender-state table was at capacity.
     pub fn record_sender_state_full(&mut self, count: u64) {
         self.sender_state_full_total = self.sender_state_full_total.saturating_add(count);
     }

@@ -313,12 +313,12 @@ fn run(cfg: Config) -> std::io::Result<()> {
 
     #[cfg(feature = "udp-core")]
     if let Some(port) = cfg.udp_port {
-        // H4: secure-UDP defaults to loopback (127.0.0.1).  Replay protection
-        // tolerates ≤1024 source addresses; on any reachable network an
-        // attacker who can spoof UDP source ports rotates the eviction
-        // shadow and replays captured frames.  Operators who genuinely need
-        // a non-loopback secure-UDP bind must pass --udp-bind-addr explicitly
-        // AND --i-accept-secure-udp-non-loopback (enforced by Config).
+        // H4: secure-UDP defaults to loopback (127.0.0.1). The replay-state
+        // table is bounded and fails closed for new senders at capacity; on
+        // any reachable network that still creates an availability boundary
+        // operators must accept explicitly. Non-loopback secure-UDP binds
+        // require --udp-bind-addr AND --i-accept-secure-udp-non-loopback
+        // (enforced by Config).
         // Plaintext UDP retains the historical 0.0.0.0 default — it is
         // already gated by --i-accept-plaintext-udp.
         #[cfg(feature = "secure-udp")]
@@ -343,17 +343,19 @@ fn run(cfg: Config) -> std::io::Result<()> {
             #[cfg(not(feature = "compile-time-config"))]
             varta_warn!(
                 "secure-UDP is bound to non-loopback {addr} \
-                 (--i-accept-secure-udp-non-loopback). The 1-deep replay shadow \
-                 after capacity-forced eviction is inadequate for any reachable \
-                 network; restrict reach via firewall / private VLAN. See \
+                 (--i-accept-secure-udp-non-loopback). Replay protection now \
+                 fails closed when the bounded sender-state table is full, so \
+                 a reachable network can still deny new senders by exhausting \
+                 that table; restrict reach via firewall / private VLAN. See \
                  book/src/architecture/vlp-transports.md for the threat-boundary \
                  derivation."
             );
             #[cfg(feature = "compile-time-config")]
             varta_warn!(
-                "secure-UDP is bound to non-loopback {addr}. The 1-deep replay \
-                 shadow after capacity-forced eviction is inadequate for any \
-                 reachable network; restrict reach via firewall / private VLAN."
+                "secure-UDP is bound to non-loopback {addr}. Replay protection \
+                 fails closed when the bounded sender-state table is full, so a \
+                 reachable network can deny new senders by exhausting that \
+                 table; restrict reach via firewall / private VLAN."
             );
         }
 

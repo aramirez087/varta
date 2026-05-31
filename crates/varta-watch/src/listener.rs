@@ -273,10 +273,9 @@ pub trait BeatListener: Send + 'static {
 
     /// Drain and reset the sender-state-full counter.
     ///
-    /// Incremented when the per-sender replay map is at capacity and a
-    /// stale-sender sweep fails to free space, forcing eviction of the
-    /// oldest entry. Only listeners that maintain per-sender state will
-    /// override this.
+    /// Incremented when the per-sender replay table is at capacity and a
+    /// stale-sender sweep fails to free space for a new identity. Only
+    /// listeners that maintain per-sender state will override this.
     fn drain_sender_state_full(&mut self) -> u64 {
         0
     }

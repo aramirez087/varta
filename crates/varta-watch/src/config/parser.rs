@@ -636,12 +636,10 @@ impl Config {
             }
         }
 
-        // H4 mitigation — a secure-UDP listener carries only a 1-deep replay
-        // shadow after capacity-forced eviction.  Acceptable for loopback
-        // (only same-host processes can spoof 127.0.0.0/8 source addresses)
-        // but inadequate for any reachable network.  Refuse non-loopback
-        // binds unless the operator explicitly accepts the risk.  Defers to
-        // the runtime layer for the implicit "no --udp-bind-addr +
+        // H4 mitigation — secure-UDP replay state is bounded and fail-closed
+        // for unknown senders at capacity. Loopback keeps that admission
+        // pressure local; any reachable network must be explicitly accepted.
+        // Defers to the runtime layer for the implicit "no --udp-bind-addr +
         // secure-UDP keys → loopback default" case (resolved in main.rs).
         if let Some(port) = udp_port {
             let secure_udp = secure_key_file.is_some()

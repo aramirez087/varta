@@ -243,47 +243,41 @@ for `NetworkUnverified` origins by the existing transport gate — namespace
 mismatch adds nothing for UDP. See
 [`peer-authentication.md`](peer-authentication.md) for the full trust model.
 
-## Secure UDP — replay-shadow threat boundary (H4)
+## Secure UDP — replay-state capacity boundary (H4)
 
-`SecureUdpListener` keeps per-sender replay state in a bounded `HashMap`
-indexed by `SocketAddr`:
+`SecureUdpListener` keeps per-sender replay state in a bounded table
+indexed by the authenticated VLP frame PID:
 
 - Capacity: `MAX_SENDER_STATES = 1024` simultaneously-tracked senders.
-- After capacity is reached, `force_evict_oldest_sender` stashes the
-  evicted sender's `(addr, SenderState)` in a **single-slot**
-  `last_evicted: Option<(SocketAddr, SenderState)>` shadow so a replay
-  attempt from the just-evicted sender is still rejected.
+- Known senders can advance their replay state even while the table is full.
+- Unknown senders are accepted only if a stale-sender sweep frees a slot.
+- If the table remains full, the authenticated frame is consumed and refused;
+  no live sender's replay state is evicted to admit it.
 
-The shadow is one entry deep.  An attacker who can spoof UDP source
-addresses can cycle ≥1025 distinct sources to overwrite the shadow with
-their own chaff, then replay a captured frame from the target sender as
-if it were a "new" sender — the listener has no surviving record of
-the target's last counter and accepts the replay.
+This is a fail-closed replay posture. A reachable network can still create
+an availability event by sending authenticated traffic for enough unique
+PIDs to fill the table, but it cannot make the listener forget an existing
+sender's last counter and then accept a captured older ciphertext for that
+sender.
 
-### Why the shadow isn't deeper
+### Why the table refuses instead of evicting
 
-A 1-deep shadow is acceptable for the loopback configuration: only
-processes on the same host can craft loopback source addresses
-(`127.0.0.0/8` requires `CAP_NET_RAW` to set as a UDP source, and even
-then the kernel refuses spoofed loopback from external interfaces).  On
-any reachable network — VLAN, VPC, the public internet — the source
-address is freely forgeable, and a deeper shadow merely raises the
-attacker's required address budget rather than closing the gap.
-Bounding the shadow to a single slot keeps the eviction story
-constant-time and aligns the threat boundary with a clean operational
-constraint (network reach), rather than a fuzzy quantitative argument
-about how many spoofed sources are "enough".
+Any finite eviction shadow can be rotated out by enough authenticated chaff.
+The only replay-safe bounded behavior is to preserve live replay state and
+refuse new identities at capacity. This trades admission of new senders for
+nonce monotonicity of already-tracked senders, which matches the safety
+profile used elsewhere in Varta: capacity pressure is visible and alertable,
+but replay state is not sacrificed silently.
 
 ### Mitigation
 
 `varta-watch` defaults `--udp-bind-addr` to `127.0.0.1` when secure-UDP
-keys are configured.  Operators who genuinely need the listener to
-accept non-loopback peers must pass `--i-accept-secure-udp-non-loopback`
-explicitly — a CLI flag whose name signals the residual risk.  When the
-flag is set, a high-visibility startup warning is emitted to stderr and
-the operator is expected to constrain network reach (firewall, private
-VLAN, mTLS-fronted tunnel) so that no untrusted host can reach the bound
-port.
+keys are configured. Operators who genuinely need the listener to accept
+non-loopback peers must pass `--i-accept-secure-udp-non-loopback`
+explicitly — a CLI flag whose name signals the residual availability risk.
+When the flag is set, a high-visibility startup warning is emitted to stderr
+and the operator is expected to constrain network reach (firewall, private
+VLAN, mTLS-fronted tunnel) so that no untrusted host can reach the bound port.
 
 The recovery gate on `NetworkUnverified` origins (see
 [`peer-authentication.md`](peer-authentication.md)) remains independent
@@ -325,14 +319,13 @@ wire stream looks like a fresh session to the observer.
 
 ### Observer view
 
-The observer's per-sender state in `SecureUdpListener` is keyed by
-`(SocketAddr, iv_prefix)` with a 1-deep replay history (see
-[H4 replay shadow](#secure-udp--replay-shadow-threat-boundary-h4) above).
-When the forked child sends frames from the same source port with a
-new IV prefix, the observer transitions its current state into the
-`prev_*` slots and accepts the new prefix as a fresh session — no
-replay error, no protocol-level signal required. Fork-recovery is
-*entirely transparent* to the wire format.
+The observer's per-sender state in `SecureUdpListener` is keyed by the
+authenticated VLP frame PID, with a 1-deep IV-prefix history per sender
+(see [H4 replay-state capacity](#secure-udp--replay-state-capacity-boundary-h4)
+above). When the forked child sends frames with a new IV prefix, the
+observer transitions its current state into the `prev_*` slots and accepts
+the new prefix as a fresh session — no replay error, no protocol-level
+signal required. Fork-recovery is *entirely transparent* to the wire format.
 
 ### Advanced callers
 

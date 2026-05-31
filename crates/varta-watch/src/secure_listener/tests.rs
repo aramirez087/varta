@@ -167,100 +167,22 @@ fn rotate_back_to_first_iv_accepted() {
 }
 
 #[test]
-fn capacity_exceeded_forces_evict_and_increments_counter() {
-    let mut listener = new_listener();
-    // Fill the map with unique authenticated identities.
-    for i in 0..MAX_SENDER_STATES {
-        let identity = ReplayIdentity::from_pid(10_000 + i as u32);
-        assert!(listener.try_record_replay_state(identity, test_iv(), 1));
-    }
-    assert_eq!(listener.sender_state_len(), MAX_SENDER_STATES);
-
-    // Eviction before force-evict is a no-op for fresh entries.
-    listener.evict_stale_senders();
-    assert_eq!(listener.sender_state_len(), MAX_SENDER_STATES);
-
-    // Force-evict should remove one entry.
-    listener.force_evict_oldest_sender();
-    assert_eq!(listener.sender_state_len(), MAX_SENDER_STATES - 1);
-}
-
-#[test]
-fn evicted_sender_replay_rejected_repeatedly() {
+fn full_table_refuses_new_identity_without_eviction() {
     let mut listener = new_listener();
     let victim_identity = ReplayIdentity::from_pid(9000);
     let iv = test_iv();
 
-    // Victim sends frames up to counter 10.
     assert!(listener.try_record_replay_state(victim_identity, iv, 10));
-
-    // Fill remaining slots so table is at capacity.
     for i in 1..MAX_SENDER_STATES {
         let identity = ReplayIdentity::from_pid(10_000 + i as u32);
         assert!(listener.try_record_replay_state(identity, test_iv2(), 1));
     }
     assert_eq!(listener.sender_state_len(), MAX_SENDER_STATES);
 
-    // Force-evict the victim (oldest entry).
-    listener.force_evict_oldest_sender();
-    assert!(listener
-        .last_evicted
-        .as_ref()
-        .is_some_and(|(identity, _)| *identity == victim_identity));
-
-    // Attacker replays an old frame (counter 5) — must be rejected.
-    assert!(!listener.try_record_replay_state(victim_identity, iv, 5));
-    // Shadow must survive the rejection so the next replay is also caught.
-    assert!(listener.last_evicted.is_some());
-
-    // Second replay of the same frame — must still be rejected, not
-    // treated as a new sender.
-    assert!(!listener.try_record_replay_state(victim_identity, iv, 5));
-    assert!(listener.last_evicted.is_some());
-
-    // A genuinely new frame (counter 11) from the victim should pass.
-    assert!(listener.try_record_replay_state(victim_identity, iv, 11));
-    // Shadow consumed on success.
-    assert!(listener.last_evicted.is_none());
-}
-
-#[test]
-fn shadow_restored_when_allocate_fails() {
-    let mut listener = new_listener();
-    let victim_identity = ReplayIdentity::from_pid(9000);
-    let iv = test_iv();
-
-    // Victim sends frames up to counter 10.
-    assert!(listener.try_record_replay_state(victim_identity, iv, 10));
-
-    // Fill remaining slots so table is at capacity.
-    for i in 1..MAX_SENDER_STATES {
-        let identity = ReplayIdentity::from_pid(10_000 + i as u32);
-        assert!(listener.try_record_replay_state(identity, test_iv2(), 1));
-    }
-
-    // Force-evict the victim — it goes to the shadow.
-    listener.force_evict_oldest_sender();
-    assert!(listener
-        .last_evicted
-        .as_ref()
-        .is_some_and(|(identity, _)| *identity == victim_identity));
-
-    // Consume the freed slot with a brand-new sender so the slab is full
-    // again. This makes the next allocate_sender_slot call fail.
-    let filler = ReplayIdentity::from_pid(60_000);
-    assert!(listener.try_record_replay_state(filler, test_iv2(), 1));
+    let new_identity = ReplayIdentity::from_pid(60_000);
+    assert!(!listener.try_record_replay_state(new_identity, test_iv3(), 1));
     assert_eq!(listener.sender_state_len(), MAX_SENDER_STATES);
-
-    // A genuinely new frame from the victim (counter 11) enters the
-    // shadow path, passes validation, but allocate_sender_slot fails
-    // because the slab is full. The shadow must be RESTORED.
-    assert!(!listener.try_record_replay_state(victim_identity, iv, 11));
-    assert!(listener.last_evicted.is_some());
-
-    // A replay of an old counter must still be rejected — the shadow
-    // was restored with the advanced counter (11), so counter ≤ 11 fails.
-    assert!(!listener.try_record_replay_state(victim_identity, iv, 11));
+    assert_eq!(listener.sender_last_counter(victim_identity), Some(10));
     assert!(!listener.try_record_replay_state(victim_identity, iv, 5));
 }
 
@@ -315,6 +237,76 @@ fn bind_with_keys(keys: Vec<Key>) -> SecureUdpListener {
 fn send_wire(target: SocketAddr, wire: &[u8]) {
     let sender = UdpSocket::bind("127.0.0.1:0").expect("sender bind");
     sender.send_to(wire, target).expect("send_to");
+}
+
+#[test]
+fn full_table_existing_identity_is_accepted_without_eviction() {
+    let key_bytes = [0x5Au8; 32];
+    let mut listener = bind_with_keys(vec![Key::from_bytes(key_bytes)]);
+    let target = listener.test_local_addr();
+
+    for i in 0..MAX_SENDER_STATES {
+        let identity = ReplayIdentity::from_pid(10_000 + i as u32);
+        assert!(listener.try_record_replay_state(identity, test_iv(), 1));
+    }
+    assert_eq!(listener.sender_state_len(), MAX_SENDER_STATES);
+
+    let existing_pid = 10_000 + (MAX_SENDER_STATES as u32 - 1);
+    let mut plaintext = [0u8; 32];
+    Frame::new(Status::Ok, existing_pid, 777, 2, 0).encode(&mut plaintext);
+    let wire = build_shared_frame(&Key::from_bytes(key_bytes), test_iv(), 2, &plaintext);
+
+    send_wire(target, &wire);
+    match recv_one(&mut listener) {
+        RecvResult::Authenticated { data, .. } => {
+            assert_eq!(data, plaintext, "known sender should still authenticate");
+        }
+        _ => panic!("expected existing sender to authenticate"),
+    }
+
+    assert_eq!(listener.sender_state_len(), MAX_SENDER_STATES);
+    assert_eq!(listener.drain_sender_state_full(), 0);
+    assert_eq!(
+        listener.sender_last_counter(ReplayIdentity::from_pid(existing_pid)),
+        Some(2)
+    );
+    assert!(
+        listener
+            .sender_state_for(ReplayIdentity::from_pid(10_000))
+            .is_some(),
+        "accepting a known sender at capacity must not evict unrelated replay state"
+    );
+}
+
+#[test]
+fn full_table_new_identity_is_refused_without_forgetting_replay_state() {
+    let key_bytes = [0x6Bu8; 32];
+    let mut listener = bind_with_keys(vec![Key::from_bytes(key_bytes)]);
+    let target = listener.test_local_addr();
+    let victim_identity = ReplayIdentity::from_pid(9000);
+
+    assert!(listener.try_record_replay_state(victim_identity, test_iv(), 10));
+    for i in 1..MAX_SENDER_STATES {
+        let identity = ReplayIdentity::from_pid(10_000 + i as u32);
+        assert!(listener.try_record_replay_state(identity, test_iv2(), 1));
+    }
+    assert_eq!(listener.sender_state_len(), MAX_SENDER_STATES);
+
+    let new_pid = 60_000;
+    let mut plaintext = [0u8; 32];
+    Frame::new(Status::Ok, new_pid, 777, 1, 0).encode(&mut plaintext);
+    let wire = build_shared_frame(&Key::from_bytes(key_bytes), test_iv3(), 1, &plaintext);
+
+    send_wire(target, &wire);
+    assert!(
+        matches!(recv_one(&mut listener), RecvResult::WouldBlock),
+        "new sender at capacity must be consumed and refused"
+    );
+    assert_eq!(listener.sender_state_len(), MAX_SENDER_STATES);
+    assert_eq!(listener.drain_sender_state_full(), 1);
+    assert_eq!(listener.drain_decrypt_failures(), 0);
+    assert_eq!(listener.sender_last_counter(victim_identity), Some(10));
+    assert!(!listener.try_record_replay_state(victim_identity, test_iv(), 5));
 }
 
 /// A captured ciphertext replayed from a different UDP source port must still
