@@ -1,7 +1,7 @@
 //! Command spawn, env setup, and child capture.
 
 use std::os::unix::io::AsRawFd;
-use std::process::{Child, ChildStderr, ChildStdout, Command, Stdio};
+use std::process::{Child, ChildStderr, ChildStdout, Command, ExitStatus, Stdio};
 use std::time::Instant;
 
 use crate::audit::SpawnRecord;
@@ -31,6 +31,9 @@ pub(super) struct Outstanding {
     pub(super) stderr_len: u32,
     /// True iff either pipe's reads hit the per-child cap and we stopped reading.
     pub(super) truncated: bool,
+    /// Exit status captured once `try_wait` reaps the child, while bounded
+    /// stdio draining may still need later ticks before audit completion.
+    pub(super) completed_status: Option<ExitStatus>,
 }
 
 /// Take the piped stdout/stderr handles off `child` (when capture is enabled)
@@ -103,6 +106,7 @@ impl Recovery {
                                 stdout_len: 0,
                                 stderr_len: 0,
                                 truncated: false,
+                                completed_status: None,
                             },
                         );
                         self.emit_spawn_audit(

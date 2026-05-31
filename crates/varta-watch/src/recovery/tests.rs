@@ -5,6 +5,7 @@ use crate::peer_cred::BeatOrigin;
 use crate::probe_table::{mix32, BoundedIndex};
 
 use super::debounce::{InsertOutcome, LastFiredTable, MAX_LAST_FIRED_CAPACITY};
+use super::reaper::CAPTURE_DRAIN_BYTES_PER_TICK;
 use super::{Recovery, RecoveryMode, RecoveryOutcome};
 
 #[test]
@@ -371,6 +372,95 @@ fn capture_truncates_at_per_child_cap() {
         "expected truncated=true, got: {complete}"
     );
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn capture_cap_closes_pipes_so_chatty_child_can_exit() {
+    let mut rec = Recovery::with_mode(
+        RecoveryMode::Exec {
+            program: "yes".to_string(),
+            args: vec!["X".to_string()],
+        },
+        Duration::ZERO,
+    )
+    .with_capture(64);
+
+    match rec.on_stall(9, BeatOrigin::KernelAttested, false, 0) {
+        RecoveryOutcome::Spawned { .. } => {}
+        other => panic!("expected Spawned, got {other:?}"),
+    }
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        if Instant::now() >= deadline {
+            panic!("chatty child stayed outstanding after capture cap");
+        }
+        let outcomes = rec.try_reap(0);
+        if outcomes
+            .iter()
+            .any(|o| matches!(o, RecoveryOutcome::Reaped { .. }))
+        {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn completed_child_capture_drain_is_bounded_per_tick() {
+    let mut rec = Recovery::with_mode(
+        RecoveryMode::Exec {
+            program: "head".to_string(),
+            args: vec![
+                "-c".to_string(),
+                "6000".to_string(),
+                "/dev/zero".to_string(),
+            ],
+        },
+        Duration::ZERO,
+    )
+    .with_capture(8192);
+
+    match rec.on_stall(10, BeatOrigin::KernelAttested, false, 0) {
+        RecoveryOutcome::Spawned { .. } => {}
+        other => panic!("expected Spawned, got {other:?}"),
+    }
+
+    std::thread::sleep(Duration::from_millis(100));
+    let outcomes = rec.try_reap(0);
+    assert!(
+        !outcomes
+            .iter()
+            .any(|o| matches!(o, RecoveryOutcome::Reaped { .. })),
+        "completed child should stay pending until bounded capture drain finishes"
+    );
+    let entry = rec
+        .outstanding
+        .get(10)
+        .expect("completed child should remain outstanding during deferred capture drain");
+    assert!(
+        entry.stdout_len as usize <= CAPTURE_DRAIN_BYTES_PER_TICK,
+        "one tick drained {} bytes, above budget {}",
+        entry.stdout_len,
+        CAPTURE_DRAIN_BYTES_PER_TICK
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        if Instant::now() >= deadline {
+            panic!("timed out waiting for deferred capture drain");
+        }
+        let outcomes = rec.try_reap(0);
+        if outcomes
+            .iter()
+            .any(|o| matches!(o, RecoveryOutcome::Reaped { .. }))
+        {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
 }
 
 #[test]

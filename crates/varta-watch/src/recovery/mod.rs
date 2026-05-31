@@ -658,6 +658,9 @@ impl Recovery {
                 let Some(entry_mut) = self.outstanding.get_mut(pid) else {
                     continue;
                 };
+                if entry_mut.completed_status.is_some() {
+                    continue;
+                }
                 let Some(to) = self.timeout else { continue };
                 if entry_mut.spawned_at.elapsed() < to {
                     continue;
