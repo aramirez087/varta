@@ -2,6 +2,59 @@ use super::*;
 use std::net::SocketAddr;
 use varta_vlp::{Frame, Status};
 
+// --- Cross-prefix replay regression coverage -------------------------------
+//
+// These call `try_record_replay_state` directly (with explicit inner nonces)
+// to exercise the per-sender nonce high-water mark added alongside the 1-deep
+// IV-prefix history. The legacy tests below go through `record_for_test`, which
+// auto-supplies a monotonic nonce and therefore never trips this guard.
+
+#[test]
+fn aged_out_prefix_replay_is_rejected() {
+    let mut listener = new_listener();
+    let identity = test_identity();
+    let iv1 = test_iv();
+    let iv2 = test_iv2();
+    let iv3 = test_iv3();
+
+    // Legitimate rotations carry strictly-increasing authenticated nonces.
+    assert!(listener.try_record_replay_state(identity, iv1, 100, 10));
+    assert!(listener.try_record_replay_state(identity, iv2, 200, 20));
+    assert!(listener.try_record_replay_state(identity, iv3, 50, 30));
+
+    // iv1 has aged out of the 1-deep history (current = iv3, prev = iv2).
+    // Replaying a captured iv1 frame with its original inner nonce must now be
+    // rejected by the per-sender nonce high-water mark. Before the fix the
+    // third arm accepted it unconditionally (see `double_rotation_shifts_prev`).
+    assert!(!listener.try_record_replay_state(identity, iv1, 100, 10));
+
+    // The replay must not perturb committed state — iv3 stays current and the
+    // high-water mark is unchanged.
+    assert_eq!(listener.sender_iv_random(identity), Some(iv3));
+    assert_eq!(listener.sender_last_counter(identity), Some(50));
+    assert_eq!(listener.sender_max_nonce(identity), Some(30));
+}
+
+#[test]
+fn genuine_rotation_with_newer_nonce_still_accepted() {
+    let mut listener = new_listener();
+    let identity = test_identity();
+    let iv1 = test_iv();
+    let iv2 = test_iv2();
+    let iv3 = test_iv3();
+
+    assert!(listener.try_record_replay_state(identity, iv1, 100, 10));
+    assert!(listener.try_record_replay_state(identity, iv2, 200, 20));
+
+    // A real new prefix always carries a nonce newer than anything seen, even
+    // when its per-prefix IV counter restarts low — it must still be accepted.
+    assert!(listener.try_record_replay_state(identity, iv3, 1, 21));
+
+    assert_eq!(listener.sender_iv_random(identity), Some(iv3));
+    assert_eq!(listener.sender_last_counter(identity), Some(1));
+    assert_eq!(listener.sender_max_nonce(identity), Some(21));
+}
+
 fn test_key() -> Key {
     Key::from_bytes([0xabu8; 32])
 }
@@ -41,7 +94,7 @@ fn new_sender_accepted_and_inserted() {
     let iv = test_iv();
     let counter = 1;
 
-    assert!(listener.try_record_replay_state(identity, iv, counter));
+    assert!(listener.record_for_test(identity, iv, counter));
     assert_eq!(listener.sender_iv_random(identity), Some(iv));
     assert_eq!(listener.sender_last_counter(identity), Some(counter));
 }
@@ -52,8 +105,8 @@ fn increasing_counter_accepted() {
     let identity = test_identity();
     let iv = test_iv();
 
-    assert!(listener.try_record_replay_state(identity, iv, 1));
-    assert!(listener.try_record_replay_state(identity, iv, 2));
+    assert!(listener.record_for_test(identity, iv, 1));
+    assert!(listener.record_for_test(identity, iv, 2));
     assert_eq!(listener.sender_last_counter(identity), Some(2));
 }
 
@@ -63,8 +116,8 @@ fn same_counter_rejected() {
     let identity = test_identity();
     let iv = test_iv();
 
-    assert!(listener.try_record_replay_state(identity, iv, 5));
-    assert!(!listener.try_record_replay_state(identity, iv, 5));
+    assert!(listener.record_for_test(identity, iv, 5));
+    assert!(!listener.record_for_test(identity, iv, 5));
 }
 
 #[test]
@@ -73,8 +126,8 @@ fn lower_counter_rejected() {
     let identity = test_identity();
     let iv = test_iv();
 
-    assert!(listener.try_record_replay_state(identity, iv, 5));
-    assert!(!listener.try_record_replay_state(identity, iv, 3));
+    assert!(listener.record_for_test(identity, iv, 5));
+    assert!(!listener.record_for_test(identity, iv, 3));
 }
 
 #[test]
@@ -84,9 +137,9 @@ fn new_iv_random_accepted_and_rotates() {
     let iv1 = test_iv();
     let iv2 = test_iv2();
 
-    assert!(listener.try_record_replay_state(identity, iv1, 100));
+    assert!(listener.record_for_test(identity, iv1, 100));
     // Rotation: iv1 → iv2
-    assert!(listener.try_record_replay_state(identity, iv2, 1));
+    assert!(listener.record_for_test(identity, iv2, 1));
 
     assert_eq!(listener.sender_iv_random(identity), Some(iv2));
     assert_eq!(listener.sender_last_counter(identity), Some(1));
@@ -102,13 +155,13 @@ fn replay_after_rotation_rejected() {
     let iv2 = test_iv2();
 
     // Sender uses iv1 up to counter 100, then rotates to iv2
-    assert!(listener.try_record_replay_state(identity, iv1, 100));
-    assert!(listener.try_record_replay_state(identity, iv2, 1));
+    assert!(listener.record_for_test(identity, iv1, 100));
+    assert!(listener.record_for_test(identity, iv2, 1));
 
     // Replay of a frame from the iv1 epoch at counter 50 → rejected
-    assert!(!listener.try_record_replay_state(identity, iv1, 50));
+    assert!(!listener.record_for_test(identity, iv1, 50));
     // Replay of the last frame from iv1 epoch at counter 100 → rejected (not strictly greater)
-    assert!(!listener.try_record_replay_state(identity, iv1, 100));
+    assert!(!listener.record_for_test(identity, iv1, 100));
 }
 
 #[test]
@@ -118,11 +171,11 @@ fn larger_counter_from_prev_iv_accepted() {
     let iv1 = test_iv();
     let iv2 = test_iv2();
 
-    assert!(listener.try_record_replay_state(identity, iv1, 100));
-    assert!(listener.try_record_replay_state(identity, iv2, 1));
+    assert!(listener.record_for_test(identity, iv1, 100));
+    assert!(listener.record_for_test(identity, iv2, 1));
     // An out-of-order delayed frame from iv1 with counter > prev_last_counter
     // is accepted (non-replay)
-    assert!(listener.try_record_replay_state(identity, iv1, 150));
+    assert!(listener.record_for_test(identity, iv1, 150));
     assert_eq!(listener.sender_iv_random(identity), Some(iv2));
     assert_eq!(listener.sender_prev_last_counter(identity), Some(150));
 }
@@ -135,10 +188,10 @@ fn double_rotation_shifts_prev() {
     let iv2 = test_iv2();
     let iv3 = test_iv3();
 
-    assert!(listener.try_record_replay_state(identity, iv1, 100));
-    assert!(listener.try_record_replay_state(identity, iv2, 200));
+    assert!(listener.record_for_test(identity, iv1, 100));
+    assert!(listener.record_for_test(identity, iv2, 200));
     // Third rotation: iv2 → iv3; iv1 is lost from history
-    assert!(listener.try_record_replay_state(identity, iv3, 50));
+    assert!(listener.record_for_test(identity, iv3, 50));
 
     assert_eq!(listener.sender_iv_random(identity), Some(iv3));
     assert_eq!(listener.sender_last_counter(identity), Some(50));
@@ -153,12 +206,12 @@ fn rotate_back_to_first_iv_accepted() {
     let iv1 = test_iv();
     let iv2 = test_iv2();
 
-    assert!(listener.try_record_replay_state(identity, iv1, 100));
-    assert!(listener.try_record_replay_state(identity, iv2, 50));
+    assert!(listener.record_for_test(identity, iv1, 100));
+    assert!(listener.record_for_test(identity, iv2, 50));
     // Frame from iv1 arrives with counter > prev_last_counter —
     // accepted as non-replay (delayed frame from previous epoch).
     // State is updated but iv2 remains current.
-    assert!(listener.try_record_replay_state(identity, iv1, 200));
+    assert!(listener.record_for_test(identity, iv1, 200));
 
     assert_eq!(listener.sender_iv_random(identity), Some(iv2));
     assert_eq!(listener.sender_last_counter(identity), Some(50));
@@ -172,18 +225,18 @@ fn full_table_refuses_new_identity_without_eviction() {
     let victim_identity = ReplayIdentity::from_pid(9000);
     let iv = test_iv();
 
-    assert!(listener.try_record_replay_state(victim_identity, iv, 10));
+    assert!(listener.record_for_test(victim_identity, iv, 10));
     for i in 1..MAX_SENDER_STATES {
         let identity = ReplayIdentity::from_pid(10_000 + i as u32);
-        assert!(listener.try_record_replay_state(identity, test_iv2(), 1));
+        assert!(listener.record_for_test(identity, test_iv2(), 1));
     }
     assert_eq!(listener.sender_state_len(), MAX_SENDER_STATES);
 
     let new_identity = ReplayIdentity::from_pid(60_000);
-    assert!(!listener.try_record_replay_state(new_identity, test_iv3(), 1));
+    assert!(!listener.record_for_test(new_identity, test_iv3(), 1));
     assert_eq!(listener.sender_state_len(), MAX_SENDER_STATES);
     assert_eq!(listener.sender_last_counter(victim_identity), Some(10));
-    assert!(!listener.try_record_replay_state(victim_identity, iv, 5));
+    assert!(!listener.record_for_test(victim_identity, iv, 5));
 }
 
 // ----- H3: constant-trial-count AEAD poll -----
@@ -247,7 +300,7 @@ fn full_table_existing_identity_is_accepted_without_eviction() {
 
     for i in 0..MAX_SENDER_STATES {
         let identity = ReplayIdentity::from_pid(10_000 + i as u32);
-        assert!(listener.try_record_replay_state(identity, test_iv(), 1));
+        assert!(listener.record_for_test(identity, test_iv(), 1));
     }
     assert_eq!(listener.sender_state_len(), MAX_SENDER_STATES);
 
@@ -285,10 +338,10 @@ fn full_table_new_identity_is_refused_without_forgetting_replay_state() {
     let target = listener.test_local_addr();
     let victim_identity = ReplayIdentity::from_pid(9000);
 
-    assert!(listener.try_record_replay_state(victim_identity, test_iv(), 10));
+    assert!(listener.record_for_test(victim_identity, test_iv(), 10));
     for i in 1..MAX_SENDER_STATES {
         let identity = ReplayIdentity::from_pid(10_000 + i as u32);
-        assert!(listener.try_record_replay_state(identity, test_iv2(), 1));
+        assert!(listener.record_for_test(identity, test_iv2(), 1));
     }
     assert_eq!(listener.sender_state_len(), MAX_SENDER_STATES);
 
@@ -306,7 +359,7 @@ fn full_table_new_identity_is_refused_without_forgetting_replay_state() {
     assert_eq!(listener.drain_sender_state_full(), 1);
     assert_eq!(listener.drain_decrypt_failures(), 0);
     assert_eq!(listener.sender_last_counter(victim_identity), Some(10));
-    assert!(!listener.try_record_replay_state(victim_identity, test_iv(), 5));
+    assert!(!listener.record_for_test(victim_identity, test_iv(), 5));
 }
 
 /// A captured ciphertext replayed from a different UDP source port must still

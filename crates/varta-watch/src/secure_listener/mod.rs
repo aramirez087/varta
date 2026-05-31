@@ -4,18 +4,27 @@
 //! decrypts and verifies them using the pre-shared key(s), and returns the
 //! decrypted 32-byte VLP frame via the standard [`BeatListener`] trait.
 //!
-//! Replay protection is enforced at three layers:
+//! Replay protection is enforced at several layers:
 //! 1. The listener performs an atomic check-and-update of per-sender replay
 //!    state **after** successful AEAD decryption, eliminating the TOCTOU
 //!    window between the replay check and state insertion.
 //! 2. A 1-deep IV-rotation history (prev_iv_random / prev_last_counter)
-//!    prevents replay of frames from a previously-used IV prefix after the
-//!    sender rotates to a new one.
-//! 3. The bounded sender table fails closed at capacity: known senders can
+//!    bounds replay *within* the current and immediately-previous IV prefix
+//!    via their per-prefix counters.
+//! 3. A per-sender high-water mark of the authenticated inner VLP nonce
+//!    (`SenderState::max_nonce`) bounds replay *across* prefix rotations: a
+//!    frame on a prefix that has aged out of the 1-deep history is accepted
+//!    only if its nonce strictly exceeds every nonce already seen for that
+//!    sender. This closes replay of a fully-aged-out prefix, which the
+//!    IV-history alone cannot (a captured old frame would otherwise look like
+//!    a fresh rotation).
+//! 4. The bounded sender table fails closed at capacity: known senders can
 //!    advance their state, but unknown senders are refused after the stale
 //!    sweep instead of evicting unrelated replay history.
-//! 4. The observer's [`Tracker`] enforces per-pid nonce monotonicity on
-//!    the decrypted frame.
+//! 5. The observer's [`Tracker`] enforces per-pid nonce monotonicity on
+//!    the decrypted frame (a backstop that is lost if the tracker slot is
+//!    evicted under capacity pressure, which is why layer 3 enforces the same
+//!    invariant at the dedicated replay layer).
 
 use std::io;
 use std::net::{SocketAddr, UdpSocket};
@@ -85,6 +94,13 @@ impl Hash32 for ReplayIdentity {
 /// alongside the IV/counter pair so that a linear walk over the slab can
 /// recover the index key (matches the `OutstandingTable` pattern, which
 /// stores pid-keyed values keyed by their own value).
+///
+/// `max_nonce` is the high-water mark of the authenticated inner VLP frame
+/// nonce (`plaintext[16..24]`) seen for this sender across **all** IV prefixes.
+/// The IV-prefix pair only guards replay *within* the current/previous epoch;
+/// the inner nonce is monotonic per pid across every rotation kind (counter
+/// wrap, operator reconnect — fork changes the pid, hence a fresh sender), so
+/// it is the cross-prefix bound that closes replay of a fully-aged-out prefix.
 #[derive(Clone, Debug)]
 struct SenderState {
     identity: ReplayIdentity,
@@ -92,17 +108,19 @@ struct SenderState {
     last_counter: u32,
     prev_iv_random: [u8; 8],
     prev_last_counter: u32,
+    max_nonce: u64,
     last_seen: Instant,
 }
 
 impl SenderState {
-    fn new(identity: ReplayIdentity, iv_random: [u8; 8], counter: u32) -> Self {
+    fn new(identity: ReplayIdentity, iv_random: [u8; 8], counter: u32, frame_nonce: u64) -> Self {
         SenderState {
             identity,
             iv_random,
             last_counter: counter,
             prev_iv_random: [0u8; 8],
             prev_last_counter: 0,
+            max_nonce: frame_nonce,
             last_seen: Instant::now(),
         }
     }
@@ -311,24 +329,38 @@ impl SecureUdpListener {
     }
 
     /// Atomic replay check + state update: returns `true` if the
-    /// (sender, iv_random, counter) combination is valid, and updates the
-    /// replay state in the same operation to close the TOCTOU window.
+    /// (sender, iv_random, counter, frame_nonce) combination is valid, and
+    /// updates the replay state in the same operation to close the TOCTOU
+    /// window.
     ///
     /// Three cases per sender lookup:
     /// 1. Same IV prefix   → `counter > last_counter` required
     /// 2. Previous IV prefix → `counter > prev_last_counter` required
     ///    (catches replay of frames from a recently-rotated epoch)
-    /// 3. Neither matches   → accepted as new or rotated IV, current state
-    ///    moves to `prev_*` fields
+    /// 3. Neither matches (a new or rotated IV prefix) → accepted only if
+    ///    `frame_nonce > max_nonce`. The IV-prefix history is 1-deep, so a
+    ///    captured frame from a prefix that has aged out of `iv_random` /
+    ///    `prev_iv_random` would otherwise land here and be re-accepted as a
+    ///    "fresh rotation". The authenticated inner VLP nonce is monotonic
+    ///    per pid across every legitimate rotation, so requiring it to exceed
+    ///    the per-sender high-water mark rejects any aged-out replay while
+    ///    still admitting genuine rotations (which always carry a newer
+    ///    nonce). On accept, current state moves to `prev_*` fields.
     ///
-    /// Note: `counter > state.last_counter` would become false after u64
-    /// wraparound, but at 1 beat/nanosecond this requires ~585 million
-    /// years — not a practical concern.
+    /// `max_nonce` is advanced on every accept (all three arms). Within the
+    /// current / previous prefix, replay is still bounded by the per-prefix
+    /// counter alone (arms 1 & 2 do not gate on `max_nonce`), preserving the
+    /// existing tolerance for in-flight reordering inside the recent epochs.
+    ///
+    /// Note: `counter > state.last_counter` and the `frame_nonce` HWM would
+    /// become false after u64 wraparound, but at 1 beat/nanosecond this
+    /// requires ~585 million years — not a practical concern.
     fn try_record_replay_state(
         &mut self,
         identity: ReplayIdentity,
         iv_random: [u8; 8],
         counter: u32,
+        frame_nonce: u64,
     ) -> bool {
         if let Some(slot) = self.sender_index.get(identity) {
             let state = match self.sender_slab.get_mut(slot).and_then(Option::as_mut) {
@@ -345,6 +377,7 @@ impl SecureUdpListener {
             if state.iv_random == iv_random {
                 if counter > state.last_counter {
                     state.last_counter = counter;
+                    state.max_nonce = state.max_nonce.max(frame_nonce);
                     state.last_seen = Instant::now();
                     return true;
                 }
@@ -354,9 +387,18 @@ impl SecureUdpListener {
             if state.prev_iv_random == iv_random {
                 if counter > state.prev_last_counter {
                     state.prev_last_counter = counter;
+                    state.max_nonce = state.max_nonce.max(frame_nonce);
                     state.last_seen = Instant::now();
                     return true;
                 }
+                return false;
+            }
+
+            // New or rotated IV prefix. The 1-deep prefix history has no
+            // record of it, so the only cross-prefix replay bound is the
+            // authenticated inner nonce: reject anything not strictly newer
+            // than every frame already accepted for this sender.
+            if frame_nonce <= state.max_nonce {
                 return false;
             }
 
@@ -364,11 +406,12 @@ impl SecureUdpListener {
             state.prev_last_counter = state.last_counter;
             state.iv_random = iv_random;
             state.last_counter = counter;
+            state.max_nonce = frame_nonce;
             state.last_seen = Instant::now();
             return true;
         }
 
-        let new_state = SenderState::new(identity, iv_random, counter);
+        let new_state = SenderState::new(identity, iv_random, counter, frame_nonce);
         self.allocate_sender_slot(identity, new_state)
     }
 
@@ -406,6 +449,33 @@ impl SecureUdpListener {
         self.sender_index
             .get(identity)
             .and_then(|slot| self.sender_slab.get(slot)?.as_ref())
+    }
+
+    #[cfg(test)]
+    fn sender_max_nonce(&self, identity: ReplayIdentity) -> Option<u64> {
+        self.sender_state_for(identity).map(|s| s.max_nonce)
+    }
+
+    /// Test-only shim that supplies a globally-monotonic inner nonce.
+    ///
+    /// The legacy IV/counter replay tests predate the cross-prefix nonce
+    /// high-water mark and only exercise the per-prefix counter logic. Feeding
+    /// each successive call a strictly newer nonce keeps their exact semantics:
+    /// a genuine rotation (the third arm) is never refused by the `max_nonce`
+    /// guard, so every prior accept/reject expectation is preserved. Tests that
+    /// exercise the cross-prefix guard itself call [`try_record_replay_state`]
+    /// directly with explicit nonces.
+    #[cfg(test)]
+    fn record_for_test(
+        &mut self,
+        identity: ReplayIdentity,
+        iv_random: [u8; 8],
+        counter: u32,
+    ) -> bool {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static TEST_NONCE: AtomicU64 = AtomicU64::new(1);
+        let nonce = TEST_NONCE.fetch_add(1, Ordering::Relaxed);
+        self.try_record_replay_state(identity, iv_random, counter, nonce)
     }
 
     #[cfg(test)]
@@ -565,6 +635,20 @@ impl BeatListener for SecureUdpListener {
             // the source-port replay bypass and matches the observer tracker's
             // pid-keyed liveness model.
             let replay_identity = ReplayIdentity::from_frame_bytes(&plaintext);
+            // Authenticated inner VLP nonce (`plaintext[16..24]`, see
+            // varta-vlp Frame layout). Monotonic per pid across IV-prefix
+            // rotations, so it bounds replay of an aged-out prefix that the
+            // 1-deep `iv_random`/`prev_iv_random` history no longer remembers.
+            let frame_nonce = u64::from_le_bytes([
+                plaintext[16],
+                plaintext[17],
+                plaintext[18],
+                plaintext[19],
+                plaintext[20],
+                plaintext[21],
+                plaintext[22],
+                plaintext[23],
+            ]);
             let known_identity = self.sender_index.get(replay_identity).is_some();
             if !known_identity && self.sender_index.len() >= MAX_SENDER_STATES {
                 self.evict_stale_senders();
@@ -579,7 +663,7 @@ impl BeatListener for SecureUdpListener {
             }
 
             // Atomic replay check + state update after AEAD success.
-            if !self.try_record_replay_state(replay_identity, iv_random, iv_counter) {
+            if !self.try_record_replay_state(replay_identity, iv_random, iv_counter, frame_nonce) {
                 if known_identity {
                     self.decrypt_failures = self.decrypt_failures.wrapping_add(1);
                 } else {
