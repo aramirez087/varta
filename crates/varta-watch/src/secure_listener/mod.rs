@@ -544,7 +544,7 @@ impl BeatListener for SecureUdpListener {
                 }
                 _ => {
                     self.truncated_count = self.truncated_count.wrapping_add(1);
-                    continue;
+                    return RecvResult::ShortRead;
                 }
             };
 
@@ -554,7 +554,10 @@ impl BeatListener for SecureUdpListener {
 
             let Some(plaintext) = decrypted else {
                 self.decrypt_failures = self.decrypt_failures.wrapping_add(1);
-                continue;
+                // One bad datagram is one poll unit. Do not privately drain
+                // the socket here: a sustained unauthenticated flood must not
+                // pin the observer inside this listener and starve maintenance.
+                return RecvResult::WouldBlock;
             };
 
             // Replay identity is authenticated data from the decrypted VLP
@@ -571,7 +574,8 @@ impl BeatListener for SecureUdpListener {
                 // evicting live replay state. Drop the authenticated frame
                 // and surface capacity pressure instead.
                 self.sender_state_full = self.sender_state_full.saturating_add(1);
-                continue;
+                // Same one-datagram budget as AEAD failures above.
+                return RecvResult::WouldBlock;
             }
 
             // Atomic replay check + state update after AEAD success.
@@ -581,7 +585,8 @@ impl BeatListener for SecureUdpListener {
                 } else {
                     self.sender_state_full = self.sender_state_full.saturating_add(1);
                 }
-                continue;
+                // Same one-datagram budget as AEAD failures above.
+                return RecvResult::WouldBlock;
             }
 
             let origin = match self.recovery_trust {

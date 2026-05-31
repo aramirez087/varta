@@ -678,7 +678,10 @@ mod udp_impl {
                     }
                     Ok(_) => {
                         self.truncated_count = self.truncated_count.wrapping_add(1);
-                        continue;
+                        // Match the observer's one-datagram poll contract:
+                        // malformed UDP traffic must not keep this listener
+                        // draining indefinitely inside one poll iteration.
+                        return RecvResult::ShortRead;
                     }
                     Err(e) => match e.kind() {
                         io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut => {

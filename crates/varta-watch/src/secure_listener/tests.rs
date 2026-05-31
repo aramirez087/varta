@@ -485,12 +485,60 @@ fn aead_attempts_equals_keys_len_on_decrypt_failure() {
     let wire = build_shared_frame(&stranger, test_iv(), 1, &plaintext);
     send_wire(target, &wire);
 
-    // recv() consumes datagrams in a loop; the unauthenticated frame
-    // increments decrypt_failures and continues, returning WouldBlock.
+    // recv() consumes one unauthenticated frame, increments
+    // decrypt_failures, and returns WouldBlock.
     let _ = recv_one(&mut listener);
     assert_eq!(
         listener.drain_aead_attempts(),
         3,
         "decrypt-failure path must still pay the full attempt budget"
     );
+}
+
+#[test]
+fn recv_returns_after_one_decrypt_failure_even_when_valid_frame_is_queued() {
+    use std::time::Instant;
+
+    let key_bytes = [0x31u8; 32];
+    let mut listener = bind_with_keys(vec![Key::from_bytes(key_bytes)]);
+    let target = listener.test_local_addr();
+
+    let invalid_wire =
+        build_shared_frame(&Key::from_bytes([0xFFu8; 32]), test_iv(), 1, &[0xBBu8; 32]);
+    let mut valid_plaintext = [0u8; 32];
+    Frame::new(Status::Ok, 22_222, 777, 1, 0).encode(&mut valid_plaintext);
+    let valid_wire =
+        build_shared_frame(&Key::from_bytes(key_bytes), test_iv(), 1, &valid_plaintext);
+
+    let sender = UdpSocket::bind("127.0.0.1:0").expect("sender bind");
+    sender.send_to(&invalid_wire, target).expect("send invalid");
+    sender.send_to(&valid_wire, target).expect("send valid");
+
+    let deadline = Instant::now() + Duration::from_millis(500);
+    loop {
+        match listener.recv() {
+            RecvResult::WouldBlock => {
+                if listener.drain_decrypt_failures() == 1 {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "listener did not consume the queued invalid frame"
+                );
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            RecvResult::Authenticated { .. } => {
+                panic!("recv must not drain past an invalid frame to a queued valid frame")
+            }
+            RecvResult::ShortRead => panic!("test sends only secure-frame-sized datagrams"),
+            RecvResult::CtrlTruncated(e) | RecvResult::IoError(e) => {
+                panic!("unexpected receive error: {e}")
+            }
+        }
+    }
+
+    match recv_one(&mut listener) {
+        RecvResult::Authenticated { data, .. } => assert_eq!(data, valid_plaintext),
+        _ => panic!("queued valid frame should authenticate on the next recv call"),
+    }
 }
