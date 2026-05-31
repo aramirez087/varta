@@ -131,12 +131,12 @@ impl FileExporter {
     /// Record an evicted pid line into the file export. This is called from
     /// the main loop when a tracker slot is reclaimed, so the operator has
     /// a per-pid trace of eviction events.
-    pub fn record_eviction_pid(&mut self, pid: u32, observer_ns: u64) {
+    pub fn record_eviction_pid(&mut self, pid: u32, observer_ns: u64) -> io::Result<()> {
         let result = writeln!(self.sink, "{observer_ns}\teviction\t{pid}\t-\t-\t-",);
         if let Err(e) = result {
-            self.pending_err = Some(e);
+            self.remember_error(&e);
+            Err(e)
         } else {
-            self.pending_err = None;
             let line_len = decimal_digits(observer_ns) as u64
                 + 1  // \t
                 + 8  // "eviction"
@@ -149,14 +149,20 @@ impl FileExporter {
                 + 1  // \t
                 + 1  // -
                 + 1; // \n
-            self.after_write(line_len);
+            self.after_write(line_len)
         }
+    }
+
+    fn remember_error(&mut self, e: &io::Error) {
+        self.pending_err = Some(io::Error::new(e.kind(), e.to_string()));
     }
 
     /// Called after every successful write. Drives optional per-record
     /// `fdatasync` (when `--export-file-sync-every` is set) and file
     /// rotation (when `--export-file-max-bytes` is set).
-    fn after_write(&mut self, line_len: u64) {
+    fn after_write(&mut self, line_len: u64) -> io::Result<()> {
+        let mut first_err = None;
+
         // Per-record durability: mirror `audit.rs::write_line`. When
         // disabled (sync_every == 0) the counter is never touched.
         if self.sync_every > 0 {
@@ -167,27 +173,34 @@ impl FileExporter {
                     Err(e) => {
                         // Latch the error; rotation below still runs so
                         // we don't deadlock on a stuck sync.
-                        self.pending_err = Some(e);
+                        self.remember_error(&e);
+                        first_err = Some(e);
                     }
                 }
             }
         }
 
         let Some(max) = self.max_bytes else {
-            return;
+            return match first_err {
+                Some(e) => Err(e),
+                None => Ok(()),
+            };
         };
         self.bytes_written = self.bytes_written.saturating_add(line_len);
         if self.bytes_written < max {
-            return;
+            return match first_err {
+                Some(e) => Err(e),
+                None => Ok(()),
+            };
         }
         // Rotation needed.
         if let Err(e) = self.sink.flush() {
-            self.pending_err = Some(e);
-            return;
+            self.remember_error(&e);
+            return Err(first_err.unwrap_or(e));
         }
         if let Err(e) = Self::rotate(&self.path) {
-            self.pending_err = Some(e);
-            return;
+            self.remember_error(&e);
+            return Err(first_err.unwrap_or(e));
         }
         match OpenOptions::new()
             .create(true)
@@ -198,9 +211,14 @@ impl FileExporter {
                 self.sink = BufWriter::new(file);
                 self.bytes_written = 0;
                 self.writes_since_sync = 0;
+                match first_err {
+                    Some(e) => Err(e),
+                    None => Ok(()),
+                }
             }
             Err(e) => {
-                self.pending_err = Some(e);
+                self.remember_error(&e);
+                Err(first_err.unwrap_or(e))
             }
         }
     }
@@ -376,12 +394,11 @@ impl Exporter for FileExporter {
             }
         };
         if let Err(ref e) = result {
-            self.pending_err = Some(io::Error::new(e.kind(), e.to_string()));
+            self.remember_error(e);
         }
         match result {
             Err(e) => Err(e),
             Ok(()) => {
-                self.pending_err = None;
                 let actual_len = if line_len > 0 {
                     line_len
                 } else {
@@ -416,8 +433,7 @@ impl Exporter for FileExporter {
                         _ => unreachable!(),
                     }
                 };
-                self.after_write(actual_len);
-                Ok(())
+                self.after_write(actual_len)
             }
         }
     }
@@ -458,6 +474,32 @@ fn status_label(s: Status) -> &'static str {
 mod tests {
     use super::*;
 
+    fn rotation_reopen_fixture(name: &str) -> (PathBuf, PathBuf) {
+        let dir =
+            std::env::temp_dir().join(format!("varta-file-export-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let path = dir.join("export.tsv");
+        (dir, path)
+    }
+
+    fn sample_beat(observer_ns: u64) -> Event {
+        Event::Beat {
+            pid: 42,
+            status: Status::Ok,
+            payload: 7,
+            nonce: 1,
+            origin: crate::peer_cred::BeatOrigin::KernelAttested,
+            pid_ns_inode: None,
+            observer_ns,
+        }
+    }
+
     #[test]
     fn namespace_conflict_does_not_panic() {
         let dir = std::env::temp_dir().join("varta-file-export-ns-test");
@@ -478,5 +520,70 @@ mod tests {
             "expected namespace_conflict in TSV, got: {content}"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn record_reports_rotation_reopen_failure() {
+        let (dir, path) = rotation_reopen_fixture("record-rotation-error");
+        let mut fe = FileExporter::create(&path, Some(1), 0).unwrap();
+
+        std::fs::remove_file(&path).unwrap();
+        std::fs::remove_dir(&dir).unwrap();
+
+        let err = fe
+            .record(&sample_beat(123))
+            .expect_err("rotation reopen failure must be returned");
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
+
+        let pending = fe
+            .flush()
+            .expect_err("rotation reopen failure must remain latched");
+        assert_eq!(pending.kind(), io::ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn successful_record_does_not_clear_latched_rotation_error() {
+        let (dir, path) = rotation_reopen_fixture("record-latched-error");
+        let mut fe = FileExporter::create(&path, Some(1), 0).unwrap();
+
+        std::fs::remove_file(&path).unwrap();
+        std::fs::remove_dir(&dir).unwrap();
+
+        let err = fe
+            .record(&sample_beat(123))
+            .expect_err("first rotation reopen must fail");
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
+        assert!(fe.pending_err.is_some());
+
+        std::fs::create_dir_all(&dir).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        fe.record(&sample_beat(124))
+            .expect("second rotation can reopen after parent dir is restored");
+        assert!(fe.pending_err.is_some());
+
+        let pending = fe
+            .flush()
+            .expect_err("latched rotation error must survive later successful writes");
+        assert_eq!(pending.kind(), io::ErrorKind::NotFound);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn record_eviction_pid_reports_rotation_reopen_failure() {
+        let (dir, path) = rotation_reopen_fixture("eviction-rotation-error");
+        let mut fe = FileExporter::create(&path, Some(1), 0).unwrap();
+
+        std::fs::remove_file(&path).unwrap();
+        std::fs::remove_dir(&dir).unwrap();
+
+        let err = fe
+            .record_eviction_pid(42, 123)
+            .expect_err("eviction rotation reopen failure must be returned");
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
     }
 }

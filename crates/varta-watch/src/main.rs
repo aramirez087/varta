@@ -1128,7 +1128,9 @@ fn run(cfg: Config) -> std::io::Result<()> {
 
         if let Some(evicted_pid) = observer.drain_evicted_pid() {
             if let Some(fe) = file_export.as_mut() {
-                fe.record_eviction_pid(evicted_pid, observer.now_ns());
+                if let Err(e) = fe.record_eviction_pid(evicted_pid, observer.now_ns()) {
+                    varta_error_rl!(LogKind::FileExportIo, "file export error: {e}");
+                }
             }
             #[cfg(feature = "prometheus-exporter")]
             if let Some(pe) = prom_export.as_mut() {

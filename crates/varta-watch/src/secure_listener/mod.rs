@@ -22,7 +22,7 @@ use varta_vlp::crypto::{self, Key, NONCE_BYTES, SECURE_FRAME_MASTER_BYTES, TAG_B
 
 use crate::listener::{BeatListener, TransportTrust};
 use crate::peer_cred::{BeatOrigin, RecvResult};
-use crate::probe_table::BoundedIndex;
+use crate::probe_table::{BoundedIndex, Hash32};
 
 /// Wire size of a shared-key VLP frame.
 const SECURE_FRAME_LEN: usize = crypto::SECURE_FRAME_BYTES;
@@ -40,17 +40,51 @@ const EVICTION_TTL: Duration = Duration::from_secs(600); // 10 minutes
 /// How often the stale-sender sweep runs.
 const EVICTION_INTERVAL: Duration = Duration::from_secs(60);
 
+/// Authenticated replay identity.
+///
+/// UDP source addresses are not stable enough, or authenticated enough, to
+/// identify a secure sender: reconnects can legitimately change source ports,
+/// while a replay attacker can transmit a captured ciphertext from a different
+/// port. The decrypted VLP frame PID is AEAD-authenticated, and it matches the
+/// observer's tracker identity, so replay state is keyed by that PID.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ReplayIdentity(u32);
+
+impl ReplayIdentity {
+    #[inline]
+    fn from_frame_bytes(plaintext: &[u8; 32]) -> Self {
+        Self(u32::from_le_bytes([
+            plaintext[4],
+            plaintext[5],
+            plaintext[6],
+            plaintext[7],
+        ]))
+    }
+
+    #[cfg(test)]
+    const fn from_pid(pid: u32) -> Self {
+        Self(pid)
+    }
+}
+
+impl Hash32 for ReplayIdentity {
+    #[inline]
+    fn hash32(&self) -> u32 {
+        self.0.hash32()
+    }
+}
+
 /// Per-sender replay guard state.
 ///
 /// Tracks the current IV prefix and its last counter, plus a 1-deep history
 /// of the previous IV prefix/counter so that frames from a recently-rotated
-/// IV are still checked for replay. The originating `addr` is stored
+/// IV are still checked for replay. The authenticated `identity` is stored
 /// alongside the IV/counter pair so that a linear walk over the slab can
 /// recover the index key (matches the `OutstandingTable` pattern, which
 /// stores pid-keyed values keyed by their own value).
 #[derive(Clone, Debug)]
 struct SenderState {
-    addr: SocketAddr,
+    identity: ReplayIdentity,
     iv_random: [u8; 8],
     last_counter: u32,
     prev_iv_random: [u8; 8],
@@ -59,9 +93,9 @@ struct SenderState {
 }
 
 impl SenderState {
-    fn new(addr: SocketAddr, iv_random: [u8; 8], counter: u32) -> Self {
+    fn new(identity: ReplayIdentity, iv_random: [u8; 8], counter: u32) -> Self {
         SenderState {
-            addr,
+            identity,
             iv_random,
             last_counter: counter,
             prev_iv_random: [0u8; 8],
@@ -98,12 +132,12 @@ pub struct SecureUdpListener {
     /// LIFO of available slab indices. Pre-populated with
     /// `(0..MAX_SENDER_STATES).rev()` so the first insert lands at slot 0.
     sender_free_list: Vec<u32>,
-    /// `SocketAddr → slab index` mapping with bounded WCET (no SipHash, no
+    /// `ReplayIdentity → slab index` mapping with bounded WCET (no SipHash, no
     /// rehash). Sized identically to the slab so the load-factor invariant
     /// for `BoundedIndex` holds. Replaces the previous
-    /// `HashMap<SocketAddr, SenderState>` per the project-wide DNR rule
+    /// `HashMap<ReplayIdentity, SenderState>` per the project-wide DNR rule
     /// (see cerebrum 2026-05-14 "Generic `BoundedIndex<K>`").
-    sender_index: BoundedIndex<SocketAddr>,
+    sender_index: BoundedIndex<ReplayIdentity>,
     next_eviction_check: Instant,
     decrypt_failures: u64,
     truncated_count: u64,
@@ -116,13 +150,17 @@ pub struct SecureUdpListener {
     /// counter is the operational signal that the constant-trial-count
     /// timing-leak fix is active.
     aead_attempts: u64,
-    last_evicted: Option<(SocketAddr, SenderState)>,
+    last_evicted: Option<(ReplayIdentity, SenderState)>,
     recovery_trust: TransportTrust,
 }
 
 /// Build the pre-allocated `(slab, free_list, index)` triple used by both
 /// `bind` and `bind_with_master`. Keeps the capacity invariant in one place.
-fn new_sender_state_store() -> (Vec<Option<SenderState>>, Vec<u32>, BoundedIndex<SocketAddr>) {
+fn new_sender_state_store() -> (
+    Vec<Option<SenderState>>,
+    Vec<u32>,
+    BoundedIndex<ReplayIdentity>,
+) {
     let mut slab = Vec::with_capacity(MAX_SENDER_STATES);
     for _ in 0..MAX_SENDER_STATES {
         slab.push(None);
@@ -232,7 +270,7 @@ impl SecureUdpListener {
                 .is_some_and(|s| s.last_seen <= cutoff);
             if stale {
                 if let Some(state) = self.sender_slab[slot].take() {
-                    self.sender_index.remove(state.addr);
+                    self.sender_index.remove(state.identity);
                     self.sender_free_list.push(slot as u32);
                 }
             }
@@ -254,10 +292,10 @@ impl SecureUdpListener {
             .map(|(i, _)| i);
         if let Some(slot) = oldest_slot {
             if let Some(state) = self.sender_slab[slot].take() {
-                self.sender_index.remove(state.addr);
+                self.sender_index.remove(state.identity);
                 self.sender_free_list.push(slot as u32);
-                let addr = state.addr;
-                self.last_evicted = Some((addr, state));
+                let identity = state.identity;
+                self.last_evicted = Some((identity, state));
             }
         }
     }
@@ -344,11 +382,11 @@ impl SecureUdpListener {
     /// years — not a practical concern.
     fn try_record_replay_state(
         &mut self,
-        sender: SocketAddr,
+        identity: ReplayIdentity,
         iv_random: [u8; 8],
         counter: u32,
     ) -> bool {
-        if let Some(slot) = self.sender_index.get(sender) {
+        if let Some(slot) = self.sender_index.get(identity) {
             let state = match self.sender_slab.get_mut(slot).and_then(Option::as_mut) {
                 Some(s) => s,
                 None => {
@@ -390,41 +428,41 @@ impl SecureUdpListener {
         // through to a fresh insert. On replay rejection the shadow is
         // preserved so repeated replays cannot bypass protection by
         // exhausting the shadow on the first attempt.
-        if let Some((addr, _)) = self.last_evicted.as_ref() {
-            if *addr == sender {
+        if let Some((evicted_identity, _)) = self.last_evicted.as_ref() {
+            if *evicted_identity == identity {
                 let (_, ref evicted_state) = *self.last_evicted.as_ref().unwrap();
                 let valid = Self::validate_replay(evicted_state, iv_random, counter);
                 if !valid {
                     return false;
                 }
                 let (_, mut evicted_state) = self.last_evicted.take().unwrap();
-                evicted_state.addr = sender;
+                evicted_state.identity = identity;
                 Self::apply_replay_update(&mut evicted_state, iv_random, counter);
-                if !self.allocate_sender_slot(sender, evicted_state.clone()) {
-                    self.last_evicted = Some((sender, evicted_state));
+                if !self.allocate_sender_slot(identity, evicted_state.clone()) {
+                    self.last_evicted = Some((identity, evicted_state));
                     return false;
                 }
                 return true;
             }
         }
 
-        let new_state = SenderState::new(sender, iv_random, counter);
-        self.allocate_sender_slot(sender, new_state)
+        let new_state = SenderState::new(identity, iv_random, counter);
+        self.allocate_sender_slot(identity, new_state)
     }
 
-    /// Pop a free slab slot, register `addr → slot` in the index, and write
+    /// Pop a free slab slot, register `identity → slot` in the index, and write
     /// `state` to the slab. Returns `false` (rolling back the pop) when no
     /// free slot is available or the index probe budget is exhausted; the
     /// caller treats this as a soft refusal. In production the outer
     /// capacity guard in `recv` ensures a free slot exists before calling
     /// `try_record_replay_state`, so this only matters for direct unit
     /// tests and as defense-in-depth.
-    fn allocate_sender_slot(&mut self, addr: SocketAddr, state: SenderState) -> bool {
+    fn allocate_sender_slot(&mut self, identity: ReplayIdentity, state: SenderState) -> bool {
         let Some(slot_u32) = self.sender_free_list.pop() else {
             return false;
         };
         let slot = slot_u32 as usize;
-        if self.sender_index.insert(addr, slot).is_err() {
+        if self.sender_index.insert(identity, slot).is_err() {
             self.sender_free_list.push(slot_u32);
             return false;
         }
@@ -435,37 +473,37 @@ impl SecureUdpListener {
             // free_list yielded an out-of-bounds index — structural bug.
             // Roll back the index insert and return false rather than
             // panicking on the recv path.
-            self.sender_index.remove(addr);
+            self.sender_index.remove(identity);
             debug_assert!(false, "free_list yielded slot ≥ sender_slab.len()");
             false
         }
     }
 
     #[cfg(test)]
-    fn sender_state_for(&self, addr: &SocketAddr) -> Option<&SenderState> {
+    fn sender_state_for(&self, identity: ReplayIdentity) -> Option<&SenderState> {
         self.sender_index
-            .get(*addr)
+            .get(identity)
             .and_then(|slot| self.sender_slab.get(slot)?.as_ref())
     }
 
     #[cfg(test)]
-    fn sender_iv_random(&self, addr: &SocketAddr) -> Option<[u8; 8]> {
-        self.sender_state_for(addr).map(|s| s.iv_random)
+    fn sender_iv_random(&self, identity: ReplayIdentity) -> Option<[u8; 8]> {
+        self.sender_state_for(identity).map(|s| s.iv_random)
     }
 
     #[cfg(test)]
-    fn sender_last_counter(&self, addr: &SocketAddr) -> Option<u32> {
-        self.sender_state_for(addr).map(|s| s.last_counter)
+    fn sender_last_counter(&self, identity: ReplayIdentity) -> Option<u32> {
+        self.sender_state_for(identity).map(|s| s.last_counter)
     }
 
     #[cfg(test)]
-    fn sender_prev_iv_random(&self, addr: &SocketAddr) -> Option<[u8; 8]> {
-        self.sender_state_for(addr).map(|s| s.prev_iv_random)
+    fn sender_prev_iv_random(&self, identity: ReplayIdentity) -> Option<[u8; 8]> {
+        self.sender_state_for(identity).map(|s| s.prev_iv_random)
     }
 
     #[cfg(test)]
-    fn sender_prev_last_counter(&self, addr: &SocketAddr) -> Option<u32> {
-        self.sender_state_for(addr).map(|s| s.prev_last_counter)
+    fn sender_prev_last_counter(&self, identity: ReplayIdentity) -> Option<u32> {
+        self.sender_state_for(identity).map(|s| s.prev_last_counter)
     }
 
     #[cfg(test)]
@@ -492,7 +530,7 @@ impl BeatListener for SecureUdpListener {
                 self.next_eviction_check = now + EVICTION_INTERVAL;
             }
 
-            let (nread, sender) = match self.sock.recv_from(&mut buf) {
+            let (nread, _sender) = match self.sock.recv_from(&mut buf) {
                 Ok((n, addr)) => (n, addr),
                 Err(e) => match e.kind() {
                     io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut => {
@@ -612,8 +650,14 @@ impl BeatListener for SecureUdpListener {
                 );
             }
 
+            // Replay identity is authenticated data from the decrypted VLP
+            // frame, not the unauthenticated UDP source address. This closes
+            // the source-port replay bypass and matches the observer tracker's
+            // pid-keyed liveness model.
+            let replay_identity = ReplayIdentity::from_frame_bytes(&plaintext);
+
             // Atomic replay check + state update after AEAD success.
-            if !self.try_record_replay_state(sender, iv_random, iv_counter) {
+            if !self.try_record_replay_state(replay_identity, iv_random, iv_counter) {
                 self.decrypt_failures = self.decrypt_failures.wrapping_add(1);
                 continue;
             }

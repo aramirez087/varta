@@ -1,5 +1,6 @@
 use super::*;
 use std::net::SocketAddr;
+use varta_vlp::{Frame, Status};
 
 fn test_key() -> Key {
     Key::from_bytes([0xabu8; 32])
@@ -22,8 +23,8 @@ fn new_listener() -> SecureUdpListener {
         .expect("bind should succeed")
 }
 
-fn test_addr() -> SocketAddr {
-    "127.0.0.1:9999".parse().unwrap()
+fn test_identity() -> ReplayIdentity {
+    ReplayIdentity::from_pid(42)
 }
 
 #[test]
@@ -36,142 +37,142 @@ fn bind_requires_at_least_one_key() {
 #[test]
 fn new_sender_accepted_and_inserted() {
     let mut listener = new_listener();
-    let addr = test_addr();
+    let identity = test_identity();
     let iv = test_iv();
     let counter = 1;
 
-    assert!(listener.try_record_replay_state(addr, iv, counter));
-    assert_eq!(listener.sender_iv_random(&addr), Some(iv));
-    assert_eq!(listener.sender_last_counter(&addr), Some(counter));
+    assert!(listener.try_record_replay_state(identity, iv, counter));
+    assert_eq!(listener.sender_iv_random(identity), Some(iv));
+    assert_eq!(listener.sender_last_counter(identity), Some(counter));
 }
 
 #[test]
 fn increasing_counter_accepted() {
     let mut listener = new_listener();
-    let addr = test_addr();
+    let identity = test_identity();
     let iv = test_iv();
 
-    assert!(listener.try_record_replay_state(addr, iv, 1));
-    assert!(listener.try_record_replay_state(addr, iv, 2));
-    assert_eq!(listener.sender_last_counter(&addr), Some(2));
+    assert!(listener.try_record_replay_state(identity, iv, 1));
+    assert!(listener.try_record_replay_state(identity, iv, 2));
+    assert_eq!(listener.sender_last_counter(identity), Some(2));
 }
 
 #[test]
 fn same_counter_rejected() {
     let mut listener = new_listener();
-    let addr = test_addr();
+    let identity = test_identity();
     let iv = test_iv();
 
-    assert!(listener.try_record_replay_state(addr, iv, 5));
-    assert!(!listener.try_record_replay_state(addr, iv, 5));
+    assert!(listener.try_record_replay_state(identity, iv, 5));
+    assert!(!listener.try_record_replay_state(identity, iv, 5));
 }
 
 #[test]
 fn lower_counter_rejected() {
     let mut listener = new_listener();
-    let addr = test_addr();
+    let identity = test_identity();
     let iv = test_iv();
 
-    assert!(listener.try_record_replay_state(addr, iv, 5));
-    assert!(!listener.try_record_replay_state(addr, iv, 3));
+    assert!(listener.try_record_replay_state(identity, iv, 5));
+    assert!(!listener.try_record_replay_state(identity, iv, 3));
 }
 
 #[test]
 fn new_iv_random_accepted_and_rotates() {
     let mut listener = new_listener();
-    let addr = test_addr();
+    let identity = test_identity();
     let iv1 = test_iv();
     let iv2 = test_iv2();
 
-    assert!(listener.try_record_replay_state(addr, iv1, 100));
+    assert!(listener.try_record_replay_state(identity, iv1, 100));
     // Rotation: iv1 → iv2
-    assert!(listener.try_record_replay_state(addr, iv2, 1));
+    assert!(listener.try_record_replay_state(identity, iv2, 1));
 
-    assert_eq!(listener.sender_iv_random(&addr), Some(iv2));
-    assert_eq!(listener.sender_last_counter(&addr), Some(1));
-    assert_eq!(listener.sender_prev_iv_random(&addr), Some(iv1));
-    assert_eq!(listener.sender_prev_last_counter(&addr), Some(100));
+    assert_eq!(listener.sender_iv_random(identity), Some(iv2));
+    assert_eq!(listener.sender_last_counter(identity), Some(1));
+    assert_eq!(listener.sender_prev_iv_random(identity), Some(iv1));
+    assert_eq!(listener.sender_prev_last_counter(identity), Some(100));
 }
 
 #[test]
 fn replay_after_rotation_rejected() {
     let mut listener = new_listener();
-    let addr = test_addr();
+    let identity = test_identity();
     let iv1 = test_iv();
     let iv2 = test_iv2();
 
     // Sender uses iv1 up to counter 100, then rotates to iv2
-    assert!(listener.try_record_replay_state(addr, iv1, 100));
-    assert!(listener.try_record_replay_state(addr, iv2, 1));
+    assert!(listener.try_record_replay_state(identity, iv1, 100));
+    assert!(listener.try_record_replay_state(identity, iv2, 1));
 
     // Replay of a frame from the iv1 epoch at counter 50 → rejected
-    assert!(!listener.try_record_replay_state(addr, iv1, 50));
+    assert!(!listener.try_record_replay_state(identity, iv1, 50));
     // Replay of the last frame from iv1 epoch at counter 100 → rejected (not strictly greater)
-    assert!(!listener.try_record_replay_state(addr, iv1, 100));
+    assert!(!listener.try_record_replay_state(identity, iv1, 100));
 }
 
 #[test]
 fn larger_counter_from_prev_iv_accepted() {
     let mut listener = new_listener();
-    let addr = test_addr();
+    let identity = test_identity();
     let iv1 = test_iv();
     let iv2 = test_iv2();
 
-    assert!(listener.try_record_replay_state(addr, iv1, 100));
-    assert!(listener.try_record_replay_state(addr, iv2, 1));
+    assert!(listener.try_record_replay_state(identity, iv1, 100));
+    assert!(listener.try_record_replay_state(identity, iv2, 1));
     // An out-of-order delayed frame from iv1 with counter > prev_last_counter
     // is accepted (non-replay)
-    assert!(listener.try_record_replay_state(addr, iv1, 150));
-    assert_eq!(listener.sender_iv_random(&addr), Some(iv2));
-    assert_eq!(listener.sender_prev_last_counter(&addr), Some(150));
+    assert!(listener.try_record_replay_state(identity, iv1, 150));
+    assert_eq!(listener.sender_iv_random(identity), Some(iv2));
+    assert_eq!(listener.sender_prev_last_counter(identity), Some(150));
 }
 
 #[test]
 fn double_rotation_shifts_prev() {
     let mut listener = new_listener();
-    let addr = test_addr();
+    let identity = test_identity();
     let iv1 = test_iv();
     let iv2 = test_iv2();
     let iv3 = test_iv3();
 
-    assert!(listener.try_record_replay_state(addr, iv1, 100));
-    assert!(listener.try_record_replay_state(addr, iv2, 200));
+    assert!(listener.try_record_replay_state(identity, iv1, 100));
+    assert!(listener.try_record_replay_state(identity, iv2, 200));
     // Third rotation: iv2 → iv3; iv1 is lost from history
-    assert!(listener.try_record_replay_state(addr, iv3, 50));
+    assert!(listener.try_record_replay_state(identity, iv3, 50));
 
-    assert_eq!(listener.sender_iv_random(&addr), Some(iv3));
-    assert_eq!(listener.sender_last_counter(&addr), Some(50));
-    assert_eq!(listener.sender_prev_iv_random(&addr), Some(iv2));
-    assert_eq!(listener.sender_prev_last_counter(&addr), Some(200));
+    assert_eq!(listener.sender_iv_random(identity), Some(iv3));
+    assert_eq!(listener.sender_last_counter(identity), Some(50));
+    assert_eq!(listener.sender_prev_iv_random(identity), Some(iv2));
+    assert_eq!(listener.sender_prev_last_counter(identity), Some(200));
 }
 
 #[test]
 fn rotate_back_to_first_iv_accepted() {
     let mut listener = new_listener();
-    let addr = test_addr();
+    let identity = test_identity();
     let iv1 = test_iv();
     let iv2 = test_iv2();
 
-    assert!(listener.try_record_replay_state(addr, iv1, 100));
-    assert!(listener.try_record_replay_state(addr, iv2, 50));
+    assert!(listener.try_record_replay_state(identity, iv1, 100));
+    assert!(listener.try_record_replay_state(identity, iv2, 50));
     // Frame from iv1 arrives with counter > prev_last_counter —
     // accepted as non-replay (delayed frame from previous epoch).
     // State is updated but iv2 remains current.
-    assert!(listener.try_record_replay_state(addr, iv1, 200));
+    assert!(listener.try_record_replay_state(identity, iv1, 200));
 
-    assert_eq!(listener.sender_iv_random(&addr), Some(iv2));
-    assert_eq!(listener.sender_last_counter(&addr), Some(50));
-    assert_eq!(listener.sender_prev_iv_random(&addr), Some(iv1));
-    assert_eq!(listener.sender_prev_last_counter(&addr), Some(200));
+    assert_eq!(listener.sender_iv_random(identity), Some(iv2));
+    assert_eq!(listener.sender_last_counter(identity), Some(50));
+    assert_eq!(listener.sender_prev_iv_random(identity), Some(iv1));
+    assert_eq!(listener.sender_prev_last_counter(identity), Some(200));
 }
 
 #[test]
 fn capacity_exceeded_forces_evict_and_increments_counter() {
     let mut listener = new_listener();
-    // Fill the map with unique addresses.
+    // Fill the map with unique authenticated identities.
     for i in 0..MAX_SENDER_STATES {
-        let addr = SocketAddr::from(([127, 0, 0, 1], (10_000 + i as u16)));
-        assert!(listener.try_record_replay_state(addr, test_iv(), 1));
+        let identity = ReplayIdentity::from_pid(10_000 + i as u32);
+        assert!(listener.try_record_replay_state(identity, test_iv(), 1));
     }
     assert_eq!(listener.sender_state_len(), MAX_SENDER_STATES);
 
@@ -187,16 +188,16 @@ fn capacity_exceeded_forces_evict_and_increments_counter() {
 #[test]
 fn evicted_sender_replay_rejected_repeatedly() {
     let mut listener = new_listener();
-    let victim_addr = SocketAddr::from(([127, 0, 0, 1], 9000));
+    let victim_identity = ReplayIdentity::from_pid(9000);
     let iv = test_iv();
 
     // Victim sends frames up to counter 10.
-    assert!(listener.try_record_replay_state(victim_addr, iv, 10));
+    assert!(listener.try_record_replay_state(victim_identity, iv, 10));
 
     // Fill remaining slots so table is at capacity.
     for i in 1..MAX_SENDER_STATES {
-        let addr = SocketAddr::from(([127, 0, 0, 1], (10_000 + i as u16)));
-        assert!(listener.try_record_replay_state(addr, test_iv2(), 1));
+        let identity = ReplayIdentity::from_pid(10_000 + i as u32);
+        assert!(listener.try_record_replay_state(identity, test_iv2(), 1));
     }
     assert_eq!(listener.sender_state_len(), MAX_SENDER_STATES);
 
@@ -205,20 +206,20 @@ fn evicted_sender_replay_rejected_repeatedly() {
     assert!(listener
         .last_evicted
         .as_ref()
-        .is_some_and(|(a, _)| *a == victim_addr));
+        .is_some_and(|(identity, _)| *identity == victim_identity));
 
     // Attacker replays an old frame (counter 5) — must be rejected.
-    assert!(!listener.try_record_replay_state(victim_addr, iv, 5));
+    assert!(!listener.try_record_replay_state(victim_identity, iv, 5));
     // Shadow must survive the rejection so the next replay is also caught.
     assert!(listener.last_evicted.is_some());
 
     // Second replay of the same frame — must still be rejected, not
     // treated as a new sender.
-    assert!(!listener.try_record_replay_state(victim_addr, iv, 5));
+    assert!(!listener.try_record_replay_state(victim_identity, iv, 5));
     assert!(listener.last_evicted.is_some());
 
     // A genuinely new frame (counter 11) from the victim should pass.
-    assert!(listener.try_record_replay_state(victim_addr, iv, 11));
+    assert!(listener.try_record_replay_state(victim_identity, iv, 11));
     // Shadow consumed on success.
     assert!(listener.last_evicted.is_none());
 }
@@ -226,16 +227,16 @@ fn evicted_sender_replay_rejected_repeatedly() {
 #[test]
 fn shadow_restored_when_allocate_fails() {
     let mut listener = new_listener();
-    let victim_addr = SocketAddr::from(([127, 0, 0, 1], 9000));
+    let victim_identity = ReplayIdentity::from_pid(9000);
     let iv = test_iv();
 
     // Victim sends frames up to counter 10.
-    assert!(listener.try_record_replay_state(victim_addr, iv, 10));
+    assert!(listener.try_record_replay_state(victim_identity, iv, 10));
 
     // Fill remaining slots so table is at capacity.
     for i in 1..MAX_SENDER_STATES {
-        let addr = SocketAddr::from(([127, 0, 0, 1], (10_000 + i as u16)));
-        assert!(listener.try_record_replay_state(addr, test_iv2(), 1));
+        let identity = ReplayIdentity::from_pid(10_000 + i as u32);
+        assert!(listener.try_record_replay_state(identity, test_iv2(), 1));
     }
 
     // Force-evict the victim — it goes to the shadow.
@@ -243,24 +244,24 @@ fn shadow_restored_when_allocate_fails() {
     assert!(listener
         .last_evicted
         .as_ref()
-        .is_some_and(|(a, _)| *a == victim_addr));
+        .is_some_and(|(identity, _)| *identity == victim_identity));
 
     // Consume the freed slot with a brand-new sender so the slab is full
     // again. This makes the next allocate_sender_slot call fail.
-    let filler = SocketAddr::from(([127, 0, 0, 1], 60_000));
+    let filler = ReplayIdentity::from_pid(60_000);
     assert!(listener.try_record_replay_state(filler, test_iv2(), 1));
     assert_eq!(listener.sender_state_len(), MAX_SENDER_STATES);
 
     // A genuinely new frame from the victim (counter 11) enters the
     // shadow path, passes validation, but allocate_sender_slot fails
     // because the slab is full. The shadow must be RESTORED.
-    assert!(!listener.try_record_replay_state(victim_addr, iv, 11));
+    assert!(!listener.try_record_replay_state(victim_identity, iv, 11));
     assert!(listener.last_evicted.is_some());
 
     // A replay of an old counter must still be rejected — the shadow
     // was restored with the advanced counter (11), so counter ≤ 11 fails.
-    assert!(!listener.try_record_replay_state(victim_addr, iv, 11));
-    assert!(!listener.try_record_replay_state(victim_addr, iv, 5));
+    assert!(!listener.try_record_replay_state(victim_identity, iv, 11));
+    assert!(!listener.try_record_replay_state(victim_identity, iv, 5));
 }
 
 // ----- H3: constant-trial-count AEAD poll -----
@@ -314,6 +315,39 @@ fn bind_with_keys(keys: Vec<Key>) -> SecureUdpListener {
 fn send_wire(target: SocketAddr, wire: &[u8]) {
     let sender = UdpSocket::bind("127.0.0.1:0").expect("sender bind");
     sender.send_to(wire, target).expect("send_to");
+}
+
+/// A captured ciphertext replayed from a different UDP source port must still
+/// be rejected. The replay key is the authenticated frame PID, not the
+/// unauthenticated source address.
+#[test]
+fn replay_from_different_source_port_is_rejected() {
+    let key_bytes = [0x5Au8; 32];
+    let mut listener = bind_with_keys(vec![Key::from_bytes(key_bytes)]);
+    let target = listener.test_local_addr();
+
+    let mut plaintext = [0u8; 32];
+    Frame::new(Status::Ok, 12_345, 777, 1, 0).encode(&mut plaintext);
+    let wire = build_shared_frame(&Key::from_bytes(key_bytes), test_iv(), 9, &plaintext);
+
+    send_wire(target, &wire);
+    match recv_one(&mut listener) {
+        RecvResult::Authenticated { data, .. } => {
+            assert_eq!(data, plaintext, "first ciphertext should authenticate");
+        }
+        _ => panic!("expected first frame to authenticate"),
+    }
+
+    send_wire(target, &wire);
+    assert!(
+        matches!(recv_one(&mut listener), RecvResult::WouldBlock),
+        "replayed ciphertext from a new source port must be consumed and rejected"
+    );
+    assert_eq!(
+        listener.drain_decrypt_failures(),
+        1,
+        "transport replay rejection must increment decrypt_failures"
+    );
 }
 
 /// Frame encrypted by the *last* rotation key must still decrypt, AND
