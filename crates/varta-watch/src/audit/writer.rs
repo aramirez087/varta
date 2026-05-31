@@ -70,6 +70,13 @@ impl RecoveryAuditLog {
     pub(super) fn emit(&mut self, kind: AuditKind, body: &str) {
         let seq = self.next_seq;
         self.next_seq = self.next_seq.saturating_add(1);
+        if self.pending_lines.len() >= AUDIT_RING_CAP {
+            // Preserve a durable seq gap while keeping the persisted hash
+            // chain linear over records that actually reached the ring.
+            self.audit_dropped_total = self.audit_dropped_total.saturating_add(1);
+            return;
+        }
+
         let mut hash_body = String::with_capacity(body.len() + 24);
         let _ = write!(hash_body, "{seq}\t{body}");
 
@@ -116,10 +123,7 @@ impl RecoveryAuditLog {
     /// `emit` on the hot path; the actual BufWriter write is deferred to
     /// `flush_pending` in the maintenance phase.
     fn write_line(&mut self, line: &str) {
-        if self.pending_lines.len() >= AUDIT_RING_CAP {
-            self.audit_dropped_total = self.audit_dropped_total.saturating_add(1);
-            return;
-        }
+        debug_assert!(self.pending_lines.len() < AUDIT_RING_CAP);
         self.pending_lines.push_back(line.to_owned());
         let len = self.pending_lines.len();
         if !self.ring_above_warn && len >= RING_WATERMARK_WARN {
@@ -367,6 +371,47 @@ mod tests {
             source: "inline",
             template_len: 0,
         }
+    }
+
+    #[cfg(feature = "audit-chain")]
+    fn assert_spawn_chain_is_linear(records: &[&str]) {
+        let mut prev = [0u8; 32];
+        for line in records {
+            let (hash_body, chain_hex) = line.rsplit_once('\t').expect("chain column");
+            let expected =
+                varta_vlp::crypto::audit_chain_hash(&prev, b"spawn", hash_body.as_bytes());
+            let actual = varta_vlp::util::decode_hex_32(chain_hex.as_bytes()).expect("hex chain");
+            assert_eq!(actual, expected, "chain mismatch for record: {line}");
+            prev = actual;
+        }
+    }
+
+    #[cfg(feature = "audit-chain")]
+    #[test]
+    fn ring_full_drop_preserves_hash_chain_and_seq_gap() {
+        let (mut log, ctr) = synthetic_log_with_counter(1);
+        for i in 0..AUDIT_RING_CAP as u32 {
+            log.record_spawn(&dummy_spawn(i));
+        }
+        assert_eq!(log.pending_lines.len(), AUDIT_RING_CAP);
+
+        log.record_spawn(&dummy_spawn(99_999));
+        assert_eq!(log.audit_dropped_total, 1);
+        log.flush_pending(Duration::MAX);
+
+        log.record_spawn(&dummy_spawn(100_000));
+        log.flush_pending(Duration::MAX);
+
+        let bytes = ctr.buf.lock().unwrap().clone();
+        let body = String::from_utf8(bytes).expect("audit body is utf8");
+        let records: Vec<&str> = body.lines().collect();
+        assert_eq!(records.len(), AUDIT_RING_CAP + 1, "got: {body}");
+        assert_eq!(
+            records.last().and_then(|line| line.split('\t').next()),
+            Some("258"),
+            "the dropped record must leave a durable sequence gap"
+        );
+        assert_spawn_chain_is_linear(&records);
     }
 
     #[test]
