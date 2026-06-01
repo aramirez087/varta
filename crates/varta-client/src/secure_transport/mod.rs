@@ -588,8 +588,8 @@ fn os_random(_buf: &mut [u8]) -> io::Result<()> {
 ///
 /// **Note:** `SecureUdpTransport` no longer calls this — it uses
 /// [`read_iv_session_salt`] for the 16-byte session salt. Retained here for
-/// the panic-hook installer which emits a one-shot frame with a fresh
-/// 8-byte IV.
+/// the panic-hook installer, which captures an install-process IV prefix and
+/// separately captures a fork salt for forked children.
 #[cfg_attr(
     not(any(test, all(feature = "panic-handler", feature = "secure-udp"))),
     allow(dead_code)
@@ -684,10 +684,9 @@ pub(crate) fn fallback_iv_random() -> [u8; 8] {
 /// `RandomState` key is the dominant entropy source, plus the time / PID /
 /// TID mixers. Use only when no OS entropy source is reachable.
 ///
-/// Currently consumed only by the in-module collision test; retained as a
-/// parity API for a future panic-hook `accept_degraded_entropy` variant
-/// that needs a 16-byte salt (mirroring the existing 8-byte
-/// `install_panic_handler_secure_udp_accept_degraded_entropy`).
+/// Consumed by the secure panic-hook degraded-entropy installer, which needs
+/// fork-child IV prefixes to be derivable without calling OS entropy from the
+/// hook body.
 #[cfg(any(feature = "accept-degraded-entropy", test))]
 #[allow(dead_code)]
 pub(crate) fn fallback_iv_session_salt() -> [u8; 16] {

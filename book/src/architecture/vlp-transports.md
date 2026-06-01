@@ -165,12 +165,15 @@ varta-watch --socket /tmp/varta.sock --threshold-ms 500 \
     build if master-key mode was in use.
   - Replay attacks are blocked by enforcing monotonic IV counters per sender.
     Key rotation is supported via `--accepted-key-file` (no downtime required).
-  - **Panic-hook entropy**: `install_panic_handler_secure_udp` reads entropy at
-    install time and **fails closed** if all sources (`getrandom`, `getentropy`,
-    `/dev/urandom`) are unavailable. In chrooted environments without `/dev`,
-    use `install_panic_handler_secure_udp_accept_degraded_entropy` to opt into a
-    non-cryptographic fallback — see `book/src/architecture/peer-authentication.md`
-    for the full nonce-reuse risk analysis.
+  - **Panic-hook entropy**: `install_panic_handler_secure_udp` reads all IV
+    material at install time and **fails closed** if the entropy chain
+    (`getrandom`, `getentropy`, `/dev/urandom`) is unavailable. Forked-child
+    panic prefixes are derived from that pre-read salt with HKDF, so the hook
+    never calls the OS entropy chain. In chrooted environments without `/dev`,
+    use `install_panic_handler_secure_udp_accept_degraded_entropy` to opt into
+    a non-cryptographic fallback — see
+    `book/src/architecture/peer-authentication.md` for the full nonce-reuse
+    risk analysis.
 
 - **Recovery commands**: Exec mode only (shell mode was permanently removed):
   - `--recovery-exec`: Command executed directly via `execvp(2)` with `{pid}`
@@ -356,17 +359,18 @@ widening approach.
 
 ### Panic-hook parallel
 
-`install_panic_handler_secure_udp` caches an 8-byte IV at install time
-to avoid the (non-async-signal-safe) entropy read inside the panic
-hook itself. The same fork hazard applies: a child that panics would
-otherwise emit `(cached_iv, iv_counter=1)` — colliding with the
-parent's identical pair if the parent panicked too. The installer
-snapshots `install_pid` and, inside the hook, re-runs the entropy
-chain (`getrandom`/`getentropy` → `/dev/urandom`) when the PID has
-changed. The strict variant fails closed (skips the secure frame) when
-no entropy source is reachable; the `accept-degraded-entropy` variant
-falls back to `fallback_iv_random()` per the documented degraded-entropy
-policy.
+`install_panic_handler_secure_udp` caches an 8-byte IV prefix plus a
+16-byte fork salt at install time to avoid non-async-signal-safe entropy
+reads inside the panic hook itself. The same fork hazard applies: a child
+that panics would otherwise emit `(cached_iv, iv_counter=1)` — colliding
+with the parent's identical pair if the parent panicked too. The installer
+snapshots `install_pid`; if the hook later sees a different PID, it derives
+a child-specific IV prefix with HKDF-SHA256 over the pre-read fork salt,
+the panic PID, the panic timestamp, and the AEAD counter. No `getrandom`,
+`getentropy`, or `/dev/urandom` call happens from the hook body. The strict
+variant fails closed at install time when no entropy source is reachable;
+the `accept-degraded-entropy` variant falls back to `fallback_iv_random()`
+and `fallback_iv_session_salt()` per the documented degraded-entropy policy.
 
 ## Cross-references
 

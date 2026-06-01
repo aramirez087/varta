@@ -479,12 +479,15 @@ hot-reload is planned for a future release.
 
 ### Panic-hook entropy policy (secure UDP)
 
-`install_panic_handler_secure_udp` reads 8 bytes of cryptographic entropy at
-install time (`getrandom(2)` on Linux, `getentropy(3)` on macOS/BSD, falling
-back to `/dev/urandom`). The IV is pre-computed once so that no file I/O
-occurs inside the panic handler itself (async-signal-safety).
+`install_panic_handler_secure_udp` reads all IV material at install time
+(`getrandom(2)` on Linux, `getentropy(3)` on macOS/BSD, falling back to
+`/dev/urandom`): an 8-byte prefix for the installing process plus a 16-byte
+salt for forked children. If a forked child panics, the hook derives a
+child-specific IV prefix with HKDF-SHA256 over the pre-read salt, PID,
+timestamp, and AEAD counter. No file I/O or OS entropy call occurs inside the
+panic handler itself (async-signal-safety).
 
-**Fail-closed default:** if all entropy sources fail — common in chrooted
+**Fail-closed default:** if the entropy chain fails — common in chrooted
 environments without a mounted `/dev` — the function returns
 `Err(PanicInstallError::EntropyUnavailable)` and the hook is NOT registered.
 This prevents a panic-time Critical frame from reusing a deterministic IV
@@ -492,9 +495,9 @@ under the same AEAD key, which would be a catastrophic nonce-reuse failure.
 
 **Degraded-entropy opt-in:** use
 `install_panic_handler_secure_udp_accept_degraded_entropy` to fall back to a
-non-cryptographic IV derived from PID, TID, monotonic time, and a counter
-(SipHash-2-4). This always succeeds but accepts nonce-reuse risk if the
-process panics more than once. The verbose function name is intentional
+non-cryptographic IV prefix and fork salt derived from PID, TID, monotonic
+time, and counters (SipHash-2-4). This always succeeds but accepts nonce-reuse
+risk if the fallback inputs collide. The verbose function name is intentional
 structural enforcement matching the project's `--i-accept-<risk>` convention.
 
 ### Little-endian only

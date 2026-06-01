@@ -98,6 +98,47 @@ pub fn derive_iv_prefix(session_salt: &[u8; 16], prefix_index: u32) -> Result<[u
     Ok(okm)
 }
 
+/// Derive an 8-byte IV prefix for a secure-UDP panic hook firing after
+/// `fork(2)`.
+///
+/// The secure panic hook pre-reads `session_salt` at install time. If a
+/// forked child panics later, the hook cannot safely call `getrandom(2)` or
+/// open `/dev/urandom`: a panic hook may run from a signal-handler context,
+/// and those calls are not async-signal-safe. This KDF lets the hook derive a
+/// child-specific IV prefix with pure stack computation instead.
+///
+/// `panic_pid`, `timestamp`, and `iv_counter` are all authenticated in the
+/// sealed frame path: the PID and timestamp are inside the VLP plaintext, and
+/// the counter is part of the AEAD nonce. Including all three in the KDF info
+/// gives forked children a distinct prefix without consuming entropy in the
+/// hook body.
+///
+/// # Errors
+///
+/// Returns `Err(KdfError)` if HKDF expand fails. Unreachable for VLP's fixed
+/// `[u8; 8]` OKM against the pinned `hkdf` crate, but surfaced as `Result`
+/// so any future upstream change is observable rather than a silent abort.
+pub fn derive_panic_iv_prefix(
+    session_salt: &[u8; 16],
+    panic_pid: u32,
+    timestamp: u64,
+    iv_counter: u32,
+) -> Result<[u8; 8], KdfError> {
+    let hk = Hkdf::<Sha256>::new(None, session_salt);
+    // info = "varta-panic-iv-v1\0" (18 bytes)
+    //      || panic_pid LE (4 bytes)
+    //      || timestamp LE (8 bytes)
+    //      || iv_counter LE (4 bytes)
+    let mut info = [0u8; 34];
+    info[..18].copy_from_slice(b"varta-panic-iv-v1\0");
+    info[18..22].copy_from_slice(&panic_pid.to_le_bytes());
+    info[22..30].copy_from_slice(&timestamp.to_le_bytes());
+    info[30..34].copy_from_slice(&iv_counter.to_le_bytes());
+    let mut okm = [0u8; 8];
+    hk.expand(&info, &mut okm).map_err(|_| KdfError)?;
+    Ok(okm)
+}
+
 /// Derive an epoch-scoped 256-bit key from an agent key.
 ///
 /// Uses HKDF-SHA256 with the epoch number encoded in the info string.
@@ -230,6 +271,29 @@ mod tests {
             derive_iv_prefix(&salt_b, 0).expect("kdf must succeed"),
             "different salts must produce different prefixes"
         );
+    }
+
+    #[test]
+    fn panic_iv_prefix_is_deterministic() {
+        let salt = [0xA5u8; 16];
+        let p1 = derive_panic_iv_prefix(&salt, 42, 1_000, 7).expect("kdf must succeed");
+        let p2 = derive_panic_iv_prefix(&salt, 42, 1_000, 7).expect("kdf must succeed");
+        assert_eq!(p1, p2);
+    }
+
+    #[test]
+    fn panic_iv_prefix_changes_with_pid_timestamp_and_counter() {
+        let salt = [0xA5u8; 16];
+        let baseline = derive_panic_iv_prefix(&salt, 42, 1_000, 7).expect("kdf must succeed");
+        let different_pid = derive_panic_iv_prefix(&salt, 43, 1_000, 7).expect("kdf must succeed");
+        let different_timestamp =
+            derive_panic_iv_prefix(&salt, 42, 1_001, 7).expect("kdf must succeed");
+        let different_counter =
+            derive_panic_iv_prefix(&salt, 42, 1_000, 8).expect("kdf must succeed");
+
+        assert_ne!(baseline, different_pid);
+        assert_ne!(baseline, different_timestamp);
+        assert_ne!(baseline, different_counter);
     }
 
     #[test]
