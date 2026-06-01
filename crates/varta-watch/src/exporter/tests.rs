@@ -654,6 +654,34 @@ fn recovery_refused_debounce_capacity_outcome_drives_counters() {
     );
 }
 
+#[test]
+fn recovery_reaped_outcome_records_duration_metrics() {
+    use std::os::unix::process::ExitStatusExt;
+
+    let mut prom = PromExporter::bind("127.0.0.1:0".parse().unwrap(), make_token()).expect("bind");
+    let outcome = crate::recovery::RecoveryOutcome::Reaped {
+        child_pid: 123,
+        status: std::process::ExitStatus::from_raw(0),
+        duration_ns: 42_000,
+    };
+
+    prom.record_recovery_outcome(&outcome, outcome.duration_ns());
+    prom.render_body();
+    let body = &prom.body_buf;
+    assert!(
+        body.contains("varta_recovery_outcomes_total{outcome=\"reaped_zero\"} 1"),
+        "reaped_zero outcome counter must increment; body:\n{body}"
+    );
+    assert!(
+        body.contains("varta_recovery_duration_ns_sum 42000"),
+        "duration sum must include reaped outcome duration; body:\n{body}"
+    );
+    assert!(
+        body.contains("varta_recovery_duration_count_total 1"),
+        "duration count must increment for reaped outcomes; body:\n{body}"
+    );
+}
+
 /// Every stage label must appear in the rendered body even before any
 /// observation has landed (stable-label-set contract). Also verifies the
 /// `+Inf` literal (not `inf`) is used for the implicit bucket.

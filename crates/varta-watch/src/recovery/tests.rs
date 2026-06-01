@@ -50,6 +50,42 @@ fn exec_mode_spawns_command_via_execvp() {
 }
 
 #[test]
+fn reaped_outcome_carries_duration_for_metrics() {
+    let mut rec = Recovery::with_mode(
+        RecoveryMode::Exec {
+            program: "true".to_string(),
+            args: vec![],
+        },
+        Duration::ZERO,
+    );
+
+    match rec.on_stall(43, BeatOrigin::KernelAttested, false, 0) {
+        RecoveryOutcome::Spawned { .. } => {}
+        other => panic!("expected Spawned in exec mode, got {other:?}"),
+    }
+
+    std::thread::sleep(Duration::from_millis(20));
+    let deadline = Instant::now() + Duration::from_millis(500);
+    loop {
+        if Instant::now() >= deadline {
+            panic!("timed out waiting for Reaped");
+        }
+        let outcomes = rec.try_reap(0);
+        if let Some(duration_ns) = outcomes.into_iter().find_map(|o| match o {
+            RecoveryOutcome::Reaped { duration_ns, .. } => Some(duration_ns),
+            _ => None,
+        }) {
+            assert!(
+                duration_ns > 0,
+                "reaped outcome must carry non-zero duration for metrics"
+            );
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[test]
 fn exec_mode_substitutes_pid_in_args() {
     let mut rec = Recovery::with_mode(
         RecoveryMode::Exec {

@@ -56,7 +56,11 @@ pub enum RecoveryOutcome {
 
     /// A previously-`Spawned` child has exited and was reaped on this
     /// tick. The observer never blocks waiting for this transition.
-    Reaped { child_pid: u32, status: ExitStatus },
+    Reaped {
+        child_pid: u32,
+        status: ExitStatus,
+        duration_ns: u64,
+    },
 
     /// A previously-`Spawned` child exceeded `recovery_timeout` and was
     /// killed via `kill(2)` on this tick.

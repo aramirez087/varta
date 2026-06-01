@@ -886,8 +886,8 @@ impl PromExporter {
 
     /// Record a recovery outcome and optional duration. Increments the
     /// `varta_recovery_outcomes_total{outcome=…}` counter; when
-    /// `duration_ns` is provided (typically only for `Reaped` / `Killed`
-    /// outcomes), bumps the duration sum + count.
+    /// `duration_ns` is provided (currently `Reaped` outcomes), bumps the
+    /// duration sum + count.
     ///
     /// `RefusedUnauthenticatedSource` outcomes additionally bump
     /// `varta_recovery_refused_total{reason="unauthenticated_transport"}`;

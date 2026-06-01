@@ -92,6 +92,8 @@ pub enum RecoveryOutcome {
         child_pid: u32,
         /// `ExitStatus` from `Child::try_wait`.
         status: std::process::ExitStatus,
+        /// Wall-clock time from successful spawn to final reap.
+        duration_ns: u64,
     },
     /// A previously-spawned child exceeded its `recovery_timeout`
     /// deadline and was killed via `kill(2)` on this tick.
@@ -158,6 +160,16 @@ pub enum RecoveryOutcome {
         /// Agent pid whose stall was refused.
         pid: u32,
     },
+}
+
+impl RecoveryOutcome {
+    /// Wall-clock recovery duration for terminal child-completion outcomes.
+    pub fn duration_ns(&self) -> Option<u64> {
+        match self {
+            Self::Reaped { duration_ns, .. } => Some(*duration_ns),
+            _ => None,
+        }
+    }
 }
 
 /// Per-pid debounced runner of a `recovery_cmd` template.

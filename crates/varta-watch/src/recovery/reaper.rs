@@ -65,6 +65,7 @@ impl Recovery {
                 let entry = self.outstanding.remove(pid)?;
                 let killed = entry.killed;
                 let status = entry.completed_status?;
+                let duration_ns = Self::recovery_duration_ns(entry.spawned_at);
                 self.emit_complete_audit(
                     pid,
                     child_pid,
@@ -81,7 +82,11 @@ impl Recovery {
                     entry.truncated,
                     observer_ns,
                 );
-                Some(RecoveryOutcome::Reaped { child_pid, status })
+                Some(RecoveryOutcome::Reaped {
+                    child_pid,
+                    status,
+                    duration_ns,
+                })
             }
             Step::ReapFailed { child_pid, error } => {
                 Some(self.finish_reap_failed(pid, child_pid, error, observer_ns))
@@ -206,6 +211,10 @@ impl Recovery {
         entry.stderr_handle = None;
     }
 
+    fn recovery_duration_ns(spawned_at: Instant) -> u64 {
+        spawned_at.elapsed().as_nanos().min(u64::MAX as u128) as u64
+    }
+
     /// Emit a recovery-complete audit record (if a sink is configured)
     /// from already-extracted fields.
     #[allow(clippy::too_many_arguments)]
@@ -228,7 +237,7 @@ impl Recovery {
         use std::os::unix::process::ExitStatusExt;
         let exit_code = status.and_then(|s| s.code());
         let signal = status.and_then(|s| s.signal());
-        let duration_ns = spawned_at.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+        let duration_ns = Self::recovery_duration_ns(spawned_at);
         let _ = wallclock_at_spawn_ms;
         sink.record_complete(&CompleteRecord {
             wallclock_ms: RecoveryAuditLog::wallclock_ms_now(),

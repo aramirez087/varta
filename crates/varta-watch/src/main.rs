@@ -946,7 +946,7 @@ fn run(cfg: Config) -> std::io::Result<()> {
                     let outcome = rec.on_stall(*pid, *origin, cross_namespace_agent, *observer_ns);
                     #[cfg(feature = "prometheus-exporter")]
                     if let Some(pe) = prom_export.as_mut() {
-                        pe.record_recovery_outcome(&outcome, None);
+                        pe.record_recovery_outcome(&outcome, outcome.duration_ns());
                     }
                     match outcome {
                         RecoveryOutcome::Spawned { child_pid } => {
@@ -1419,15 +1419,12 @@ fn run(cfg: Config) -> std::io::Result<()> {
             for outcome in rec.try_reap(observer.now_ns()) {
                 #[cfg(feature = "prometheus-exporter")]
                 if let Some(pe) = prom_export.as_mut() {
-                    // Duration is only meaningful for terminal outcomes; the
-                    // audit sink already carries the exact ns, but the
-                    // Prometheus sum/count tracks aggregate runtime trends.
-                    // We pass `None` here and rely on the audit log for
-                    // per-recovery duration history.
-                    pe.record_recovery_outcome(&outcome, None);
+                    pe.record_recovery_outcome(&outcome, outcome.duration_ns());
                 }
                 match outcome {
-                    RecoveryOutcome::Reaped { child_pid, status } if !status.success() => {
+                    RecoveryOutcome::Reaped {
+                        child_pid, status, ..
+                    } if !status.success() => {
                         varta_warn_child!(
                             child_pid,
                             "recovery child {child_pid} exited non-zero: {status}"
