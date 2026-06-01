@@ -395,6 +395,51 @@ fn replay_from_different_source_port_is_rejected() {
     );
 }
 
+/// Authenticated UDP payloads that fail VLP decode must still surface to the
+/// observer as decode errors, but they must not allocate replay-state slots.
+/// Before the fix, a key holder could send CRC-valid `Status::Stall` frames
+/// with many distinct pids and fill `MAX_SENDER_STATES` before the observer
+/// rejected those frames at `Frame::decode`.
+#[test]
+fn authenticated_invalid_vlp_does_not_allocate_replay_state() {
+    let key_bytes = [0x72u8; 32];
+    let mut listener = bind_with_keys(vec![Key::from_bytes(key_bytes)]);
+    let target = listener.test_local_addr();
+
+    let pid = 44_444;
+    let identity = ReplayIdentity::from_pid(pid);
+    let mut plaintext = [0u8; 32];
+    Frame::new(Status::Stall, pid, 777, 1, 0).encode(&mut plaintext);
+    assert!(
+        matches!(
+            Frame::decode(&plaintext),
+            Err(varta_vlp::DecodeError::StallOnWire)
+        ),
+        "fixture must be structurally authenticated but VLP-invalid"
+    );
+    let wire = build_shared_frame(&Key::from_bytes(key_bytes), test_iv(), 1, &plaintext);
+
+    send_wire(target, &wire);
+    match recv_one(&mut listener) {
+        RecvResult::Authenticated { data, .. } => {
+            assert_eq!(data, plaintext, "observer must still see the decode error");
+        }
+        _ => panic!("expected authenticated plaintext"),
+    }
+
+    assert_eq!(
+        listener.sender_state_len(),
+        0,
+        "decode-invalid payload must not allocate sender replay state"
+    );
+    assert!(listener.sender_state_for(identity).is_none());
+    assert_eq!(
+        listener.drain_decrypt_failures(),
+        0,
+        "VLP decode failures remain observer decode errors, not AEAD failures"
+    );
+}
+
 /// Frame encrypted by the *last* rotation key must still decrypt, AND
 /// `drain_aead_attempts` must equal `keys.len()` — proving the poll did
 /// not early-exit on success.

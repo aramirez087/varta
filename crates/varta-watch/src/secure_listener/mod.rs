@@ -31,6 +31,7 @@ use std::net::{SocketAddr, UdpSocket};
 use std::time::{Duration, Instant};
 
 use varta_vlp::crypto::{self, Key, NONCE_BYTES, SECURE_FRAME_MASTER_BYTES, TAG_BYTES};
+use varta_vlp::Frame;
 
 use crate::listener::{BeatListener, TransportTrust};
 use crate::peer_cred::{BeatOrigin, RecvResult};
@@ -64,13 +65,8 @@ struct ReplayIdentity(u32);
 
 impl ReplayIdentity {
     #[inline]
-    fn from_frame_bytes(plaintext: &[u8; 32]) -> Self {
-        Self(u32::from_le_bytes([
-            plaintext[4],
-            plaintext[5],
-            plaintext[6],
-            plaintext[7],
-        ]))
+    fn from_frame(frame: &Frame) -> Self {
+        Self(frame.pid)
     }
 
     #[cfg(test)]
@@ -630,25 +626,41 @@ impl BeatListener for SecureUdpListener {
                 return RecvResult::WouldBlock;
             };
 
-            // Replay identity is authenticated data from the decrypted VLP
+            let origin = match self.recovery_trust {
+                TransportTrust::Operator => BeatOrigin::OperatorAttestedTransport,
+                TransportTrust::Untrusted => BeatOrigin::NetworkUnverified,
+            };
+            // Replay state is keyed by the authenticated VLP identity, but it
+            // must not be allocated until the VLP frame itself validates. A
+            // holder of the UDP key can otherwise send authenticated garbage
+            // with many fake pid fields and pin MAX_SENDER_STATES replay
+            // slots before the observer later rejects the payload as
+            // DecodeError. Return the plaintext unchanged so the observer's
+            // existing decode-error metrics and file-export semantics stay
+            // identical to UDS/plain UDP.
+            let decoded_frame = match Frame::decode(&plaintext) {
+                Ok(frame) => frame,
+                Err(_) => {
+                    return RecvResult::Authenticated {
+                        peer_pid: 0,
+                        peer_uid: 0,
+                        peer_pid_ns_inode: None,
+                        origin,
+                        data: plaintext,
+                    };
+                }
+            };
+
+            // Replay identity is authenticated data from the decoded VLP
             // frame, not the unauthenticated UDP source address. This closes
             // the source-port replay bypass and matches the observer tracker's
             // pid-keyed liveness model.
-            let replay_identity = ReplayIdentity::from_frame_bytes(&plaintext);
-            // Authenticated inner VLP nonce (`plaintext[16..24]`, see
-            // varta-vlp Frame layout). Monotonic per pid across IV-prefix
-            // rotations, so it bounds replay of an aged-out prefix that the
-            // 1-deep `iv_random`/`prev_iv_random` history no longer remembers.
-            let frame_nonce = u64::from_le_bytes([
-                plaintext[16],
-                plaintext[17],
-                plaintext[18],
-                plaintext[19],
-                plaintext[20],
-                plaintext[21],
-                plaintext[22],
-                plaintext[23],
-            ]);
+            let replay_identity = ReplayIdentity::from_frame(&decoded_frame);
+            // Authenticated inner VLP nonce. Monotonic per pid across
+            // IV-prefix rotations, so it bounds replay of an aged-out prefix
+            // that the 1-deep `iv_random`/`prev_iv_random` history no longer
+            // remembers.
+            let frame_nonce = decoded_frame.nonce;
             let known_identity = self.sender_index.get(replay_identity).is_some();
             if !known_identity && self.sender_index.len() >= MAX_SENDER_STATES {
                 self.evict_stale_senders();
@@ -673,10 +685,6 @@ impl BeatListener for SecureUdpListener {
                 return RecvResult::WouldBlock;
             }
 
-            let origin = match self.recovery_trust {
-                TransportTrust::Operator => BeatOrigin::OperatorAttestedTransport,
-                TransportTrust::Untrusted => BeatOrigin::NetworkUnverified,
-            };
             return RecvResult::Authenticated {
                 peer_pid: 0,
                 peer_uid: 0,
