@@ -11,13 +11,13 @@
 //! 2. A 1-deep IV-rotation history (prev_iv_random / prev_last_counter)
 //!    bounds replay *within* the current and immediately-previous IV prefix
 //!    via their per-prefix counters.
-//! 3. A per-sender high-water mark of the authenticated inner VLP nonce
-//!    (`SenderState::max_nonce`) bounds replay *across* prefix rotations: a
-//!    frame on a prefix that has aged out of the 1-deep history is accepted
-//!    only if its nonce strictly exceeds every nonce already seen for that
-//!    sender. This closes replay of a fully-aged-out prefix, which the
-//!    IV-history alone cannot (a captured old frame would otherwise look like
-//!    a fresh rotation).
+//! 3. A per-sender high-water mark of authenticated regular VLP nonces
+//!    (`SenderState::max_regular_nonce`) bounds replay *across* prefix
+//!    rotations: a non-terminal frame on a prefix that has aged out of the
+//!    1-deep history is accepted only if its nonce strictly exceeds every
+//!    regular nonce already seen for that sender. Terminal panic frames carry
+//!    the reserved `NONCE_TERMINAL` sentinel, so they are tracked by their
+//!    authenticated timestamp instead and cannot poison later normal liveness.
 //! 4. The bounded sender table fails closed at capacity: known senders can
 //!    advance their state, but unknown senders are refused after the stale
 //!    sweep instead of evicting unrelated replay history.
@@ -31,7 +31,7 @@ use std::net::{SocketAddr, UdpSocket};
 use std::time::{Duration, Instant};
 
 use varta_vlp::crypto::{self, Key, NONCE_BYTES, SECURE_FRAME_MASTER_BYTES, TAG_BYTES};
-use varta_vlp::Frame;
+use varta_vlp::{Frame, NONCE_TERMINAL};
 
 use crate::listener::{BeatListener, TransportTrust};
 use crate::peer_cred::{BeatOrigin, RecvResult};
@@ -91,12 +91,15 @@ impl Hash32 for ReplayIdentity {
 /// recover the index key (matches the `OutstandingTable` pattern, which
 /// stores pid-keyed values keyed by their own value).
 ///
-/// `max_nonce` is the high-water mark of the authenticated inner VLP frame
-/// nonce (`plaintext[16..24]`) seen for this sender across **all** IV prefixes.
+/// `max_regular_nonce` is the high-water mark of authenticated non-terminal
+/// VLP frame nonces seen for this sender across **all** IV prefixes. Terminal
+/// panic frames use the reserved `NONCE_TERMINAL` sentinel (`u64::MAX`), which
+/// would otherwise permanently poison the regular high-water mark; those
+/// frames are instead replay-bounded by `max_terminal_timestamp`.
+///
 /// The IV-prefix pair only guards replay *within* the current/previous epoch;
-/// the inner nonce is monotonic per pid across every rotation kind (counter
-/// wrap, operator reconnect — fork changes the pid, hence a fresh sender), so
-/// it is the cross-prefix bound that closes replay of a fully-aged-out prefix.
+/// the regular nonce / terminal timestamp high-water marks close replay of a
+/// fully-aged-out prefix that the 1-deep IV history no longer remembers.
 #[derive(Clone, Debug)]
 struct SenderState {
     identity: ReplayIdentity,
@@ -104,21 +107,52 @@ struct SenderState {
     last_counter: u32,
     prev_iv_random: [u8; 8],
     prev_last_counter: u32,
-    max_nonce: u64,
+    max_regular_nonce: u64,
+    max_terminal_timestamp: Option<u64>,
     last_seen: Instant,
 }
 
 impl SenderState {
-    fn new(identity: ReplayIdentity, iv_random: [u8; 8], counter: u32, frame_nonce: u64) -> Self {
-        SenderState {
+    fn new(
+        identity: ReplayIdentity,
+        iv_random: [u8; 8],
+        counter: u32,
+        frame_nonce: u64,
+        frame_timestamp: u64,
+    ) -> Self {
+        let mut state = SenderState {
             identity,
             iv_random,
             last_counter: counter,
             prev_iv_random: [0u8; 8],
             prev_last_counter: 0,
-            max_nonce: frame_nonce,
+            max_regular_nonce: 0,
+            max_terminal_timestamp: None,
             last_seen: Instant::now(),
+        };
+        state.observe_frame_clock(frame_nonce, frame_timestamp);
+        state
+    }
+
+    fn observe_frame_clock(&mut self, frame_nonce: u64, frame_timestamp: u64) {
+        if frame_nonce == NONCE_TERMINAL {
+            self.max_terminal_timestamp = Some(
+                self.max_terminal_timestamp
+                    .map_or(frame_timestamp, |max| max.max(frame_timestamp)),
+            );
+        } else {
+            self.max_regular_nonce = self.max_regular_nonce.max(frame_nonce);
         }
+    }
+
+    fn accepts_aged_out_prefix(&self, frame_nonce: u64, frame_timestamp: u64) -> bool {
+        if frame_nonce == NONCE_TERMINAL {
+            return match self.max_terminal_timestamp {
+                Some(max) => frame_timestamp > max,
+                None => true,
+            };
+        }
+        frame_nonce > self.max_regular_nonce
     }
 }
 
@@ -325,38 +359,34 @@ impl SecureUdpListener {
     }
 
     /// Atomic replay check + state update: returns `true` if the
-    /// (sender, iv_random, counter, frame_nonce) combination is valid, and
-    /// updates the replay state in the same operation to close the TOCTOU
-    /// window.
+    /// (sender, iv_random, counter, frame_nonce, frame_timestamp) combination
+    /// is valid, and updates the replay state in the same operation to close
+    /// the TOCTOU window.
     ///
     /// Three cases per sender lookup:
     /// 1. Same IV prefix   → `counter > last_counter` required
     /// 2. Previous IV prefix → `counter > prev_last_counter` required
     ///    (catches replay of frames from a recently-rotated epoch)
-    /// 3. Neither matches (a new or rotated IV prefix) → accepted only if
-    ///    `frame_nonce > max_nonce`. The IV-prefix history is 1-deep, so a
-    ///    captured frame from a prefix that has aged out of `iv_random` /
+    /// 3. Neither matches (a new or rotated IV prefix) → regular frames are
+    ///    accepted only if `frame_nonce > max_regular_nonce`; terminal panic
+    ///    frames are accepted only if their authenticated timestamp is newer
+    ///    than the previous terminal frame. The IV-prefix history is 1-deep,
+    ///    so a captured frame from a prefix that has aged out of `iv_random` /
     ///    `prev_iv_random` would otherwise land here and be re-accepted as a
-    ///    "fresh rotation". The authenticated inner VLP nonce is monotonic
-    ///    per pid across every legitimate rotation, so requiring it to exceed
-    ///    the per-sender high-water mark rejects any aged-out replay while
-    ///    still admitting genuine rotations (which always carry a newer
-    ///    nonce). On accept, current state moves to `prev_*` fields.
+    ///    "fresh rotation".
     ///
-    /// `max_nonce` is advanced on every accept (all three arms). Within the
-    /// current / previous prefix, replay is still bounded by the per-prefix
-    /// counter alone (arms 1 & 2 do not gate on `max_nonce`), preserving the
-    /// existing tolerance for in-flight reordering inside the recent epochs.
-    ///
-    /// Note: `counter > state.last_counter` and the `frame_nonce` HWM would
-    /// become false after u64 wraparound, but at 1 beat/nanosecond this
-    /// requires ~585 million years — not a practical concern.
+    /// The high-water state is advanced on every accept (all three arms).
+    /// Within the current / previous prefix, replay is still bounded by the
+    /// per-prefix counter alone (arms 1 & 2 do not gate on the high-water
+    /// marks), preserving the existing tolerance for in-flight reordering
+    /// inside the recent epochs.
     fn try_record_replay_state(
         &mut self,
         identity: ReplayIdentity,
         iv_random: [u8; 8],
         counter: u32,
         frame_nonce: u64,
+        frame_timestamp: u64,
     ) -> bool {
         if let Some(slot) = self.sender_index.get(identity) {
             let state = match self.sender_slab.get_mut(slot).and_then(Option::as_mut) {
@@ -373,7 +403,7 @@ impl SecureUdpListener {
             if state.iv_random == iv_random {
                 if counter > state.last_counter {
                     state.last_counter = counter;
-                    state.max_nonce = state.max_nonce.max(frame_nonce);
+                    state.observe_frame_clock(frame_nonce, frame_timestamp);
                     state.last_seen = Instant::now();
                     return true;
                 }
@@ -383,7 +413,7 @@ impl SecureUdpListener {
             if state.prev_iv_random == iv_random {
                 if counter > state.prev_last_counter {
                     state.prev_last_counter = counter;
-                    state.max_nonce = state.max_nonce.max(frame_nonce);
+                    state.observe_frame_clock(frame_nonce, frame_timestamp);
                     state.last_seen = Instant::now();
                     return true;
                 }
@@ -391,10 +421,10 @@ impl SecureUdpListener {
             }
 
             // New or rotated IV prefix. The 1-deep prefix history has no
-            // record of it, so the only cross-prefix replay bound is the
-            // authenticated inner nonce: reject anything not strictly newer
-            // than every frame already accepted for this sender.
-            if frame_nonce <= state.max_nonce {
+            // record of it, so the cross-prefix replay bound is the
+            // authenticated regular nonce, or the authenticated terminal
+            // timestamp for panic-hook sentinel frames.
+            if !state.accepts_aged_out_prefix(frame_nonce, frame_timestamp) {
                 return false;
             }
 
@@ -402,12 +432,13 @@ impl SecureUdpListener {
             state.prev_last_counter = state.last_counter;
             state.iv_random = iv_random;
             state.last_counter = counter;
-            state.max_nonce = frame_nonce;
+            state.observe_frame_clock(frame_nonce, frame_timestamp);
             state.last_seen = Instant::now();
             return true;
         }
 
-        let new_state = SenderState::new(identity, iv_random, counter, frame_nonce);
+        let new_state =
+            SenderState::new(identity, iv_random, counter, frame_nonce, frame_timestamp);
         self.allocate_sender_slot(identity, new_state)
     }
 
@@ -448,8 +479,8 @@ impl SecureUdpListener {
     }
 
     #[cfg(test)]
-    fn sender_max_nonce(&self, identity: ReplayIdentity) -> Option<u64> {
-        self.sender_state_for(identity).map(|s| s.max_nonce)
+    fn sender_max_regular_nonce(&self, identity: ReplayIdentity) -> Option<u64> {
+        self.sender_state_for(identity).map(|s| s.max_regular_nonce)
     }
 
     /// Test-only shim that supplies a globally-monotonic inner nonce.
@@ -457,10 +488,10 @@ impl SecureUdpListener {
     /// The legacy IV/counter replay tests predate the cross-prefix nonce
     /// high-water mark and only exercise the per-prefix counter logic. Feeding
     /// each successive call a strictly newer nonce keeps their exact semantics:
-    /// a genuine rotation (the third arm) is never refused by the `max_nonce`
-    /// guard, so every prior accept/reject expectation is preserved. Tests that
-    /// exercise the cross-prefix guard itself call [`try_record_replay_state`]
-    /// directly with explicit nonces.
+    /// a genuine rotation (the third arm) is never refused by the regular
+    /// nonce high-water guard, so every prior accept/reject expectation is
+    /// preserved. Tests that exercise the cross-prefix guard itself call
+    /// [`try_record_replay_state`] directly with explicit nonces.
     #[cfg(test)]
     fn record_for_test(
         &mut self,
@@ -471,7 +502,7 @@ impl SecureUdpListener {
         use std::sync::atomic::{AtomicU64, Ordering};
         static TEST_NONCE: AtomicU64 = AtomicU64::new(1);
         let nonce = TEST_NONCE.fetch_add(1, Ordering::Relaxed);
-        self.try_record_replay_state(identity, iv_random, counter, nonce)
+        self.try_record_replay_state(identity, iv_random, counter, nonce, nonce)
     }
 
     #[cfg(test)]
@@ -661,6 +692,7 @@ impl BeatListener for SecureUdpListener {
             // that the 1-deep `iv_random`/`prev_iv_random` history no longer
             // remembers.
             let frame_nonce = decoded_frame.nonce;
+            let frame_timestamp = decoded_frame.timestamp;
             let known_identity = self.sender_index.get(replay_identity).is_some();
             if !known_identity && self.sender_index.len() >= MAX_SENDER_STATES {
                 self.evict_stale_senders();
@@ -675,7 +707,13 @@ impl BeatListener for SecureUdpListener {
             }
 
             // Atomic replay check + state update after AEAD success.
-            if !self.try_record_replay_state(replay_identity, iv_random, iv_counter, frame_nonce) {
+            if !self.try_record_replay_state(
+                replay_identity,
+                iv_random,
+                iv_counter,
+                frame_nonce,
+                frame_timestamp,
+            ) {
                 if known_identity {
                     self.decrypt_failures = self.decrypt_failures.wrapping_add(1);
                 } else {

@@ -1,6 +1,6 @@
 use super::*;
 use std::net::SocketAddr;
-use varta_vlp::{Frame, Status};
+use varta_vlp::{Frame, Status, NONCE_TERMINAL};
 
 // --- Cross-prefix replay regression coverage -------------------------------
 //
@@ -18,21 +18,21 @@ fn aged_out_prefix_replay_is_rejected() {
     let iv3 = test_iv3();
 
     // Legitimate rotations carry strictly-increasing authenticated nonces.
-    assert!(listener.try_record_replay_state(identity, iv1, 100, 10));
-    assert!(listener.try_record_replay_state(identity, iv2, 200, 20));
-    assert!(listener.try_record_replay_state(identity, iv3, 50, 30));
+    assert!(listener.try_record_replay_state(identity, iv1, 100, 10, 10));
+    assert!(listener.try_record_replay_state(identity, iv2, 200, 20, 20));
+    assert!(listener.try_record_replay_state(identity, iv3, 50, 30, 30));
 
     // iv1 has aged out of the 1-deep history (current = iv3, prev = iv2).
     // Replaying a captured iv1 frame with its original inner nonce must now be
     // rejected by the per-sender nonce high-water mark. Before the fix the
     // third arm accepted it unconditionally (see `double_rotation_shifts_prev`).
-    assert!(!listener.try_record_replay_state(identity, iv1, 100, 10));
+    assert!(!listener.try_record_replay_state(identity, iv1, 100, 10, 10));
 
     // The replay must not perturb committed state — iv3 stays current and the
     // high-water mark is unchanged.
     assert_eq!(listener.sender_iv_random(identity), Some(iv3));
     assert_eq!(listener.sender_last_counter(identity), Some(50));
-    assert_eq!(listener.sender_max_nonce(identity), Some(30));
+    assert_eq!(listener.sender_max_regular_nonce(identity), Some(30));
 }
 
 #[test]
@@ -43,16 +43,62 @@ fn genuine_rotation_with_newer_nonce_still_accepted() {
     let iv2 = test_iv2();
     let iv3 = test_iv3();
 
-    assert!(listener.try_record_replay_state(identity, iv1, 100, 10));
-    assert!(listener.try_record_replay_state(identity, iv2, 200, 20));
+    assert!(listener.try_record_replay_state(identity, iv1, 100, 10, 10));
+    assert!(listener.try_record_replay_state(identity, iv2, 200, 20, 20));
 
     // A real new prefix always carries a nonce newer than anything seen, even
     // when its per-prefix IV counter restarts low — it must still be accepted.
-    assert!(listener.try_record_replay_state(identity, iv3, 1, 21));
+    assert!(listener.try_record_replay_state(identity, iv3, 1, 21, 21));
 
     assert_eq!(listener.sender_iv_random(identity), Some(iv3));
     assert_eq!(listener.sender_last_counter(identity), Some(1));
-    assert_eq!(listener.sender_max_nonce(identity), Some(21));
+    assert_eq!(listener.sender_max_regular_nonce(identity), Some(21));
+}
+
+#[test]
+fn terminal_panic_nonce_does_not_poison_regular_rotation() {
+    let mut listener = new_listener();
+    let identity = test_identity();
+    let regular_iv = test_iv();
+    let panic_iv = test_iv2();
+    let fresh_iv = test_iv3();
+
+    assert!(listener.try_record_replay_state(identity, regular_iv, 100, 10, 1_000));
+    assert!(listener.try_record_replay_state(identity, panic_iv, 1, NONCE_TERMINAL, 2_000));
+
+    // The original regular transport can still have an in-flight frame from
+    // the previous prefix after the panic-hook frame rotated the sender state.
+    assert!(listener.try_record_replay_state(identity, regular_iv, 101, 11, 3_000));
+
+    // Regression: storing NONCE_TERMINAL in the regular high-water mark made
+    // every later fresh IV prefix look like an aged-out replay until the
+    // sender state expired.
+    assert!(listener.try_record_replay_state(identity, fresh_iv, 1, 12, 4_000));
+    assert_eq!(listener.sender_iv_random(identity), Some(fresh_iv));
+    assert_eq!(listener.sender_max_regular_nonce(identity), Some(12));
+}
+
+#[test]
+fn aged_out_terminal_panic_replay_is_rejected_by_timestamp() {
+    let mut listener = new_listener();
+    let identity = test_identity();
+    let regular_iv = test_iv();
+    let panic_iv = test_iv2();
+    let fresh_iv = test_iv3();
+    let newer_panic_iv = test_iv4();
+
+    assert!(listener.try_record_replay_state(identity, regular_iv, 100, 10, 1_000));
+    assert!(listener.try_record_replay_state(identity, panic_iv, 1, NONCE_TERMINAL, 2_000));
+    assert!(listener.try_record_replay_state(identity, fresh_iv, 1, 11, 3_000));
+    assert!(listener.try_record_replay_state(identity, regular_iv, 101, 12, 4_000));
+
+    // panic_iv has aged out of the 1-deep IV history (current = regular_iv,
+    // previous = fresh_iv). Replaying the captured terminal frame must still
+    // be rejected even though terminal frames do not advance max_regular_nonce.
+    assert!(!listener.try_record_replay_state(identity, panic_iv, 1, NONCE_TERMINAL, 2_000));
+
+    // A genuinely later terminal frame on a new prefix remains admissible.
+    assert!(listener.try_record_replay_state(identity, newer_panic_iv, 1, NONCE_TERMINAL, 5_000));
 }
 
 fn test_key() -> Key {
@@ -69,6 +115,10 @@ fn test_iv2() -> [u8; 8] {
 
 fn test_iv3() -> [u8; 8] {
     [0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18]
+}
+
+fn test_iv4() -> [u8; 8] {
+    [0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28]
 }
 
 fn new_listener() -> SecureUdpListener {
