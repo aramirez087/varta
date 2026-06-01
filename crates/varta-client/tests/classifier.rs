@@ -7,7 +7,7 @@ use std::io;
 
 use varta_client::{classify_send_error, BeatError, BeatOutcome, DropReason};
 
-// The ENOBUFS constant is module-private in client.rs, so it is replicated
+// The errno constants are module-private in client.rs, so they are replicated
 // here with identical cfg guards. If the numeric value ever changes it must
 // be updated in both places.
 #[cfg(target_os = "linux")]
@@ -26,16 +26,18 @@ const ENOBUFS_FOR_THIS_OS: i32 = 55;
 #[cfg(any(target_os = "solaris", target_os = "illumos"))]
 const ENOBUFS_FOR_THIS_OS: i32 = 111;
 
-/// Validates that the hardcoded `ENOBUFS` constant matches the value defined
+const ENOSPC_FOR_THIS_OS: i32 = 28;
+
+/// Validates that the hardcoded errno constants match the values defined
 /// in the system errno header on the current platform.  Reads the canonical
 /// header file at test time; if the header is absent (cross-compilation,
 /// minimal container), the test is skipped.
 ///
-/// This guards against kernel errno renumbering silently misclassifying
-/// `ENOBUFS` (transient `Dropped`) as an unexpected `Failed` error.
+/// This guards against kernel errno renumbering silently misclassifying send
+/// failures as unexpected `Failed` errors.
 #[cfg(not(miri))]
 #[test]
-fn enobufs_matches_system_header() {
+fn hardcoded_errno_values_match_system_header() {
     #[cfg(target_os = "linux")]
     let header_paths: &[&str] = &[
         "/usr/include/asm-generic/errno-base.h",
@@ -75,54 +77,8 @@ fn enobufs_matches_system_header() {
     )))]
     let header_paths: &[&str] = &[];
 
-    let mut seen_enobufs = false;
-    'search: for path in header_paths {
-        let content = match std::fs::read_to_string(path) {
-            Ok(c) => c,
-            Err(_) => continue,
-        };
-
-        for line in content.lines() {
-            let trimmed = line.trim();
-            let Some(rest) = trimmed.strip_prefix("#define") else {
-                continue;
-            };
-            let rest = rest.trim_start();
-            if !rest.starts_with("ENOBUFS") {
-                continue;
-            }
-            // Only match "ENOBUFS" followed by whitespace, not "ENOBUFS_ERROR" etc.
-            let after = &rest["ENOBUFS".len()..];
-            if !after.is_empty() && !after.starts_with(|c: char| c.is_whitespace()) {
-                continue;
-            }
-            let value_str = after.split_whitespace().next();
-            let value = value_str
-                .unwrap_or("")
-                .trim_end_matches(|c: char| !c.is_ascii_digit())
-                .parse::<i32>()
-                .unwrap_or_else(|_| {
-                    panic!(
-                        "failed to parse ENOBUFS value from line: {line} \
-                         (value_str={value_str:?})"
-                    )
-                });
-            assert_eq!(
-                value, ENOBUFS_FOR_THIS_OS,
-                "ENOBUFS constant ({ENOBUFS_FOR_THIS_OS}) does not match system header \
-                 value ({value}) — the hardcoded constant in client.rs is stale for this \
-                 kernel / libc version"
-            );
-            seen_enobufs = true;
-            break 'search;
-        }
-    }
-
-    assert!(
-        seen_enobufs,
-        "ENOBUFS definition not found in system errno header; \
-         check header_paths and the parser"
-    );
+    assert_errno(header_paths, "ENOBUFS", ENOBUFS_FOR_THIS_OS);
+    assert_errno(header_paths, "ENOSPC", ENOSPC_FOR_THIS_OS);
 }
 
 #[cfg(any(
@@ -133,6 +89,8 @@ fn enobufs_matches_system_header() {
     target_os = "netbsd",
     target_os = "openbsd",
     target_os = "dragonfly",
+    target_os = "solaris",
+    target_os = "illumos",
 ))]
 #[test]
 fn enobufs_classifies_as_dropped() {
@@ -143,6 +101,18 @@ fn enobufs_classifies_as_dropped() {
             BeatOutcome::Dropped(DropReason::KernelQueueFull)
         ),
         "ENOBUFS (code {ENOBUFS_FOR_THIS_OS}) should classify as Dropped(KernelQueueFull)"
+    );
+}
+
+#[test]
+fn enospc_classifies_as_storage_full() {
+    let err = io::Error::from_raw_os_error(ENOSPC_FOR_THIS_OS);
+    assert!(
+        matches!(
+            classify_send_error(&err),
+            BeatOutcome::Dropped(DropReason::StorageFull)
+        ),
+        "ENOSPC (code {ENOSPC_FOR_THIS_OS}) should classify as Dropped(StorageFull)"
     );
 }
 
@@ -200,15 +170,6 @@ fn broken_pipe_classifies_as_peer_gone() {
     ));
 }
 
-#[test]
-fn storage_full_classifies_as_storage_full() {
-    let err = io::Error::from(io::ErrorKind::StorageFull);
-    assert!(matches!(
-        classify_send_error(&err),
-        BeatOutcome::Dropped(DropReason::StorageFull)
-    ));
-}
-
 // Structural invariant: DropReason is Copy + Eq and fits in one byte.
 const _: () = {
     const fn assert_copy_eq<T: Copy + Eq>() {}
@@ -257,4 +218,58 @@ fn beat_error_unknown_errno_uses_kind() {
     let io_err = be.to_io_error();
     assert_eq!(io_err.kind(), io::ErrorKind::WouldBlock);
     assert_eq!(io_err.raw_os_error(), None);
+}
+
+#[cfg(not(miri))]
+fn assert_errno(header_paths: &[&str], symbol: &str, expected: i32) {
+    for path in header_paths {
+        let content = match std::fs::read_to_string(path) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+        if let Some(value) = parse_errno_define(&content, symbol) {
+            assert_eq!(
+                value, expected,
+                "{symbol} constant ({expected}) does not match system header \
+                 value ({value}) — the hardcoded constant in client.rs is stale for this \
+                 kernel / libc version"
+            );
+            return;
+        }
+    }
+
+    panic!(
+        "{symbol} definition not found in system errno header; \
+         check header_paths and the parser"
+    );
+}
+
+#[cfg(not(miri))]
+fn parse_errno_define(content: &str, symbol: &str) -> Option<i32> {
+    for line in content.lines() {
+        let trimmed = line.trim();
+        let Some(rest) = trimmed.strip_prefix("#define") else {
+            continue;
+        };
+        let rest = rest.trim_start();
+        if !rest.starts_with(symbol) {
+            continue;
+        }
+        let after = &rest[symbol.len()..];
+        if !after.is_empty() && !after.starts_with(|c: char| c.is_whitespace()) {
+            continue;
+        }
+        let value_str = after.split_whitespace().next()?;
+        let value = value_str
+            .trim_end_matches(|c: char| !c.is_ascii_digit())
+            .parse::<i32>()
+            .unwrap_or_else(|_| {
+                panic!(
+                    "failed to parse {symbol} value from line: {line} \
+                     (value_str={value_str:?})"
+                )
+            });
+        return Some(value);
+    }
+    None
 }

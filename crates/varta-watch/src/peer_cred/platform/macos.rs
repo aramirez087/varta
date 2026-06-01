@@ -222,28 +222,29 @@ const _: () = assert!(mem::size_of::<AuditToken>() == 32);
 // (u32 + u32 + i16 + 2 pad + [u32; 16] = 76 bytes on LP64).
 const _: () = assert!(mem::size_of::<Xucred>() == 76);
 
-// Compile-time offset-of assertions for every field the recvmsg path
-// touches.  Manual layouts are a tradeoff: we avoid the libc crate to
-// satisfy the zero-dependency constraint, but field-order / padding
-// mistakes would silently corrupt I/O.  These guards catch divergence
-// on any kernel/libc version, turning undefined behaviour into a hard
-// compile error.
-const _: () = assert!(mem::offset_of!(Msghdr, msg_name) == 0);
-const _: () = assert!(mem::offset_of!(Msghdr, msg_namelen) == 8);
-const _: () = assert!(mem::offset_of!(Msghdr, msg_iov) == 16);
-const _: () = assert!(mem::offset_of!(Msghdr, msg_iovlen) == 24);
-const _: () = assert!(mem::offset_of!(Msghdr, msg_control) == 32);
-const _: () = assert!(mem::offset_of!(Msghdr, msg_controllen) == 40);
-const _: () = assert!(mem::offset_of!(Msghdr, msg_flags) == 44);
-
-const _: () = assert!(mem::offset_of!(Iovec, iov_base) == 0);
-const _: () = assert!(mem::offset_of!(Iovec, iov_len) == 8);
-
+// Offset checks for every field the recvmsg path touches. Manual layouts are a
+// tradeoff: we avoid the libc crate to satisfy the zero-dependency constraint,
+// but field-order / padding mistakes would silently corrupt I/O. These guards
+// catch divergence on any kernel/libc version during tests.
 #[cfg(test)]
 mod tests {
-    use super::{get_peer_pid, get_token};
+    use super::{get_peer_pid, get_token, Iovec, Msghdr};
     use std::os::unix::io::AsRawFd;
     use std::os::unix::net::UnixDatagram;
+
+    #[test]
+    fn recvmsg_layout_offsets_match_xnu_abi() {
+        assert_field_offset!(Msghdr, msg_name, 0);
+        assert_field_offset!(Msghdr, msg_namelen, 8);
+        assert_field_offset!(Msghdr, msg_iov, 16);
+        assert_field_offset!(Msghdr, msg_iovlen, 24);
+        assert_field_offset!(Msghdr, msg_control, 32);
+        assert_field_offset!(Msghdr, msg_controllen, 40);
+        assert_field_offset!(Msghdr, msg_flags, 44);
+
+        assert_field_offset!(Iovec, iov_base, 0);
+        assert_field_offset!(Iovec, iov_len, 8);
+    }
 
     #[test]
     fn connected_datagram_pair_reports_peer_token() {

@@ -16,7 +16,7 @@
 
 #![cfg(feature = "prometheus-exporter")]
 
-use core::net::IpAddr;
+use std::net::IpAddr;
 use std::time::{Duration, Instant};
 
 use crate::probe_table::{BoundedIndex, ProbeExhausted};
@@ -175,7 +175,7 @@ pub trait LastSeen {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use core::net::Ipv4Addr;
+    use std::net::Ipv4Addr;
 
     #[derive(Clone, Copy)]
     struct TestState {

@@ -49,11 +49,10 @@ pub(super) const fn cmsg_align(len: usize) -> usize {
 /// Implementors must guarantee:
 ///
 /// - `Hdr` is `#[repr(C)]` and matches the kernel's `struct cmsghdr` layout
-///   on the implementing platform. Verified by compile-time `offset_of!`
-///   assertions in `super::plat`.
+///   on the implementing platform. Verified by layout guards in `super::plat`.
 /// - `Cred` is the platform's credential payload type. For typed payloads
 ///   (Linux `struct ucred`, BSD `struct cmsgcred`) it must be `#[repr(C)]`
-///   with layout verified by compile-time `offset_of!` assertions. For
+///   with layout verified by layout guards. For
 ///   opaque payloads (illumos `ucred_t`) it may be the unit type `()` — in
 ///   that case `extract_pid_uid` receives a raw pointer and delegates to
 ///   libc accessors rather than casting.
@@ -197,8 +196,8 @@ where
         // - Alignment: the receive path's ancillary buffer is
         //   `#[repr(align(8))]` (see `recv::AncBuf`) and `cmsg_align` ensures
         //   `cursor` is on an 8-byte boundary; the platform's `Cmsghdr` has
-        //   an alignment of at most `usize` (asserted by `offset_of!` macros
-        //   in `super::plat`).
+        //   an alignment of at most `usize` (covered by layout guards in
+        //   `super::plat`).
         // - The pointed-to bytes are initialised cmsghdr bytes per `recvmsg(2)`
         //   semantics (or equivalent fuzz/test fabrication).
         let hdr_ptr = unsafe { self.base.add(self.cursor) } as *const P::Hdr;

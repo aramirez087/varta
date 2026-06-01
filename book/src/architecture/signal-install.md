@@ -105,7 +105,7 @@ Follow this checklist:
 
 1. **`kernel_abi.rs`**: add a `#[cfg(target_arch = "...")]` arm with the
    `KernelSigAction` struct.  Check `<asm/signal.h>` for the layout.
-   Add `const` size and `offset_of!` assertions matching every field.
+   Add a `const` size assertion and a `layout_tests` offset check for every field.
 
 2. **`syscall.rs`**: add `rt_sigaction_raw` for the new arch.  Consult the
    architecture's syscall ABI (syscall number, register convention, instruction).

@@ -829,10 +829,17 @@ fn parse_iteration_percentiles(body: &str) -> Option<(f64, f64, f64)> {
 
     // For each percentile, return the le upper bound of the first cumulative
     // bucket that contains at least ceil(total × q) observations.
-    let p50_s = iter_bucket_bound(&counts, &BOUNDS_S, (total * 500).div_ceil(1000));
-    let p99_s = iter_bucket_bound(&counts, &BOUNDS_S, (total * 990).div_ceil(1000));
-    let p999_s = iter_bucket_bound(&counts, &BOUNDS_S, (total * 999).div_ceil(1000));
+    let p50_s = iter_bucket_bound(&counts, &BOUNDS_S, div_ceil(total * 500, 1000));
+    let p99_s = iter_bucket_bound(&counts, &BOUNDS_S, div_ceil(total * 990, 1000));
+    let p999_s = iter_bucket_bound(&counts, &BOUNDS_S, div_ceil(total * 999, 1000));
     Some((p50_s * 1000.0, p99_s * 1000.0, p999_s * 1000.0))
+}
+
+#[allow(clippy::manual_div_ceil, clippy::manual_is_multiple_of)]
+fn div_ceil(numerator: u64, denominator: u64) -> u64 {
+    // Rust 1.70 does not have stable integer `div_ceil` / `is_multiple_of`.
+    debug_assert!(denominator != 0);
+    numerator / denominator + u64::from(numerator % denominator != 0)
 }
 
 fn iter_bucket_bound(counts: &[u64; 9], bounds_s: &[f64; 8], target: u64) -> f64 {

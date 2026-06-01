@@ -43,6 +43,12 @@ const ENOBUFS: i32 = 55;
 #[cfg(any(target_os = "solaris", target_os = "illumos"))]
 const ENOBUFS: i32 = 111;
 
+/// POSIX `ENOSPC` ("No space left on device"). The value is stable across the
+/// Unix targets Varta supports; hard-coded to preserve the zero-dependency
+/// invariant and to keep Rust 1.70 compatibility (`ErrorKind::StorageFull` was
+/// stabilized later).
+const ENOSPC: i32 = 28;
+
 /// Catch-all for unlisted Unix targets.
 /// Cross-compilation to an unsupported target silently uses the wrong
 /// value; fail at compile time instead.
@@ -71,6 +77,9 @@ pub fn classify_send_error(e: &io::Error) -> BeatOutcome {
         if code == ENOBUFS {
             return BeatOutcome::Dropped(DropReason::KernelQueueFull);
         }
+        if code == ENOSPC {
+            return BeatOutcome::Dropped(DropReason::StorageFull);
+        }
     }
 
     match e.kind() {
@@ -84,9 +93,7 @@ pub fn classify_send_error(e: &io::Error) -> BeatOutcome {
         io::ErrorKind::ConnectionReset
         | io::ErrorKind::NotConnected
         | io::ErrorKind::BrokenPipe => BeatOutcome::Dropped(DropReason::PeerGone),
-        // (e) Host out of disk space.
-        io::ErrorKind::StorageFull => BeatOutcome::Dropped(DropReason::StorageFull),
-        // (f) Unexpected error: capture as a Copy POD that cannot allocate.
+        // (e) Unexpected error: capture as a Copy POD that cannot allocate.
         _ => BeatOutcome::Failed(BeatError::from_io(e)),
     }
 }
@@ -178,7 +185,7 @@ pub enum DropReason {
     PeerGone,
     /// The host filesystem is out of space (UDS socket path on a full volume).
     ///
-    /// Source: `StorageFull`. Retrying without clearing disk space will not
+    /// Source: `ENOSPC`. Retrying without clearing disk space will not
     /// resolve this; operator intervention is required.
     StorageFull,
 }

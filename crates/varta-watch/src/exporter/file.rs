@@ -85,6 +85,11 @@ pub struct FileExporter {
 /// Number of rotated file generations kept.
 const MAX_ROTATION_GENERATIONS: u32 = 5;
 
+/// POSIX `EXDEV` ("cross-device link"). Used directly so the rotation fallback
+/// remains compatible with Rust 1.70, where `ErrorKind::CrossesDevices` is not
+/// available.
+const EXDEV: i32 = 18;
+
 impl FileExporter {
     /// Open `path` in append mode (creating it if necessary) and wrap it
     /// in a [`BufWriter`].
@@ -243,12 +248,10 @@ impl FileExporter {
             }
         }
         let first = format!("{path_str}.1");
-        // CrossesDevices: stable 1.85, MSRV 1.70; correct on Linux/macOS
-        #[allow(clippy::incompatible_msrv)]
         match std::fs::rename(path, &first) {
             Ok(()) => {}
             Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-            Err(e) if e.kind() == io::ErrorKind::CrossesDevices => {
+            Err(e) if is_cross_device_error(&e) => {
                 std::fs::copy(path, &first)?;
                 std::fs::remove_file(path)?;
             }
@@ -256,6 +259,10 @@ impl FileExporter {
         }
         Ok(())
     }
+}
+
+fn is_cross_device_error(e: &io::Error) -> bool {
+    e.raw_os_error() == Some(EXDEV)
 }
 
 impl Exporter for FileExporter {

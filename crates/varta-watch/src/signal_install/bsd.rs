@@ -4,8 +4,8 @@
 /// the libc wrapper is correct and idiomatic here.
 use std::io;
 
-// Per-platform sigaction struct: ABI-pinned with compile-time size / offset
-// assertions below.
+// Per-platform sigaction struct: ABI-pinned with compile-time size assertions
+// and test-time offset checks below.
 
 #[cfg(target_os = "macos")]
 #[repr(C)]
@@ -32,20 +32,6 @@ struct SigAction {
 const _: () = assert!(core::mem::size_of::<SigAction>() == 16);
 #[cfg(target_os = "freebsd")]
 const _: () = assert!(core::mem::size_of::<SigAction>() == 32);
-
-#[cfg(target_os = "macos")]
-const _: () = assert!(core::mem::offset_of!(SigAction, sa_handler) == 0);
-#[cfg(target_os = "macos")]
-const _: () = assert!(core::mem::offset_of!(SigAction, sa_mask) == 8);
-#[cfg(target_os = "macos")]
-const _: () = assert!(core::mem::offset_of!(SigAction, sa_flags) == 12);
-
-#[cfg(target_os = "freebsd")]
-const _: () = assert!(core::mem::offset_of!(SigAction, sa_handler) == 0);
-#[cfg(target_os = "freebsd")]
-const _: () = assert!(core::mem::offset_of!(SigAction, sa_flags) == 8);
-#[cfg(target_os = "freebsd")]
-const _: () = assert!(core::mem::offset_of!(SigAction, sa_mask) == 12);
 
 #[cfg(target_os = "macos")]
 const SA_RESTART: i32 = 0x0002;
@@ -76,4 +62,25 @@ pub(super) unsafe fn install(handler: extern "C" fn(i32)) -> io::Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod layout_tests {
+    use super::SigAction;
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn sigaction_offsets_match_xnu_layout() {
+        assert_field_offset!(SigAction, sa_handler, 0);
+        assert_field_offset!(SigAction, sa_mask, 8);
+        assert_field_offset!(SigAction, sa_flags, 12);
+    }
+
+    #[cfg(target_os = "freebsd")]
+    #[test]
+    fn sigaction_offsets_match_freebsd_layout() {
+        assert_field_offset!(SigAction, sa_handler, 0);
+        assert_field_offset!(SigAction, sa_flags, 8);
+        assert_field_offset!(SigAction, sa_mask, 12);
+    }
 }

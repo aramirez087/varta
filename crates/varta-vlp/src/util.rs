@@ -28,7 +28,8 @@ impl core::fmt::Display for HexDecodeError {
     }
 }
 
-impl core::error::Error for HexDecodeError {}
+#[cfg(feature = "std")]
+impl std::error::Error for HexDecodeError {}
 
 /// Decode 64 ASCII hex characters into a 32-byte array.
 ///

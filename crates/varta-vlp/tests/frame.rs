@@ -348,10 +348,13 @@ fn decode_error_implements_display_and_error() {
     assert!(bad_timestamp.contains("ffff") || bad_timestamp.contains("FFFF"));
     assert!(bad_nonce.contains("Ok"));
 
-    let _as_dyn: &dyn core::error::Error = &DecodeError::BadMagic;
-    let _as_dyn_pid: &dyn core::error::Error = &DecodeError::BadPid(0);
-    let _as_dyn_crc: &dyn core::error::Error = &DecodeError::BadCrc {
-        expected: 0,
-        actual: 0,
-    };
+    #[cfg(feature = "std")]
+    {
+        let _as_dyn: &dyn std::error::Error = &DecodeError::BadMagic;
+        let _as_dyn_pid: &dyn std::error::Error = &DecodeError::BadPid(0);
+        let _as_dyn_crc: &dyn std::error::Error = &DecodeError::BadCrc {
+            expected: 0,
+            actual: 0,
+        };
+    }
 }

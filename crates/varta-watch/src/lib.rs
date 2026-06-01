@@ -2,7 +2,7 @@
 #![forbid(clippy::dbg_macro, clippy::print_stdout)]
 // SAFETY: unsafe_code is legitimately required for FFI to kernel interfaces
 // (recvmsg/cmsg parsing in peer_cred.rs, umask in listener.rs).  All unsafe
-// sites are guarded by compile-time layout assertions and per-block SAFETY
+// sites are guarded by layout assertions/tests and per-block SAFETY
 // comments.  The workspace-level deny forces us to explicitly opt in here.
 #![allow(unsafe_code)]
 
@@ -46,8 +46,26 @@ compile_error!(
      forging beats.  Class-A safety-critical (mission-critical) builds \
      must use `secure-udp` for any UDP transport.  See \
      book/src/architecture/safety-profiles.md for the supported feature \
-     matrix."
+    matrix."
 );
+
+#[cfg(test)]
+macro_rules! assert_field_offset {
+    ($ty:ty, $field:tt, $expected:expr) => {{
+        let uninit = core::mem::MaybeUninit::<$ty>::uninit();
+        let base = uninit.as_ptr();
+        // SAFETY: `addr_of!` forms a raw pointer to a field without
+        // dereferencing or reading from the uninitialised value.
+        let field = unsafe { core::ptr::addr_of!((*base).$field) };
+        assert_eq!(
+            field as usize - base as usize,
+            $expected,
+            "unexpected offset for {}::{}",
+            stringify!($ty),
+            stringify!($field)
+        );
+    }};
+}
 
 pub mod audit;
 pub mod clock;

@@ -30,10 +30,6 @@ struct SigActionLibc {
 }
 
 const _: () = assert!(core::mem::size_of::<SigActionLibc>() == 152);
-const _: () = assert!(core::mem::offset_of!(SigActionLibc, sa_handler) == 0);
-const _: () = assert!(core::mem::offset_of!(SigActionLibc, sa_mask) == 8);
-const _: () = assert!(core::mem::offset_of!(SigActionLibc, sa_flags) == 136);
-const _: () = assert!(core::mem::offset_of!(SigActionLibc, sa_restorer) == 144);
 
 extern "C" {
     fn sigaction(signum: i32, act: *const SigActionLibc, oldact: *mut SigActionLibc) -> i32;
@@ -67,4 +63,17 @@ pub(super) unsafe fn install(handler: extern "C" fn(i32)) -> io::Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod layout_tests {
+    use super::SigActionLibc;
+
+    #[test]
+    fn sigaction_libc_offsets_match_linux_layout() {
+        assert_field_offset!(SigActionLibc, sa_handler, 0);
+        assert_field_offset!(SigActionLibc, sa_mask, 8);
+        assert_field_offset!(SigActionLibc, sa_flags, 136);
+        assert_field_offset!(SigActionLibc, sa_restorer, 144);
+    }
 }

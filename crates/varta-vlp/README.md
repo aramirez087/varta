@@ -36,13 +36,12 @@ offset │ size │ field      │ notes
                                                               total  32 bytes
 ```
 
-The layout is locked by compile-time assertions in `src/lib.rs`:
+The layout is locked by compile-time size/alignment assertions in `src/lib.rs`
+and field-offset tests in the same module:
 
 ```rust
 const _: () = assert!(core::mem::size_of::<Frame>() == 32);
 const _: () = assert!(core::mem::align_of::<Frame>() == 8);
-const _: () = assert!(core::mem::offset_of!(Frame, magic) == 0);
-// ... one per field.
 ```
 
 Plus a runtime golden-bytes regression in `tests/frame.rs`.

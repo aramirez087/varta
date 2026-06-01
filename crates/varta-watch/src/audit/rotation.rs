@@ -11,6 +11,11 @@ use super::RecoveryAuditLog;
 /// Number of rotated file generations kept.
 const AUDIT_ROTATION_GENERATIONS: u32 = 5;
 
+/// POSIX `EXDEV` ("cross-device link"). Used directly so the rotation fallback
+/// remains compatible with Rust 1.70, where `ErrorKind::CrossesDevices` is not
+/// available.
+const EXDEV: i32 = 18;
+
 /// Maximum bytes read from the tail of an existing file when resuming.
 const TAIL_SCAN_BYTES: u64 = 4096;
 
@@ -161,11 +166,10 @@ impl RecoveryAuditLog {
                         };
                     } else {
                         let first = format!("{path_str}.1");
-                        #[allow(clippy::incompatible_msrv)]
                         let rename_result = match std::fs::rename(&self.path, &first) {
                             Ok(()) => Ok(()),
                             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
-                            Err(e) if e.kind() == io::ErrorKind::CrossesDevices => {
+                            Err(e) if is_cross_device_error(&e) => {
                                 std::fs::copy(&self.path, &first)
                                     .and_then(|_| std::fs::remove_file(&self.path))
                             }
@@ -338,6 +342,10 @@ impl RecoveryAuditLog {
             has_v2_header: true,
         })
     }
+}
+
+fn is_cross_device_error(e: &io::Error) -> bool {
+    e.raw_os_error() == Some(EXDEV)
 }
 
 #[cfg(test)]

@@ -33,6 +33,15 @@ const LINUX_DEFAULT_PID_MAX: u32 = 4_194_304;
 pub fn read_pid_max() -> u32 {
     use std::io::Read;
 
+    // Miri runs with filesystem isolation enabled: opening `/proc` is an
+    // unsupported operation that aborts the interpreter rather than returning
+    // a catchable `Err`, so the fallback path below never fires under Miri.
+    // Return the permissive default directly — the same value the `Err(_)`
+    // arm would yield on a host without `/proc`.
+    if cfg!(miri) {
+        return LINUX_DEFAULT_PID_MAX;
+    }
+
     let mut buf = [0u8; 16];
     let n = match std::fs::File::open("/proc/sys/kernel/pid_max").and_then(|mut f| f.read(&mut buf))
     {

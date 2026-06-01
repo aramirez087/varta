@@ -160,13 +160,6 @@ pub struct Frame {
 
 const _: () = assert!(core::mem::size_of::<Frame>() == 32);
 const _: () = assert!(core::mem::align_of::<Frame>() == 8);
-const _: () = assert!(core::mem::offset_of!(Frame, magic) == 0);
-const _: () = assert!(core::mem::offset_of!(Frame, version) == 2);
-const _: () = assert!(core::mem::offset_of!(Frame, status) == 3);
-const _: () = assert!(core::mem::offset_of!(Frame, pid) == 4);
-const _: () = assert!(core::mem::offset_of!(Frame, timestamp) == 8);
-const _: () = assert!(core::mem::offset_of!(Frame, nonce) == 16);
-const _: () = assert!(core::mem::offset_of!(Frame, payload) == 24);
 
 impl Frame {
     /// Construct a new frame with the canonical [`MAGIC`] prefix and
@@ -392,4 +385,24 @@ impl core::fmt::Display for DecodeError {
     }
 }
 
-impl core::error::Error for DecodeError {}
+#[cfg(feature = "std")]
+impl std::error::Error for DecodeError {}
+
+#[cfg(test)]
+mod layout_tests {
+    use super::{Frame, Status};
+
+    #[test]
+    fn frame_field_offsets_match_wire_layout() {
+        let frame = Frame::new(Status::Ok, 2, 3, 4, 5);
+        let base = core::ptr::addr_of!(frame) as usize;
+
+        assert_eq!(core::ptr::addr_of!(frame.magic) as usize - base, 0);
+        assert_eq!(core::ptr::addr_of!(frame.version) as usize - base, 2);
+        assert_eq!(core::ptr::addr_of!(frame.status) as usize - base, 3);
+        assert_eq!(core::ptr::addr_of!(frame.pid) as usize - base, 4);
+        assert_eq!(core::ptr::addr_of!(frame.timestamp) as usize - base, 8);
+        assert_eq!(core::ptr::addr_of!(frame.nonce) as usize - base, 16);
+        assert_eq!(core::ptr::addr_of!(frame.payload) as usize - base, 24);
+    }
+}

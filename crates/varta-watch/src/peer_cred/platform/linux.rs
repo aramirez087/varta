@@ -97,8 +97,8 @@ const _: () = assert!(
 /// Zero-sized marker type that selects the Linux cmsg-walking parameters.
 pub(crate) struct LinuxCmsg;
 
-// SAFETY: All required layouts are verified at compile time elsewhere in
-// this file:
+// SAFETY: All required layouts are verified by size assertions and offset
+// tests elsewhere in this file:
 // - `Cmsghdr`: cmsg_len@0 (usize), cmsg_level@8 (i32), cmsg_type@12 (i32),
 //   total size 16.
 // - `Ucred`: pid@0 (i32), uid@4 (u32), gid@8 (u32), total size 12.
@@ -173,30 +173,36 @@ pub(crate) fn ctrl_truncated(mhdr: &Msghdr) -> bool {
 
 // Compile-time invariant: glibc/Linux msghdr is 56 bytes on every 64-bit
 // target Rust supports.  A Rust-side field reorder or padding mistake
-// becomes a hard compile error instead of UB at recvmsg time.
+// becomes a test failure instead of UB at recvmsg time.
 const _: () = assert!(mem::size_of::<Msghdr>() == 56);
 
-// Compile-time offset-of assertions for every field the recvmsg path
-// touches.  Manual layouts are a tradeoff: we avoid the libc crate to
-// satisfy the zero-dependency constraint, but field-order / padding
-// mistakes would silently corrupt I/O.  These guards catch divergence
-// on any kernel/libc version, turning undefined behaviour into a hard
-// compile error.
-const _: () = assert!(mem::offset_of!(Msghdr, msg_name) == 0);
-const _: () = assert!(mem::offset_of!(Msghdr, msg_namelen) == 8);
-const _: () = assert!(mem::offset_of!(Msghdr, msg_iov) == 16);
-const _: () = assert!(mem::offset_of!(Msghdr, msg_iovlen) == 24);
-const _: () = assert!(mem::offset_of!(Msghdr, msg_control) == 32);
-const _: () = assert!(mem::offset_of!(Msghdr, msg_controllen) == 40);
-const _: () = assert!(mem::offset_of!(Msghdr, msg_flags) == 48);
+// Offset checks for every field the recvmsg path touches. Manual layouts are a
+// tradeoff: we avoid the libc crate to satisfy the zero-dependency constraint,
+// but field-order / padding mistakes would silently corrupt I/O. These guards
+// catch divergence on any kernel/libc version during tests.
+#[cfg(test)]
+mod layout_tests {
+    use super::{Cmsghdr, Iovec, Msghdr, Ucred};
 
-const _: () = assert!(mem::offset_of!(Iovec, iov_base) == 0);
-const _: () = assert!(mem::offset_of!(Iovec, iov_len) == 8);
+    #[test]
+    fn recvmsg_layout_offsets_match_linux_abi() {
+        assert_field_offset!(Msghdr, msg_name, 0);
+        assert_field_offset!(Msghdr, msg_namelen, 8);
+        assert_field_offset!(Msghdr, msg_iov, 16);
+        assert_field_offset!(Msghdr, msg_iovlen, 24);
+        assert_field_offset!(Msghdr, msg_control, 32);
+        assert_field_offset!(Msghdr, msg_controllen, 40);
+        assert_field_offset!(Msghdr, msg_flags, 48);
 
-const _: () = assert!(mem::offset_of!(Cmsghdr, cmsg_len) == 0);
-const _: () = assert!(mem::offset_of!(Cmsghdr, cmsg_level) == 8);
-const _: () = assert!(mem::offset_of!(Cmsghdr, cmsg_type) == 12);
+        assert_field_offset!(Iovec, iov_base, 0);
+        assert_field_offset!(Iovec, iov_len, 8);
 
-const _: () = assert!(mem::offset_of!(Ucred, pid) == 0);
-const _: () = assert!(mem::offset_of!(Ucred, uid) == 4);
-const _: () = assert!(mem::offset_of!(Ucred, gid) == 8);
+        assert_field_offset!(Cmsghdr, cmsg_len, 0);
+        assert_field_offset!(Cmsghdr, cmsg_level, 8);
+        assert_field_offset!(Cmsghdr, cmsg_type, 12);
+
+        assert_field_offset!(Ucred, pid, 0);
+        assert_field_offset!(Ucred, uid, 4);
+        assert_field_offset!(Ucred, gid, 8);
+    }
+}

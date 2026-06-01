@@ -23,7 +23,7 @@
 
 use core::marker::Copy;
 use core::mem::MaybeUninit;
-use core::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, SocketAddr};
 
 /// 32-bit hash trait used by [`BoundedIndex`]. Implementations must be pure
 /// functions of `self` — deterministic across processes and free of any
@@ -324,7 +324,7 @@ impl Hash32 for SocketAddr {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use core::net::{Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6};
+    use std::net::{Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6};
 
     #[test]
     fn entry_u32_is_8_bytes() {

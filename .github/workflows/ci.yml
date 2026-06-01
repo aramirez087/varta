@@ -5,6 +5,42 @@ on:
   pull_request:
 
 jobs:
+  msrv:
+    name: msrv (rust 1.70)
+    runs-on: ubuntu-latest
+    # MSRV 1.70 is the consumer contract for the SHIPPABLE crates only
+    # (varta-vlp, varta-client, varta-watch). The dev-only crates
+    # (varta-tests, varta-bench) pull proptest -> tempfile -> getrandom,
+    # whose current releases are edition-2024 and need Cargo >= 1.85.
+    # That dev toolchain floor is intentionally NOT the library MSRV, so
+    # this job checks the production crates explicitly instead of
+    # `--workspace` (which would resolve the dev-deps and fail to even
+    # download). Running the test suite itself requires Rust >= 1.85.
+    steps:
+      - name: checkout
+        uses: actions/checkout@v4
+
+      - name: rust toolchain (1.70)
+        uses: dtolnay/rust-toolchain@1.70.0
+
+      - name: production crates check (default features)
+        run: cargo check --locked -p varta-vlp -p varta-client -p varta-watch
+
+      - name: varta-vlp std feature check
+        run: cargo check --locked -p varta-vlp --features std
+
+      - name: varta-vlp crypto feature check
+        run: cargo check --locked -p varta-vlp --features crypto
+
+      - name: varta-client secure-udp + panic-handler check
+        run: cargo check --locked -p varta-client --features secure-udp,panic-handler
+
+      - name: varta-watch feature check (secure-udp, prometheus-exporter)
+        run: cargo check --locked -p varta-watch --features secure-udp,prometheus-exporter
+
+      - name: varta-watch lib test target check
+        run: cargo test --locked -p varta-watch --lib --no-run
+
   ci:
     name: gate (${{ matrix.os }})
     strategy:

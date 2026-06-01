@@ -26,7 +26,8 @@
 //     sa_mask          16  sigset_t       1×unsigned long
 //     total size       24
 //
-// Compile-time offset / size assertions follow each struct definition.
+// Compile-time size assertions and test-time offset checks follow each struct
+// definition.
 
 // ---------------------------------------------------------------------------
 // x86_64
@@ -52,14 +53,6 @@ pub struct KernelSigAction {
 
 #[cfg(target_arch = "x86_64")]
 const _: () = assert!(core::mem::size_of::<KernelSigAction>() == 32);
-#[cfg(target_arch = "x86_64")]
-const _: () = assert!(core::mem::offset_of!(KernelSigAction, sa_handler) == 0);
-#[cfg(target_arch = "x86_64")]
-const _: () = assert!(core::mem::offset_of!(KernelSigAction, sa_flags) == 8);
-#[cfg(target_arch = "x86_64")]
-const _: () = assert!(core::mem::offset_of!(KernelSigAction, sa_restorer) == 16);
-#[cfg(target_arch = "x86_64")]
-const _: () = assert!(core::mem::offset_of!(KernelSigAction, sa_mask) == 24);
 
 // ---------------------------------------------------------------------------
 // aarch64 — no sa_restorer field
@@ -82,12 +75,6 @@ pub struct KernelSigAction {
 
 #[cfg(target_arch = "aarch64")]
 const _: () = assert!(core::mem::size_of::<KernelSigAction>() == 24);
-#[cfg(target_arch = "aarch64")]
-const _: () = assert!(core::mem::offset_of!(KernelSigAction, sa_handler) == 0);
-#[cfg(target_arch = "aarch64")]
-const _: () = assert!(core::mem::offset_of!(KernelSigAction, sa_flags) == 8);
-#[cfg(target_arch = "aarch64")]
-const _: () = assert!(core::mem::offset_of!(KernelSigAction, sa_mask) == 16);
 
 // ---------------------------------------------------------------------------
 // riscv64 — same asm-generic layout as aarch64, no sa_restorer field.
@@ -113,9 +100,40 @@ pub struct KernelSigAction {
 
 #[cfg(target_arch = "riscv64")]
 const _: () = assert!(core::mem::size_of::<KernelSigAction>() == 24);
-#[cfg(target_arch = "riscv64")]
-const _: () = assert!(core::mem::offset_of!(KernelSigAction, sa_handler) == 0);
-#[cfg(target_arch = "riscv64")]
-const _: () = assert!(core::mem::offset_of!(KernelSigAction, sa_flags) == 8);
-#[cfg(target_arch = "riscv64")]
-const _: () = assert!(core::mem::offset_of!(KernelSigAction, sa_mask) == 16);
+
+#[cfg(all(
+    test,
+    any(
+        target_arch = "x86_64",
+        target_arch = "aarch64",
+        target_arch = "riscv64"
+    )
+))]
+mod layout_tests {
+    use super::KernelSigAction;
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn kernel_sigaction_offsets_match_x86_64_layout() {
+        assert_field_offset!(KernelSigAction, sa_handler, 0);
+        assert_field_offset!(KernelSigAction, sa_flags, 8);
+        assert_field_offset!(KernelSigAction, sa_restorer, 16);
+        assert_field_offset!(KernelSigAction, sa_mask, 24);
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn kernel_sigaction_offsets_match_aarch64_layout() {
+        assert_field_offset!(KernelSigAction, sa_handler, 0);
+        assert_field_offset!(KernelSigAction, sa_flags, 8);
+        assert_field_offset!(KernelSigAction, sa_mask, 16);
+    }
+
+    #[cfg(target_arch = "riscv64")]
+    #[test]
+    fn kernel_sigaction_offsets_match_riscv64_layout() {
+        assert_field_offset!(KernelSigAction, sa_handler, 0);
+        assert_field_offset!(KernelSigAction, sa_flags, 8);
+        assert_field_offset!(KernelSigAction, sa_mask, 16);
+    }
+}

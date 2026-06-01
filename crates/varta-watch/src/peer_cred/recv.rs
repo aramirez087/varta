@@ -198,10 +198,10 @@ pub(crate) fn recv_authenticated(fd: i32) -> RecvResult {
             //   - the actual control length into `mhdr.msg_controllen` and the
             //     flags into `mhdr.msg_flags`.
             // All pointed-to buffers are stack-allocated for the duration of
-            // this function. The `Msghdr` field layout is verified at compile
-            // time by `offset_of!` assertions in `plat`. `&mut mhdr` is the
-            // single exclusive borrow for the duration of the call. The return
-            // value is checked below: `< 0` is errno, `>= 0` is byte count.
+            // this function. The `Msghdr` field layout is verified by layout
+            // guards in `plat`. `&mut mhdr` is the single exclusive borrow for
+            // the duration of the call. The return value is checked below:
+            // `< 0` is errno, `>= 0` is byte count.
             let ret = unsafe { plat::recvmsg(fd, &mut mhdr, 0) };
             if ret < 0 {
                 let err = io::Error::last_os_error();

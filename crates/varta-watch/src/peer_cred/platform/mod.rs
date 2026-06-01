@@ -5,8 +5,8 @@
 //! (`SOL_SOCKET`, `SO_PASSCRED` / `LOCAL_PEERTOKEN` / `LOCAL_CREDS`, ...),
 //! the inline `extern "C"` declarations for `setsockopt` / `recvmsg` /
 //! `getsockopt`, the `ANCILLARY_BUFFER_SIZE` constant, the
-//! `peer_pid_after_recv` extractor, and the compile-time `offset_of!`
-//! assertions that catch ABI drift on any kernel/libc combination.
+//! `peer_pid_after_recv` extractor, and the layout guards that catch ABI drift
+//! on any kernel/libc combination.
 //!
 //! Only the active target's module is compiled; this `mod.rs` re-exports its
 //! contents under the path `super::plat::*` (aliased in `peer_cred::mod.rs`)

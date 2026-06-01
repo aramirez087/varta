@@ -203,30 +203,38 @@ pub(crate) fn ctrl_truncated(_mhdr: &Msghdr) -> bool {
     false
 }
 
-// --- compile-time layout guards -------------------------------------------
+// --- layout guards ----------------------------------------------------------
 
 const _: () = assert!(mem::size_of::<Msghdr>() == 48);
 const _: () = assert!(mem::size_of::<Cmsgcred>() == 84);
 const _: () = assert!(mem::size_of::<Iovec>() == 16);
 
-const _: () = assert!(mem::offset_of!(Msghdr, msg_name) == 0);
-const _: () = assert!(mem::offset_of!(Msghdr, msg_namelen) == 8);
-const _: () = assert!(mem::offset_of!(Msghdr, msg_iov) == 16);
-const _: () = assert!(mem::offset_of!(Msghdr, msg_iovlen) == 24);
-const _: () = assert!(mem::offset_of!(Msghdr, msg_control) == 32);
-const _: () = assert!(mem::offset_of!(Msghdr, msg_controllen) == 40);
-const _: () = assert!(mem::offset_of!(Msghdr, msg_flags) == 44);
+#[cfg(test)]
+mod layout_tests {
+    use super::{Cmsgcred, Cmsghdr, Iovec, Msghdr};
 
-const _: () = assert!(mem::offset_of!(Iovec, iov_base) == 0);
-const _: () = assert!(mem::offset_of!(Iovec, iov_len) == 8);
+    #[test]
+    fn recvmsg_layout_offsets_match_bsd_abi() {
+        assert_field_offset!(Msghdr, msg_name, 0);
+        assert_field_offset!(Msghdr, msg_namelen, 8);
+        assert_field_offset!(Msghdr, msg_iov, 16);
+        assert_field_offset!(Msghdr, msg_iovlen, 24);
+        assert_field_offset!(Msghdr, msg_control, 32);
+        assert_field_offset!(Msghdr, msg_controllen, 40);
+        assert_field_offset!(Msghdr, msg_flags, 44);
 
-const _: () = assert!(mem::offset_of!(Cmsghdr, cmsg_len) == 0);
-const _: () = assert!(mem::offset_of!(Cmsghdr, cmsg_level) == 4);
-const _: () = assert!(mem::offset_of!(Cmsghdr, cmsg_type) == 8);
+        assert_field_offset!(Iovec, iov_base, 0);
+        assert_field_offset!(Iovec, iov_len, 8);
 
-const _: () = assert!(mem::offset_of!(Cmsgcred, cmcred_pid) == 0);
-const _: () = assert!(mem::offset_of!(Cmsgcred, cmcred_uid) == 4);
-const _: () = assert!(mem::offset_of!(Cmsgcred, cmcred_euid) == 8);
-const _: () = assert!(mem::offset_of!(Cmsgcred, cmcred_gid) == 12);
-const _: () = assert!(mem::offset_of!(Cmsgcred, cmcred_ngroups) == 16);
-const _: () = assert!(mem::offset_of!(Cmsgcred, cmcred_groups) == 20);
+        assert_field_offset!(Cmsghdr, cmsg_len, 0);
+        assert_field_offset!(Cmsghdr, cmsg_level, 4);
+        assert_field_offset!(Cmsghdr, cmsg_type, 8);
+
+        assert_field_offset!(Cmsgcred, cmcred_pid, 0);
+        assert_field_offset!(Cmsgcred, cmcred_uid, 4);
+        assert_field_offset!(Cmsgcred, cmcred_euid, 8);
+        assert_field_offset!(Cmsgcred, cmcred_gid, 12);
+        assert_field_offset!(Cmsgcred, cmcred_ngroups, 16);
+        assert_field_offset!(Cmsgcred, cmcred_groups, 20);
+    }
+}

@@ -176,5 +176,11 @@ Varta is built for high-assurance environments.
 - **No heap allocation** after `Varta::connect` in the steady-state beat path.
 - **No blocking** — `WouldBlock` is treated as `Dropped`, never as an error
   that stalls the caller.
-- **MSRV** — Minimum Supported Rust Version is **1.70.0**.
+- **MSRV** — Minimum Supported Rust Version is **1.70.0** for the
+  shippable crates (`varta-vlp`, `varta-client`, `varta-watch`). This is
+  the contract for consumers and is enforced in CI. Building and running
+  the **test suite** needs Rust **≥ 1.85**, because the dev-only crates
+  (`varta-tests`, `varta-bench`) depend on `proptest`, whose transitive
+  `getrandom`/`tempfile` releases are edition-2024. The dev toolchain
+  floor is intentionally not the library MSRV.
 - **Edition 2021**, stable channel pinned via `rust-toolchain.toml` (channel pin, not a version pin — any current stable ≥ MSRV builds).
