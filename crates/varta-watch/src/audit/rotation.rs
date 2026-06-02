@@ -107,8 +107,12 @@ impl RecoveryAuditLog {
                         self.audit_rotation_budget_exceeded_total.saturating_add(1);
                     return RotationOutcome::Deferred;
                 }
-                self.direct_write_line(&line);
-                self.refresh_falling_edge_watermarks();
+                if self.direct_write_line(&line) {
+                    self.refresh_falling_edge_watermarks();
+                } else {
+                    self.pending_lines.push_front(line);
+                    return RotationOutcome::Deferred;
+                }
             }
             self.refresh_falling_edge_watermarks();
             let final_chain = self.prev_chain;

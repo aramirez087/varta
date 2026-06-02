@@ -340,8 +340,12 @@ impl RecoveryAuditLog {
                 break;
             }
             let line = self.pending_lines.pop_front().unwrap();
-            self.refresh_falling_edge_watermarks();
-            self.direct_write_line(&line);
+            if self.direct_write_line(&line) {
+                self.refresh_falling_edge_watermarks();
+            } else {
+                self.pending_lines.push_front(line);
+                break;
+            }
         }
         self.refresh_falling_edge_watermarks();
     }
@@ -402,7 +406,9 @@ impl RecoveryAuditLog {
 impl Drop for RecoveryAuditLog {
     fn drop(&mut self) {
         while let Some(line) = self.pending_lines.pop_front() {
-            self.direct_write_line(&line);
+            if !self.direct_write_line(&line) {
+                break;
+            }
         }
         let _ = self.sink.flush();
         let _ = self.sink.get_ref().sync_data();

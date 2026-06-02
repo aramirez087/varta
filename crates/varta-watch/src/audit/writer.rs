@@ -99,7 +99,7 @@ impl RecoveryAuditLog {
 
         let mut line = String::with_capacity(hash_body.len() + chain_hex.len() + 2);
         let _ = writeln!(line, "{hash_body}\t{chain_hex}");
-        self.direct_write_line(&line);
+        let _ = self.direct_write_line(&line);
     }
 
     /// Compute the next chain hash, advance `self.prev_chain`, and return
@@ -151,7 +151,7 @@ impl RecoveryAuditLog {
     /// Used for boot records (startup / rotation) and by `flush_pending`
     /// when draining. fsync cadence is governed by `sync_every` plus the
     /// optional `sync_interval`.
-    pub(super) fn direct_write_line(&mut self, line: &str) {
+    pub(super) fn direct_write_line(&mut self, line: &str) -> bool {
         match self.sink.write_all(line.as_bytes()) {
             Ok(()) => {
                 self.bytes_written = self.bytes_written.saturating_add(line.len() as u64);
@@ -183,9 +183,11 @@ impl RecoveryAuditLog {
                         self.needs_rotation = true;
                     }
                 }
+                true
             }
             Err(e) => {
                 self.pending_err = Some(e);
+                false
             }
         }
     }
@@ -322,6 +324,38 @@ mod tests {
         }
     }
 
+    /// Sink that rejects the first write before accepting later writes.
+    struct FailFirstWriteSink {
+        ctr: Arc<SyncCounter>,
+        fail_next: bool,
+    }
+
+    impl Write for FailFirstWriteSink {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            if self.fail_next {
+                self.fail_next = false;
+                return Err(io::Error::new(
+                    io::ErrorKind::Other,
+                    "synthetic write failure",
+                ));
+            }
+            *self.ctr.writes.lock().unwrap() += 1;
+            self.ctr.buf.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl DurableSink for FailFirstWriteSink {
+        fn sync_data(&self) -> io::Result<()> {
+            *self.ctr.syncs.lock().unwrap() += 1;
+            Ok(())
+        }
+    }
+
     /// Build a synthetic log around a test sink with explicit knobs.
     fn synthetic_log_with(
         sink: Box<dyn DurableSink>,
@@ -330,8 +364,26 @@ mod tests {
         sync_interval: Option<Duration>,
         max_bytes: Option<u64>,
     ) -> RecoveryAuditLog {
+        synthetic_log_with_buf_capacity(
+            sink,
+            sync_every,
+            fsync_budget,
+            sync_interval,
+            max_bytes,
+            8 * 1024,
+        )
+    }
+
+    fn synthetic_log_with_buf_capacity(
+        sink: Box<dyn DurableSink>,
+        sync_every: u32,
+        fsync_budget: Duration,
+        sync_interval: Option<Duration>,
+        max_bytes: Option<u64>,
+        buf_capacity: usize,
+    ) -> RecoveryAuditLog {
         RecoveryAuditLog {
-            sink: BufWriter::new(sink),
+            sink: BufWriter::with_capacity(buf_capacity, sink),
             path: PathBuf::from("/dev/null"),
             max_bytes,
             bytes_written: 0,
@@ -438,6 +490,70 @@ mod tests {
             drain_wall < Duration::from_millis(250),
             "drain wall-time {drain_wall:?} should be bounded"
         );
+    }
+
+    #[test]
+    fn flush_pending_keeps_line_queued_when_write_is_not_accepted() {
+        let ctr = Arc::new(SyncCounter::default());
+        let sink = Box::new(FailFirstWriteSink {
+            ctr: ctr.clone(),
+            fail_next: true,
+        });
+        let mut log =
+            synthetic_log_with_buf_capacity(sink, 64, Duration::from_secs(10), None, None, 1);
+        log.record_spawn(&dummy_spawn(7));
+        assert_eq!(log.pending_lines.len(), 1);
+
+        log.flush_pending(Duration::MAX);
+
+        assert_eq!(
+            log.pending_lines.len(),
+            1,
+            "line must stay queued when the direct write rejects it"
+        );
+        assert!(log.pending_err.is_some());
+        assert!(
+            ctr.buf.lock().unwrap().is_empty(),
+            "failed write must not be counted as persisted"
+        );
+
+        let _ = log.take_pending_err();
+        log.flush_pending(Duration::MAX);
+
+        assert_eq!(log.pending_lines.len(), 0);
+        let body = String::from_utf8(ctr.buf.lock().unwrap().clone()).expect("audit body utf8");
+        let records: Vec<&str> = body.lines().collect();
+        assert_eq!(
+            records.len(),
+            1,
+            "retry should persist exactly one record: {body}"
+        );
+        assert!(records[0].contains("\tspawn\t7\t7\texec\t"));
+    }
+
+    #[test]
+    fn rotation_pre_drain_keeps_line_queued_when_write_is_not_accepted() {
+        let ctr = Arc::new(SyncCounter::default());
+        let sink = Box::new(FailFirstWriteSink {
+            ctr,
+            fail_next: true,
+        });
+        let mut log =
+            synthetic_log_with_buf_capacity(sink, 64, Duration::from_secs(10), None, None, 1);
+        log.needs_rotation = true;
+        log.record_spawn(&dummy_spawn(9));
+
+        let outcome = log.drive_audit_rotation(Duration::MAX);
+
+        assert_eq!(outcome, crate::audit::RotationOutcome::Deferred);
+        assert_eq!(
+            log.pending_lines.len(),
+            1,
+            "rotation must not capture final_chain while a pending line failed to drain"
+        );
+        assert!(log.rotation_progress.is_idle());
+        assert!(log.needs_rotation);
+        assert!(log.pending_err.is_some());
     }
 
     #[test]
