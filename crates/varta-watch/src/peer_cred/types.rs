@@ -75,6 +75,26 @@ pub enum BeatOrigin {
     SocketModeOnly,
 }
 
+impl BeatOrigin {
+    /// Relative trust strength for resolving same-pid transport races.
+    ///
+    /// Recovery eligibility is still enforced separately by
+    /// `Recovery::on_stall`; this ordering only prevents a weaker transport
+    /// from pinning a pid before a stronger transport can prove liveness.
+    pub(crate) const fn trust_rank(self) -> u8 {
+        match self {
+            BeatOrigin::NetworkUnverified => 0,
+            BeatOrigin::SocketModeOnly => 1,
+            BeatOrigin::OperatorAttestedTransport => 2,
+            BeatOrigin::KernelAttested => 3,
+        }
+    }
+
+    pub(crate) const fn can_replace(self, pinned: BeatOrigin) -> bool {
+        self.trust_rank() > pinned.trust_rank()
+    }
+}
+
 /// Outcome of a single `recvmsg(2)` call with credential extraction.
 pub enum RecvResult {
     /// A full 32-byte frame was received along with credentials. `peer_pid`

@@ -485,7 +485,7 @@ pub struct PromExporter {
     /// indicate a code bug, not load.
     recovery_invariant_violations_total: u64,
     /// Tracker-level cross-origin conflicts — beats dropped because the
-    /// slot's pinned transport origin disagreed with the beat's origin.
+    /// beat's transport origin was weaker than the slot's pinned origin.
     /// Surfaced as `varta_origin_conflict_total`.
     origin_conflict_total: u64,
     /// Frames dropped at receive because the peer's PID-namespace inode
@@ -942,8 +942,8 @@ impl PromExporter {
 
     /// Record one or more origin-conflict drops. See
     /// [`crate::tracker::Tracker::take_origin_conflicts`] —
-    /// a beat was dropped because its transport origin disagreed with the
-    /// slot's pinned origin (first-origin-wins). Surfaced as
+    /// a beat was dropped because its transport origin was weaker than the
+    /// slot's pinned origin. Surfaced as
     /// `varta_origin_conflict_total`.
     pub fn record_origin_conflicts(&mut self, count: u64) {
         self.origin_conflict_total = self.origin_conflict_total.saturating_add(count);

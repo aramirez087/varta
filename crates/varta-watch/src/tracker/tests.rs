@@ -243,11 +243,11 @@ fn scan_truncated_counter_increments_on_dry_scan() {
     assert_eq!(t.take_eviction_scan_truncated(), 0);
 }
 
-/// First-origin-wins: once a slot is pinned to an origin, a beat with a
-/// different origin is dropped as `OriginConflict` without mutating the
-/// slot or incrementing the slot's `last_ns`.
+/// Once a slot is pinned to a strong origin, a beat from a weaker origin is
+/// dropped as `OriginConflict` without mutating the slot or incrementing the
+/// slot's `last_ns`.
 #[test]
-fn origin_conflict_first_origin_wins() {
+fn weaker_origin_conflict_does_not_mutate_stronger_slot() {
     let mut t = Tracker::new(8, EvictionPolicy::Strict, DEFAULT_EVICTION_SCAN_WINDOW);
     let threshold_ns = 100;
 
@@ -295,6 +295,85 @@ fn origin_conflict_first_origin_wins() {
         ),
         Update::Refreshed
     );
+}
+
+#[test]
+fn higher_trust_origin_replaces_lower_trust_preemption() {
+    let mut t = Tracker::new(8, EvictionPolicy::Strict, DEFAULT_EVICTION_SCAN_WINDOW);
+    let threshold_ns = 100;
+
+    assert_eq!(
+        t.record(
+            &frame(7, 99),
+            10,
+            threshold_ns,
+            BeatOrigin::NetworkUnverified,
+            None,
+        ),
+        Update::Inserted
+    );
+
+    assert_eq!(
+        t.record(
+            &frame(7, 1),
+            20,
+            threshold_ns,
+            BeatOrigin::KernelAttested,
+            Some(4026531836),
+        ),
+        Update::Refreshed
+    );
+
+    assert_eq!(t.last_ns_of(7), Some(20));
+    assert_eq!(t.entries[0].last_nonce, 1);
+    assert_eq!(t.entries[0].origin, BeatOrigin::KernelAttested);
+    assert_eq!(t.pid_ns_inode_of(7), Some(Some(4026531836)));
+    assert_eq!(t.take_origin_conflicts(), 0);
+
+    assert_eq!(
+        t.record(
+            &frame(7, 100),
+            30,
+            threshold_ns,
+            BeatOrigin::NetworkUnverified,
+            None,
+        ),
+        Update::OriginConflict
+    );
+    assert_eq!(t.entries[0].origin, BeatOrigin::KernelAttested);
+    assert_eq!(t.entries[0].last_nonce, 1);
+}
+
+#[test]
+fn higher_trust_origin_replacement_clears_prior_stall_latch() {
+    let mut t = Tracker::new(8, EvictionPolicy::Strict, DEFAULT_EVICTION_SCAN_WINDOW);
+    let threshold_ns = 100;
+
+    assert_eq!(
+        t.record(
+            &frame(7, 99),
+            10,
+            threshold_ns,
+            BeatOrigin::NetworkUnverified,
+            None,
+        ),
+        Update::Inserted
+    );
+    t.drain_stalled_slots(120, threshold_ns, |_, _, _, _, _| {});
+    assert_eq!(t.stall_emitted_count, 1);
+
+    assert_eq!(
+        t.record(
+            &frame(7, 1),
+            130,
+            threshold_ns,
+            BeatOrigin::KernelAttested,
+            None,
+        ),
+        Update::Refreshed
+    );
+    assert_eq!(t.stall_emitted_count, 0);
+    assert!(!t.entries[0].stall_emitted);
 }
 
 /// Panic-hook terminal frames use `NONCE_TERMINAL`, but they are not part of

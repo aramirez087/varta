@@ -137,10 +137,10 @@ pub struct Slot {
     pub(crate) last_ns: u64,
     /// Most recent [`Status`] reported by this pid.
     pub(crate) status: Status,
-    /// Transport origin pinned at the slot's first beat. Used to gate
-    /// recovery-eligibility — beats from a different origin than the pinned
-    /// one are rejected as [`Update::OriginConflict`] without mutating the
-    /// slot. See [`BeatOrigin`] for the trust model.
+    /// Strongest transport origin accepted for this pid. Used to gate
+    /// recovery-eligibility. Weaker conflicting origins are rejected as
+    /// [`Update::OriginConflict`]; stronger origins replace weaker preemption
+    /// attempts. See [`BeatOrigin`] for the trust model.
     pub(crate) origin: BeatOrigin,
     /// PID-namespace inode pinned at the slot's first beat (Linux only).
     ///
@@ -256,11 +256,8 @@ pub enum Update {
     /// table was not modified.
     CapacityExceeded,
     /// A beat arrived for a pid that is already tracked, but the beat's
-    /// transport origin disagrees with the origin pinned by the slot's
-    /// first beat. First-origin-wins: the slot is **not** mutated and the
-    /// beat is dropped. Prevents an attacker on an untrusted transport
-    /// from "tainting" a slot that legitimately belongs to a kernel-attested
-    /// agent (or vice-versa).
+    /// transport origin is weaker than the origin pinned by the slot. The
+    /// slot is **not** mutated and the beat is dropped.
     OriginConflict,
     /// A beat arrived for a pid that is already tracked, but the beat's
     /// kernel-attested PID-namespace inode disagrees with the inode pinned
@@ -314,8 +311,8 @@ pub struct Tracker {
     /// without finding a victim while the table was full. Surfaced via
     /// [`Tracker::take_eviction_scan_truncated`] for Prometheus.
     eviction_scan_truncated: u64,
-    /// Count of beats dropped because their transport origin disagreed with
-    /// the slot's pinned origin (first-origin-wins). Surfaced via
+    /// Count of beats dropped because their transport origin was weaker than
+    /// the slot's pinned origin. Surfaced via
     /// [`Tracker::take_origin_conflicts`] for Prometheus.
     origin_conflicts: u64,
     /// Count of beats dropped because their kernel-attested PID-namespace
@@ -429,8 +426,16 @@ impl Tracker {
             };
             if slot.used {
                 if slot.origin != origin {
-                    self.origin_conflicts = self.origin_conflicts.saturating_add(1);
-                    return Update::OriginConflict;
+                    if origin.can_replace(slot.origin) {
+                        if slot.stall_emitted {
+                            self.stall_emitted_count = self.stall_emitted_count.saturating_sub(1);
+                        }
+                        *slot = Slot::from_frame(frame, now_ns, status, origin, peer_pid_ns_inode);
+                        return Update::Refreshed;
+                    } else {
+                        self.origin_conflicts = self.origin_conflicts.saturating_add(1);
+                        return Update::OriginConflict;
+                    }
                 }
                 // First-namespace-wins. Same precedence as origin: an actively
                 // disagreeing inode is a conflict. A `None → Some` upgrade is

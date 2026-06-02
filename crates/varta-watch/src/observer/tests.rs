@@ -323,6 +323,28 @@ impl ScriptedListener {
         }
         Self { results }
     }
+
+    fn with_origin_frames(frames: &[(u32, u64, u32, BeatOrigin)]) -> Self {
+        let mut results = VecDeque::new();
+        for &(pid, nonce, payload, origin) in frames {
+            let frame = Frame::new(Status::Ok, pid, 1, nonce, payload);
+            let mut data = [0u8; 32];
+            frame.encode(&mut data);
+            let peer_pid = if origin == BeatOrigin::KernelAttested {
+                pid
+            } else {
+                0
+            };
+            results.push_back(RecvResult::Authenticated {
+                peer_pid,
+                peer_uid: 0,
+                peer_pid_ns_inode: None,
+                origin,
+                data,
+            });
+        }
+        Self { results }
+    }
 }
 
 impl BeatListener for ScriptedListener {
@@ -435,5 +457,64 @@ fn per_pid_limited_frame_does_not_spend_global_token() {
         obs.drain_global_rate_limited(),
         0,
         "no frame should have exhausted the global bucket"
+    );
+}
+
+#[test]
+fn higher_trust_origin_repairs_untrusted_preemption_before_rate_limit() {
+    let mut obs = Observer::new(
+        Duration::from_secs(60),
+        64,
+        EvictionPolicy::Strict,
+        DEFAULT_EVICTION_SCAN_WINDOW,
+        Some(1),
+        0,
+        0,
+        ClockSource::Monotonic,
+    )
+    .expect("Observer::new should succeed");
+
+    obs.add_listener(Box::new(ScriptedListener::with_origin_frames(&[
+        (42, 99, 100, BeatOrigin::NetworkUnverified),
+        (42, 1, 200, BeatOrigin::KernelAttested),
+    ])));
+
+    let first = obs.poll();
+    assert!(
+        matches!(
+            first,
+            Some(Event::Beat {
+                pid: 42,
+                payload: 100,
+                origin: BeatOrigin::NetworkUnverified,
+                ..
+            })
+        ),
+        "untrusted preemption frame should be recorded first, got {first:?}"
+    );
+
+    let second = obs.poll();
+    assert!(
+        matches!(
+            second,
+            Some(Event::Beat {
+                pid: 42,
+                payload: 200,
+                nonce: 1,
+                origin: BeatOrigin::KernelAttested,
+                ..
+            })
+        ),
+        "kernel-attested beat should replace the weaker slot immediately, got {second:?}"
+    );
+    assert_eq!(
+        obs.drain_per_pid_rate_limited(),
+        0,
+        "trust-upgrade beats must not be dropped by the stale weak slot timestamp"
+    );
+    assert_eq!(
+        obs.drain_origin_conflicts(),
+        0,
+        "a higher-trust replacement is not an origin conflict"
     );
 }

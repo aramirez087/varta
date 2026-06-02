@@ -193,10 +193,8 @@ pub enum Event {
         observer_ns: u64,
     },
     /// A beat arrived for an already-tracked pid, but its transport origin
-    /// disagreed with the origin pinned by the slot's first beat. The slot
-    /// was not mutated; the beat was dropped. First-origin-wins prevents an
-    /// attacker on an untrusted transport from "tainting" a slot that
-    /// legitimately belongs to a kernel-attested agent.
+    /// was weaker than the origin pinned by the slot. The slot was not
+    /// mutated; the beat was dropped.
     OriginConflict {
         /// The pid claimed by the dropped beat (same as the existing slot's pid).
         claimed_pid: u32,
@@ -523,6 +521,18 @@ impl Observer {
                                 }
                                 break;
                             }
+                            // Capture the slot's pre-record pinned origin (if
+                            // any) so an OriginConflict event can report what
+                            // the slot was pinned to without an extra lookup
+                            // afterwards. Also let higher-trust origins repair
+                            // lower-trust preemption before the per-pid limiter
+                            // can drop the corrective beat.
+                            let slot_origin_before = self.tracker.origin_of(frame.pid);
+                            let origin_upgrade = match slot_origin_before {
+                                Some(pinned) => origin.can_replace(pinned),
+                                None => false,
+                            };
+
                             // Per-pid rate limiting is an O(1) tracker lookup
                             // and must run before the global bucket. A
                             // same-pid burst that is already being dropped
@@ -531,14 +541,17 @@ impl Observer {
                             // the global limiter below, preserving the
                             // rotation-attack guard before namespace reads or
                             // tracker insertion.
-                            if let Some(interval_ns) = self.rate_limit_interval_ns {
-                                if let Some(last_ns) = self.tracker.last_ns_of(frame.pid) {
-                                    if now_ns.saturating_sub(last_ns) < interval_ns {
-                                        self.rate_limited_total[RateLimitReason::PerPid as usize] =
+                            if !origin_upgrade {
+                                if let Some(interval_ns) = self.rate_limit_interval_ns {
+                                    if let Some(last_ns) = self.tracker.last_ns_of(frame.pid) {
+                                        if now_ns.saturating_sub(last_ns) < interval_ns {
                                             self.rate_limited_total
+                                                [RateLimitReason::PerPid as usize] = self
+                                                .rate_limited_total
                                                 [RateLimitReason::PerPid as usize]
                                                 .saturating_add(1);
-                                        continue;
+                                            continue;
+                                        }
                                     }
                                 }
                             }
@@ -597,11 +610,6 @@ impl Observer {
                                 }
                                 break;
                             }
-                            // Capture the slot's pre-record pinned origin (if
-                            // any) so an OriginConflict event can report what
-                            // the slot was pinned to without an extra lookup
-                            // afterwards.
-                            let slot_origin_before = self.tracker.origin_of(frame.pid);
                             match self.tracker.record(
                                 &frame,
                                 now_ns,
@@ -807,8 +815,8 @@ impl Observer {
     }
 
     /// Drain and reset the per-tracker origin-conflict counter — number of
-    /// beats dropped because their transport origin disagreed with the
-    /// slot's pinned origin (first-origin-wins). Surfaced as
+    /// beats dropped because their transport origin was weaker than the
+    /// slot's pinned origin. Surfaced as
     /// `varta_origin_conflict_total` in the Prometheus exporter.
     pub fn drain_origin_conflicts(&mut self) -> u64 {
         self.tracker.take_origin_conflicts()

@@ -203,12 +203,13 @@ A recovery command MUST NEVER fire for a pid whose beat lifetime is not
 | Secure UDP    | No — frame is *cryptographically* authenticated but the kernel does not attest the sending process; a holder of the AEAD key (or a per-agent key derived from a leaked master key) can forge a beat for any pid | No                            |
 
 Internally each beat is tagged with a `BeatOrigin`
-(`KernelAttested` vs `NetworkUnverified`).  The tracker pins the origin on
-the slot's first beat and rejects subsequent beats from a different
-origin as `Event::OriginConflict` (counter:
-`varta_origin_conflict_total`).  First-origin-wins prevents an attacker on
-an untrusted transport from "tainting" a slot that legitimately belongs to
-a kernel-attested agent.
+(`KernelAttested`, `OperatorAttestedTransport`, `SocketModeOnly`, or
+`NetworkUnverified`).  The tracker handles origin races monotonically by
+trust: a stronger origin can replace a weaker preemption attempt for the
+same pid, while weaker conflicting beats are rejected as
+`Event::OriginConflict` (counter: `varta_origin_conflict_total`). This
+prevents an attacker on an untrusted transport from pinning a pid before a
+kernel-attested agent can prove liveness.
 
 ### Two-layer enforcement
 
@@ -436,7 +437,7 @@ metacharacter interpretation is structurally impossible.
 | `varta_prom_connections_dropped_total{reason="..."}` | counter | `/metrics` connections accepted but closed before serving.  Reasons: `drain` (serve budget exhausted), `rate_limit` (per-IP token bucket empty), `ip_table_full` (per-IP state map force-evicted). |
 | `varta_prom_auth_failures_total`                     | counter | `/metrics` scrapes that arrived without `Authorization: Bearer <hex>` or with a wrong token.  Always emitted on every scrape (even at zero), so `absent()` alert rules stay green-on-green until the first incident. |
 | `varta_recovery_refused_total{reason="..."}`         | counter | Recovery commands NOT spawned because of a structural safety gate. Only reason currently defined: `unauthenticated_transport` (stalled slot's pinned origin was `NetworkUnverified` and the operator did not enable UDP-origin recovery). Emitted at zero on every scrape. |
-| `varta_origin_conflict_total`                        | counter | Beats dropped because the slot's pinned transport origin disagreed with the beat's origin (first-origin-wins). Non-zero values indicate either operator misconfiguration (same pid emitted from two transports) or an active spoofing attempt. |
+| `varta_origin_conflict_total`                        | counter | Beats dropped because the beat's transport origin was weaker than the slot's pinned origin. Non-zero values indicate either operator misconfiguration (same pid emitted from two transports) or an active spoofing attempt. |
 
 ## Trust model summary
 

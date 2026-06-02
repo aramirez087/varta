@@ -50,7 +50,6 @@ jobs:
           mkdir -p _site
           # Copy landing page assets into root
           cp index.html _site/
-          cp style.css _site/
           cp script.js _site/
           cp sitemap.xml _site/ 2>/dev/null || true
           cp robots.txt _site/ 2>/dev/null || true

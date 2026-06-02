@@ -264,13 +264,12 @@ impl super::PromExporter {
                 );
             }
         }
-        // varta_origin_conflict_total — beats dropped because the slot's
-        // pinned transport origin disagreed with the beat's origin
-        // (first-origin-wins). Non-zero values indicate either operator
-        // misconfiguration (same pid emitted from two transports) or an
-        // active spoofing attempt.
+        // varta_origin_conflict_total — beats dropped because the beat's
+        // transport origin was weaker than the slot's pinned origin. Non-zero
+        // values indicate either operator misconfiguration (same pid emitted
+        // from two transports) or an active spoofing attempt.
         self.body_buf.push_str(
-            "# HELP varta_origin_conflict_total Beats dropped because the slot's pinned transport origin disagreed with the beat's origin.\n",
+            "# HELP varta_origin_conflict_total Beats dropped because the beat's transport origin was weaker than the slot's pinned origin.\n",
         );
         self.body_buf
             .push_str("# TYPE varta_origin_conflict_total counter\n");
