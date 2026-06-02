@@ -99,7 +99,14 @@ impl RecoveryAuditLog {
 
         let mut line = String::with_capacity(hash_body.len() + chain_hex.len() + 2);
         let _ = writeln!(line, "{hash_body}\t{chain_hex}");
-        let _ = self.direct_write_line(&line);
+        if !self.direct_write_line(&line) {
+            if self.pending_lines.len() < AUDIT_RING_CAP {
+                self.pending_lines.push_front(line);
+                self.refresh_rising_edge_watermarks();
+            } else {
+                self.audit_dropped_total = self.audit_dropped_total.saturating_add(1);
+            }
+        }
     }
 
     /// Compute the next chain hash, advance `self.prev_chain`, and return
@@ -125,6 +132,10 @@ impl RecoveryAuditLog {
     fn write_line(&mut self, line: &str) {
         debug_assert!(self.pending_lines.len() < AUDIT_RING_CAP);
         self.pending_lines.push_back(line.to_owned());
+        self.refresh_rising_edge_watermarks();
+    }
+
+    fn refresh_rising_edge_watermarks(&mut self) {
         let len = self.pending_lines.len();
         if !self.ring_above_warn && len >= RING_WATERMARK_WARN {
             self.ring_above_warn = true;
@@ -529,6 +540,44 @@ mod tests {
             "retry should persist exactly one record: {body}"
         );
         assert!(records[0].contains("\tspawn\t7\t7\texec\t"));
+    }
+
+    #[test]
+    fn emit_direct_keeps_boot_line_queued_when_write_is_not_accepted() {
+        let ctr = Arc::new(SyncCounter::default());
+        let sink = Box::new(FailFirstWriteSink {
+            ctr: ctr.clone(),
+            fail_next: true,
+        });
+        let mut log =
+            synthetic_log_with_buf_capacity(sink, 64, Duration::from_secs(10), None, None, 1);
+
+        log.emit_boot(BootReason::Fresh, None);
+
+        assert_eq!(
+            log.pending_lines.len(),
+            1,
+            "direct boot record must stay queued when the sink rejects it"
+        );
+        assert!(log.pending_err.is_some());
+        assert!(
+            ctr.buf.lock().unwrap().is_empty(),
+            "failed direct write must not be counted as persisted"
+        );
+
+        let _ = log.take_pending_err();
+        log.flush_pending(Duration::MAX);
+
+        assert_eq!(log.pending_lines.len(), 0);
+        let body = String::from_utf8(ctr.buf.lock().unwrap().clone()).expect("audit body utf8");
+        let records: Vec<&str> = body.lines().collect();
+        assert_eq!(
+            records.len(),
+            1,
+            "retry should persist exactly one boot record: {body}"
+        );
+        assert!(records[0].contains("\tboot\t"));
+        assert!(records[0].contains("\tfresh\t"));
     }
 
     #[test]
