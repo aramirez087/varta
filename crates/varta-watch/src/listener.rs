@@ -564,21 +564,84 @@ fn path_occupant(path: &Path) -> io::Result<PathOccupant> {
     }
 }
 
-/// Probe whether a live listener is accepting datagrams at `path`.
+/// Probe whether a live listener is bound at `path`.
 fn probe_live(path: &Path) -> io::Result<bool> {
     let sock = UnixDatagram::unbound()?;
 
-    if let Err(e) = sock.connect(path) {
-        return match e.kind() {
+    match sock.connect(path) {
+        Ok(()) => Ok(true),
+        Err(e) => match e.kind() {
+            ErrorKind::ConnectionRefused | ErrorKind::NotFound => Ok(false),
             ErrorKind::PermissionDenied => Err(e),
-            _ => Ok(false),
-        };
+            _ => Err(e),
+        },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::probe_live;
+    use std::io::ErrorKind;
+    use std::os::unix::net::UnixDatagram;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    fn temp_socket_path(label: &str) -> (PathBuf, PathBuf) {
+        let mut dir = std::env::temp_dir();
+        let seq = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        dir.push(format!(
+            "varta-listener-{label}-{}-{nanos}-{seq}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&dir).expect("create temp socket dir");
+        let path = dir.join("sock");
+        (dir, path)
     }
 
-    match sock.send(&[]) {
-        Ok(_) => Ok(true),
-        Err(e) if e.kind() == ErrorKind::PermissionDenied => Err(e),
-        Err(_) => Ok(false),
+    #[test]
+    fn probe_live_returns_false_for_stale_socket_file() {
+        let (dir, path) = temp_socket_path("stale");
+        {
+            let _server = UnixDatagram::bind(&path).expect("bind server");
+        }
+
+        assert!(
+            path.exists(),
+            "dropping a UnixDatagram leaves the socket path"
+        );
+        assert!(!probe_live(&path).expect("probe stale socket"));
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir(&dir);
+    }
+
+    #[test]
+    fn probe_live_does_not_enqueue_empty_datagram() {
+        let (dir, path) = temp_socket_path("live");
+        let server = UnixDatagram::bind(&path).expect("bind server");
+        server
+            .set_nonblocking(true)
+            .expect("make server recv nonblocking");
+
+        assert!(probe_live(&path).expect("probe live socket"));
+
+        let mut buf = [0u8; 32];
+        match server.recv(&mut buf) {
+            Err(e) if e.kind() == ErrorKind::WouldBlock => {}
+            Ok(n) => panic!("probe_live must not enqueue a datagram, received {n} bytes"),
+            Err(e) => panic!("unexpected recv error after probe_live: {e}"),
+        }
+
+        drop(server);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir(&dir);
     }
 }
 
