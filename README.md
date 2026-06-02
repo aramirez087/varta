@@ -1,14 +1,14 @@
 <p align="center">
-  <img src="assets/og.svg" alt="Varta — zero-overhead health protocol for distributed local agents" width="100%">
-</p>
-
-<p align="center">
   <a href="https://github.com/aramirez087/Varta/actions/workflows/ci.yml">
     <img src="https://github.com/aramirez087/Varta/actions/workflows/ci.yml/badge.svg" alt="CI Status">
   </a>
   <img src="https://img.shields.io/badge/license-MIT%2FApache--2.0-blue.svg" alt="License">
   <img src="https://img.shields.io/badge/fuzzing-active-success" alt="Fuzzing">
   <img src="https://img.shields.io/badge/miri-passing-success" alt="Miri">
+</p>
+
+<p align="center">
+  <img src="assets/og.svg" alt="Varta — zero-overhead health protocol for distributed local agents" width="100%">
 </p>
 
 **Zero dependencies. Zero allocations. Agents that never go dark.**
