@@ -362,7 +362,7 @@ widening approach.
 `install_panic_handler_secure_udp` caches an 8-byte IV prefix plus a
 16-byte fork salt at install time to avoid non-async-signal-safe entropy
 reads inside the panic hook itself. The same fork hazard applies: a child
-that panics would otherwise emit `(cached_iv, iv_counter=1)` — colliding
+that panics would otherwise emit `(cached_iv, iv_counter=0)` — colliding
 with the parent's identical pair if the parent panicked too. The installer
 snapshots `install_pid`; if the hook later sees a different PID, it derives
 a child-specific IV prefix with HKDF-SHA256 over the pre-read fork salt,

@@ -242,6 +242,13 @@ fn build_secure_panic_frame(
     Some(secure_frame)
 }
 
+#[cfg(all(feature = "panic-handler", feature = "secure-udp"))]
+#[inline]
+fn claim_secure_panic_counter(counter: &std::sync::atomic::AtomicU64) -> Option<u32> {
+    let claimed = counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    u32::try_from(claimed).ok()
+}
+
 /// Entropy material read before installing the secure panic hook.
 #[cfg(all(feature = "panic-handler", feature = "secure-udp"))]
 #[derive(Clone, Copy)]
@@ -271,7 +278,7 @@ pub(crate) fn install_with_entropy_provider<F>(
 where
     F: FnOnce() -> std::io::Result<SecurePanicEntropy>,
 {
-    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::atomic::AtomicU64;
 
     let start = Instant::now();
     // Pre-compute all IV material at install time — /dev/urandom reads are
@@ -292,10 +299,12 @@ where
     // the same `(iv_random, 1)` 12-byte ChaCha20-Poly1305 nonce under
     // the same key on every fire — catastrophic AEAD nonce reuse
     // (recovers plaintext, lets attackers forge messages). Atomic
-    // fetch-add guarantees each fire claims a distinct counter value;
-    // the underlying nonce space is 2^32 panics per process, far beyond
-    // any realistic budget.
-    let iv_counter_atom = AtomicU32::new(0);
+    // fetch-add guarantees each fire claims a distinct counter value. The
+    // first value is 0, matching the secure transport spec's "new sessions
+    // start at iv_counter = 0" rule. The claim state is wider than the
+    // 32-bit wire counter so exhaustion drops the frame instead of wrapping
+    // into nonce reuse.
+    let iv_counter_atom = AtomicU64::new(0);
     // Pre-bind the UDP socket at install time. bind(2)/connect(2)/fcntl(2)
     // are NOT async-signal-safe per POSIX.1-2017 §2.4.3, so the hook
     // closure must never call them. Socket FD is inherited across fork(2);
@@ -311,13 +320,9 @@ where
         let _ = (|| {
             let panic_pid = std::process::id();
             let timestamp = start.elapsed().as_nanos().min(u64::MAX as u128) as u64;
-            // Claim a unique counter for this fire. `wrapping_add(1)` so
-            // the first emitted counter is 1 (preserving the original
-            // wire value); successive fires use 2, 3, … Wraps at
-            // u32::MAX → 0 → 1 only after 2^32 panics in one process.
-            let iv_counter = iv_counter_atom
-                .fetch_add(1, Ordering::Relaxed)
-                .wrapping_add(1);
+            // Claim a unique counter for this fire. The first panic frame uses
+            // iv_counter = 0, then 1, 2, ... matching vlp-secure.md §5.
+            let iv_counter = claim_secure_panic_counter(&iv_counter_atom)?;
             let nonce_prefix: [u8; 8] = if panic_pid != install_pid {
                 // Forked since install. Derive a fresh prefix using only
                 // stack-local HKDF work; calling getrandom(2) or opening
@@ -534,12 +539,16 @@ mod tests {
         let panic_pid = 1234;
         let timestamp = 1_000_000u64;
 
-        // Simulate the counter sequence the patched closure would produce
-        // on two successive panic fires (1, then 2).
-        let f1 = build_secure_panic_frame(&key, nonce_prefix, 1, panic_pid, timestamp)
+        let f1 = build_secure_panic_frame(&key, nonce_prefix, 0, panic_pid, timestamp)
             .expect("seal must succeed for the pinned 32-byte panic frame");
-        let f2 = build_secure_panic_frame(&key, nonce_prefix, 2, panic_pid, timestamp)
+        let f2 = build_secure_panic_frame(&key, nonce_prefix, 1, panic_pid, timestamp)
             .expect("seal must succeed for the pinned 32-byte panic frame");
+
+        assert_eq!(
+            &f1[8..12],
+            &[0, 0, 0, 0],
+            "secure panic-hook sessions must start at iv_counter=0"
+        );
 
         // On-wire counter bytes (offset 8..12) must differ.
         assert_ne!(
@@ -564,21 +573,21 @@ mod tests {
     /// closure body relies on this invariant for AEAD nonce uniqueness.
     #[test]
     fn atomic_fetch_add_claims_distinct_counters_under_contention() {
-        use std::sync::atomic::{AtomicU32, Ordering};
+        use std::sync::atomic::AtomicU64;
         use std::sync::Arc;
         use std::thread;
 
         const THREADS: u32 = 8;
         const PER_THREAD: u32 = 1_000;
 
-        let atom = Arc::new(AtomicU32::new(0));
+        let atom = Arc::new(AtomicU64::new(0));
         let mut handles = Vec::with_capacity(THREADS as usize);
         for _ in 0..THREADS {
             let a = Arc::clone(&atom);
             handles.push(thread::spawn(move || {
                 let mut seen = Vec::with_capacity(PER_THREAD as usize);
                 for _ in 0..PER_THREAD {
-                    seen.push(a.fetch_add(1, Ordering::Relaxed).wrapping_add(1));
+                    seen.push(claim_secure_panic_counter(&a).expect("counter space available"));
                 }
                 seen
             }));
@@ -594,6 +603,24 @@ mod tests {
             all.len(),
             total,
             "fetch_add must give every concurrent caller a distinct counter"
+        );
+    }
+
+    #[test]
+    fn secure_panic_counter_exhaustion_drops_before_reuse() {
+        use std::sync::atomic::AtomicU64;
+
+        let atom = AtomicU64::new(u32::MAX as u64);
+
+        assert_eq!(
+            claim_secure_panic_counter(&atom),
+            Some(u32::MAX),
+            "last in-range wire counter remains valid"
+        );
+        assert_eq!(
+            claim_secure_panic_counter(&atom),
+            None,
+            "counter exhaustion must not wrap to iv_counter=0 under the same prefix"
         );
     }
 
