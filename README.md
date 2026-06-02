@@ -1,5 +1,3 @@
-# Varta
-
 <p align="center">
   <img src="assets/og.svg" alt="Varta — zero-overhead health protocol for distributed local agents" width="100%">
 </p>
