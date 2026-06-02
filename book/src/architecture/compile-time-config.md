@@ -58,6 +58,10 @@ are ignored.  Each remaining line is `KEY = VALUE`:
 - Repeated singleton keys are a build error; repeated list keys
   (`recovery_env`) accumulate.
 - Unknown keys are a build error that surfaces during `cargo build`.
+- Cross-field safety rules are also build errors: `udp_port` requires a
+  secure key source, recovery on secure UDP requires
+  `i_accept_recovery_on_secure_udp = true`, and non-loopback secure UDP
+  requires `i_accept_secure_udp_non_loopback = true`.
 
 Example:
 
@@ -122,9 +126,9 @@ strict_namespace_check = true
 | `self_watchdog_secs` | u64 | none | Self-watchdog deadline (auto-enables under systemd). |
 | `hw_watchdog` | path | none | Hardware watchdog device (`/dev/watchdog`). |
 | `i_accept_plaintext_udp` | bool | `false` | Runtime acknowledgement. |
-| `i_accept_recovery_on_secure_udp` | bool | `false` | Recovery on secure-UDP transport. |
+| `i_accept_recovery_on_secure_udp` | bool | `false` | Required when secure UDP is combined with recovery. |
 | `i_accept_recovery_on_plaintext_udp` | bool | `false` | Recovery on plaintext UDP. |
-| `i_accept_secure_udp_non_loopback` | bool | `false` | Non-loopback secure-UDP bind. |
+| `i_accept_secure_udp_non_loopback` | bool | `false` | Required when secure UDP binds a non-loopback address. |
 | `allow_cross_namespace_agents` | bool | `false` | Permit cross-PID-namespace beats. |
 | `strict_namespace_check` | bool | `false` | Fatal exit on cross-namespace agent. |
 | `inject_wedge_ms` | u64 | none | Test-hooks only (requires `test-hooks` feature). |

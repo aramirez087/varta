@@ -135,6 +135,8 @@ pub fn parse_kv(input: &str) -> Result<ParsedConfig, String> {
             }
         };
 
+        validate_value(spec, value, lineno + 1)?;
+
         match spec.kind {
             FlagKind::List => {
                 out.lists
@@ -250,7 +252,144 @@ pub fn parse_kv(input: &str) -> Result<ParsedConfig, String> {
         }
     }
 
+    validate_cross_field(&out)?;
+
     Ok(out)
+}
+
+fn validate_value(spec: &FlagSpec, value: &str, lineno: usize) -> Result<(), String> {
+    match spec.kind {
+        FlagKind::Path | FlagKind::Str | FlagKind::List => Ok(()),
+        FlagKind::Bool => match value {
+            v if v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("false") => Ok(()),
+            _ => Err(format!(
+                "line {lineno}: {}: expected true or false, got {value:?}",
+                spec.key
+            )),
+        },
+        FlagKind::U64 => value
+            .parse::<u64>()
+            .map(|_| ())
+            .map_err(|_| format!("line {lineno}: {}: not a valid u64: {value:?}", spec.key)),
+        FlagKind::U32 => value
+            .parse::<u32>()
+            .map(|_| ())
+            .map_err(|_| format!("line {lineno}: {}: not a valid u32: {value:?}", spec.key)),
+        FlagKind::U16 => value
+            .parse::<u16>()
+            .map(|_| ())
+            .map_err(|_| format!("line {lineno}: {}: not a valid u16: {value:?}", spec.key)),
+        FlagKind::Usize => value.parse::<usize>().map(|_| ()).map_err(|_| {
+            format!(
+                "line {lineno}: {}: not a valid unsigned integer: {value:?}",
+                spec.key
+            )
+        }),
+        FlagKind::Octal => parse_octal_str(value)
+            .map(|_| ())
+            .ok_or_else(|| format!("line {lineno}: {}: not a valid octal mode", spec.key)),
+        FlagKind::SocketAddr => value
+            .parse::<std::net::SocketAddr>()
+            .map(|_| ())
+            .map_err(|_| {
+                format!(
+                    "line {lineno}: {}: not a valid socket address: {value:?}",
+                    spec.key
+                )
+            }),
+        FlagKind::IpAddr => value.parse::<std::net::IpAddr>().map(|_| ()).map_err(|_| {
+            format!(
+                "line {lineno}: {}: not a valid IP address: {value:?}",
+                spec.key
+            )
+        }),
+        FlagKind::ClockSource => match value {
+            "monotonic" | "boottime" | "monotonic-raw" | "monotonic_raw" => Ok(()),
+            _ => Err(format!(
+                "line {lineno}: {}: invalid clock source: {value:?}",
+                spec.key
+            )),
+        },
+        FlagKind::EvictionPolicy => match value {
+            "strict" | "balanced" => Ok(()),
+            _ => Err(format!(
+                "line {lineno}: {}: invalid eviction policy: {value:?}",
+                spec.key
+            )),
+        },
+        FlagKind::SignalHandlerMode => match value {
+            "direct" | "libc" => Ok(()),
+            _ => Err(format!(
+                "line {lineno}: {}: invalid signal handler mode: {value:?}",
+                spec.key
+            )),
+        },
+    }
+}
+
+fn has_key(parsed: &ParsedConfig, key: &str) -> bool {
+    parsed.singletons.contains_key(key)
+}
+
+fn bool_key(parsed: &ParsedConfig, key: &str) -> Result<bool, String> {
+    match parsed.singletons.get(key).map(String::as_str) {
+        Some(v) if v.eq_ignore_ascii_case("true") => Ok(true),
+        Some(v) if v.eq_ignore_ascii_case("false") => Ok(false),
+        Some(v) => Err(format!("{key}: expected true or false, got {v:?}")),
+        None => Ok(false),
+    }
+}
+
+fn validate_cross_field(parsed: &ParsedConfig) -> Result<(), String> {
+    let has_recovery_exec = has_key(parsed, "recovery_exec_cmd");
+    let has_recovery_file = has_key(parsed, "recovery_exec_file");
+    let has_recovery = has_recovery_exec || has_recovery_file;
+    if has_recovery_exec && has_recovery_file {
+        return Err("recovery_exec_cmd and recovery_exec_file are mutually exclusive".to_string());
+    }
+    if bool_key(parsed, "recovery_capture_stdio")? && !has_recovery {
+        return Err(
+            "recovery_capture_stdio requires recovery_exec_cmd or recovery_exec_file".to_string(),
+        );
+    }
+
+    let has_udp = has_key(parsed, "udp_port");
+    let has_secure_key = has_key(parsed, "secure_key_file")
+        || has_key(parsed, "accepted_key_file")
+        || has_key(parsed, "master_key_file");
+
+    if has_udp && !has_secure_key {
+        return Err(
+            "udp_port in compile-time-config requires secure_key_file, accepted_key_file, or master_key_file"
+                .to_string(),
+        );
+    }
+
+    if has_recovery
+        && has_udp
+        && has_secure_key
+        && !bool_key(parsed, "i_accept_recovery_on_secure_udp")?
+    {
+        return Err(
+            "recovery on secure UDP requires i_accept_recovery_on_secure_udp = true".to_string(),
+        );
+    }
+
+    if has_udp && has_secure_key {
+        if let Some(ip_raw) = parsed.singletons.get("udp_bind_addr") {
+            let ip: std::net::IpAddr = ip_raw
+                .parse()
+                .map_err(|_| format!("udp_bind_addr: not a valid IP address: {ip_raw:?}"))?;
+            if !ip.is_loopback() && !bool_key(parsed, "i_accept_secure_udp_non_loopback")? {
+                return Err(
+                    "non-loopback secure UDP requires i_accept_secure_udp_non_loopback = true"
+                        .to_string(),
+                );
+            }
+        }
+    }
+
+    Ok(())
 }
 
 // Render a Rust constructor that emits a `Config` literal.  All emitted

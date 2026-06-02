@@ -132,6 +132,39 @@ threshold_ms = 5000
 }
 
 #[test]
+fn invalid_bool_value_is_rejected() {
+    let bad = "\
+socket = /tmp/x.sock
+threshold_ms = 5000
+strict_namespace_check = maybe
+";
+    let err = parse_kv(bad).expect_err("invalid bool value must error");
+    assert!(err.contains("strict_namespace_check"), "got: {err}");
+}
+
+#[test]
+fn invalid_clock_source_is_rejected() {
+    let bad = "\
+socket = /tmp/x.sock
+threshold_ms = 5000
+clock_source = bootime
+";
+    let err = parse_kv(bad).expect_err("invalid clock source must error");
+    assert!(err.contains("clock_source"), "got: {err}");
+}
+
+#[test]
+fn invalid_eviction_policy_is_rejected() {
+    let bad = "\
+socket = /tmp/x.sock
+threshold_ms = 5000
+tracker_eviction_policy = balance
+";
+    let err = parse_kv(bad).expect_err("invalid eviction policy must error");
+    assert!(err.contains("tracker_eviction_policy"), "got: {err}");
+}
+
+#[test]
 fn recovery_cmd_is_rejected_as_unknown_key() {
     // `recovery_cmd` was removed; operators must use `recovery_exec_cmd`.
     // The config-file parser must reject it so a stale config file is
@@ -179,4 +212,95 @@ tracker_capacity = 4097
 ";
     let err = parse_kv(bad).expect_err("tracker_capacity above max must error");
     assert!(err.contains("tracker_capacity"), "got: {err}");
+}
+
+#[test]
+fn recovery_secure_udp_without_accept_is_rejected() {
+    let bad = "\
+socket = /tmp/x.sock
+threshold_ms = 5000
+udp_port = 8443
+secure_key_file = /etc/varta/agent.key
+recovery_exec_cmd = /usr/bin/true
+";
+    let err = parse_kv(bad).expect_err("recovery on secure UDP must require accept key");
+    assert!(
+        err.contains("i_accept_recovery_on_secure_udp"),
+        "got: {err}"
+    );
+}
+
+#[test]
+fn recovery_secure_udp_with_accept_is_allowed() {
+    let cfg = "\
+socket = /tmp/x.sock
+threshold_ms = 5000
+udp_port = 8443
+secure_key_file = /etc/varta/agent.key
+recovery_exec_cmd = /usr/bin/true
+i_accept_recovery_on_secure_udp = true
+";
+    parse_kv(cfg).expect("explicitly accepted secure-UDP recovery should parse");
+}
+
+#[test]
+fn secure_udp_non_loopback_without_accept_is_rejected() {
+    let bad = "\
+socket = /tmp/x.sock
+threshold_ms = 5000
+udp_port = 8443
+udp_bind_addr = 0.0.0.0
+secure_key_file = /etc/varta/agent.key
+";
+    let err = parse_kv(bad).expect_err("non-loopback secure UDP must require accept key");
+    assert!(
+        err.contains("i_accept_secure_udp_non_loopback"),
+        "got: {err}"
+    );
+}
+
+#[test]
+fn secure_udp_loopback_without_accept_is_allowed() {
+    let cfg = "\
+socket = /tmp/x.sock
+threshold_ms = 5000
+udp_port = 8443
+udp_bind_addr = 127.0.0.1
+secure_key_file = /etc/varta/agent.key
+";
+    parse_kv(cfg).expect("loopback secure UDP should not require non-loopback accept key");
+}
+
+#[test]
+fn udp_port_without_secure_key_is_rejected_in_compile_time_config() {
+    let bad = "\
+socket = /tmp/x.sock
+threshold_ms = 5000
+udp_port = 8443
+";
+    let err = parse_kv(bad).expect_err("compile-time UDP must have a secure key source");
+    assert!(err.contains("secure_key_file"), "got: {err}");
+}
+
+#[test]
+fn recovery_capture_stdio_without_recovery_is_rejected() {
+    let bad = "\
+socket = /tmp/x.sock
+threshold_ms = 5000
+recovery_capture_stdio = true
+";
+    let err = parse_kv(bad).expect_err("capture without recovery must error");
+    assert!(err.contains("recovery_capture_stdio"), "got: {err}");
+}
+
+#[test]
+fn duplicate_recovery_sources_are_rejected() {
+    let bad = "\
+socket = /tmp/x.sock
+threshold_ms = 5000
+recovery_exec_cmd = /usr/bin/true
+recovery_exec_file = /etc/varta/recover.cmd
+";
+    let err = parse_kv(bad).expect_err("duplicate recovery sources must error");
+    assert!(err.contains("mutually exclusive"), "got: {err}");
 }
