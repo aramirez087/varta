@@ -42,6 +42,19 @@ pub(super) enum InsertOutcome {
     RefusedCapacity,
 }
 
+enum ReservationKind {
+    Existing,
+    Empty,
+    EvictOldest { evicted_pid: u32 },
+}
+
+pub(super) struct LastFiredReservation {
+    idx: usize,
+    pid: u32,
+    fired_at: Instant,
+    kind: ReservationKind,
+}
+
 /// Fixed-capacity, array-backed ledger of recent recovery fires.
 ///
 /// Replaces the original `HashMap<u32, Instant>` whose reactive pruning
@@ -57,10 +70,9 @@ pub(super) enum InsertOutcome {
 ///   backing store — deterministic, no `HashMap` rehash, no
 ///   randomised hash function.
 /// * **Fail-closed under capacity pressure.** When the table is full
-///   and no entry's age exceeds `debounce`, [`try_insert`] returns
-///   [`InsertOutcome::RefusedCapacity`]; the caller emits a refusal
-///   audit row and bumps a Prometheus counter so operators see the
-///   condition.
+///   and no entry's age exceeds `debounce`, reservation returns `None`;
+///   the caller emits a refusal audit row and bumps a Prometheus counter
+///   so operators see the condition.
 /// * **Clock-regression defense.** All age comparisons use
 ///   [`Instant::saturating_duration_since`], which returns
 ///   [`Duration::ZERO`] on regression — preventing a backwards clock
@@ -72,8 +84,6 @@ pub(super) enum InsertOutcome {
 ///
 /// See `book/src/architecture/observer-liveness.md` for the operator-facing
 /// semantics and alerting recommendation.
-///
-/// [`try_insert`]: LastFiredTable::try_insert
 pub(super) struct LastFiredTable {
     pub(super) slots: Box<[Option<LastFiredSlot>]>,
     /// Number of slots currently holding `Some`.
@@ -107,12 +117,12 @@ impl LastFiredTable {
         None
     }
 
-    pub(super) fn try_insert(
+    pub(super) fn try_reserve(
         &mut self,
         pid: u32,
         now: Instant,
         debounce: Duration,
-    ) -> InsertOutcome {
+    ) -> Option<LastFiredReservation> {
         let mut existing_slot: Option<usize> = None;
         let mut first_empty: Option<usize> = None;
         let mut oldest: Option<(usize, Instant)> = None;
@@ -136,28 +146,21 @@ impl LastFiredTable {
         }
 
         if let Some(idx) = existing_slot {
-            match self.slots.get_mut(idx) {
-                Some(slot) => *slot = Some(LastFiredSlot { pid, fired_at: now }),
-                None => {
-                    self.invariant_violations = self.invariant_violations.saturating_add(1);
-                    return InsertOutcome::RefusedCapacity;
-                }
-            }
-            return InsertOutcome::Inserted;
+            return Some(LastFiredReservation {
+                idx,
+                pid,
+                fired_at: now,
+                kind: ReservationKind::Existing,
+            });
         }
 
         if let Some(idx) = first_empty {
-            match self.slots.get_mut(idx) {
-                Some(slot) => {
-                    *slot = Some(LastFiredSlot { pid, fired_at: now });
-                    self.occupied = self.occupied.saturating_add(1);
-                }
-                None => {
-                    self.invariant_violations = self.invariant_violations.saturating_add(1);
-                    return InsertOutcome::RefusedCapacity;
-                }
-            }
-            return InsertOutcome::Inserted;
+            return Some(LastFiredReservation {
+                idx,
+                pid,
+                fired_at: now,
+                kind: ReservationKind::Empty,
+            });
         }
 
         if let Some((idx, oldest_at)) = oldest {
@@ -167,24 +170,75 @@ impl LastFiredTable {
                     Some(Some(s)) => s.pid,
                     _ => {
                         self.invariant_violations = self.invariant_violations.saturating_add(1);
-                        return InsertOutcome::RefusedCapacity;
+                        return None;
                     }
                 };
-                match self.slots.get_mut(idx) {
-                    Some(slot) => *slot = Some(LastFiredSlot { pid, fired_at: now }),
-                    None => {
-                        self.invariant_violations = self.invariant_violations.saturating_add(1);
-                        return InsertOutcome::RefusedCapacity;
-                    }
-                }
-                self.evictions = self.evictions.saturating_add(1);
-                return InsertOutcome::EvictedOldest { evicted_pid };
+                return Some(LastFiredReservation {
+                    idx,
+                    pid,
+                    fired_at: now,
+                    kind: ReservationKind::EvictOldest { evicted_pid },
+                });
             }
-            return InsertOutcome::RefusedCapacity;
+            return None;
         }
 
         self.invariant_violations = self.invariant_violations.saturating_add(1);
-        InsertOutcome::RefusedCapacity
+        None
+    }
+
+    pub(super) fn commit_reserved(&mut self, reservation: LastFiredReservation) -> InsertOutcome {
+        let Some(slot) = self.slots.get_mut(reservation.idx) else {
+            self.invariant_violations = self.invariant_violations.saturating_add(1);
+            return InsertOutcome::RefusedCapacity;
+        };
+
+        match reservation.kind {
+            ReservationKind::Existing => {
+                *slot = Some(LastFiredSlot {
+                    pid: reservation.pid,
+                    fired_at: reservation.fired_at,
+                });
+                InsertOutcome::Inserted
+            }
+            ReservationKind::Empty => {
+                if slot.is_none() {
+                    self.occupied = self.occupied.saturating_add(1);
+                } else {
+                    self.invariant_violations = self.invariant_violations.saturating_add(1);
+                }
+                *slot = Some(LastFiredSlot {
+                    pid: reservation.pid,
+                    fired_at: reservation.fired_at,
+                });
+                InsertOutcome::Inserted
+            }
+            ReservationKind::EvictOldest { evicted_pid } => {
+                if slot.is_none() {
+                    self.invariant_violations = self.invariant_violations.saturating_add(1);
+                    self.occupied = self.occupied.saturating_add(1);
+                }
+                *slot = Some(LastFiredSlot {
+                    pid: reservation.pid,
+                    fired_at: reservation.fired_at,
+                });
+                self.evictions = self.evictions.saturating_add(1);
+                InsertOutcome::EvictedOldest { evicted_pid }
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn try_insert(
+        &mut self,
+        pid: u32,
+        now: Instant,
+        debounce: Duration,
+    ) -> InsertOutcome {
+        match self.try_reserve(pid, now, debounce) {
+            Some(reservation) => self.commit_reserved(reservation),
+            None => InsertOutcome::RefusedCapacity,
+        }
     }
 
     pub(super) fn prune_expired(&mut self, now: Instant, threshold: Duration) {

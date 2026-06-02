@@ -8,6 +8,7 @@ use crate::audit::SpawnRecord;
 use crate::nonblock_fd::set_nonblocking_fd;
 use crate::outstanding_table::Reservation as OutstandingReservation;
 
+use super::debounce::LastFiredReservation;
 use super::env;
 use super::{Recovery, RecoveryMode, RecoveryOutcome};
 
@@ -69,6 +70,7 @@ impl Recovery {
         now: Instant,
         observer_ns: u64,
         reservation: OutstandingReservation,
+        last_fired_reservation: LastFiredReservation,
     ) -> RecoveryOutcome {
         let capture_on = self.capture_cap > 0;
         match &self.mode {
@@ -109,6 +111,7 @@ impl Recovery {
                                 completed_status: None,
                             },
                         );
+                        self.last_fired.commit_reserved(last_fired_reservation);
                         self.emit_spawn_audit(
                             wallclock_ms,
                             observer_ns,

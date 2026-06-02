@@ -36,7 +36,7 @@ mod env;
 mod reaper;
 mod runner;
 
-use debounce::{InsertOutcome, LastFiredTable};
+use debounce::LastFiredTable;
 use runner::Outstanding;
 
 /// Maximum number of outstanding pids visited per [`Recovery::try_reap`] call.
@@ -607,25 +607,30 @@ impl Recovery {
             }
         };
 
-        match self.last_fired.try_insert(pid, now, self.debounce) {
-            InsertOutcome::Inserted | InsertOutcome::EvictedOldest { .. } => {}
-            InsertOutcome::RefusedCapacity => {
-                self.outstanding.release_reservation(reservation);
-                self.refused_debounce_capacity = self.refused_debounce_capacity.saturating_add(1);
-                if let Some(sink) = self.audit_sink.as_mut() {
-                    sink.record_refused(&RefusedRecord {
-                        wallclock_ms: RecoveryAuditLog::wallclock_ms_now(),
-                        observer_ns,
-                        agent_pid: pid,
-                        reason: "debounce_capacity",
-                    });
-                }
-                return RecoveryOutcome::RefusedDebounceCapacity { pid };
+        let Some(last_fired_reservation) = self.last_fired.try_reserve(pid, now, self.debounce)
+        else {
+            self.outstanding.release_reservation(reservation);
+            self.refused_debounce_capacity = self.refused_debounce_capacity.saturating_add(1);
+            if let Some(sink) = self.audit_sink.as_mut() {
+                sink.record_refused(&RefusedRecord {
+                    wallclock_ms: RecoveryAuditLog::wallclock_ms_now(),
+                    observer_ns,
+                    agent_pid: pid,
+                    reason: "debounce_capacity",
+                });
             }
-        }
+            return RecoveryOutcome::RefusedDebounceCapacity { pid };
+        };
 
         let wallclock_ms = RecoveryAuditLog::wallclock_ms_now();
-        self.spawn_exec_child(pid, wallclock_ms, now, observer_ns, reservation)
+        self.spawn_exec_child(
+            pid,
+            wallclock_ms,
+            now,
+            observer_ns,
+            reservation,
+            last_fired_reservation,
+        )
     }
 
     /// Drain completed or timeout-exceeded children.

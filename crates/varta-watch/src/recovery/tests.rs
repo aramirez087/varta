@@ -583,6 +583,37 @@ fn refusal_does_not_burn_debounce_window() {
 }
 
 #[test]
+fn spawn_failure_does_not_burn_debounce_window() {
+    let dir = audit_tmpdir("spawn-failure-debounce");
+    let missing = dir.join("missing-recovery-command");
+    let mut rec = Recovery::with_mode(
+        RecoveryMode::Exec {
+            program: missing.display().to_string(),
+            args: vec![],
+        },
+        Duration::from_secs(60),
+    );
+
+    match rec.on_stall(7, BeatOrigin::KernelAttested, false, 0) {
+        RecoveryOutcome::SpawnFailed(e) => assert_eq!(e.kind(), std::io::ErrorKind::NotFound),
+        other => panic!("expected SpawnFailed for missing command, got {other:?}"),
+    }
+
+    rec.mode = RecoveryMode::Exec {
+        program: "true".to_string(),
+        args: vec![],
+    };
+
+    match rec.on_stall(7, BeatOrigin::KernelAttested, false, 0) {
+        RecoveryOutcome::Spawned { .. } => {}
+        other => panic!("failed spawn must not debounce a later valid recovery, got {other:?}"),
+    }
+
+    drop(rec);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn refuses_recovery_on_cross_namespace_agent() {
     let mut rec = Recovery::with_mode(
         RecoveryMode::Exec {
@@ -695,6 +726,47 @@ fn last_fired_table_refusal_does_not_burn_debounce_window() {
         InsertOutcome::EvictedOldest { .. } | InsertOutcome::Inserted
     ));
     assert_eq!(table.get(99), Some(later));
+}
+
+#[test]
+fn last_fired_reservation_does_not_mutate_until_commit() {
+    let mut table = LastFiredTable::with_capacity(1);
+    let now = Instant::now();
+
+    let reservation = table
+        .try_reserve(99, now, Duration::from_secs(1))
+        .expect("reservation should fit");
+
+    assert_eq!(table.len(), 0);
+    assert!(table.get(99).is_none());
+
+    assert_eq!(table.commit_reserved(reservation), InsertOutcome::Inserted);
+    assert_eq!(table.len(), 1);
+    assert_eq!(table.get(99), Some(now));
+}
+
+#[test]
+fn last_fired_eviction_reservation_preserves_old_slot_until_commit() {
+    let mut table = LastFiredTable::with_capacity(1);
+    let debounce = Duration::from_millis(100);
+    let t0 = Instant::now();
+    assert_eq!(table.try_insert(10, t0, debounce), InsertOutcome::Inserted);
+
+    let later = t0 + Duration::from_millis(200);
+    let reservation = table
+        .try_reserve(99, later, debounce)
+        .expect("old entry should be reservable for eviction");
+
+    assert_eq!(table.get(10), Some(t0));
+    assert!(table.get(99).is_none());
+
+    assert_eq!(
+        table.commit_reserved(reservation),
+        InsertOutcome::EvictedOldest { evicted_pid: 10 }
+    );
+    assert!(table.get(10).is_none());
+    assert_eq!(table.get(99), Some(later));
+    assert_eq!(table.take_evictions(), 1);
 }
 
 #[test]
