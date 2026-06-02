@@ -290,9 +290,15 @@ pub struct Varta<T: BeatTransport = UdsTransport> {
     transport: T,
     buf: [u8; 32],
     start: Instant,
+    /// Last regular-beat nonce accepted by the kernel. `beat()` builds the
+    /// next candidate from this value and commits it only after `send(2)`
+    /// succeeds, so dropped attempts do not create invisible nonce gaps.
     nonce: u64,
     consecutive_dropped: u32,
     reconnect_after: u32,
+    /// Last regular-beat timestamp accepted by the kernel. Like `nonce`,
+    /// this is commit-on-success state; dropped attempts may observe clock
+    /// regressions, but they do not advance the wire timestamp high-water mark.
     last_timestamp: u64,
     clock_regressions: u64,
     /// PID captured at `connect` / `reconnect` time. Compared against
@@ -509,15 +515,32 @@ impl<T: BeatTransport> Varta<T> {
         }
     }
 
+    fn next_regular_nonce(&self) -> (u64, bool) {
+        if self.nonce < NONCE_TERMINAL - 1 {
+            (self.nonce + 1, false)
+        } else {
+            (0, true)
+        }
+    }
+
+    fn commit_sent_frame(&mut self, nonce: u64, timestamp: u64, wrapped: bool) {
+        self.nonce = nonce;
+        self.last_timestamp = timestamp;
+        if wrapped {
+            warn_nonce_wrapping();
+        }
+    }
+
     /// Emit a single VLP frame carrying `status` and an opaque 8-byte
     /// `payload`.
     ///
-    /// The nonce increments first (starting from 1) and wraps to 0 on
-    /// exhaustion; the very first beat after `connect` carries `nonce == 1`. The frame is
-    /// constructed on the stack, encoded into the owned scratch buffer, and
-    /// handed to `send(2)`. The steady-state path (`Sent` / `Dropped`) neither
-    /// blocks nor allocates; the rare `Failed` path may allocate when cloning
-    /// the underlying [`io::Error`].
+    /// The nonce candidate starts at 1 and wraps to 0 on exhaustion. It is
+    /// committed only when the underlying `send(2)` accepts the datagram; a
+    /// `Dropped` or `Failed` attempt leaves the next successful beat on the
+    /// same nonce. The frame is constructed on the stack, encoded into the
+    /// owned scratch buffer, and handed to `send(2)`. The steady-state path
+    /// (`Sent` / `Dropped`) neither blocks nor allocates; the rare `Failed`
+    /// path preserves the allocation-free [`BeatError`] shape.
     ///
     /// When [`set_reconnect_after`](Self::set_reconnect_after) is enabled and
     /// the consecutive-dropped threshold is crossed, `beat` will internally
@@ -550,12 +573,7 @@ impl<T: BeatTransport> Varta<T> {
                 Err(e) => return BeatOutcome::Failed(BeatError::from_io(&e)),
             }
         }
-        if self.nonce < NONCE_TERMINAL - 1 {
-            self.nonce += 1;
-        } else {
-            warn_nonce_wrapping();
-            self.nonce = 0;
-        }
+        let (candidate_nonce, wrapped_nonce) = self.next_regular_nonce();
         // Saturate the nanosecond timestamp at `u64::MAX as u128` so the cast
         // never wraps. `u64::MAX` itself is reserved as a wire-level sentinel
         // (`DecodeError::BadTimestamp`); reaching it would require ~584.5
@@ -572,27 +590,35 @@ impl<T: BeatTransport> Varta<T> {
             // clamp below.
             self.clock_regressions = self.clock_regressions.saturating_add(1);
         }
-        self.last_timestamp = self.last_timestamp.max(raw_elapsed);
-        let timestamp = self.last_timestamp;
+        let timestamp = self.last_timestamp.max(raw_elapsed);
         debug_assert!(
-            self.nonce != NONCE_TERMINAL,
+            candidate_nonce != NONCE_TERMINAL,
             "regular beat nonce must not equal NONCE_TERMINAL sentinel"
         );
-        let frame = Frame::new(status, pid, timestamp, self.nonce, payload);
+        let frame = Frame::new(status, pid, timestamp, candidate_nonce, payload);
         frame.encode(&mut self.buf);
         let outcome = self.send_frame();
         match &outcome {
+            BeatOutcome::Sent => {
+                self.commit_sent_frame(candidate_nonce, timestamp, wrapped_nonce);
+                self.consecutive_dropped = 0;
+                outcome
+            }
             BeatOutcome::Dropped(_) => {
                 self.consecutive_dropped = self.consecutive_dropped.saturating_add(1);
                 if self.reconnect_after > 0 && self.consecutive_dropped >= self.reconnect_after {
                     self.consecutive_dropped = 0;
                     if self.transport.reconnect().is_ok() {
-                        return self.send_frame();
+                        let retry = self.send_frame();
+                        if matches!(retry, BeatOutcome::Sent) {
+                            self.commit_sent_frame(candidate_nonce, timestamp, wrapped_nonce);
+                        }
+                        return retry;
                     }
                 }
                 outcome
             }
-            _ => {
+            BeatOutcome::Failed(_) => {
                 self.consecutive_dropped = 0;
                 outcome
             }
@@ -852,6 +878,172 @@ mod tests {
             connect_pid: std::process::id(),
             fork_recoveries: 0,
         }
+    }
+
+    #[derive(Clone, Copy)]
+    enum SendStep {
+        Sent,
+        WouldBlock,
+        PermissionDenied,
+    }
+
+    struct ScriptedTransport {
+        steps: &'static [SendStep],
+        attempts: usize,
+        attempted_nonces: [u64; 8],
+        accepted_nonces: [u64; 8],
+        accepted: usize,
+        reconnects: u32,
+    }
+
+    impl ScriptedTransport {
+        fn new(steps: &'static [SendStep]) -> Self {
+            Self {
+                steps,
+                attempts: 0,
+                attempted_nonces: [0; 8],
+                accepted_nonces: [0; 8],
+                accepted: 0,
+                reconnects: 0,
+            }
+        }
+    }
+
+    impl BeatTransport for ScriptedTransport {
+        fn send(&mut self, buf: &[u8; 32]) -> io::Result<usize> {
+            let frame = Frame::decode(buf).expect("client must encode a valid VLP frame");
+            let step = self
+                .steps
+                .get(self.attempts)
+                .copied()
+                .unwrap_or(SendStep::Sent);
+            if self.attempts < self.attempted_nonces.len() {
+                self.attempted_nonces[self.attempts] = frame.nonce;
+            }
+            self.attempts = self.attempts.saturating_add(1);
+            match step {
+                SendStep::Sent => {
+                    if self.accepted < self.accepted_nonces.len() {
+                        self.accepted_nonces[self.accepted] = frame.nonce;
+                    }
+                    self.accepted = self.accepted.saturating_add(1);
+                    Ok(32)
+                }
+                SendStep::WouldBlock => Err(io::Error::from(io::ErrorKind::WouldBlock)),
+                SendStep::PermissionDenied => Err(io::Error::from(io::ErrorKind::PermissionDenied)),
+            }
+        }
+
+        fn reconnect(&mut self) -> io::Result<()> {
+            self.reconnects = self.reconnects.saturating_add(1);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn dropped_beat_does_not_commit_regular_nonce() {
+        let mut agent = varta_with_transport(ScriptedTransport::new(&[
+            SendStep::WouldBlock,
+            SendStep::Sent,
+        ]));
+
+        let dropped = agent.beat(Status::Ok, 0);
+        assert!(
+            matches!(dropped, BeatOutcome::Dropped(DropReason::KernelQueueFull)),
+            "expected first send to be dropped, got {dropped:?}"
+        );
+        assert_eq!(
+            agent.nonce, 0,
+            "dropped send must not advance the committed VLP nonce"
+        );
+        assert_eq!(
+            agent.transport.attempted_nonces[0], 1,
+            "first attempted frame still uses the first regular nonce"
+        );
+
+        let sent = agent.beat(Status::Ok, 0);
+        assert!(matches!(sent, BeatOutcome::Sent), "got {sent:?}");
+        assert_eq!(agent.nonce, 1);
+        assert_eq!(
+            &agent.transport.attempted_nonces[..2],
+            &[1, 1],
+            "retrying after an unaccepted datagram must reuse the nonce"
+        );
+        assert_eq!(&agent.transport.accepted_nonces[..1], &[1]);
+    }
+
+    #[test]
+    fn failed_beat_does_not_commit_regular_nonce() {
+        let mut agent = varta_with_transport(ScriptedTransport::new(&[
+            SendStep::PermissionDenied,
+            SendStep::Sent,
+        ]));
+
+        let failed = agent.beat(Status::Ok, 0);
+        assert!(
+            matches!(failed, BeatOutcome::Failed(_)),
+            "expected first send to fail, got {failed:?}"
+        );
+        assert_eq!(
+            agent.nonce, 0,
+            "unexpected send failure must not advance the committed VLP nonce"
+        );
+
+        let sent = agent.beat(Status::Ok, 0);
+        assert!(matches!(sent, BeatOutcome::Sent), "got {sent:?}");
+        assert_eq!(agent.nonce, 1);
+        assert_eq!(&agent.transport.attempted_nonces[..2], &[1, 1]);
+        assert_eq!(&agent.transport.accepted_nonces[..1], &[1]);
+    }
+
+    #[test]
+    fn reconnect_retry_commits_pending_nonce_only_when_retry_is_sent() {
+        let mut agent = varta_with_transport(ScriptedTransport::new(&[
+            SendStep::WouldBlock,
+            SendStep::Sent,
+        ]));
+        agent.set_reconnect_after(1);
+
+        let outcome = agent.beat(Status::Ok, 0);
+        assert!(matches!(outcome, BeatOutcome::Sent), "got {outcome:?}");
+        assert_eq!(agent.transport.reconnects, 1);
+        assert_eq!(agent.nonce, 1);
+        assert_eq!(
+            &agent.transport.attempted_nonces[..2],
+            &[1, 1],
+            "the retry after reconnect must send the same pending frame"
+        );
+        assert_eq!(&agent.transport.accepted_nonces[..1], &[1]);
+    }
+
+    #[test]
+    fn dropped_wrap_attempt_does_not_commit_nonce_wrap() {
+        let mut agent = varta_with_transport(ScriptedTransport::new(&[
+            SendStep::WouldBlock,
+            SendStep::Sent,
+        ]));
+        agent.nonce = NONCE_TERMINAL - 1;
+
+        let dropped = agent.beat(Status::Ok, 0);
+        assert!(
+            matches!(dropped, BeatOutcome::Dropped(DropReason::KernelQueueFull)),
+            "expected wrap attempt to be dropped, got {dropped:?}"
+        );
+        assert_eq!(
+            agent.nonce,
+            NONCE_TERMINAL - 1,
+            "dropped wrap attempt must leave the sentinel-adjacent nonce committed"
+        );
+        assert_eq!(
+            agent.transport.attempted_nonces[0], 0,
+            "the pending wrapped frame uses nonce 0, never NONCE_TERMINAL"
+        );
+
+        let sent = agent.beat(Status::Ok, 0);
+        assert!(matches!(sent, BeatOutcome::Sent), "got {sent:?}");
+        assert_eq!(agent.nonce, 0);
+        assert_eq!(&agent.transport.attempted_nonces[..2], &[0, 0]);
+        assert_eq!(&agent.transport.accepted_nonces[..1], &[0]);
     }
 
     #[test]
