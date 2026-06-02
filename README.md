@@ -1,7 +1,7 @@
 # Varta
 
 <p align="center">
-  <img src="assets/varta-animation.svg" alt="Varta Animation" width="100%">
+  <img src="assets/og.svg" alt="Varta — zero-overhead health protocol for distributed local agents" width="100%">
 </p>
 
 <p align="center">
@@ -70,19 +70,24 @@ Full operator guide: [`book/src/operations/install.md`](book/src/operations/inst
 
 ## Install (Rust client)
 
-Varta is not yet published to crates.io (post-v0.1.0). Use a path dependency:
+Varta is published on crates.io:
 
 ```toml
-[dependencies.varta-client]
-path = "path/to/varta/crates/varta-client"
+[dependencies]
+varta-client = "0.2"
+```
+
+Or add it with Cargo:
+
+```bash
+cargo add varta-client
 ```
 
 To enable the optional panic hook or UDP transport:
 
 ```toml
-[dependencies.varta-client]
-path = "path/to/varta/crates/varta-client"
-features = ["panic-handler", "udp"]
+[dependencies]
+varta-client = { version = "0.2", features = ["panic-handler", "udp"] }
 ```
 
 > **Building a client in another language?** The VLP wire format is

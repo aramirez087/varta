@@ -46,11 +46,19 @@ pub(super) fn max_beat_rate_limits_and_reports_metric() {
     let agent_pid = std::process::id();
     {
         let mut agent = Varta::connect(&socket).expect("Varta::connect");
-        for _ in 0..50 {
-            // Send as fast as possible — no backoff sleep for Dropped,
-            // because Dropped is expected here due to rate limiting.
+        for i in 0..50 {
+            // Pace beats ~20ms apart (50/s, still 5x the 10/s limit).
+            // A tight unpaced burst is delivered reliably on Linux but
+            // macOS AF_UNIX SOCK_DGRAM does not honor the large SO_RCVBUF
+            // request and caps in-flight datagrams via net.local.dgram.recvspace,
+            // so the burst can ENOBUFS down to a single delivered beat — too
+            // few for the per-pid limiter to register a drop. Pacing keeps the
+            // observer receiving every beat while still exceeding the rate.
             if let BeatOutcome::Failed(e) = agent.beat(Status::Ok, 0) {
                 panic!("unexpected hard failure: {e}");
+            }
+            if i < 49 {
+                std::thread::sleep(Duration::from_millis(20));
             }
         }
     }

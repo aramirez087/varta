@@ -1,0 +1,103 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 630" width="1200" height="630">
+  <defs>
+    <pattern id="grid" width="50" height="50" patternUnits="userSpaceOnUse">
+      <path d="M 50 0 L 0 0 0 50" fill="none" stroke="#ffffff" stroke-opacity="0.025" stroke-width="1" />
+    </pattern>
+    <radialGradient id="glow" cx="50%" cy="40%" r="60%">
+      <stop offset="0%" stop-color="#ff4757" stop-opacity="0.18" />
+      <stop offset="100%" stop-color="#ff4757" stop-opacity="0" />
+    </radialGradient>
+    <filter id="pulse" x="-50%" y="-50%" width="200%" height="200%">
+      <feGaussianBlur stdDeviation="4" />
+    </filter>
+  </defs>
+
+  <rect width="1200" height="630" fill="#09090b" />
+  <rect width="1200" height="630" fill="url(#glow)" />
+  <rect width="1200" height="630" fill="url(#grid)" />
+
+  <!-- Terminal-style frame brackets -->
+  <path d="M 50 50 L 50 30 L 90 30" fill="none" stroke="#27272a" stroke-width="2" stroke-linecap="round" />
+  <path d="M 1150 50 L 1150 30 L 1110 30" fill="none" stroke="#27272a" stroke-width="2" stroke-linecap="round" />
+  <path d="M 50 580 L 50 600 L 90 600" fill="none" stroke="#27272a" stroke-width="2" stroke-linecap="round" />
+  <path d="M 1150 580 L 1150 600 L 1110 600" fill="none" stroke="#27272a" stroke-width="2" stroke-linecap="round" />
+
+  <!-- Left: wordmark + tagline -->
+  <g font-family="ui-monospace, 'JetBrains Mono', Menlo, monospace">
+    <!-- VARTA wordmark with terminal prompt -->
+    <text x="90" y="200" font-size="42" font-weight="700" fill="#52525b" letter-spacing="2">&gt;</text>
+    <text x="150" y="200" font-size="64" font-weight="800" fill="#f4f4f5" letter-spacing="-1">VARTA</text>
+
+    <!-- Accent dot -->
+    <circle cx="148" cy="188" r="5" fill="#ff4757" />
+
+    <!-- Tagline (h1) -->
+    <text x="90" y="280" font-size="32" font-weight="700" fill="#f4f4f5">Zero-overhead health protocol</text>
+    <text x="90" y="320" font-size="32" font-weight="700" fill="#f4f4f5">for distributed local agents.</text>
+
+    <!-- Sub -->
+    <text x="90" y="380" font-size="18" font-weight="500" fill="#a1a1aa">32-byte heartbeats over UDS &amp; UDP.</text>
+    <text x="90" y="406" font-size="18" font-weight="500" fill="#a1a1aa">No dependencies. No allocations.</text>
+
+    <!-- Spec chips -->
+    <g transform="translate(90, 460)">
+      <rect width="148" height="36" rx="6" fill="none" stroke="#27272a" stroke-width="1.5" />
+      <text x="74" y="23" text-anchor="middle" font-size="13" font-weight="600" fill="#ff4757" letter-spacing="1">P99 &lt; 1μs</text>
+    </g>
+    <g transform="translate(252, 460)">
+      <rect width="148" height="36" rx="6" fill="none" stroke="#27272a" stroke-width="1.5" />
+      <text x="74" y="23" text-anchor="middle" font-size="13" font-weight="600" fill="#10b981" letter-spacing="1">0 DEPS</text>
+    </g>
+    <g transform="translate(414, 460)">
+      <rect width="148" height="36" rx="6" fill="none" stroke="#27272a" stroke-width="1.5" />
+      <text x="74" y="23" text-anchor="middle" font-size="13" font-weight="600" fill="#a1a1aa" letter-spacing="1">RUST 2021</text>
+    </g>
+  </g>
+
+  <!-- Right: agent → observer diagram -->
+  <g transform="translate(720, 200)">
+    <!-- Static wire path -->
+    <path d="M 50 100 L 200 100 L 215 50 L 230 160 L 245 70 L 260 100 L 410 100"
+          fill="none" stroke="#27272a" stroke-width="2" stroke-linecap="round" opacity="0.5" />
+
+    <!-- Glowing pulse (static) -->
+    <path d="M 50 100 L 200 100 L 215 50 L 230 160 L 245 70 L 260 100 L 410 100"
+          fill="none" stroke="#ff4757" stroke-width="3" stroke-linecap="round" filter="url(#pulse)" opacity="0.85" />
+
+    <!-- AGENT node -->
+    <circle cx="50" cy="100" r="22" fill="none" stroke="#ff4757" stroke-width="1.5" opacity="0.5" />
+    <circle cx="50" cy="100" r="13" fill="none" stroke="#27272a" stroke-width="2" />
+    <circle cx="50" cy="100" r="6" fill="#ff4757" />
+
+    <text x="50" y="160" text-anchor="middle" font-family="ui-monospace, 'JetBrains Mono', Menlo, monospace" font-size="14" font-weight="700" fill="#f4f4f5" letter-spacing="2">AGENT</text>
+    <text x="50" y="180" text-anchor="middle" font-family="ui-monospace, 'JetBrains Mono', Menlo, monospace" font-size="11" font-weight="500" fill="#a1a1aa">varta-client</text>
+    <text x="50" y="196" text-anchor="middle" font-family="ui-monospace, 'JetBrains Mono', Menlo, monospace" font-size="9.5" fill="#52525b">zero-allocation</text>
+
+    <!-- HUD center label -->
+    <g transform="translate(230, -10)">
+      <path d="M -75 0 L -85 0 L -85 10" fill="none" stroke="#27272a" stroke-width="1.5" />
+      <path d="M -85 24 L -85 34 L -75 34" fill="none" stroke="#27272a" stroke-width="1.5" />
+      <path d="M 75 0 L 85 0 L 85 10" fill="none" stroke="#27272a" stroke-width="1.5" />
+      <path d="M 85 24 L 85 34 L 75 34" fill="none" stroke="#27272a" stroke-width="1.5" />
+      <text x="0" y="14" text-anchor="middle" font-family="ui-monospace, 'JetBrains Mono', Menlo, monospace" font-size="11" font-weight="700" fill="#ff4757" letter-spacing="1.5">32-BYTE FRAME</text>
+      <text x="0" y="30" text-anchor="middle" font-family="ui-monospace, 'JetBrains Mono', Menlo, monospace" font-size="9" fill="#52525b" letter-spacing="1">UDS · UDP</text>
+    </g>
+
+    <!-- OBSERVER node -->
+    <circle cx="410" cy="100" r="22" fill="none" stroke="#27272a" stroke-width="1.5" stroke-dasharray="4 4" />
+    <circle cx="410" cy="100" r="13" fill="none" stroke="#27272a" stroke-width="2" />
+    <circle cx="410" cy="100" r="6" fill="#10b981" />
+
+    <text x="410" y="160" text-anchor="middle" font-family="ui-monospace, 'JetBrains Mono', Menlo, monospace" font-size="14" font-weight="700" fill="#f4f4f5" letter-spacing="2">OBSERVER</text>
+    <text x="410" y="180" text-anchor="middle" font-family="ui-monospace, 'JetBrains Mono', Menlo, monospace" font-size="11" font-weight="500" fill="#a1a1aa">varta-watch</text>
+    <text x="410" y="196" text-anchor="middle" font-family="ui-monospace, 'JetBrains Mono', Menlo, monospace" font-size="9.5" fill="#52525b">prom-exporter</text>
+  </g>
+
+  <!-- Footer: URL + version -->
+  <g font-family="ui-monospace, 'JetBrains Mono', Menlo, monospace" font-size="14" fill="#52525b">
+    <text x="90" y="570" font-weight="500">varta.sh</text>
+    <text x="190" y="570" font-weight="500">·</text>
+    <text x="210" y="570" font-weight="500">MIT / Apache-2.0</text>
+    <text x="1110" y="570" text-anchor="end" font-weight="600" fill="#ff4757">v0.2.0</text>
+  </g>
+</svg>
