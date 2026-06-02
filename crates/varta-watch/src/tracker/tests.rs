@@ -1,7 +1,7 @@
 use super::pid_index::{PidIndex, ProbeExhausted};
 use super::{EvictionPolicy, Tracker, Update, DEFAULT_EVICTION_SCAN_WINDOW, MAX_CAPACITY};
 use crate::peer_cred::BeatOrigin;
-use varta_vlp::{Frame, Status};
+use varta_vlp::{Frame, Status, NONCE_TERMINAL};
 
 fn frame(pid: u32, nonce: u64) -> Frame {
     Frame::new(Status::Ok, pid, nonce, nonce, 0)
@@ -294,6 +294,56 @@ fn origin_conflict_first_origin_wins() {
             None
         ),
         Update::Refreshed
+    );
+}
+
+/// Panic-hook terminal frames use `NONCE_TERMINAL`, but they are not part of
+/// the regular beat nonce stream. A recoverable panic must not make later
+/// healthy beats look out-of-order when the regular nonce is already above
+/// the wrap-detection low-water threshold.
+#[test]
+fn terminal_panic_nonce_does_not_poison_regular_stream() {
+    let mut t = Tracker::new(8, EvictionPolicy::Strict, DEFAULT_EVICTION_SCAN_WINDOW);
+    let threshold_ns = 100;
+    let pid = 7;
+    let regular_before = 2_000_000;
+    let regular_after = regular_before + 1;
+
+    assert_eq!(
+        t.record(&frame(pid, regular_before), 10, threshold_ns, ORIGIN, None,),
+        Update::Inserted
+    );
+
+    let terminal = Frame::new(Status::Critical, pid, regular_before + 1, NONCE_TERMINAL, 0);
+    assert_eq!(
+        t.record(&terminal, 20, threshold_ns, ORIGIN, None),
+        Update::Refreshed
+    );
+
+    let mut stalled_nonce = None;
+    t.drain_stalled_slots(120, threshold_ns, |p, last_nonce, _, _, _| {
+        if p == pid {
+            stalled_nonce = Some(last_nonce);
+        }
+    });
+    assert_eq!(
+        stalled_nonce,
+        Some(NONCE_TERMINAL),
+        "stall telemetry should report the terminal frame as the last observed beat"
+    );
+
+    assert_eq!(
+        t.record(&frame(pid, regular_after), 130, threshold_ns, ORIGIN, None),
+        Update::Refreshed
+    );
+    assert_eq!(
+        t.entries[0].last_nonce, regular_after,
+        "terminal sentinel must not replace the regular nonce high-water mark"
+    );
+    assert_eq!(
+        t.take_nonce_wraps(),
+        0,
+        "recovering from a terminal frame is not a real nonce-space wrap"
     );
 }
 

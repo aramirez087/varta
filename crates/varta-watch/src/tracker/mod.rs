@@ -14,7 +14,7 @@
 //! uses a deterministic integer mixer (Murmur3 finalizer) and linear
 //! probing with a fixed budget, so every operation has a tight WCET bound.
 
-use varta_vlp::{Frame, Status};
+use varta_vlp::{Frame, Status, NONCE_TERMINAL};
 
 use crate::peer_cred::BeatOrigin;
 
@@ -111,8 +111,27 @@ pub enum EvictionPolicy {
 pub struct Slot {
     /// OS process id of the tracked agent.
     pub(crate) pid: u32,
-    /// Most recent nonce accepted from this pid.
+    /// Most recent non-terminal nonce accepted from this pid.
+    ///
+    /// Panic-hook terminal frames carry `NONCE_TERMINAL`; storing that
+    /// sentinel here would poison the regular nonce high-water mark and make
+    /// later healthy beats look out-of-order. `has_regular_nonce` marks
+    /// whether this field is initialized for slots first created by a
+    /// terminal frame.
     pub(crate) last_nonce: u64,
+    /// True iff `last_nonce` contains an accepted regular-beat nonce.
+    pub(crate) has_regular_nonce: bool,
+    /// Most recent accepted wire nonce, including `NONCE_TERMINAL`.
+    ///
+    /// Used only for stall telemetry. Regular monotonicity checks use
+    /// `last_nonce` + `has_regular_nonce`.
+    pub(crate) last_observed_nonce: u64,
+    /// Highest accepted timestamp for a terminal panic frame.
+    ///
+    /// Terminal frames all use the same nonce sentinel, so timestamp is the
+    /// only frame-local ordering signal available to reject terminal replays
+    /// without blocking later regular beats.
+    pub(crate) last_terminal_timestamp: Option<u64>,
     /// Observer-local timestamp (nanoseconds since [`crate::observer::Observer`]
     /// start) of the last accepted beat for this pid.
     pub(crate) last_ns: u64,
@@ -141,7 +160,87 @@ pub struct Slot {
     pub(crate) stall_emitted: bool,
 }
 
-impl Slot {}
+impl Slot {
+    fn from_frame(
+        frame: &Frame,
+        now_ns: u64,
+        status: Status,
+        origin: BeatOrigin,
+        peer_pid_ns_inode: Option<u64>,
+    ) -> Self {
+        let is_terminal = frame.nonce == NONCE_TERMINAL;
+        Slot {
+            pid: frame.pid,
+            last_nonce: if is_terminal { 0 } else { frame.nonce },
+            has_regular_nonce: !is_terminal,
+            last_observed_nonce: frame.nonce,
+            last_terminal_timestamp: if is_terminal {
+                Some(frame.timestamp)
+            } else {
+                None
+            },
+            last_ns: now_ns,
+            status,
+            origin,
+            pid_ns_inode: peer_pid_ns_inode,
+            used: true,
+            stall_emitted: false,
+        }
+    }
+
+    fn clear_stall_emitted(&mut self) -> bool {
+        if self.stall_emitted {
+            self.stall_emitted = false;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn refresh_terminal(&mut self, frame: &Frame, now_ns: u64, status: Status) -> bool {
+        match self.last_terminal_timestamp {
+            Some(last) if frame.timestamp <= last => return false,
+            _ => {}
+        }
+        self.last_terminal_timestamp = Some(frame.timestamp);
+        self.last_observed_nonce = frame.nonce;
+        self.last_ns = now_ns;
+        self.status = status;
+        true
+    }
+
+    fn refresh_regular(&mut self, frame: &Frame, now_ns: u64, status: Status) -> RegularRefresh {
+        if self.has_regular_nonce && frame.nonce <= self.last_nonce {
+            // Detect nonce wrap: agent exhausted u64 nonce space and looped
+            // to 0. last_nonce is near u64::MAX and the incoming nonce is
+            // near 0, a gap too large to be a genuine out-of-order beat.
+            let wrap_lo = NONCE_WRAP_THRESHOLD;
+            let wrap_hi = u64::MAX.saturating_sub(NONCE_WRAP_THRESHOLD);
+            if self.last_nonce >= wrap_hi && frame.nonce <= wrap_lo {
+                self.last_nonce = frame.nonce;
+                self.has_regular_nonce = true;
+                self.last_observed_nonce = frame.nonce;
+                self.last_ns = now_ns;
+                self.status = status;
+                return RegularRefresh::Wrapped;
+            }
+            return RegularRefresh::OutOfOrder;
+        }
+        self.last_nonce = frame.nonce;
+        self.has_regular_nonce = true;
+        self.last_observed_nonce = frame.nonce;
+        self.last_ns = now_ns;
+        self.status = status;
+        RegularRefresh::Accepted
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RegularRefresh {
+    Accepted,
+    Wrapped,
+    OutOfOrder,
+}
 
 /// Result of [`Tracker::record`].
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -350,41 +449,30 @@ impl Tracker {
                     (None, Some(_)) => true,
                     _ => false,
                 };
-                if frame.nonce <= slot.last_nonce {
-                    // Detect nonce wrap: agent exhausted u64 nonce space
-                    // and looped to 0.  last_nonce is near u64::MAX and
-                    // the incoming nonce is near 0 — a gap this large
-                    // cannot be a genuine out-of-order beat. Both bounds
-                    // are inclusive so the threshold-boundary case
-                    // (`last_nonce == wrap_hi`, `frame.nonce == wrap_lo`)
-                    // is treated as a wrap rather than dropped as
-                    // out-of-order.
-                    let wrap_lo = NONCE_WRAP_THRESHOLD;
-                    let wrap_hi = u64::MAX.saturating_sub(NONCE_WRAP_THRESHOLD);
-                    if slot.last_nonce >= wrap_hi && frame.nonce <= wrap_lo {
-                        if namespace_upgrade {
-                            slot.pid_ns_inode = peer_pid_ns_inode;
-                        }
-                        slot.last_nonce = frame.nonce;
-                        slot.last_ns = now_ns;
-                        slot.status = status;
-                        if slot.stall_emitted {
-                            slot.stall_emitted = false;
-                            self.stall_emitted_count = self.stall_emitted_count.saturating_sub(1);
-                        }
-                        self.nonce_wraps = self.nonce_wraps.saturating_add(1);
-                        return Update::Refreshed;
+                if frame.nonce == NONCE_TERMINAL {
+                    if !slot.refresh_terminal(frame, now_ns, status) {
+                        return Update::OutOfOrder;
                     }
-                    return Update::OutOfOrder;
+                    if namespace_upgrade {
+                        slot.pid_ns_inode = peer_pid_ns_inode;
+                    }
+                    if slot.clear_stall_emitted() {
+                        self.stall_emitted_count = self.stall_emitted_count.saturating_sub(1);
+                    }
+                    return Update::Refreshed;
+                }
+
+                match slot.refresh_regular(frame, now_ns, status) {
+                    RegularRefresh::Accepted => {}
+                    RegularRefresh::Wrapped => {
+                        self.nonce_wraps = self.nonce_wraps.saturating_add(1);
+                    }
+                    RegularRefresh::OutOfOrder => return Update::OutOfOrder,
                 }
                 if namespace_upgrade {
                     slot.pid_ns_inode = peer_pid_ns_inode;
                 }
-                slot.last_nonce = frame.nonce;
-                slot.last_ns = now_ns;
-                slot.status = status;
-                if slot.stall_emitted {
-                    slot.stall_emitted = false;
+                if slot.clear_stall_emitted() {
                     self.stall_emitted_count = self.stall_emitted_count.saturating_sub(1);
                 }
                 return Update::Refreshed;
@@ -407,16 +495,7 @@ impl Tracker {
                     self.capacity_exceeded = self.capacity_exceeded.saturating_add(1);
                     return Update::CapacityExceeded;
                 };
-                *slot_mut = Slot {
-                    pid: frame.pid,
-                    last_nonce: frame.nonce,
-                    last_ns: now_ns,
-                    status,
-                    origin,
-                    pid_ns_inode: peer_pid_ns_inode,
-                    used: true,
-                    stall_emitted: false,
-                };
+                *slot_mut = Slot::from_frame(frame, now_ns, status, origin, peer_pid_ns_inode);
                 if self.pid_to_index.insert(frame.pid, evict_idx).is_err() {
                     // Probe budget exhausted — roll back the slot write so
                     // the table stays internally consistent and surface
@@ -468,16 +547,13 @@ impl Tracker {
             self.capacity_exceeded = self.capacity_exceeded.saturating_add(1);
             return Update::CapacityExceeded;
         }
-        self.entries.push(Slot {
-            pid: frame.pid,
-            last_nonce: frame.nonce,
-            last_ns: now_ns,
+        self.entries.push(Slot::from_frame(
+            frame,
+            now_ns,
             status,
             origin,
-            pid_ns_inode: peer_pid_ns_inode,
-            used: true,
-            stall_emitted: false,
-        });
+            peer_pid_ns_inode,
+        ));
         self.len += 1;
         Update::Inserted
     }
@@ -687,7 +763,7 @@ impl Tracker {
                     self.stall_emitted_count = self.stall_emitted_count.saturating_add(1);
                     cb(
                         slot.pid,
-                        slot.last_nonce,
+                        slot.last_observed_nonce,
                         slot.last_ns,
                         slot.origin,
                         slot.pid_ns_inode,
