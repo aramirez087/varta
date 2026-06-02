@@ -1,11 +1,12 @@
 use std::io::{self, Read, Write as IoWrite};
-use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream};
 use std::time::{Duration, Instant};
 
 use varta_vlp::crypto::BearerToken;
 use varta_vlp::{DecodeError, Status};
 
 use crate::observer::Event;
+use crate::probe_table::{BoundedIndex, Hash32};
 
 use super::bearer_token::parse_authorization_bearer;
 use super::http::{drain_read_to_would_block, PROM_DRAIN_READ_CAP};
@@ -558,6 +559,80 @@ fn allow_ip_burst_zero_is_unlimited() {
     assert!(
         prom.ip_state.is_empty(),
         "burst=0 path must not allocate per-IP state"
+    );
+}
+
+fn prom_probe_cluster_ips(count: usize) -> Vec<IpAddr> {
+    let table_size = MAX_PROM_IP_STATES
+        .saturating_mul(2)
+        .max(2)
+        .next_power_of_two();
+    let mask = table_size - 1;
+    let mut ips = Vec::with_capacity(count);
+
+    for host in 1u32..=0x00ff_ffff {
+        let ip = IpAddr::V4(Ipv4Addr::new(
+            10,
+            ((host >> 16) & 0xff) as u8,
+            ((host >> 8) & 0xff) as u8,
+            (host & 0xff) as u8,
+        ));
+        if (ip.hash32() as usize & mask) == 0 {
+            ips.push(ip);
+            if ips.len() == count {
+                return ips;
+            }
+        }
+    }
+
+    panic!("could not find {count} IPs for the same Prometheus probe cluster");
+}
+
+/// Probe exhaustion is distinct from ordinary capacity pressure: a 64-slot
+/// collision cluster can make `IpStateTable::insert` fail while the table is
+/// still far below `MAX_PROM_IP_STATES`. New IPs must fail closed here, or an
+/// untracked source gets a fresh burst allowance on every retry.
+#[test]
+fn allow_ip_probe_exhaustion_fails_closed() {
+    let mut prom = PromExporter::bind_with_rate_limit(
+        "127.0.0.1:0".parse().unwrap(),
+        make_token(),
+        /* rate_per_sec */ 1,
+        /* rate_burst   */ 1,
+    )
+    .expect("bind");
+    let t0 = Instant::now();
+    let cluster = prom_probe_cluster_ips(BoundedIndex::<IpAddr>::MAX_PROBE + 1);
+
+    for ip in cluster.iter().take(BoundedIndex::<IpAddr>::MAX_PROBE) {
+        assert!(prom.allow_ip(*ip, t0), "seed IP {ip} should be admitted");
+    }
+    assert_eq!(prom.ip_state.len(), BoundedIndex::<IpAddr>::MAX_PROBE);
+
+    let refused_ip = cluster[BoundedIndex::<IpAddr>::MAX_PROBE];
+    assert!(!prom.allow_ip(refused_ip, t0));
+    assert!(
+        !prom.allow_ip(refused_ip, t0),
+        "retries from an unrecordable IP must not receive fresh buckets"
+    );
+
+    let idx = drop_reason_index(DropReason::IpTableFull);
+    assert_eq!(
+        prom.connections_dropped_total[idx], 2,
+        "probe-exhausted insert refusals must be visible as ip_table_full pressure"
+    );
+    assert_eq!(
+        prom.ip_state.len(),
+        BoundedIndex::<IpAddr>::MAX_PROBE,
+        "failed inserts must not perturb tracked source state"
+    );
+
+    prom.render_body();
+    assert!(
+        prom.body_buf
+            .contains("varta_prom_ip_state_probe_exhausted_total 2"),
+        "probe-exhaustion metric must expose failed inserts:\n{}",
+        prom.body_buf
     );
 }
 

@@ -64,6 +64,8 @@ impl super::PromExporter {
                 }
             }
             None => {
+                let table_full_idx = drop_reason_index(DropReason::IpTableFull);
+                let mut recorded_table_pressure = false;
                 if self.ip_state.len() >= MAX_PROM_IP_STATES {
                     // Try to make room by evicting stale entries first.
                     self.ip_state.evict_older_than(now, PROM_IP_STATE_TTL);
@@ -75,21 +77,33 @@ impl super::PromExporter {
                     if let Some(oldest_ip) = self.ip_state.oldest_ip() {
                         self.ip_state.remove(oldest_ip);
                     }
-                    self.connections_dropped_total[drop_reason_index(DropReason::IpTableFull)] =
-                        self.connections_dropped_total[drop_reason_index(DropReason::IpTableFull)]
-                            .saturating_add(1);
+                    self.connections_dropped_total[table_full_idx] =
+                        self.connections_dropped_total[table_full_idx].saturating_add(1);
+                    recorded_table_pressure = true;
                 }
                 // New entry starts with a full bucket minus the one token
-                // consumed by this connection.
+                // consumed by this connection. If the bounded index cannot
+                // record the source, fail closed; otherwise this IP would get
+                // a fresh bucket on every retry and bypass the limiter.
                 let tokens_milli = cap_milli.saturating_sub(1000);
-                let _ = self.ip_state.insert(
-                    ip,
-                    super::PromIpState {
-                        tokens_milli,
-                        last_refill: now,
-                        last_seen: now,
-                    },
-                );
+                if self
+                    .ip_state
+                    .insert(
+                        ip,
+                        super::PromIpState {
+                            tokens_milli,
+                            last_refill: now,
+                            last_seen: now,
+                        },
+                    )
+                    .is_err()
+                {
+                    if !recorded_table_pressure {
+                        self.connections_dropped_total[table_full_idx] =
+                            self.connections_dropped_total[table_full_idx].saturating_add(1);
+                    }
+                    return false;
+                }
                 true
             }
         }
