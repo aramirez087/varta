@@ -130,6 +130,17 @@ fn test_identity() -> ReplayIdentity {
     ReplayIdentity::from_pid(42)
 }
 
+fn set_last_seen(listener: &mut SecureUdpListener, identity: ReplayIdentity, last_seen: Instant) {
+    let slot = listener
+        .sender_index
+        .get(identity)
+        .expect("identity must be indexed");
+    listener.sender_slab[slot]
+        .as_mut()
+        .expect("indexed slot must hold sender state")
+        .last_seen = last_seen;
+}
+
 #[test]
 fn bind_requires_at_least_one_key() {
     let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
@@ -287,6 +298,39 @@ fn full_table_refuses_new_identity_without_eviction() {
     assert_eq!(listener.sender_state_len(), MAX_SENDER_STATES);
     assert_eq!(listener.sender_last_counter(victim_identity), Some(10));
     assert!(!listener.record_for_test(victim_identity, iv, 5));
+}
+
+#[test]
+fn stale_sender_eviction_uses_saturating_age() {
+    let mut listener = new_listener();
+    let fresh_identity = ReplayIdentity::from_pid(50_001);
+    let stale_identity = ReplayIdentity::from_pid(50_002);
+
+    assert!(listener.record_for_test(fresh_identity, test_iv(), 1));
+    assert!(listener.record_for_test(stale_identity, test_iv2(), 1));
+
+    let sweep_now = Instant::now() + EVICTION_TTL + Duration::from_secs(2);
+    set_last_seen(
+        &mut listener,
+        fresh_identity,
+        sweep_now + Duration::from_secs(1),
+    );
+    set_last_seen(
+        &mut listener,
+        stale_identity,
+        sweep_now - EVICTION_TTL - Duration::from_secs(1),
+    );
+
+    listener.evict_stale_senders_at(sweep_now);
+
+    assert!(
+        listener.sender_state_for(fresh_identity).is_some(),
+        "future last_seen must saturate to age 0 and remain tracked"
+    );
+    assert!(
+        listener.sender_state_for(stale_identity).is_none(),
+        "sender older than EVICTION_TTL must be evicted"
+    );
 }
 
 // ----- H3: constant-trial-count AEAD poll -----

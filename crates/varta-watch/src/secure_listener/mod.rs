@@ -309,13 +309,18 @@ impl SecureUdpListener {
     /// short-lived agents (cron jobs, CI runners). Linear scan over the
     /// fixed-size slab so the WCET is bounded at `MAX_SENDER_STATES`.
     fn evict_stale_senders(&mut self) {
-        let cutoff = Instant::now() - EVICTION_TTL;
+        self.evict_stale_senders_at(Instant::now());
+    }
+
+    fn evict_stale_senders_at(&mut self, now: Instant) {
         for slot in 0..self.sender_slab.len() {
             let stale = self
                 .sender_slab
                 .get(slot)
                 .and_then(|opt| opt.as_ref())
-                .is_some_and(|s| s.last_seen <= cutoff);
+                // Compare by age rather than computing `now - EVICTION_TTL`:
+                // `Instant` subtraction can underflow on low-uptime systems.
+                .is_some_and(|s| now.saturating_duration_since(s.last_seen) >= EVICTION_TTL);
             if stale {
                 if let Some(state) = self.sender_slab[slot].take() {
                     self.sender_index.remove(state.identity);
