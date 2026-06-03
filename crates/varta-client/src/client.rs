@@ -606,15 +606,21 @@ impl<T: BeatTransport> Varta<T> {
             }
             BeatOutcome::Dropped(_) => {
                 self.consecutive_dropped = self.consecutive_dropped.saturating_add(1);
-                if self.reconnect_after > 0 && self.consecutive_dropped >= self.reconnect_after {
+                if self.reconnect_after > 0
+                    && self.consecutive_dropped >= self.reconnect_after
+                    && self.transport.reconnect().is_ok()
+                {
+                    // Only reset on a *successful* reconnect. A failed
+                    // reconnect leaves the counter saturated so the next
+                    // Dropped beat re-crosses the threshold and retries
+                    // immediately, rather than re-arming a full
+                    // `reconnect_after`-beat window.
                     self.consecutive_dropped = 0;
-                    if self.transport.reconnect().is_ok() {
-                        let retry = self.send_frame();
-                        if matches!(retry, BeatOutcome::Sent) {
-                            self.commit_sent_frame(candidate_nonce, timestamp, wrapped_nonce);
-                        }
-                        return retry;
+                    let retry = self.send_frame();
+                    if matches!(retry, BeatOutcome::Sent) {
+                        self.commit_sent_frame(candidate_nonce, timestamp, wrapped_nonce);
                     }
+                    return retry;
                 }
                 outcome
             }
@@ -865,6 +871,24 @@ mod tests {
         }
     }
 
+    /// A transport whose `send` always `WouldBlock`s (→ `Dropped`) and whose
+    /// `reconnect` always fails. Used to assert that a *failed* auto-reconnect
+    /// leaves `consecutive_dropped` saturated rather than resetting it.
+    struct DropAndFailReconnect {
+        reconnects: u32,
+    }
+
+    impl BeatTransport for DropAndFailReconnect {
+        fn send(&mut self, _buf: &[u8; 32]) -> io::Result<usize> {
+            Err(io::Error::from(io::ErrorKind::WouldBlock))
+        }
+
+        fn reconnect(&mut self) -> io::Result<()> {
+            self.reconnects = self.reconnects.saturating_add(1);
+            Err(io::Error::from(io::ErrorKind::ConnectionRefused))
+        }
+    }
+
     fn varta_with_transport<T: BeatTransport>(transport: T) -> Varta<T> {
         Varta {
             transport,
@@ -1068,6 +1092,42 @@ mod tests {
         assert_eq!(
             agent.transport.sent, 0,
             "no frame should be sent when fork-recovery fails"
+        );
+    }
+
+    /// Regression: a *failed* auto-reconnect must not reset
+    /// `consecutive_dropped`. The reset is gated on `reconnect().is_ok()`, so
+    /// a failed reconnect leaves the counter saturated and the next `Dropped`
+    /// beat re-crosses the threshold and retries reconnect immediately —
+    /// rather than re-arming a full `reconnect_after`-beat window.
+    #[test]
+    fn failed_reconnect_preserves_consecutive_dropped_for_immediate_retry() {
+        let mut agent = varta_with_transport(DropAndFailReconnect { reconnects: 0 });
+        agent.set_reconnect_after(2);
+
+        // First drop: 0 -> 1, below threshold, no reconnect attempted.
+        assert!(matches!(agent.beat(Status::Ok, 0), BeatOutcome::Dropped(_)));
+        assert_eq!(agent.consecutive_dropped, 1);
+        assert_eq!(agent.transport.reconnects, 0);
+
+        // Second drop: 1 -> 2 crosses the threshold; reconnect is attempted
+        // and FAILS, so the counter must stay saturated at 2.
+        assert!(matches!(agent.beat(Status::Ok, 0), BeatOutcome::Dropped(_)));
+        assert_eq!(
+            agent.transport.reconnects, 1,
+            "threshold crossing must attempt reconnect"
+        );
+        assert_eq!(
+            agent.consecutive_dropped, 2,
+            "a failed reconnect must NOT disarm the counter"
+        );
+
+        // Third drop: threshold still crossed, so reconnect is retried on the
+        // very next beat — not after another full window.
+        assert!(matches!(agent.beat(Status::Ok, 0), BeatOutcome::Dropped(_)));
+        assert_eq!(
+            agent.transport.reconnects, 2,
+            "next drop after a failed reconnect must retry reconnect immediately"
         );
     }
 

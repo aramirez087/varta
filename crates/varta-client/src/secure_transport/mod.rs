@@ -580,32 +580,6 @@ fn os_random(_buf: &mut [u8]) -> io::Result<()> {
 
 // -----------------------------------------------------------------------
 
-/// Read a cryptographically-random 8-byte IV prefix.
-///
-/// Called once at `connect()` / `reconnect()` time — never on the beat path.
-/// Tries `getrandom(2)` / `getentropy(3)` first (no `/dev` mount required),
-/// then falls back to `/dev/urandom`.
-///
-/// **Note:** `SecureUdpTransport` no longer calls this — it uses
-/// [`read_iv_session_salt`] for the 16-byte session salt. Retained here for
-/// the panic-hook installer, which captures an install-process IV prefix and
-/// separately captures a fork salt for forked children.
-#[cfg_attr(
-    not(any(test, all(feature = "panic-handler", feature = "secure-udp"))),
-    allow(dead_code)
-)]
-pub(crate) fn read_iv_random() -> io::Result<[u8; 8]> {
-    let mut buf = [0u8; 8];
-    if os_random(&mut buf).is_ok() {
-        return Ok(buf);
-    }
-    std::fs::File::open("/dev/urandom").and_then(|mut f| {
-        use std::io::Read;
-        f.read_exact(&mut buf)
-    })?;
-    Ok(buf)
-}
-
 /// Read a cryptographically-random 16-byte session salt.
 ///
 /// Called once at `connect()` / `reconnect()` time — never on the beat path

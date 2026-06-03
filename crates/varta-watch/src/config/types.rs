@@ -267,7 +267,9 @@ pub struct Config {
     pub hw_watchdog: Option<PathBuf>,
     /// Per-source-IP refill rate (connections per second) for the
     /// Prometheus `/metrics` endpoint.  Defaults to
-    /// [`DEFAULT_PROM_RATE_LIMIT_PER_SEC`].
+    /// [`DEFAULT_PROM_RATE_LIMIT_PER_SEC`].  `0` disables per-IP rate
+    /// limiting (same as a `0` burst); a zero refill cannot meaningfully
+    /// limit — it would only lock out a steady scraper after the burst.
     pub prom_rate_limit_per_sec: u32,
     /// Per-source-IP burst (token-bucket capacity) for the Prometheus
     /// `/metrics` endpoint.  Defaults to [`DEFAULT_PROM_RATE_LIMIT_BURST`].

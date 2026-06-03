@@ -35,6 +35,11 @@ pub(super) struct Outstanding {
     /// Exit status captured once `try_wait` reaps the child, while bounded
     /// stdio draining may still need later ticks before audit completion.
     pub(super) completed_status: Option<ExitStatus>,
+    /// Monotonic instant the child was first observed exited (stamped with
+    /// `completed_status`). Bounds how long post-exit capture draining may
+    /// pin this entry when a backgrounded grandchild keeps the pipe
+    /// write-end open so the read-end never reaches EOF.
+    pub(super) completed_at: Option<Instant>,
 }
 
 /// Take the piped stdout/stderr handles off `child` (when capture is enabled)
@@ -109,6 +114,7 @@ impl Recovery {
                                 stderr_len: 0,
                                 truncated: false,
                                 completed_status: None,
+                                completed_at: None,
                             },
                         );
                         self.last_fired.commit_reserved(last_fired_reservation);

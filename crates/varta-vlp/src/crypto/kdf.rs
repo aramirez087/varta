@@ -297,6 +297,25 @@ mod tests {
     }
 
     #[test]
+    fn panic_iv_prefix_distinct_for_recycled_pid_at_same_counter() {
+        // Security regression (secure panic hook): a PID-recycled descendant
+        // that inherits the install-time salt and fires its first panic at
+        // iv_counter = 0 must NOT reuse the original installer's
+        // (pid, counter=0) prefix under the same key — that would be a
+        // catastrophic AEAD nonce collision. Distinctness is carried by the
+        // monotonic `timestamp` (elapsed since the shared install instant),
+        // which differs between the two process lifetimes. This is the only
+        // thing standing in for the former (and unsound) PID-equality check.
+        let salt = [0x5Au8; 16];
+        let installer = derive_panic_iv_prefix(&salt, 4242, 1_000, 0).expect("kdf must succeed");
+        let recycled = derive_panic_iv_prefix(&salt, 4242, 9_999_000, 0).expect("kdf must succeed");
+        assert_ne!(
+            installer, recycled,
+            "recycled-PID descendant must not reuse the installer's IV prefix at counter 0"
+        );
+    }
+
+    #[test]
     fn derive_iv_prefix_domain_separation() {
         let salt = [0x42u8; 16];
         let mut padded = [0u8; 32];

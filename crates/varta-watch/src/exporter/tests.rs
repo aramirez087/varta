@@ -562,6 +562,36 @@ fn allow_ip_burst_zero_is_unlimited() {
     );
 }
 
+/// Regression: `rate_per_sec = 0` with a non-zero burst must NOT permanently
+/// lock out a steady scraper. A token bucket that never refills would, after
+/// the initial burst is spent, deny every subsequent request forever (and
+/// `last_seen` updates keep the entry from aging out of the table). A zero
+/// refill is treated as the "disabled" sentinel, identical to a zero burst.
+#[test]
+fn allow_ip_refill_zero_does_not_lock_out() {
+    let mut prom = PromExporter::bind_with_rate_limit(
+        "127.0.0.1:0".parse().unwrap(),
+        make_token(),
+        /* rate_per_sec */ 0,
+        /* rate_burst   */ 10,
+    )
+    .expect("bind");
+    let ip: std::net::IpAddr = "127.0.0.1".parse().unwrap();
+    let t = Instant::now();
+    // Far more calls than the configured burst — every one must be allowed,
+    // since a zero refill rate disables limiting rather than wedging it.
+    for _ in 0..1000 {
+        assert!(
+            prom.allow_ip(ip, t),
+            "rate_per_sec=0 must disable limiting, never lock out"
+        );
+    }
+    assert!(
+        prom.ip_state.is_empty(),
+        "refill=0 path must not allocate per-IP state"
+    );
+}
+
 fn prom_probe_cluster_ips(count: usize) -> Vec<IpAddr> {
     let table_size = MAX_PROM_IP_STATES
         .saturating_mul(2)

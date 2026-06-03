@@ -5,7 +5,7 @@ use crate::peer_cred::BeatOrigin;
 use crate::probe_table::{mix32, BoundedIndex};
 
 use super::debounce::{InsertOutcome, LastFiredTable, MAX_LAST_FIRED_CAPACITY};
-use super::reaper::CAPTURE_DRAIN_BYTES_PER_TICK;
+use super::reaper::{CAPTURE_DRAIN_BYTES_PER_TICK, POST_EXIT_CAPTURE_DRAIN_GRACE};
 use super::{Recovery, RecoveryMode, RecoveryOutcome};
 
 #[test]
@@ -423,6 +423,77 @@ fn capture_truncates_at_per_child_cap() {
         "expected truncated=true, got: {complete}"
     );
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Regression: a recovery command that exits immediately but backgrounds a
+/// grandchild inheriting the capture pipe write-end must not pin its
+/// outstanding slot forever. The immediate child is reaped (`completed_status`
+/// set), but the read-end never reaches EOF (the grandchild holds the
+/// write-end) and stays below the cap (never `truncated`), so the two original
+/// `capture_drained` terminal conditions are never met. The post-exit grace
+/// is the only thing that reclaims the slot; without it, `on_stall` returns
+/// `Debounced` for this pid forever and the leak can starve other pids.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn exited_child_with_open_inherited_pipe_is_reclaimed_after_grace() {
+    const PID: u32 = 991;
+
+    let mut rec = Recovery::with_mode(
+        RecoveryMode::Exec {
+            // The `sh` exits 0 immediately; the backgrounded `sleep` inherits
+            // the piped stdout/stderr fds and keeps the write-end open well
+            // past the grace window, so the read-end never sees EOF.
+            program: "sh".to_string(),
+            args: vec!["-c".to_string(), "sleep 10 & exit 0".to_string()],
+        },
+        Duration::ZERO,
+    )
+    .with_capture(8192);
+
+    match rec.on_stall(PID, BeatOrigin::KernelAttested, false, 0) {
+        RecoveryOutcome::Spawned { .. } => {}
+        other => panic!("expected Spawned, got {other:?}"),
+    }
+
+    // Let the immediate `sh` exit, then reap once: this observes the exit and
+    // stamps `completed_at`. Capture is NOT drained (pipe open, below cap), so
+    // the slot must remain outstanding — this is exactly the wedged state.
+    std::thread::sleep(Duration::from_millis(250));
+    let early = rec.try_reap(0);
+    assert!(
+        !early
+            .iter()
+            .any(|o| matches!(o, RecoveryOutcome::Reaped { .. })),
+        "must not reap before the post-exit grace elapses"
+    );
+    assert!(
+        rec.outstanding.contains(PID),
+        "exited child with an open inherited pipe must stay outstanding while draining"
+    );
+
+    // Past the grace the slot is reclaimed even though the pipe never reached
+    // EOF — proving the leak is bounded rather than permanent.
+    std::thread::sleep(POST_EXIT_CAPTURE_DRAIN_GRACE + Duration::from_millis(500));
+    let mut reaped = false;
+    for _ in 0..10 {
+        if rec
+            .try_reap(0)
+            .iter()
+            .any(|o| matches!(o, RecoveryOutcome::Reaped { .. }))
+        {
+            reaped = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        reaped,
+        "slot must be reclaimed after the post-exit grace despite no pipe EOF"
+    );
+    assert!(
+        !rec.outstanding.contains(PID),
+        "outstanding slot must be freed after the grace-driven reap"
+    );
 }
 
 #[test]

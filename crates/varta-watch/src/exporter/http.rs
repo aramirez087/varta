@@ -29,8 +29,15 @@ impl super::PromExporter {
     /// bumps the corresponding drop counter so operators can observe
     /// rate-limit vs table-full pressure separately.
     pub(super) fn allow_ip(&mut self, ip: IpAddr, now: Instant) -> bool {
-        // Burst of 0 means "no per-IP limit". Skip the bookkeeping entirely.
-        if self.rate_burst == 0 {
+        // A zero burst — or a zero refill rate — means "no per-IP limit";
+        // skip the bookkeeping entirely. The `rate_per_sec == 0` case is not
+        // merely an optimization: a token bucket that never refills would
+        // permanently lock out a steady scraper once its initial burst is
+        // spent (and `last_seen` updates on every drop keep the entry from
+        // aging out of the table), so a zero refill is treated as the same
+        // documented "disabled" sentinel as a zero burst rather than as an
+        // unsatisfiable limit.
+        if self.rate_burst == 0 || self.rate_per_sec == 0 {
             return true;
         }
         let cap_milli: u32 = self.rate_burst.saturating_mul(1000);

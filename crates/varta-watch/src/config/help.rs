@@ -211,7 +211,8 @@ OPTIONAL:
                                      accepted and immediately closed
                                      without serving.  Counted as
                                      varta_prom_connections_dropped_total
-                                     {reason=\"rate_limit\"}.
+                                     {reason=\"rate_limit\"}.  0 disables
+                                     per-IP rate limiting (same as a 0 burst).
     --prom-rate-limit-burst <N>    Maximum burst (and bucket capacity) for
                                      the per-source-IP token bucket
                                      (default 10).  Tune higher only if

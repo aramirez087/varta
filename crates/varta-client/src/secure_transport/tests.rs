@@ -32,14 +32,6 @@ fn os_random_yields_distinct_outputs() {
 }
 
 #[test]
-fn read_iv_random_succeeds() {
-    assert!(
-        read_iv_random().is_ok(),
-        "read_iv_random failed on this platform"
-    );
-}
-
-#[test]
 fn fallback_iv_session_salt_unique_across_calls() {
     use std::collections::HashSet;
     let outputs: HashSet<[u8; 16]> = (0..1000).map(|_| fallback_iv_session_salt()).collect();
