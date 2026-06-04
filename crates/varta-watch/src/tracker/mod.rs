@@ -446,8 +446,20 @@ impl Tracker {
                         self.namespace_conflicts = self.namespace_conflicts.saturating_add(1);
                         return Update::NamespaceConflict;
                     }
-                    (Some(_), None) => {
-                        // Regression — pinned-then-lost is a tampering signal.
+                    // A pinned-then-lost inode is normally a tampering signal.
+                    // Exception: a panic hook's terminal frame (`NONCE_TERMINAL`)
+                    // is the agent's dying gasp. The process is already exiting,
+                    // so by the time the single-threaded observer reads
+                    // `/proc/<pid>/ns/pid` the link is gone and the inode reads
+                    // back `None`. That is benign process death, not a namespace
+                    // swap — the terminal beat must still be recorded (and its
+                    // `Critical` status surfaced) rather than dropped as a
+                    // conflict. The `_ => false` fall-through keeps the slot's
+                    // pinned inode (`Some`) intact. Regular frames keep the
+                    // strict pinned-then-lost semantics. A genuine cross-ns
+                    // swap `(Some(a), Some(b)) a != b` is still refused above,
+                    // terminal or not.
+                    (Some(_), None) if frame.nonce != NONCE_TERMINAL => {
                         self.namespace_conflicts = self.namespace_conflicts.saturating_add(1);
                         return Update::NamespaceConflict;
                     }

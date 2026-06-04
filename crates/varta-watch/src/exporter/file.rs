@@ -332,7 +332,7 @@ impl Exporter for FileExporter {
                 + 1  // \t
                 + 1  // "-"
                 + 1  // \t
-                + 13 // "auth_failure"
+                + 12 // "auth_failure"
                 + 1
             } // \n
         };
@@ -525,6 +525,30 @@ mod tests {
         assert!(
             content.contains("namespace_conflict"),
             "expected namespace_conflict in TSV, got: {content}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The AuthFailure length estimate must exactly equal the bytes written,
+    /// or rotation accounting drifts and the file rotates early. Regression
+    /// for the `+ 13` vs 12-byte `auth_failure` off-by-one: the running
+    /// `bytes_written` counter must track the real on-disk size byte-for-byte.
+    #[test]
+    fn auth_failure_length_estimate_matches_bytes_written() {
+        let (dir, path) = rotation_reopen_fixture("auth-failure-len");
+        // Large cap so nothing rotates; we only assert the byte counter.
+        let mut fe = FileExporter::create(&path, Some(1_000_000), 0).unwrap();
+        fe.record(&Event::AuthFailure {
+            claimed_pid: 4242,
+            observer_ns: 1_234_567,
+        })
+        .unwrap();
+        fe.flush().unwrap();
+        let on_disk = std::fs::metadata(&path).unwrap().len();
+        assert_eq!(
+            fe.bytes_written, on_disk,
+            "estimated bytes_written ({}) must equal the real file size ({on_disk})",
+            fe.bytes_written
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

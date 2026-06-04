@@ -51,16 +51,14 @@ pub(super) enum RotationProgress {
     /// No rotation in progress.
     Idle,
     /// Generation renames are still pending.
-    Renaming {
-        next_gen: u32,
-        final_chain: [u8; 32],
-    },
-    /// All renames done; open a fresh fd for the live PATH.
-    OpeningFd { final_chain: [u8; 32] },
-    /// fd open; write the v2 header.
-    WritingHeader { final_chain: [u8; 32] },
-    /// Header written; emit the post-rotation boot record and final fsync.
-    EmittingBoot { final_chain: [u8; 32] },
+    Renaming { next_gen: u32 },
+    /// All renames done (the live file is now `PATH.1`). Drain any records
+    /// emitted during the rotation window into `.1`, snapshot the final chain
+    /// at the swap boundary, then open the new fd + write the v2 header +
+    /// post-rotation `boot` record atomically (no further deferral), so the
+    /// boot's `prev_chain` column equals `.1`'s true on-disk tail and no
+    /// record (nor the header) is ever displaced ahead of the boot anchor.
+    Finalizing,
 }
 
 impl RotationProgress {
@@ -82,23 +80,27 @@ impl RecoveryAuditLog {
         }
         let call_start = Instant::now();
         if self.rotation_progress.is_idle() {
-            // Drain any ring-buffered lines into the CURRENT file before
-            // capturing `final_chain`. The hash chain advances at emit time
-            // (ring-enqueue), not at disk-write time, so `self.prev_chain`
-            // can be ahead of the records actually written to the live file
-            // whenever `flush_pending` hit its per-tick budget with lines
-            // still queued. Rotating without draining first would (a) drop
-            // those records out of the generation being rotated to `.1` and
-            // (b) record a post-rotation `boot` whose `prev_chain` is ahead
-            // of `.1`'s last on-disk chain — a non-linear chain that a
-            // tamper-evidence verifier cannot distinguish from forgery.
+            // Drain any ring-buffered lines into the CURRENT file before the
+            // generation renames begin. The hash chain advances at emit time
+            // (ring-enqueue), not at disk-write time, so `self.prev_chain` can
+            // be ahead of the records actually written to the live file. This
+            // pre-drain bounds the ring early and makes the pre-rotation file
+            // durable before it is renamed to `.1`.
+            //
+            // The *authoritative* `final_chain` snapshot — the value the
+            // post-rotation `boot` records as its `prev_chain` column — is NOT
+            // taken here. Records keep arriving (on_stall / try_reap) and
+            // flushing into the soon-to-be `.1` file throughout a multi-tick
+            // rotation, so a snapshot captured at rotation start would be stale
+            // by the time the boot is written, producing a non-linear chain a
+            // tamper-evidence verifier cannot distinguish from forgery. The
+            // snapshot is therefore taken at the sink-swap boundary in
+            // `Finalizing`, after a second budget-honored drain.
+            //
             // `flush_and_sync` only flushes the BufWriter; it does not touch
-            // the ring, so the drain must be explicit (mirrors `Drop`).
-            // The ring is bounded by `AUDIT_RING_CAP`, but the underlying
-            // writes and sync cadence can still take wall-clock time. Honor
-            // the rotation budget while draining so a full ring cannot pin
-            // the single-threaded observer before the state machine reaches
-            // its first explicit budget check.
+            // the ring, so the drain must be explicit (mirrors `Drop`). Honor
+            // the rotation budget while draining so a full ring cannot pin the
+            // single-threaded observer before the first explicit budget check.
             self.deferred_fsync_in_drain = false;
             while let Some(line) = self.pending_lines.pop_front() {
                 if call_start.elapsed() >= budget {
@@ -115,14 +117,12 @@ impl RecoveryAuditLog {
                 }
             }
             self.refresh_falling_edge_watermarks();
-            let final_chain = self.prev_chain;
             if let Err(e) = self.flush_and_sync() {
                 self.pending_err = Some(e);
                 return RotationOutcome::Deferred;
             }
             self.rotation_progress = RotationProgress::Renaming {
                 next_gen: AUDIT_ROTATION_GENERATIONS,
-                final_chain,
             };
         }
         loop {
@@ -136,10 +136,7 @@ impl RecoveryAuditLog {
                 RotationProgress::Idle => {
                     return RotationOutcome::Complete;
                 }
-                RotationProgress::Renaming {
-                    next_gen,
-                    final_chain,
-                } => {
+                RotationProgress::Renaming { next_gen } => {
                     let path_str = self.path.to_string_lossy().into_owned();
                     let sub_result = if next_gen == AUDIT_ROTATION_GENERATIONS {
                         let oldest = format!("{path_str}.{AUDIT_ROTATION_GENERATIONS}");
@@ -166,7 +163,6 @@ impl RecoveryAuditLog {
                     if next_gen > 1 {
                         self.rotation_progress = RotationProgress::Renaming {
                             next_gen: next_gen - 1,
-                            final_chain,
                         };
                     } else {
                         let first = format!("{path_str}.1");
@@ -185,10 +181,51 @@ impl RecoveryAuditLog {
                             self.needs_rotation = false;
                             return RotationOutcome::Complete;
                         }
-                        self.rotation_progress = RotationProgress::OpeningFd { final_chain };
+                        self.rotation_progress = RotationProgress::Finalizing;
                     }
                 }
-                RotationProgress::OpeningFd { final_chain } => {
+                RotationProgress::Finalizing => {
+                    // The live file has been renamed to `.1`; `self.sink` still
+                    // points at that inode (an open fd follows the inode through
+                    // a rename). Records emitted during a multi-tick rotation
+                    // window (on_stall / try_reap) advanced the chain and were
+                    // flushed by `flush_pending` into `.1`, so drain whatever is
+                    // still ring-buffered into `.1` before snapshotting. The
+                    // sink is still `.1`, so deferring here and resuming next
+                    // tick keeps appending to `.1` consistently.
+                    self.deferred_fsync_in_drain = false;
+                    while let Some(line) = self.pending_lines.pop_front() {
+                        if call_start.elapsed() >= budget {
+                            self.pending_lines.push_front(line);
+                            self.audit_rotation_budget_exceeded_total =
+                                self.audit_rotation_budget_exceeded_total.saturating_add(1);
+                            return RotationOutcome::Deferred;
+                        }
+                        if self.direct_write_line(&line) {
+                            self.refresh_falling_edge_watermarks();
+                        } else {
+                            self.pending_lines.push_front(line);
+                            return RotationOutcome::Deferred;
+                        }
+                    }
+                    self.refresh_falling_edge_watermarks();
+
+                    // Snapshot at the swap boundary: `self.prev_chain` now equals
+                    // the chain of the last record physically written to `.1`.
+                    // This is the value the post-rotation `boot` records in its
+                    // `prev_chain` column — guaranteeing it matches `.1`'s true
+                    // tail rather than a stale rotation-start head.
+                    let final_chain = self.prev_chain;
+                    if let Err(e) = self.flush_and_sync() {
+                        self.pending_err = Some(e);
+                        return RotationOutcome::Deferred;
+                    }
+
+                    // Everything from the sink swap through the boot record runs
+                    // to completion in THIS call — no `Deferred` in between — so
+                    // `flush_pending` (which runs before `drive_audit_rotation`
+                    // each tick) can never wedge a record, nor displace the v2
+                    // header, into the new generation ahead of its boot anchor.
                     use std::os::unix::fs::OpenOptionsExt;
                     let file = match OpenOptions::new()
                         .create(true)
@@ -209,9 +246,7 @@ impl RecoveryAuditLog {
                     self.sink = std::io::BufWriter::new(sink_box);
                     self.bytes_written = 0;
                     self.writes_since_sync = 0;
-                    self.rotation_progress = RotationProgress::WritingHeader { final_chain };
-                }
-                RotationProgress::WritingHeader { final_chain } => {
+
                     use std::io::Write;
                     if let Err(e) = self.sink.write_all(AUDIT_HEADER_V2.as_bytes()) {
                         self.pending_err = Some(e);
@@ -220,9 +255,7 @@ impl RecoveryAuditLog {
                         return RotationOutcome::Complete;
                     }
                     self.bytes_written = AUDIT_HEADER_V2.len() as u64;
-                    self.rotation_progress = RotationProgress::EmittingBoot { final_chain };
-                }
-                RotationProgress::EmittingBoot { final_chain } => {
+
                     self.emit_boot(BootReason::Rotation, Some(final_chain));
                     if let Err(e) = self.flush_and_sync() {
                         self.pending_err = Some(e);
@@ -577,6 +610,120 @@ mod tests {
         assert!(body.contains("\tcorrupt_tail"));
         assert!(len_after > 0);
         let _ = len_before;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Records emitted DURING a multi-tick rotation (on_stall / try_reap) are
+    /// flushed into the file that becomes `.1`. The post-rotation `boot` must
+    /// record `.1`'s true on-disk tail as its `prev_chain` column — not a chain
+    /// head snapshotted at rotation start — and the new generation must open
+    /// with that boot (no record displaced ahead of it). Otherwise an offline
+    /// tamper-evidence verifier reads the generation boundary as forgery on an
+    /// otherwise-clean Class-C log.
+    #[cfg(feature = "audit-chain")]
+    #[test]
+    fn records_emitted_during_deferred_rotation_keep_boot_chain_linear() {
+        let dir = tmpdir("emit-during-rotation");
+        let path = dir.join("audit.log");
+        // Small max_bytes makes rotation due fast; a 1 µs budget forces the
+        // rotation FSM to span multiple ticks — the only window the bug lives in.
+        let mut c = cfg(Some(120), 1);
+        c.rotation_budget = Duration::from_micros(1);
+        let (mut log, _) = RecoveryAuditLog::create(&path, c).expect("create");
+
+        let spawn = |pid: u32| crate::audit::SpawnRecord {
+            wallclock_ms: 1,
+            observer_ns: 1,
+            agent_pid: pid,
+            child_pid: pid + 100,
+            mode: "exec",
+            program: "/bin/true",
+            source: "inline",
+            template_len: 9,
+        };
+
+        // Push the file past max_bytes so rotation becomes due.
+        for pid in 0..8u32 {
+            log.record_spawn(&spawn(pid));
+        }
+        log.flush_pending(Duration::from_secs(1));
+        assert!(log.audit_rotation_due() || log.audit_rotation_pending());
+
+        // Kick off rotation; with a 1 µs budget it defers mid-flight, before
+        // the live file is renamed to `.1`.
+        let _ = log.drive_audit_rotation(Duration::from_micros(1));
+        assert!(
+            !log.rotation_progress.is_idle(),
+            "rotation must still be in progress after one budgeted step"
+        );
+
+        // Emit records DURING the rotation window, then flush — exactly the
+        // main-loop ordering (flush_audit_pending runs before drive_audit_rotation
+        // each tick). These advance the hash chain and land in the file that is
+        // about to become `.1`.
+        for pid in 100..104u32 {
+            log.record_spawn(&spawn(pid));
+        }
+        log.flush_pending(Duration::from_secs(5));
+
+        // Finish the rotation.
+        for _ in 0..256 {
+            if matches!(
+                log.drive_audit_rotation(Duration::from_secs(5)),
+                crate::audit::RotationOutcome::Complete
+            ) {
+                break;
+            }
+        }
+        assert!(log.rotation_progress.is_idle(), "rotation must complete");
+        drop(log);
+
+        let one = std::fs::read_to_string(path.with_extension("log.1")).expect("read .1");
+        let live = std::fs::read_to_string(&path).expect("read live");
+
+        // (a) The new generation opens with the rotation boot record.
+        let first_live = live
+            .lines()
+            .find(|l| !l.starts_with('#'))
+            .expect("a record in the new generation");
+        let boot_cols: Vec<&str> = first_live.split('\t').collect();
+        assert_eq!(
+            boot_cols.get(3),
+            Some(&"boot"),
+            "new generation must open with a boot record, got: {first_live}"
+        );
+        assert_eq!(
+            boot_cols.get(6),
+            Some(&"rotation"),
+            "boot reason must be rotation, got: {first_live}"
+        );
+
+        // (b) The boot's prev_chain column must equal `.1`'s on-disk tail chain.
+        let last_one = one
+            .lines()
+            .rfind(|l| !l.starts_with('#'))
+            .expect("a record in .1");
+        let one_tail_chain = last_one.rsplit('\t').next().unwrap();
+        let boot_prev = boot_cols.get(5).copied().expect("boot prev_chain column");
+        assert_eq!(
+            boot_prev, one_tail_chain,
+            "rotation boot prev_chain must equal .1's tail chain (stale-snapshot bug)"
+        );
+
+        // (c) The boot's own chain folds linearly from `.1`'s tail chain.
+        let one_tail_raw =
+            varta_vlp::util::decode_hex_32(one_tail_chain.as_bytes()).expect("hex tail chain");
+        let boot_body = first_live.rsplit_once('\t').unwrap().0;
+        let expected =
+            varta_vlp::crypto::audit_chain_hash(&one_tail_raw, b"boot", boot_body.as_bytes());
+        let expected_hex =
+            String::from_utf8(varta_vlp::util::encode_hex_32(&expected).to_vec()).unwrap();
+        let boot_chain = boot_cols.last().copied().unwrap();
+        assert_eq!(
+            boot_chain, expected_hex,
+            "boot chain must fold linearly from .1's tail chain"
+        );
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -29,7 +29,7 @@ use super::parse_helpers::{parse_octal, parse_u16, parse_u64};
 use super::types::{
     Config, ConfigError, DEFAULT_PROM_RATE_LIMIT_BURST, DEFAULT_PROM_RATE_LIMIT_PER_SEC,
     DEFAULT_READ_TIMEOUT_MS, DEFAULT_RECOVERY_CAPTURE_BYTES, DEFAULT_RECOVERY_DEBOUNCE_MS,
-    DEFAULT_SHUTDOWN_GRACE_MS, DEFAULT_SOCKET_MODE, MAX_ITERATION_BUDGET_MS,
+    DEFAULT_SHUTDOWN_GRACE_MS, DEFAULT_SOCKET_MODE, MAX_ITERATION_BUDGET_MS, MAX_READ_TIMEOUT_MS,
     MAX_RECOVERY_CAPTURE_BYTES, MAX_SCRAPE_BUDGET_MS, MIN_ITERATION_BUDGET_MS,
     MIN_SCRAPE_BUDGET_MS, MIN_SHUTDOWN_GRACE_MS, MIN_THRESHOLD_MS,
 };
@@ -733,6 +733,20 @@ impl Config {
             }
         }
 
+        // --read-timeout-ms ceiling. The idle Poll stage spends ≈ one blocking
+        // UDS recv(2) of this duration; a value at/above the Poll-stage
+        // self-watchdog abort (MAX_READ_TIMEOUT_MS = half of it) would let a
+        // perfectly healthy, idle observer trip the watchdog and
+        // process::abort() — a host reboot under --hw-watchdog. See
+        // book/src/architecture/observer-liveness.md.
+        let read_timeout_ms_resolved = read_timeout_ms.unwrap_or(DEFAULT_READ_TIMEOUT_MS);
+        if read_timeout_ms_resolved > MAX_READ_TIMEOUT_MS {
+            return Err(ConfigError::ReadTimeoutTooLarge {
+                value: read_timeout_ms_resolved,
+                max: MAX_READ_TIMEOUT_MS,
+            });
+        }
+
         Ok(Config {
             socket,
             threshold: Duration::from_millis(threshold_ms),
@@ -750,7 +764,7 @@ impl Config {
             recovery_timeout: recovery_timeout_ms.map(Duration::from_millis),
             shutdown_grace: Duration::from_millis(shutdown_grace_ms),
             socket_mode: socket_mode.unwrap_or(DEFAULT_SOCKET_MODE),
-            read_timeout: Duration::from_millis(read_timeout_ms.unwrap_or(DEFAULT_READ_TIMEOUT_MS)),
+            read_timeout: Duration::from_millis(read_timeout_ms_resolved),
             tracker_capacity: tracker_capacity_resolved,
             tracker_eviction_policy: tracker_eviction_policy.unwrap_or(EvictionPolicy::Strict),
             eviction_scan_window: eviction_scan_window_resolved,

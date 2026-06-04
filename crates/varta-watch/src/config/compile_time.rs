@@ -37,8 +37,9 @@ impl super::types::Config {
         self,
     ) -> Result<super::types::Config, super::types::ConfigError> {
         use super::types::{
-            ConfigError, MAX_ITERATION_BUDGET_MS, MAX_RECOVERY_CAPTURE_BYTES, MAX_SCRAPE_BUDGET_MS,
-            MIN_ITERATION_BUDGET_MS, MIN_SCRAPE_BUDGET_MS, MIN_SHUTDOWN_GRACE_MS, MIN_THRESHOLD_MS,
+            ConfigError, MAX_ITERATION_BUDGET_MS, MAX_READ_TIMEOUT_MS, MAX_RECOVERY_CAPTURE_BYTES,
+            MAX_SCRAPE_BUDGET_MS, MIN_ITERATION_BUDGET_MS, MIN_SCRAPE_BUDGET_MS,
+            MIN_SHUTDOWN_GRACE_MS, MIN_THRESHOLD_MS,
         };
 
         if self.threshold < std::time::Duration::from_millis(MIN_THRESHOLD_MS) {
@@ -85,6 +86,16 @@ impl super::types::Config {
                 value: duration_ms_saturating(self.scrape_budget),
                 min: MIN_SCRAPE_BUDGET_MS,
                 max: MAX_SCRAPE_BUDGET_MS,
+            });
+        }
+        // The idle Poll stage blocks ≈ one UDS recv(2) of `read_timeout`; a
+        // value above the Poll-stage self-watchdog abort would self-abort a
+        // healthy idle observer. Mirror the argv parser's ceiling here so the
+        // compile-time-config path enforces the same invariant.
+        if duration_ms_saturating(self.read_timeout) > MAX_READ_TIMEOUT_MS {
+            return Err(ConfigError::ReadTimeoutTooLarge {
+                value: duration_ms_saturating(self.read_timeout),
+                max: MAX_READ_TIMEOUT_MS,
             });
         }
 

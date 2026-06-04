@@ -677,6 +677,60 @@ fn namespace_some_to_none_is_conflict() {
     assert_eq!(t.take_namespace_conflicts(), 1);
 }
 
+/// A panic hook's terminal frame (`NONCE_TERMINAL`) is the agent's dying
+/// gasp. By the time the single-threaded observer reads `/proc/<pid>/ns/pid`
+/// the process has exited and the inode reads back `None`. That `Some → None`
+/// must NOT drop the terminal beat as a namespace conflict: `Critical` is the
+/// most important signal in the agent's life. The pinned inode is retained
+/// and the tamper counter is left untouched. Counterpart to
+/// `namespace_some_to_none_is_conflict` (which keeps strict semantics for a
+/// regular nonce).
+#[test]
+fn terminal_gasp_with_lost_namespace_inode_is_recorded_not_conflict() {
+    let mut t = Tracker::new(8, EvictionPolicy::Strict, DEFAULT_EVICTION_SCAN_WINDOW);
+    let threshold_ns = 100;
+    // Healthy beat pins the slot's namespace inode.
+    assert_eq!(
+        t.record(
+            &frame(7, 1),
+            0,
+            threshold_ns,
+            BeatOrigin::KernelAttested,
+            Some(123),
+        ),
+        Update::Inserted
+    );
+    // Agent panics: Critical + NONCE_TERMINAL, but /proc is already gone.
+    let terminal = Frame::new(Status::Critical, 7, 2, NONCE_TERMINAL, 0);
+    let r = t.record(
+        &terminal,
+        10,
+        threshold_ns,
+        BeatOrigin::KernelAttested,
+        None,
+    );
+    assert_eq!(
+        r,
+        Update::Refreshed,
+        "the dying gasp must be recorded, not refused as a conflict"
+    );
+    assert_eq!(
+        t.entries[0].status,
+        Status::Critical,
+        "Critical status must be surfaced to the observer"
+    );
+    assert_eq!(
+        t.pid_ns_inode_of(7),
+        Some(Some(123)),
+        "the pinned inode must be retained, not downgraded to None"
+    );
+    assert_eq!(
+        t.take_namespace_conflicts(),
+        0,
+        "benign process death must not increment the tamper counter"
+    );
+}
+
 /// `None → Some` upgrade on a same-pid rebind pins the now-known inode
 /// and falls through to refresh. This is the forgiving case for a peer
 /// whose `/proc/<pid>/ns/pid` was briefly unreadable at first contact.

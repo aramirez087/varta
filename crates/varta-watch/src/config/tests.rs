@@ -66,6 +66,50 @@ fn i_accept_shell_risk_flag_is_rejected_as_removed() {
     }
 }
 
+/// `--read-timeout-ms` must be rejected once it would exceed the Poll-stage
+/// self-watchdog abort. The idle Poll stage blocks ≈ read_timeout in one UDS
+/// `recv(2)`, so a timeout at/above the abort threshold self-aborts a healthy
+/// idle observer. Regression for the previously-unbounded `--read-timeout-ms`.
+#[test]
+fn read_timeout_above_ceiling_is_rejected() {
+    let too_big = super::types::MAX_READ_TIMEOUT_MS + 1;
+    let too_big_s = too_big.to_string();
+    match Config::from_args(args(&[
+        "--socket",
+        "/tmp/x.sock",
+        "--threshold-ms",
+        "100",
+        "--read-timeout-ms",
+        &too_big_s,
+    ])) {
+        Err(ConfigError::ReadTimeoutTooLarge { value, max }) => {
+            assert_eq!(value, too_big);
+            assert_eq!(max, super::types::MAX_READ_TIMEOUT_MS);
+            assert!(
+                max < super::types::POLL_STAGE_ABORT_MS,
+                "the ceiling must stay below the Poll-stage self-watchdog abort"
+            );
+        }
+        other => panic!("expected ReadTimeoutTooLarge, got {other:?}"),
+    }
+
+    // The ceiling value itself parses cleanly.
+    let max_s = super::types::MAX_READ_TIMEOUT_MS.to_string();
+    let cfg = Config::from_args(args(&[
+        "--socket",
+        "/tmp/x.sock",
+        "--threshold-ms",
+        "100",
+        "--read-timeout-ms",
+        &max_s,
+    ]))
+    .expect("ceiling value must parse");
+    assert_eq!(
+        cfg.read_timeout,
+        Duration::from_millis(super::types::MAX_READ_TIMEOUT_MS)
+    );
+}
+
 #[cfg(feature = "prometheus-exporter")]
 #[test]
 fn parses_full_flag_surface() {

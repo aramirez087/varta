@@ -19,6 +19,25 @@ pub const DEFAULT_SOCKET_MODE: u32 = 0o600;
 /// cannot hold the observer poll loop indefinitely.
 pub const DEFAULT_READ_TIMEOUT_MS: u64 = 100;
 
+/// Hard self-watchdog abort threshold for the `Poll` iteration stage, in
+/// milliseconds. `STAGE_ABORT_NS[IterStage::Poll]` in `main.rs` references
+/// this constant so the two cannot drift.
+pub const POLL_STAGE_ABORT_MS: u64 = 2_000;
+
+/// Upper bound for `--read-timeout-ms`. The idle `Poll` stage spends ≈ one
+/// blocking UDS `recv(2)` of `--read-timeout-ms` (see
+/// `observer-liveness.md`), so the read timeout MUST stay safely below
+/// [`POLL_STAGE_ABORT_MS`]; otherwise a perfectly healthy, idle observer
+/// trips the self-watchdog and `process::abort()`s — a host reboot under
+/// `--hw-watchdog`. Half the abort threshold leaves headroom for the rest of
+/// the poll cycle plus the watchdog's tick granularity.
+pub const MAX_READ_TIMEOUT_MS: u64 = POLL_STAGE_ABORT_MS / 2;
+
+const _: () = assert!(
+    MAX_READ_TIMEOUT_MS < POLL_STAGE_ABORT_MS,
+    "read-timeout ceiling must stay below the Poll-stage self-watchdog abort",
+);
+
 /// Minimum allowed value for `--threshold-ms`. A threshold of 0 ms would
 /// cause every agent to be perpetually stalled, triggering recovery commands
 /// on every poll cycle.
@@ -570,6 +589,15 @@ pub enum ConfigError {
         /// The maximum allowed value.
         max: usize,
     },
+    /// `--read-timeout-ms` exceeded [`MAX_READ_TIMEOUT_MS`]. A read timeout at
+    /// or above the `Poll`-stage self-watchdog abort would let a healthy, idle
+    /// observer trip the watchdog and `process::abort()`.
+    ReadTimeoutTooLarge {
+        /// The value provided, in milliseconds.
+        value: u64,
+        /// The maximum allowed value, in milliseconds.
+        max: u64,
+    },
     /// `--clock-source boottime` was requested but the host kernel has no
     /// equivalent of Linux's `CLOCK_BOOTTIME`. Currently fires on every
     /// non-Linux target (macOS, *BSD).
@@ -705,6 +733,11 @@ impl core::fmt::Display for ConfigError {
                 f,
                 "--tracker-capacity: {value} is outside the accepted range [{min}, {max}]"
             ),
+            ConfigError::ReadTimeoutTooLarge { value, max } => write!(
+                f,
+                "--read-timeout-ms: {value} ms exceeds the maximum {max} ms \
+                 (must stay below the {POLL_STAGE_ABORT_MS} ms Poll-stage self-watchdog abort)"
+            ),
             ConfigError::ClockSourceUnsupported { source, platform } => {
                 let hint = match source {
                     crate::clock::ClockSource::Boottime => {
@@ -775,6 +808,10 @@ impl core::fmt::Display for ConfigError {
             ConfigError::TrackerCapacityOutOfRange { value, min, max } => write!(
                 f,
                 "tracker capacity out of range: {value} not in [{min}, {max}] ({REF})"
+            ),
+            ConfigError::ReadTimeoutTooLarge { value, max } => write!(
+                f,
+                "read timeout out of range: {value} ms exceeds {max} ms ({REF})"
             ),
             ConfigError::ThresholdTooLow { value, min } => {
                 write!(f, "threshold below minimum: {value} ms < {min} ms ({REF})")

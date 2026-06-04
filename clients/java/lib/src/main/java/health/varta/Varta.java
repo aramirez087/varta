@@ -51,7 +51,7 @@ public final class Varta implements AutoCloseable {
     private long clockRegressions = 0L;
     private long forkRecoveries = 0L;
     private int reconnectAfter = 0;
-    private int sinceReconnect = 0;
+    private int consecutiveDropped = 0;
     private boolean closed = false;
 
     private Varta(BeatTransport transport) {
@@ -130,24 +130,14 @@ public final class Varta implements AutoCloseable {
                     connectPid = currentPid;
                     nonce = NONCE_MIN;
                     lastTimestamp = 0L;
-                    sinceReconnect = 0;
+                    consecutiveDropped = 0;
                     forkRecoveries = saturatingInc(forkRecoveries);
                 } catch (IOException e) {
                     return ErrnoClassifier.classify(e);
                 }
             }
 
-            // 2) Operator-requested periodic reconnect.
-            if (reconnectAfter > 0 && sinceReconnect >= reconnectAfter) {
-                try {
-                    transport.reconnect();
-                    sinceReconnect = 0;
-                } catch (IOException e) {
-                    return ErrnoClassifier.classify(e);
-                }
-            }
-
-            // 3) Monotonic timestamp + regression clamp.
+            // 2) Monotonic timestamp + regression clamp.
             long nowNs = System.nanoTime() - startNanos;
             if (nowNs < lastTimestamp) {
                 clockRegressions = saturatingInc(clockRegressions);
@@ -155,12 +145,12 @@ public final class Varta implements AutoCloseable {
             }
             lastTimestamp = nowNs;
 
-            // 4) Sentinel reservation: u64::MAX is reserved.
+            // 3) Sentinel reservation: u64::MAX is reserved.
             if (nowNs == 0xFFFF_FFFF_FFFF_FFFFL) {
                 nowNs = 0xFFFF_FFFF_FFFF_FFFEL;
             }
 
-            // 5) Nonce sequencing.
+            // 4) Nonce sequencing.
             long n = nonce;
             if (n == NONCE_TERMINAL) {
                 System.err.println("[varta] nonce wrapped past terminal; recycling from " + NONCE_MIN);
@@ -174,18 +164,56 @@ public final class Varta implements AutoCloseable {
                 }
             }
 
-            // 6) Encode + send.
+            // 5) Encode + send. On a Dropped outcome, mirror the cross-client
+            // contract: after `reconnectAfter` consecutive drops, reconnect and
+            // retry once (recovery from an observer restart). The counter resets
+            // on any Sent or Failed outcome.
             Codec.encodeInto(scratchBuf, status, currentPid, nowNs, n, payload, crc);
-            try {
-                int written = transport.send(scratchBuf);
-                if (written == 0) {
-                    return BeatOutcome.dropped(DropReason.KERNEL_QUEUE_FULL);
-                }
-                sinceReconnect++;
-                return BeatOutcome.sent();
-            } catch (IOException e) {
-                return ErrnoClassifier.classify(e);
+            BeatOutcome outcome = sendScratch();
+            if (outcome instanceof BeatOutcome.Sent) {
+                consecutiveDropped = 0;
+                return outcome;
             }
+            if (outcome instanceof BeatOutcome.Dropped) {
+                consecutiveDropped = saturatingIncInt(consecutiveDropped);
+                if (reconnectAfter > 0 && consecutiveDropped >= reconnectAfter) {
+                    boolean reconnected;
+                    try {
+                        transport.reconnect();
+                        reconnected = true;
+                    } catch (IOException e) {
+                        reconnected = false;
+                    }
+                    if (reconnected) {
+                        // Reset only on a *successful* reconnect. A failed
+                        // reconnect leaves the counter saturated so the next
+                        // Dropped beat re-crosses the threshold and retries
+                        // immediately, rather than re-arming a full
+                        // reconnectAfter-beat window.
+                        consecutiveDropped = 0;
+                        return sendScratch();
+                    }
+                }
+                return outcome;
+            }
+            // Failed: reset like a Sent so a transient error does not arm a
+            // spurious reconnect on the next drop.
+            consecutiveDropped = 0;
+            return outcome;
+        }
+    }
+
+    /** Send the already-encoded scratch buffer once and classify the result. */
+    private BeatOutcome sendScratch() {
+        scratchBuf.rewind();
+        try {
+            int written = transport.send(scratchBuf);
+            if (written == 0) {
+                return BeatOutcome.dropped(DropReason.KERNEL_QUEUE_FULL);
+            }
+            return BeatOutcome.sent();
+        } catch (IOException e) {
+            return ErrnoClassifier.classify(e);
         }
     }
 
@@ -197,18 +225,26 @@ public final class Varta implements AutoCloseable {
                 connectPid = currentPid();
                 nonce = NONCE_MIN;
                 lastTimestamp = 0L;
-                sinceReconnect = 0;
+                consecutiveDropped = 0;
             } catch (IOException e) {
                 throw new IllegalStateException("Varta.reconnect: " + e.getMessage(), e);
             }
         }
     }
 
-    /** Reconnect every N beats. {@code 0} (default) disables periodic reconnect. */
+    /**
+     * Auto-reconnect after {@code n} consecutive {@link BeatOutcome.Dropped}
+     * outcomes — recovery from an observer restart. The internal counter
+     * increments on each Dropped beat and resets to zero on any Sent or Failed
+     * outcome; once it reaches {@code n} the next beat reconnects and retries
+     * once. {@code 0} (default) disables auto-reconnect. Mirrors Rust's
+     * {@code Varta::set_reconnect_after}.
+     */
     public void setReconnectAfter(int n) {
         if (n < 0) throw new IllegalArgumentException("n must be >= 0");
         synchronized (lock) {
             this.reconnectAfter = n;
+            this.consecutiveDropped = 0;
         }
     }
 
@@ -239,11 +275,19 @@ public final class Varta implements AutoCloseable {
         return v == Long.MAX_VALUE ? v : v + 1;
     }
 
+    private static int saturatingIncInt(int v) {
+        return v == Integer.MAX_VALUE ? v : v + 1;
+    }
+
     private static int currentPid() {
         return (int) ProcessHandle.current().pid();
     }
 
     // Test hooks — package-private, no public stability contract.
+
+    static Varta __forTest(BeatTransport transport) {
+        return new Varta(transport);
+    }
 
     void __setConnectPidForTest(int pid) {
         synchronized (lock) { this.connectPid = pid; }

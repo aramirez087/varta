@@ -109,7 +109,7 @@ static CURRENT_STAGE: AtomicU8 = AtomicU8::new(u8::MAX);
 #[cfg(feature = "prometheus-exporter")]
 const STAGE_ABORT_NS: [u64; 6] = [
     2_000 * 1_000_000, // DrainPending: 2 s (5× 20 ms soft budget)
-    2_000 * 1_000_000, // Poll:         2 s (≈18× read_timeout default)
+    varta_watch::config::POLL_STAGE_ABORT_MS * 1_000_000, // Poll: capped vs MAX_READ_TIMEOUT_MS
     500 * 1_000_000,   // Maintenance:  500 ms (50× 10 ms)
     1_000 * 1_000_000, // RecoveryReap: 1 s (50× 20 ms)
     2_000 * 1_000_000, // ServePending: 2 s (10× 200 ms structural cap)
