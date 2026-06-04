@@ -530,9 +530,9 @@ fn main() {
         j.string_field(
             3,
             "description",
-            "HKDF-SHA256 derive_iv_prefix. IKM = session_salt. salt arg = session_salt \
-             (same 16 B). info = \"varta-iv-prefix-v1\\0\" (19 B) || prefix_index LE \
-             (4 B). OKM = 8 B (the per-session iv_random rotation).",
+            "HKDF-SHA256 derive_iv_prefix. IKM = session_salt. salt arg = empty \
+             (zeros, per RFC 5869). info = \"varta-iv-prefix-v1\\0\" (19 B) || \
+             prefix_index LE (4 B). OKM = 8 B (the per-session iv_random rotation).",
             true,
         );
         j.string_field(3, "kind", "kdf_iv_prefix", true);

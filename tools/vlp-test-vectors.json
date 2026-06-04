@@ -219,7 +219,7 @@
     },
     {
       "id": "kdf-iv-prefix",
-      "description": "HKDF-SHA256 derive_iv_prefix. IKM = session_salt. salt arg = session_salt (same 16 B). info = \"varta-iv-prefix-v1\\0\" (19 B) || prefix_index LE (4 B). OKM = 8 B (the per-session iv_random rotation).",
+      "description": "HKDF-SHA256 derive_iv_prefix. IKM = session_salt. salt arg = empty (zeros, per RFC 5869). info = \"varta-iv-prefix-v1\\0\" (19 B) || prefix_index LE (4 B). OKM = 8 B (the per-session iv_random rotation).",
       "kind": "kdf_iv_prefix",
       "session_salt_hex": "0102030405060708090a0b0c0d0e0f10",
       "prefix_index": 7,

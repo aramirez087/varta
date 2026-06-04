@@ -95,6 +95,17 @@ impl RecoveryAuditLog {
         let mut hash_body = String::with_capacity(body.len() + 24);
         let _ = write!(hash_body, "{seq}\t{body}");
 
+        // The chain hex is embedded in the line, so it must be computed before
+        // the write is attempted. Snapshot the head first: a record that is
+        // ultimately dropped (direct write fails AND the ring is full) must NOT
+        // stay folded into the chain, or an offline tamper-evidence verifier
+        // reads the resulting gap as forgery on an otherwise-clean log. This
+        // restores the same guarantee `emit()` gives via its pre-advance
+        // ring-full check — a dropped record burns its seq (durable gap) while
+        // leaving the chain head untouched.
+        #[cfg(feature = "audit-chain")]
+        let chain_head_before = self.prev_chain;
+
         let chain_hex = self.compute_and_advance_chain(kind, hash_body.as_bytes());
 
         let mut line = String::with_capacity(hash_body.len() + chain_hex.len() + 2);
@@ -104,7 +115,14 @@ impl RecoveryAuditLog {
                 self.pending_lines.push_front(line);
                 self.refresh_rising_edge_watermarks();
             } else {
+                // Record dropped: roll the chain head back so the next retained
+                // record chains from `chain_head_before`, exactly as if this
+                // record had never been emitted. The seq number stays burned.
                 self.audit_dropped_total = self.audit_dropped_total.saturating_add(1);
+                #[cfg(feature = "audit-chain")]
+                {
+                    self.prev_chain = chain_head_before;
+                }
             }
         }
     }
@@ -473,6 +491,71 @@ mod tests {
             records.last().and_then(|line| line.split('\t').next()),
             Some("258"),
             "the dropped record must leave a durable sequence gap"
+        );
+        assert_spawn_chain_is_linear(&records);
+    }
+
+    /// Direct-path sibling of `ring_full_drop_preserves_hash_chain_and_seq_gap`.
+    ///
+    /// When an `emit_direct` write fails AND the ring is already at capacity,
+    /// the boot/rotation record is dropped. The hash chain head must NOT stay
+    /// advanced by that dropped record — otherwise the next retained record
+    /// chains back to a record absent from disk, which an offline verifier
+    /// cannot distinguish from forgery. The seq number stays burned (gap).
+    #[cfg(feature = "audit-chain")]
+    #[test]
+    fn emit_direct_ring_full_and_write_failure_keeps_on_disk_chain_linear() {
+        let ctr = Arc::new(SyncCounter::default());
+        let sink = Box::new(FailFirstWriteSink {
+            ctr: ctr.clone(),
+            fail_next: true,
+        });
+        // Small BufWriter so `direct_write_line` reaches the sink (and fails)
+        // instead of buffering the line internally.
+        let mut log =
+            synthetic_log_with_buf_capacity(sink, 1, Duration::from_secs(10), None, None, 64);
+
+        // Fill the ring to capacity via deferred emits — no sink write yet, so
+        // the sink's single synthetic failure is reserved for `emit_direct`.
+        for i in 0..AUDIT_RING_CAP as u32 {
+            log.record_spawn(&dummy_spawn(i));
+        }
+        assert_eq!(log.pending_lines.len(), AUDIT_RING_CAP);
+
+        let chain_before = log.prev_chain;
+        let seq_before = log.next_seq;
+
+        // Boot record: direct write fails, ring is full → dropped.
+        log.emit_direct(AuditKind::Boot, "0\t0\tboot\t1234\t-\tstartup");
+
+        assert_eq!(
+            log.audit_dropped_total, 1,
+            "ring-full + write-fail must drop"
+        );
+        assert_eq!(
+            log.prev_chain, chain_before,
+            "a dropped direct record must not advance the hash chain"
+        );
+        assert_eq!(
+            log.next_seq,
+            seq_before.saturating_add(1),
+            "the dropped record must still burn its sequence number (durable gap)"
+        );
+
+        // End-to-end: reconstruct the chain from the persisted bytes. The 256
+        // ring records plus one later record must form a linear spawn chain
+        // with no phantom boot record spliced into it.
+        let _ = log.take_pending_err();
+        log.flush_pending(Duration::MAX);
+        log.record_spawn(&dummy_spawn(424_242));
+        log.flush_pending(Duration::MAX);
+
+        let body = String::from_utf8(ctr.buf.lock().unwrap().clone()).expect("audit body utf8");
+        let records: Vec<&str> = body.lines().collect();
+        assert_eq!(
+            records.len(),
+            AUDIT_RING_CAP + 1,
+            "256 ring records + 1 later record, boot dropped:\n{body}"
         );
         assert_spawn_chain_is_linear(&records);
     }

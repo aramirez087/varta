@@ -149,9 +149,11 @@ pub(crate) struct IllumosCmsg;
 // - `Cred = ()`: illumos `ucred_t` is opaque; extraction goes through
 //   `ucred_getpid(3C)` / `ucred_geteuid(3C)` rather than a direct cast.
 //   `size_of::<()>() == 0` so the minimum-payload check in `find_credential`
-//   evaluates to `cmsg_hdr_size + 0 = cmsg_hdr_size`, accepting any non-empty
-//   payload. The ucred accessors handle malformed payloads by returning error
-//   sentinels.
+//   evaluates to `cmsg_hdr_size + 0 = cmsg_hdr_size`. `extract_pid_uid`
+//   therefore applies its own `len >= 8` floor before dereferencing, so a
+//   header-only (zero-payload) cmsg is refused rather than read past. The
+//   ucred accessors additionally handle malformed payloads by returning
+//   error sentinels.
 // - `Msghdr`: msg_control@32, msg_controllen@40. Verified below.
 // - `SOL_SOCKET` and `SCM_UCRED` are the kernel-defined `(level, type)` pair
 //   for `SO_RECVUCRED` credential ancillary data on illumos/Solaris.
@@ -180,12 +182,23 @@ unsafe impl super::super::cmsg::CmsgPlatform for IllumosCmsg {
         mhdr.msg_controllen as usize
     }
 
-    unsafe fn extract_pid_uid(data: *const u8, _len: usize) -> Option<(u32, u32)> {
+    unsafe fn extract_pid_uid(data: *const u8, len: usize) -> Option<(u32, u32)> {
+        // A credential cmsg with `cmsg_len == cmsg_hdr_size` passes the
+        // `find_credential` minimum-length gate (which adds only
+        // `size_of::<()> == 0` for the opaque `ucred_t`) yet carries a
+        // zero-length payload. The Linux test shim reads pid@0 (i32) and
+        // euid@4 (u32) — 8 bytes — so refuse any payload shorter than that
+        // instead of reading past the declared bytes. Real illumos `ucred_t`
+        // payloads are always larger, so this never rejects a valid one.
+        if len < 8 {
+            return None;
+        }
         // SAFETY: `data` points to the `ucred_t` payload inside the
-        // kernel-supplied ancillary buffer. Both calls complete before this
-        // function returns; the buffer outlives both calls (it is
-        // stack-allocated in `recv_authenticated`). Neither accessor stores
-        // the pointer past the call (per illumos `ucred(3C)` semantics).
+        // kernel-supplied ancillary buffer, proven `>= 8` bytes by the check
+        // above. Both calls complete before this function returns; the buffer
+        // outlives both calls (it is stack-allocated in `recv_authenticated`).
+        // Neither accessor stores the pointer past the call (per illumos
+        // `ucred(3C)` semantics).
         let pid = unsafe { ucred_getpid(data as *const c_void) };
         let uid = unsafe { ucred_geteuid(data as *const c_void) };
         if pid < 0 || uid == u32::MAX {

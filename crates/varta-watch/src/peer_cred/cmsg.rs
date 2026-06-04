@@ -643,6 +643,51 @@ mod miri_cmsg_tests {
         assert_eq!(result, None, "negative pid must produce None");
     }
 
+    /// Boundary: a credential cmsg whose `cmsg_len` exactly equals the aligned
+    /// header size carries a zero-length payload. It clears `find_credential`'s
+    /// minimum-length gate (which adds only `size_of::<()> == 0` for the opaque
+    /// `ucred_t`), so `extract_pid_uid` must refuse it via its own `len >= 8`
+    /// floor rather than read the fixed-size shim payload past the declared
+    /// bytes. Complements `illumos_walker_rejects_truncated_cmsg`, which only
+    /// covers `cmsg_len < hdr_size`.
+    #[test]
+    fn illumos_walker_rejects_zero_length_ucred_payload() {
+        use super::super::platform::illumos::{IllumosCmsg, Msghdr};
+
+        let illumos_hdr_size = <IllumosCmsg as CmsgPlatform>::cmsg_hdr_size();
+        // cmsg_len == hdr_size → payload_len = hdr_size - hdr_size = 0.
+        let cmsg_len: u32 = illumos_hdr_size as u32;
+
+        #[repr(align(8))]
+        struct AlignedBuf([u8; 256]);
+        let mut buf_wrapper = AlignedBuf([0u8; 256]);
+        let buf = &mut buf_wrapper.0[..illumos_hdr_size];
+
+        buf[0..4].copy_from_slice(&cmsg_len.to_ne_bytes());
+        let sol_socket: i32 = 0xffff;
+        let scm_ucred: i32 = 0x1012;
+        buf[4..8].copy_from_slice(&sol_socket.to_ne_bytes());
+        buf[8..12].copy_from_slice(&scm_ucred.to_ne_bytes());
+
+        let mhdr = Msghdr {
+            msg_name: core::ptr::null_mut(),
+            msg_namelen: 0,
+            _pad1: 0,
+            msg_iov: core::ptr::null_mut(),
+            msg_iovlen: 0,
+            _pad2: 0,
+            msg_control: buf.as_mut_ptr() as *mut _,
+            msg_controllen: illumos_hdr_size as u32,
+            msg_flags: 0,
+        };
+
+        let result = find_credential::<IllumosCmsg>(&mhdr);
+        assert_eq!(
+            result, None,
+            "header-only (zero-payload) ucred cmsg must produce None, not an over-read"
+        );
+    }
+
     /// `cmsg_len` smaller than the minimum (hdr_size + 0) must be rejected.
     #[test]
     fn illumos_walker_rejects_truncated_cmsg() {
