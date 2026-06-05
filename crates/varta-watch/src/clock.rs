@@ -171,9 +171,9 @@ impl std::fmt::Display for ClockSourceParseError {
 
 impl std::error::Error for ClockSourceParseError {}
 
-/// Numeric tag used by the self-watchdog `static CLOCK_SOURCE: AtomicU8`
-/// in `main.rs` to communicate the chosen source to the background
-/// watchdog thread without an `Arc`.
+/// Stable numeric (de)serialization for [`ClockSource`] — a compact `u8`
+/// encoding suitable for `AtomicU8`/cross-thread publication or persistence
+/// without an `Arc`.
 impl ClockSource {
     /// 0 → `Monotonic`, 1 → `Boottime`, 2 → `MonotonicRaw`. Stable across
     /// versions; only ever produced by `as_u8` on the same enum.

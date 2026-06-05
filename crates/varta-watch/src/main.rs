@@ -21,7 +21,9 @@ use std::fs::OpenOptions;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::sync::atomic::{AtomicI32, AtomicU64, AtomicU8, Ordering};
+#[cfg(feature = "prometheus-exporter")]
+use std::sync::atomic::AtomicU8;
+use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 #[cfg(feature = "prometheus-exporter")]
@@ -116,13 +118,14 @@ const STAGE_ABORT_NS: [u64; 6] = [
     1_000 * 1_000_000, // Housekeeping: 1 s (100× 10 ms)
 ];
 
-/// Kernel clock source for `observer_now_ns()`.  Set exactly once in
-/// `run()` before the self-watchdog thread spawns, so both threads agree
-/// on the meaning of `LAST_TICK_NS` and on whether the clock advances
-/// during host suspend.  H7 — see `crates/varta-watch/src/clock.rs`.
-///
-/// Encoding: `ClockSource::as_u8()` / `ClockSource::from_u8()`.
-static CLOCK_SOURCE: AtomicU8 = AtomicU8::new(0);
+/// The self-watchdog's clock is **hardwired** to the suspend-paused
+/// monotonic clock (`CLOCK_MONOTONIC`), never the operator-selected
+/// `--clock-source`.  The watchdog measures on-CPU wedge time of the main
+/// loop; an advance-through-suspend source (`boottime` / `monotonic-raw`)
+/// would make a host suspend look like a wedge and `process::abort()` a
+/// healthy observer on wake.  Pinned by
+/// `tests::self_watchdog_clock_is_suspend_paused_not_configured_source`.
+const WATCHDOG_CLOCK: varta_watch::clock::ClockSource = varta_watch::clock::ClockSource::Monotonic;
 
 // Signal-handler installation is delegated to the `signal_install` module
 // (see `crates/varta-watch/src/signal_install/`). The handler below sets the
@@ -138,34 +141,31 @@ extern "C" fn handle_shutdown(_sig: i32) {
     SHUTDOWN.store(1, Ordering::Release);
 }
 
-/// Write `contents` to `path` atomically via a same-directory tempfile + rename.
+/// Suspend-paused monotonic nanosecond clock for the self-watchdog thread.
 ///
-/// `rename(2)` is atomic on POSIX-compliant filesystems; a reader of `path`
-/// will observe either the previous complete file or the new complete file,
-/// never a partial write.  A `.<pid>.tmp` suffix keeps concurrent observers
-/// (misconfigured onto the same path) from clobbering each other's tempfile.
-/// If the rename fails the tempfile is removed before returning the error.
-/// Monotonic nanosecond clock for the self-watchdog thread.  Reads the
-/// kernel clock selected by `--clock-source` via the `CLOCK_SOURCE`
-/// atomic — `Monotonic` (CLOCK_MONOTONIC) or `Boottime`
-/// (CLOCK_BOOTTIME, Linux only).
+/// The watchdog measures how long the main poll loop has gone without
+/// completing a tick — i.e. *on-CPU wedge time* — so it ALWAYS reads
+/// `CLOCK_MONOTONIC`, which pauses while the host is suspended, independent
+/// of the operator's `--clock-source`.
 ///
-/// Replaces an earlier `SystemTime::now()` (wall-clock) implementation
-/// which had the foot-gun of going backwards on NTP step.  The new
-/// implementation aligns the watchdog's deadline arithmetic with what
-/// the observer's `now_ns()` perceives — same clock, same semantics —
-/// so a configured medical-device deployment gets watchdog ticks that
-/// also advance during host suspend.
-fn observer_now_ns() -> u64 {
-    let src = varta_watch::clock::ClockSource::from_u8(CLOCK_SOURCE.load(Ordering::Acquire));
-    let clk_id = match src.clk_id() {
-        Some(id) => id,
-        // Unreachable: the CLI parser rejects unsupported sources before
-        // this static is written.  Defensive 0 keeps watchdog_expired's
-        // `last == 0` skip-before-first-tick semantics from misfiring.
-        None => return 0,
-    };
-    varta_watch::clock::clock_gettime_raw(clk_id).unwrap_or(0)
+/// `--clock-source boottime` / `monotonic-raw` deliberately *advance through
+/// suspend* so the STALL detector counts a 4-hour sleep as 4 hours of agent
+/// silence (see `clock.rs`).  Feeding that advance-through-suspend clock into
+/// the watchdog was a foot-gun: a suspend longer than the deadline looked
+/// identical to a wedged loop, so a healthy observer `process::abort()`ed on
+/// every wake — a reboot loop under `--hw-watchdog` on precisely the
+/// aggressively-suspending clinical devices those sources target.  Wedge time
+/// must be measured against time the CPU actually ran the (frozen-on-suspend)
+/// main loop, never against suspended wall/boot time.
+fn watchdog_now_ns() -> u64 {
+    // `Monotonic.clk_id()` is `Some(CLOCK_MONOTONIC)` on every supported
+    // platform; the `None` arm is unreachable and its defensive 0 keeps
+    // `watchdog_expired`'s `last == 0` skip-before-first-tick semantics from
+    // misfiring.
+    match WATCHDOG_CLOCK.clk_id() {
+        Some(clk_id) => varta_watch::clock::clock_gettime_raw(clk_id).unwrap_or(0),
+        None => 0,
+    }
 }
 
 /// Returns `true` when the poll loop has not ticked for longer than
@@ -175,6 +175,13 @@ fn watchdog_expired(now_ns: u64, last_ns: u64, deadline_ns: u64) -> bool {
     last_ns != 0 && now_ns.saturating_sub(last_ns) > deadline_ns
 }
 
+/// Write `contents` to `path` atomically via a same-directory tempfile + rename.
+///
+/// `rename(2)` is atomic on POSIX-compliant filesystems; a reader of `path`
+/// will observe either the previous complete file or the new complete file,
+/// never a partial write.  A `.<pid>.tmp` suffix keeps concurrent observers
+/// (misconfigured onto the same path) from clobbering each other's tempfile.
+/// If the rename fails the tempfile is removed before returning the error.
 fn write_heartbeat_atomic(path: &Path, contents: &[u8]) -> io::Result<()> {
     let pid = std::process::id();
     let mut tmp_os = path.as_os_str().to_owned();
@@ -256,13 +263,6 @@ fn run(cfg: Config) -> std::io::Result<()> {
     // startup audit can confirm the certified path is active.
     #[cfg(not(feature = "prometheus-exporter"))]
     varta_watch::varta_info!("signal_handler_mode={}", cfg.signal_handler_mode.as_str());
-
-    // Publish the configured kernel clock source to `CLOCK_SOURCE` BEFORE
-    // any thread is spawned. The self-watchdog thread reads this atomic on
-    // every tick to decide which `clock_gettime(2)` clk_id to call.
-    // Release ordering pairs with the watchdog's Acquire load in
-    // `observer_now_ns()`.
-    CLOCK_SOURCE.store(cfg.clock_source.as_u8(), Ordering::Release);
 
     let mut observer = Observer::bind(
         &cfg.socket,
@@ -789,7 +789,7 @@ fn run(cfg: Config) -> std::io::Result<()> {
                 if SHUTDOWN.load(Ordering::Acquire) != 0 {
                     return;
                 }
-                let now = observer_now_ns();
+                let now = watchdog_now_ns();
 
                 // Check 1: full-iteration deadline (existing).  Fires when the
                 // poll loop has not completed a full tick in `deadline` seconds.
@@ -910,7 +910,7 @@ fn run(cfg: Config) -> std::io::Result<()> {
         #[cfg(feature = "prometheus-exporter")]
         {
             if let Some(a) = LAST_STAGE_ENTRY_NS.get(IterStage::DrainPending as usize) {
-                a.store(observer_now_ns(), Ordering::Relaxed);
+                a.store(watchdog_now_ns(), Ordering::Relaxed);
             }
             CURRENT_STAGE.store(IterStage::DrainPending as u8, Ordering::Release);
         }
@@ -1102,7 +1102,7 @@ fn run(cfg: Config) -> std::io::Result<()> {
             }
             stage_start = Instant::now();
             if let Some(a) = LAST_STAGE_ENTRY_NS.get(IterStage::Poll as usize) {
-                a.store(observer_now_ns(), Ordering::Relaxed);
+                a.store(watchdog_now_ns(), Ordering::Relaxed);
             }
             CURRENT_STAGE.store(IterStage::Poll as u8, Ordering::Release);
         }
@@ -1159,7 +1159,7 @@ fn run(cfg: Config) -> std::io::Result<()> {
             }
             stage_start = Instant::now();
             if let Some(a) = LAST_STAGE_ENTRY_NS.get(IterStage::Maintenance as usize) {
-                a.store(observer_now_ns(), Ordering::Relaxed);
+                a.store(watchdog_now_ns(), Ordering::Relaxed);
             }
             CURRENT_STAGE.store(IterStage::Maintenance as u8, Ordering::Release);
         }
@@ -1482,7 +1482,7 @@ fn run(cfg: Config) -> std::io::Result<()> {
             }
             stage_start = Instant::now();
             if let Some(a) = LAST_STAGE_ENTRY_NS.get(IterStage::RecoveryReap as usize) {
-                a.store(observer_now_ns(), Ordering::Relaxed);
+                a.store(watchdog_now_ns(), Ordering::Relaxed);
             }
             CURRENT_STAGE.store(IterStage::RecoveryReap as u8, Ordering::Release);
         }
@@ -1540,7 +1540,7 @@ fn run(cfg: Config) -> std::io::Result<()> {
                 pe.record_stage_duration(IterStage::RecoveryReap, stage_start.elapsed());
             }
             if let Some(a) = LAST_STAGE_ENTRY_NS.get(IterStage::ServePending as usize) {
-                a.store(observer_now_ns(), Ordering::Relaxed);
+                a.store(watchdog_now_ns(), Ordering::Relaxed);
             }
             CURRENT_STAGE.store(IterStage::ServePending as u8, Ordering::Release);
 
@@ -1563,7 +1563,7 @@ fn run(cfg: Config) -> std::io::Result<()> {
             }
             stage_start = Instant::now(); // housekeeping starts after serve_pending
             if let Some(a) = LAST_STAGE_ENTRY_NS.get(IterStage::Housekeeping as usize) {
-                a.store(observer_now_ns(), Ordering::Relaxed);
+                a.store(watchdog_now_ns(), Ordering::Relaxed);
             }
             CURRENT_STAGE.store(IterStage::Housekeeping as u8, Ordering::Release);
         }
@@ -1580,10 +1580,11 @@ fn run(cfg: Config) -> std::io::Result<()> {
                 varta_error_rl!(LogKind::HeartbeatIo, "heartbeat file write error: {e}");
             }
         }
-        // Update the self-watchdog liveness timestamp.  Uses wall-clock so the
-        // watchdog thread (which cannot access the observer) reads the same
-        // epoch.  Store after the poll work so a hung hw-watchdog kick would
-        // also be caught.
+        // Update the self-watchdog liveness timestamp.  Uses the suspend-paused
+        // monotonic clock (`watchdog_now_ns`) so the watchdog thread — which
+        // cannot reach the observer's own `Clock` — reads the same epoch, and a
+        // host suspend is never mistaken for a wedged loop.  Store after the
+        // poll work so a hung hw-watchdog kick would also be caught.
         //
         // H5: systemd `WATCHDOG=1` notifications are emitted from the
         // self-watchdog thread, NOT here.  This is the load-bearing closure
@@ -1592,7 +1593,7 @@ fn run(cfg: Config) -> std::io::Result<()> {
         // `sd_notify.watchdog_tick()` on the main thread would re-open that
         // gap, so it is deliberately omitted.
         // Release pairs with the Acquire load in the self-watchdog thread.
-        LAST_TICK_NS.store(observer_now_ns(), Ordering::Release);
+        LAST_TICK_NS.store(watchdog_now_ns(), Ordering::Release);
         if let Some(ref mut hw) = hw_wdt {
             hw.kick();
         }
@@ -1699,6 +1700,48 @@ mod tests {
         let last = 1_000_000u64; // very old
         let deadline = 5_000_000_000u64; // 5 s
         assert!(watchdog_expired(now, last, deadline));
+    }
+
+    #[test]
+    fn self_watchdog_clock_is_suspend_paused_not_configured_source() {
+        use varta_watch::clock::ClockSource;
+        // The watchdog measures on-CPU wedge time, so its clock is hardwired
+        // to the suspend-paused monotonic clock — NEVER the operator's
+        // advance-through-suspend `--clock-source`.  If a future change rewires
+        // `--clock-source` back into the watchdog, this assertion fails.
+        assert_eq!(WATCHDOG_CLOCK, ClockSource::Monotonic);
+        // `Monotonic` resolves to a real `clk_id` on every supported platform,
+        // so `watchdog_now_ns()` never falls into its defensive `0` arm.
+        assert!(WATCHDOG_CLOCK.clk_id().is_some());
+        assert!(watchdog_now_ns() > 0);
+    }
+
+    #[test]
+    fn host_suspend_does_not_trip_watchdog_when_stall_clock_advances() {
+        // Model the bug class: operator runs `--clock-source boottime` on an
+        // aggressively-suspending clinical device; the host suspends for an
+        // hour while the deadline is the systemd auto-enable default (4 s).
+        let deadline_ns = 4 * 1_000_000_000; // AUTO_DEADLINE_SECS
+        let suspend_ns = 3_600 * 1_000_000_000u64; // 1 h
+        let last_tick_ns = 10 * 1_000_000_000u64; // pre-suspend baseline
+
+        // FIXED behaviour: the watchdog stamps and reads `watchdog_now_ns`
+        // (CLOCK_MONOTONIC), which PAUSES during suspend, so on resume
+        // `now - last` is only the real on-CPU delta (a few ms) — no abort.
+        let now_monotonic = last_tick_ns + 5_000_000; // 5 ms real elapsed
+        assert!(
+            !watchdog_expired(now_monotonic, last_tick_ns, deadline_ns),
+            "suspend-paused watchdog clock must not abort a healthy observer on resume"
+        );
+
+        // Regression guard: the old code fed the advance-through-suspend
+        // (boottime) clock, which jumped by the entire suspend — that single
+        // forward jump was the spurious `process::abort()` this fix removes.
+        let now_boottime = last_tick_ns + suspend_ns;
+        assert!(
+            watchdog_expired(now_boottime, last_tick_ns, deadline_ns),
+            "sanity: a suspend-inclusive clock would have tripped — the defect this fix removes"
+        );
     }
 
     fn mk_tmpdir(tag: &str) -> PathBuf {
