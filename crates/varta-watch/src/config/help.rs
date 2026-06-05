@@ -198,7 +198,8 @@ OPTIONAL:
                                      book/src/architecture/observer-liveness.md).
                                      Auto-enabled with a 4 s deadline when
                                      $WATCHDOG_USEC is set by the service
-                                     manager.  Minimum 1.
+                                     manager.  Minimum 1 (0 is rejected;
+                                     omit the flag to disable the watchdog).
     --hw-watchdog <PATH>           Open a hardware watchdog device (e.g.
                                      /dev/watchdog) and kick it once per
                                      poll iteration. On clean shutdown the

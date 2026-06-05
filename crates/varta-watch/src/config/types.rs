@@ -43,6 +43,16 @@ const _: () = assert!(
 /// on every poll cycle.
 pub const MIN_THRESHOLD_MS: u64 = 10;
 
+/// Minimum allowed value for `--self-watchdog-secs`. A deadline of `0`
+/// makes the self-watchdog fire on the very first tick after startup —
+/// once the poll loop has ticked, `now - last_tick > 0` is true forever —
+/// and `process::abort()`s a perfectly healthy observer (a host reboot
+/// under `--hw-watchdog`). `0` is the "disable" idiom for the sibling rate
+/// flags (`--max-beat-rate 0`, `--global-beat-rate 0`, …), so an operator
+/// reaching for it to *disable* the watchdog would instead arm a guaranteed
+/// self-abort; reject it loudly. To run without a watchdog, omit the flag.
+pub const MIN_SELF_WATCHDOG_SECS: u64 = 1;
+
 /// Default per-source-IP refill rate (connections per second) for the
 /// Prometheus `/metrics` endpoint token bucket.  Comfortably above the
 /// 1-per-15-second cadence used by typical Prometheus scrapers; low enough
@@ -481,6 +491,15 @@ pub enum ConfigError {
         /// The minimum allowed value.
         min: u64,
     },
+    /// `--self-watchdog-secs` value is below [`MIN_SELF_WATCHDOG_SECS`]. A
+    /// deadline of `0` self-aborts a healthy observer on the first watchdog
+    /// tick; the watchdog is disabled by omitting the flag, never by `0`.
+    SelfWatchdogTooLow {
+        /// The value that was provided, in seconds.
+        value: u64,
+        /// The minimum allowed value, in seconds.
+        min: u64,
+    },
     /// Two or more mutually exclusive recovery flags were specified.
     MutuallyExclusive {
         /// The pair of conflicting flags (e.g. `("--recovery-exec", "--recovery-exec-file")`).
@@ -670,6 +689,12 @@ impl core::fmt::Display for ConfigError {
                     "--threshold-ms: {value} is below the minimum allowed value ({min} ms)"
                 )
             }
+            ConfigError::SelfWatchdogTooLow { value, min } => write!(
+                f,
+                "--self-watchdog-secs: {value} is below the minimum {min} \
+                 (0 self-aborts a healthy observer on the first watchdog tick; \
+                 omit the flag to run without a watchdog)"
+            ),
             ConfigError::MutuallyExclusive { a, b } => {
                 write!(f, "{a} and {b} are mutually exclusive")
             }
@@ -815,6 +840,12 @@ impl core::fmt::Display for ConfigError {
             ),
             ConfigError::ThresholdTooLow { value, min } => {
                 write!(f, "threshold below minimum: {value} ms < {min} ms ({REF})")
+            }
+            ConfigError::SelfWatchdogTooLow { value, min } => {
+                write!(
+                    f,
+                    "self-watchdog deadline below minimum: {value} < {min} ({REF})"
+                )
             }
             ConfigError::ShellRecoveryNotCompiledIn => write!(
                 f,

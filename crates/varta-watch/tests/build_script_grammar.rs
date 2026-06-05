@@ -182,6 +182,17 @@ fn recovery_cmd_file_is_rejected_as_unknown_key() {
 }
 
 #[test]
+fn self_watchdog_secs_zero_is_rejected() {
+    let bad = "\
+socket = /tmp/x.sock
+threshold_ms = 5000
+self_watchdog_secs = 0
+";
+    let err = parse_kv(bad).expect_err("self_watchdog_secs=0 must error");
+    assert!(err.contains("self_watchdog_secs"), "got: {err}");
+}
+
+#[test]
 fn recovery_audit_sync_every_zero_is_rejected() {
     let bad = "\
 socket = /tmp/x.sock

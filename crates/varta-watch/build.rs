@@ -243,6 +243,20 @@ pub fn parse_kv(input: &str) -> Result<ParsedConfig, String> {
             return Err("audit_rotation_budget_ms must be >= 1".into());
         }
     }
+    if let Some(v) = out.singletons.get("self_watchdog_secs") {
+        // Keep the `1` in sync with config::types::MIN_SELF_WATCHDOG_SECS
+        // (build.rs cannot import crate consts). A baked `0` self-aborts a
+        // healthy observer on the first watchdog tick; omit the key to run
+        // without a watchdog.
+        let n: u64 = v
+            .parse()
+            .map_err(|_| format!("self_watchdog_secs: not a valid u64: {v:?}"))?;
+        if n < 1 {
+            return Err(
+                "self_watchdog_secs must be >= 1 (0 self-aborts a healthy observer)".into(),
+            );
+        }
+    }
     if let Some(v) = out.singletons.get("eviction_scan_window") {
         let n: usize = v
             .parse()

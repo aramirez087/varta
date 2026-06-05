@@ -110,6 +110,46 @@ fn read_timeout_above_ceiling_is_rejected() {
     );
 }
 
+/// `--self-watchdog-secs 0` must be rejected. A zero deadline makes the
+/// watchdog `process::abort()` a healthy observer on the first tick after
+/// startup (host reboot under `--hw-watchdog`); help text documents
+/// "Minimum 1". `0` is the disable idiom for sibling rate flags, so an
+/// operator could plausibly reach for it — reject it rather than self-abort.
+/// Regression for the previously-unbounded lower end of `--self-watchdog-secs`.
+#[test]
+fn self_watchdog_below_minimum_is_rejected() {
+    match Config::from_args(args(&[
+        "--socket",
+        "/tmp/x.sock",
+        "--threshold-ms",
+        "100",
+        "--self-watchdog-secs",
+        "0",
+    ])) {
+        Err(ConfigError::SelfWatchdogTooLow { value, min }) => {
+            assert_eq!(value, 0);
+            assert_eq!(min, super::types::MIN_SELF_WATCHDOG_SECS);
+        }
+        other => panic!("expected SelfWatchdogTooLow, got {other:?}"),
+    }
+
+    // The floor value itself parses cleanly.
+    let min_s = super::types::MIN_SELF_WATCHDOG_SECS.to_string();
+    let cfg = Config::from_args(args(&[
+        "--socket",
+        "/tmp/x.sock",
+        "--threshold-ms",
+        "100",
+        "--self-watchdog-secs",
+        &min_s,
+    ]))
+    .expect("floor value must parse");
+    assert_eq!(
+        cfg.self_watchdog,
+        Some(Duration::from_secs(super::types::MIN_SELF_WATCHDOG_SECS))
+    );
+}
+
 #[cfg(feature = "prometheus-exporter")]
 #[test]
 fn parses_full_flag_surface() {

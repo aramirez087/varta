@@ -31,7 +31,7 @@ use super::types::{
     DEFAULT_READ_TIMEOUT_MS, DEFAULT_RECOVERY_CAPTURE_BYTES, DEFAULT_RECOVERY_DEBOUNCE_MS,
     DEFAULT_SHUTDOWN_GRACE_MS, DEFAULT_SOCKET_MODE, MAX_ITERATION_BUDGET_MS, MAX_READ_TIMEOUT_MS,
     MAX_RECOVERY_CAPTURE_BYTES, MAX_SCRAPE_BUDGET_MS, MIN_ITERATION_BUDGET_MS,
-    MIN_SCRAPE_BUDGET_MS, MIN_SHUTDOWN_GRACE_MS, MIN_THRESHOLD_MS,
+    MIN_SCRAPE_BUDGET_MS, MIN_SELF_WATCHDOG_SECS, MIN_SHUTDOWN_GRACE_MS, MIN_THRESHOLD_MS,
 };
 
 #[cfg(not(feature = "compile-time-config"))]
@@ -393,6 +393,12 @@ impl Config {
                         flag: "--self-watchdog-secs",
                         raw: v,
                     })?;
+                    if secs < MIN_SELF_WATCHDOG_SECS {
+                        return Err(ConfigError::SelfWatchdogTooLow {
+                            value: secs,
+                            min: MIN_SELF_WATCHDOG_SECS,
+                        });
+                    }
                     self_watchdog = Some(Duration::from_secs(secs));
                 }
                 "--hw-watchdog" => {
