@@ -720,10 +720,12 @@ pub(super) fn serve_pending_seconds_separates_scrape_from_beat_path() {
         "iteration_count ({iter_count}) and serve_pending_count ({sp_count}) drifted by {diff}; body:\n{body}"
     );
 
-    // 4. The partial-GET pool exhausts the bounded per-tick serve window.
-    //    The observer-specific soft-budget counter below is advisory wall
-    //    time; with non-blocking accepted sockets it may stay at zero on a
-    //    fast host even while the hard connection budget is doing work.
+    // 4. The partial-GET pool must trip both scrape-pressure signals. They
+    //    count different things and are not ordered: `scrape_budget_exhausted`
+    //    fires when a single `serve_pending` hits the 100 ms / max-conn cap,
+    //    while `scrape_budget_exceeded` fires when recorded wall time exceeds
+    //    `--scrape-budget-ms` (50 ms here). macOS CI can observe many soft
+    //    overruns without a hard exhaust in the same scrape window.
     let hard_budget_exhausted = parse_metric_value(&body, "varta_scrape_budget_exhausted_total")
         .unwrap_or_else(|| panic!("missing varta_scrape_budget_exhausted_total; body:\n{body}"));
     assert!(
@@ -735,8 +737,8 @@ pub(super) fn serve_pending_seconds_separates_scrape_from_beat_path() {
             panic!("missing varta_observer_scrape_budget_exceeded_total; body:\n{body}")
         });
     assert!(
-        sb_exceeded <= hard_budget_exhausted,
-        "soft scrape-budget overrun count ({sb_exceeded}) exceeded hard budget exhaustion count ({hard_budget_exhausted}); body:\n{body}"
+        sb_exceeded >= 1,
+        "partial-GET pool did not exceed soft scrape budget; body:\n{body}"
     );
 
     // 5. +Inf bucket equals count — sanity for cumulative histogram.

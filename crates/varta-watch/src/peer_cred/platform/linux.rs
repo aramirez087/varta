@@ -161,26 +161,22 @@ pub(crate) fn peer_pid_after_recv(
             .cmsg_len
             .saturating_sub(<LinuxCmsg as super::super::cmsg::CmsgPlatform>::cmsg_hdr_size());
         match hdr.cmsg_type {
-            SCM_CREDENTIALS => {
-                if payload_len >= core::mem::size_of::<Ucred>() {
-                    // SAFETY: payload length was checked above and the cmsg
-                    // walker proved the bytes are inside the kernel-supplied
-                    // ancillary buffer.
-                    let uc = unsafe { &*(data_ptr as *const Ucred) };
-                    cred = Some((uc.pid as u32, uc.uid));
-                }
+            SCM_CREDENTIALS if payload_len >= core::mem::size_of::<Ucred>() => {
+                // SAFETY: payload length was checked above and the cmsg
+                // walker proved the bytes are inside the kernel-supplied
+                // ancillary buffer.
+                let uc = unsafe { &*(data_ptr as *const Ucred) };
+                cred = Some((uc.pid as u32, uc.uid));
             }
-            SCM_PIDFD => {
-                if payload_len >= core::mem::size_of::<i32>() {
-                    // SAFETY: payload length was checked above. Use
-                    // `read_unaligned` because the cmsg payload ABI only
-                    // promises byte validity; alignment is cheap to avoid.
-                    let fd = unsafe { data_ptr.cast::<i32>().read_unaligned() };
-                    if fd >= 0 {
-                        // SAFETY: the fd was installed into this process by
-                        // recvmsg as an owned SCM_PIDFD descriptor.
-                        pidfd = Some(unsafe { PeerPidFd::from_raw(fd) });
-                    }
+            SCM_PIDFD if payload_len >= core::mem::size_of::<i32>() => {
+                // SAFETY: payload length was checked above. Use
+                // `read_unaligned` because the cmsg payload ABI only
+                // promises byte validity; alignment is cheap to avoid.
+                let fd = unsafe { data_ptr.cast::<i32>().read_unaligned() };
+                if fd >= 0 {
+                    // SAFETY: the fd was installed into this process by
+                    // recvmsg as an owned SCM_PIDFD descriptor.
+                    pidfd = Some(unsafe { PeerPidFd::from_raw(fd) });
                 }
             }
             _ => {}

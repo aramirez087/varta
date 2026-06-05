@@ -80,6 +80,7 @@ mod tests {
     use std::os::unix::io::IntoRawFd;
 
     #[test]
+    #[cfg(not(miri))]
     fn read_peer_identity_without_pidfd_preserves_proc_fallback() {
         let (_ns, generation) = read_peer_identity(std::process::id(), None);
         assert!(
@@ -89,6 +90,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(miri))]
     fn read_peer_identity_with_non_live_pidfd_refuses_proc_metadata() {
         // A regular file polls readable immediately, which exercises the same
         // "not proven live" branch as an exited pidfd. PeerPidFd takes

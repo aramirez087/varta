@@ -413,22 +413,21 @@ mod miri_cmsg_tests {
 
     #[test]
     fn credentials_with_scm_pidfd_returns_owned_pidfd() {
-        use std::os::unix::io::IntoRawFd;
+        // Parser-level only: the SCM_PIDFD integer need not be a live kernel
+        // descriptor. Avoid open(2) so Miri isolation can exercise the walker;
+        // forget the wrapper so drop does not close(2) a synthetic fd.
+        const SYNTHETIC_FD: i32 = 42;
 
         let mut abuf = AlignedBuf([0u8; 512]);
         write_scm_credentials(&mut abuf.0, 0, 1234, 1000, 100);
-        // Any owned fd is enough for this parser-level test; PeerPidFd takes
-        // ownership and closes it when `result` is dropped.
-        let fd = std::fs::File::open("/dev/null")
-            .expect("open /dev/null")
-            .into_raw_fd();
-        write_scm_pidfd(&mut abuf.0, cmsg_space_ucred(), fd);
+        write_scm_pidfd(&mut abuf.0, cmsg_space_ucred(), SYNTHETIC_FD);
         let controllen = cmsg_space_ucred() + cmsg_space_i32();
         let mhdr = make_mhdr(&abuf.0, controllen);
         let result = plat::peer_pid_after_recv(0, &mhdr);
         let (pid, uid, pidfd) = result.expect("expected credentials");
         assert_eq!((pid, uid), (1234, 1000));
-        assert!(pidfd.is_some(), "SCM_PIDFD cmsg must be surfaced");
+        let pidfd = pidfd.expect("SCM_PIDFD cmsg must be surfaced");
+        std::mem::forget(pidfd);
     }
 
     #[test]
