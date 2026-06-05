@@ -32,7 +32,7 @@ fn exec_mode_spawns_command_via_execvp() {
         },
         Duration::ZERO,
     );
-    match rec.on_stall(42, BeatOrigin::KernelAttested, false, 0) {
+    match rec.on_stall(42, BeatOrigin::KernelAttested, false, None, 0) {
         RecoveryOutcome::Spawned { .. } => {
             std::thread::sleep(Duration::from_millis(50));
             let outcomes = rec.try_reap(0);
@@ -59,7 +59,7 @@ fn reaped_outcome_carries_duration_for_metrics() {
         Duration::ZERO,
     );
 
-    match rec.on_stall(43, BeatOrigin::KernelAttested, false, 0) {
+    match rec.on_stall(43, BeatOrigin::KernelAttested, false, None, 0) {
         RecoveryOutcome::Spawned { .. } => {}
         other => panic!("expected Spawned in exec mode, got {other:?}"),
     }
@@ -99,7 +99,7 @@ fn exec_mode_substitutes_pid_in_args() {
         },
         Duration::ZERO,
     );
-    match rec.on_stall(42, BeatOrigin::KernelAttested, false, 0) {
+    match rec.on_stall(42, BeatOrigin::KernelAttested, false, None, 0) {
         RecoveryOutcome::Spawned { .. } => {
             std::thread::sleep(Duration::from_millis(100));
             let outcomes = rec.try_reap(0);
@@ -125,7 +125,7 @@ fn exec_mode_no_shell_injection_via_pid_substitution() {
         },
         Duration::ZERO,
     );
-    match rec.on_stall(42, BeatOrigin::KernelAttested, false, 0) {
+    match rec.on_stall(42, BeatOrigin::KernelAttested, false, None, 0) {
         RecoveryOutcome::Spawned { .. } => {
             std::thread::sleep(Duration::from_millis(50));
             let outcomes = rec.try_reap(0);
@@ -154,7 +154,7 @@ fn exec_mode_env_isolation_clears_environment() {
         None,
     )
     .with_recovery_env(vec!["E1=a".to_string(), "E2=b".to_string()]);
-    match rec.on_stall(1, BeatOrigin::KernelAttested, false, 0) {
+    match rec.on_stall(1, BeatOrigin::KernelAttested, false, None, 0) {
         RecoveryOutcome::Spawned { .. } => {
             std::thread::sleep(Duration::from_millis(100));
             let outcomes = rec.try_reap(0);
@@ -217,7 +217,7 @@ fn audit_sink_records_spawn_and_complete_for_exec_mode() {
     )
     .with_audit_sink(Some(sink));
 
-    match rec.on_stall(123, BeatOrigin::KernelAttested, false, 0) {
+    match rec.on_stall(123, BeatOrigin::KernelAttested, false, None, 0) {
         RecoveryOutcome::Spawned { .. } => {}
         other => panic!("expected Spawned, got {other:?}"),
     }
@@ -285,7 +285,7 @@ fn complete_record_carries_completion_observer_ns() {
     )
     .with_audit_sink(Some(sink));
 
-    match rec.on_stall(321, BeatOrigin::KernelAttested, false, 0) {
+    match rec.on_stall(321, BeatOrigin::KernelAttested, false, None, 0) {
         RecoveryOutcome::Spawned { .. } => {}
         other => panic!("expected Spawned, got {other:?}"),
     }
@@ -337,7 +337,7 @@ fn capture_records_nonzero_length_for_chatty_child() {
     .with_capture(4096)
     .with_audit_sink(Some(sink));
 
-    match rec.on_stall(77, BeatOrigin::KernelAttested, false, 0) {
+    match rec.on_stall(77, BeatOrigin::KernelAttested, false, None, 0) {
         RecoveryOutcome::Spawned { .. } => {}
         other => panic!("expected Spawned, got {other:?}"),
     }
@@ -391,7 +391,7 @@ fn capture_truncates_at_per_child_cap() {
     .with_capture(64)
     .with_audit_sink(Some(sink));
 
-    match rec.on_stall(8, BeatOrigin::KernelAttested, false, 0) {
+    match rec.on_stall(8, BeatOrigin::KernelAttested, false, None, 0) {
         RecoveryOutcome::Spawned { .. } => {}
         other => panic!("expected Spawned, got {other:?}"),
     }
@@ -450,7 +450,7 @@ fn exited_child_with_open_inherited_pipe_is_reclaimed_after_grace() {
     )
     .with_capture(8192);
 
-    match rec.on_stall(PID, BeatOrigin::KernelAttested, false, 0) {
+    match rec.on_stall(PID, BeatOrigin::KernelAttested, false, None, 0) {
         RecoveryOutcome::Spawned { .. } => {}
         other => panic!("expected Spawned, got {other:?}"),
     }
@@ -508,7 +508,7 @@ fn capture_cap_closes_pipes_so_chatty_child_can_exit() {
     )
     .with_capture(64);
 
-    match rec.on_stall(9, BeatOrigin::KernelAttested, false, 0) {
+    match rec.on_stall(9, BeatOrigin::KernelAttested, false, None, 0) {
         RecoveryOutcome::Spawned { .. } => {}
         other => panic!("expected Spawned, got {other:?}"),
     }
@@ -545,7 +545,7 @@ fn completed_child_capture_drain_is_bounded_per_tick() {
     )
     .with_capture(8192);
 
-    match rec.on_stall(10, BeatOrigin::KernelAttested, false, 0) {
+    match rec.on_stall(10, BeatOrigin::KernelAttested, false, None, 0) {
         RecoveryOutcome::Spawned { .. } => {}
         other => panic!("expected Spawned, got {other:?}"),
     }
@@ -594,7 +594,7 @@ fn audit_disabled_does_not_create_audit_file() {
         },
         Duration::ZERO,
     );
-    match rec.on_stall(1, BeatOrigin::KernelAttested, false, 0) {
+    match rec.on_stall(1, BeatOrigin::KernelAttested, false, None, 0) {
         RecoveryOutcome::Spawned { .. } => {}
         other => panic!("expected Spawned, got {other:?}"),
     }
@@ -610,7 +610,7 @@ fn refuses_recovery_on_unauthenticated_origin_always() {
         Duration::ZERO,
     );
 
-    match rec.on_stall(42, BeatOrigin::NetworkUnverified, false, 0) {
+    match rec.on_stall(42, BeatOrigin::NetworkUnverified, false, None, 0) {
         RecoveryOutcome::RefusedUnauthenticatedSource { pid } => assert_eq!(pid, 42),
         other => panic!("expected RefusedUnauthenticatedSource, got {other:?}"),
     }
@@ -628,7 +628,7 @@ fn operator_attested_transport_fires_recovery() {
         Duration::ZERO,
     );
 
-    match rec.on_stall(42, BeatOrigin::OperatorAttestedTransport, false, 0) {
+    match rec.on_stall(42, BeatOrigin::OperatorAttestedTransport, false, None, 0) {
         RecoveryOutcome::Spawned { .. } => {}
         other => panic!("expected Spawned, got {other:?}"),
     }
@@ -645,9 +645,9 @@ fn refusal_does_not_burn_debounce_window() {
         Duration::from_secs(60),
     );
 
-    let _ = rec.on_stall(7, BeatOrigin::NetworkUnverified, false, 0);
+    let _ = rec.on_stall(7, BeatOrigin::NetworkUnverified, false, None, 0);
 
-    match rec.on_stall(7, BeatOrigin::KernelAttested, false, 0) {
+    match rec.on_stall(7, BeatOrigin::KernelAttested, false, None, 0) {
         RecoveryOutcome::Spawned { .. } => {}
         other => panic!("expected Spawned, got {other:?}"),
     }
@@ -665,7 +665,7 @@ fn spawn_failure_does_not_burn_debounce_window() {
         Duration::from_secs(60),
     );
 
-    match rec.on_stall(7, BeatOrigin::KernelAttested, false, 0) {
+    match rec.on_stall(7, BeatOrigin::KernelAttested, false, None, 0) {
         RecoveryOutcome::SpawnFailed(e) => assert_eq!(e.kind(), std::io::ErrorKind::NotFound),
         other => panic!("expected SpawnFailed for missing command, got {other:?}"),
     }
@@ -675,13 +675,86 @@ fn spawn_failure_does_not_burn_debounce_window() {
         args: vec![],
     };
 
-    match rec.on_stall(7, BeatOrigin::KernelAttested, false, 0) {
+    match rec.on_stall(7, BeatOrigin::KernelAttested, false, None, 0) {
         RecoveryOutcome::Spawned { .. } => {}
         other => panic!("failed spawn must not debounce a later valid recovery, got {other:?}"),
     }
 
     drop(rec);
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// PID-recycle regression (sibling of tracker bug-341/342): when the OS
+/// recycles a recently-recovered PID to a *different* process within the
+/// debounce window, the debounce ledger must NOT suppress the new process's
+/// recovery. The fix keys the ledger on `(pid, generation)`; a `Some != Some`
+/// generation proves the recycle and drops the stale window.
+#[test]
+fn recycled_pid_within_debounce_window_spawns_new_recovery() {
+    const GEN_A: u64 = 111;
+    const GEN_B: u64 = 222;
+    let mut rec = Recovery::new_exec("true".to_string(), vec![], Duration::from_secs(60));
+
+    // Generation A stalls and recovers; ledger pins (42, GEN_A).
+    match rec.on_stall(42, BeatOrigin::KernelAttested, false, Some(GEN_A), 0) {
+        RecoveryOutcome::Spawned { .. } => {}
+        other => panic!("expected Spawned for first generation, got {other:?}"),
+    }
+    // Reap A's child so the outstanding gate is clear; isolates the
+    // last-fired (debounce) ledger as the sole remaining gate.
+    std::thread::sleep(Duration::from_millis(50));
+    let _ = rec.try_reap(0);
+
+    // Within the SAME debounce window the kernel recycles PID 42 to an
+    // unrelated process (generation B) that genuinely stalls. The old
+    // bare-PID ledger returned Debounced here; the fix must spawn.
+    match rec.on_stall(42, BeatOrigin::KernelAttested, false, Some(GEN_B), 0) {
+        RecoveryOutcome::Spawned { .. } => {}
+        other => panic!("recycled PID must not be debounced, got {other:?}"),
+    }
+    assert_eq!(
+        rec.take_last_fired_recycle_resets(),
+        1,
+        "the recycle must be counted exactly once"
+    );
+
+    // The ledger is now re-pinned to generation B: a second B stall inside
+    // the window is correctly debounced (proves the slot was overwritten,
+    // not merely bypassed).
+    std::thread::sleep(Duration::from_millis(50));
+    let _ = rec.try_reap(0);
+    match rec.on_stall(42, BeatOrigin::KernelAttested, false, Some(GEN_B), 0) {
+        RecoveryOutcome::Debounced => {}
+        other => panic!("same generation within window must debounce, got {other:?}"),
+    }
+    assert_eq!(rec.take_last_fired_recycle_resets(), 0);
+}
+
+/// Control: with no generation token (`OperatorAttestedTransport`, non-Linux)
+/// or the *same* generation, the debounce ledger preserves its prior
+/// bare-PID behaviour — a repeat stall within the window is suppressed.
+#[test]
+fn same_or_unknown_generation_within_debounce_window_is_debounced() {
+    // Same generation.
+    let mut rec = Recovery::new_exec("true".to_string(), vec![], Duration::from_secs(60));
+    let _ = rec.on_stall(5, BeatOrigin::KernelAttested, false, Some(111), 0);
+    std::thread::sleep(Duration::from_millis(50));
+    let _ = rec.try_reap(0);
+    match rec.on_stall(5, BeatOrigin::KernelAttested, false, Some(111), 0) {
+        RecoveryOutcome::Debounced => {}
+        other => panic!("same generation must debounce, got {other:?}"),
+    }
+
+    // Unknown generation on both sides (lenient — never a recycle signal).
+    let mut rec = Recovery::new_exec("true".to_string(), vec![], Duration::from_secs(60));
+    let _ = rec.on_stall(6, BeatOrigin::KernelAttested, false, None, 0);
+    std::thread::sleep(Duration::from_millis(50));
+    let _ = rec.try_reap(0);
+    match rec.on_stall(6, BeatOrigin::KernelAttested, false, None, 0) {
+        RecoveryOutcome::Debounced => {}
+        other => panic!("unknown generation must preserve bare-PID debounce, got {other:?}"),
+    }
+    assert_eq!(rec.take_last_fired_recycle_resets(), 0);
 }
 
 #[test]
@@ -694,7 +767,7 @@ fn refuses_recovery_on_cross_namespace_agent() {
         Duration::ZERO,
     );
 
-    match rec.on_stall(42, BeatOrigin::KernelAttested, true, 0) {
+    match rec.on_stall(42, BeatOrigin::KernelAttested, true, None, 0) {
         RecoveryOutcome::RefusedCrossNamespace { pid } => assert_eq!(pid, 42),
         other => panic!("expected RefusedCrossNamespace, got {other:?}"),
     }
@@ -713,7 +786,7 @@ fn opt_in_allows_recovery_on_cross_namespace_agent() {
     )
     .with_allow_cross_namespace(true);
 
-    match rec.on_stall(42, BeatOrigin::KernelAttested, true, 0) {
+    match rec.on_stall(42, BeatOrigin::KernelAttested, true, None, 0) {
         RecoveryOutcome::Spawned { .. } => {}
         other => panic!("expected Spawned with opt-in, got {other:?}"),
     }
@@ -730,7 +803,7 @@ fn cross_namespace_gate_precedes_unauth_gate() {
         Duration::ZERO,
     );
 
-    match rec.on_stall(42, BeatOrigin::NetworkUnverified, true, 0) {
+    match rec.on_stall(42, BeatOrigin::NetworkUnverified, true, None, 0) {
         RecoveryOutcome::RefusedCrossNamespace { pid } => assert_eq!(pid, 42),
         other => panic!("expected RefusedCrossNamespace, got {other:?}"),
     }
@@ -745,16 +818,16 @@ fn last_fired_table_at_capacity_with_fresh_entries_refuses() {
     let t0 = Instant::now();
     for pid in 10..14 {
         assert_eq!(
-            table.try_insert(pid, t0, debounce),
+            table.try_insert(pid, None, t0, debounce),
             InsertOutcome::Inserted,
             "pid {pid} should fill an empty slot"
         );
     }
     assert_eq!(table.len(), 4);
 
-    let result = table.try_insert(99, t0 + Duration::from_millis(1), debounce);
+    let result = table.try_insert(99, None, t0 + Duration::from_millis(1), debounce);
     assert_eq!(result, InsertOutcome::RefusedCapacity);
-    assert!(table.get(99).is_none());
+    assert!(table.get(99, None).is_none());
     assert_eq!(table.len(), 4);
 }
 
@@ -763,19 +836,19 @@ fn last_fired_table_at_capacity_evicts_oldest_past_debounce() {
     let mut table = LastFiredTable::with_capacity(4);
     let debounce = Duration::from_millis(100);
     let t0 = Instant::now();
-    table.try_insert(10, t0, debounce);
-    table.try_insert(11, t0 + Duration::from_millis(10), debounce);
-    table.try_insert(12, t0 + Duration::from_millis(20), debounce);
-    table.try_insert(13, t0 + Duration::from_millis(30), debounce);
+    table.try_insert(10, None, t0, debounce);
+    table.try_insert(11, None, t0 + Duration::from_millis(10), debounce);
+    table.try_insert(12, None, t0 + Duration::from_millis(20), debounce);
+    table.try_insert(13, None, t0 + Duration::from_millis(30), debounce);
 
     let now = t0 + Duration::from_millis(200);
-    let outcome = table.try_insert(99, now, debounce);
+    let outcome = table.try_insert(99, None, now, debounce);
     assert_eq!(outcome, InsertOutcome::EvictedOldest { evicted_pid: 10 });
-    assert!(table.get(10).is_none());
-    assert_eq!(table.get(99), Some(now));
-    assert_eq!(table.get(11), Some(t0 + Duration::from_millis(10)));
-    assert_eq!(table.get(12), Some(t0 + Duration::from_millis(20)));
-    assert_eq!(table.get(13), Some(t0 + Duration::from_millis(30)));
+    assert!(table.get(10, None).is_none());
+    assert_eq!(table.get(99, None), Some(now));
+    assert_eq!(table.get(11, None), Some(t0 + Duration::from_millis(10)));
+    assert_eq!(table.get(12, None), Some(t0 + Duration::from_millis(20)));
+    assert_eq!(table.get(13, None), Some(t0 + Duration::from_millis(30)));
 }
 
 #[test]
@@ -783,20 +856,23 @@ fn last_fired_table_refusal_does_not_burn_debounce_window() {
     let mut table = LastFiredTable::with_capacity(2);
     let debounce = Duration::from_millis(100);
     let t0 = Instant::now();
-    table.try_insert(1, t0, debounce);
-    table.try_insert(2, t0, debounce);
+    table.try_insert(1, None, t0, debounce);
+    table.try_insert(2, None, t0, debounce);
 
-    let refused = table.try_insert(99, t0 + Duration::from_millis(50), debounce);
+    let refused = table.try_insert(99, None, t0 + Duration::from_millis(50), debounce);
     assert_eq!(refused, InsertOutcome::RefusedCapacity);
-    assert!(table.get(99).is_none(), "refusal must not leave a record");
+    assert!(
+        table.get(99, None).is_none(),
+        "refusal must not leave a record"
+    );
 
     let later = t0 + Duration::from_millis(200);
-    let outcome = table.try_insert(99, later, debounce);
+    let outcome = table.try_insert(99, None, later, debounce);
     assert!(matches!(
         outcome,
         InsertOutcome::EvictedOldest { .. } | InsertOutcome::Inserted
     ));
-    assert_eq!(table.get(99), Some(later));
+    assert_eq!(table.get(99, None), Some(later));
 }
 
 #[test]
@@ -805,15 +881,15 @@ fn last_fired_reservation_does_not_mutate_until_commit() {
     let now = Instant::now();
 
     let reservation = table
-        .try_reserve(99, now, Duration::from_secs(1))
+        .try_reserve(99, None, now, Duration::from_secs(1))
         .expect("reservation should fit");
 
     assert_eq!(table.len(), 0);
-    assert!(table.get(99).is_none());
+    assert!(table.get(99, None).is_none());
 
     assert_eq!(table.commit_reserved(reservation), InsertOutcome::Inserted);
     assert_eq!(table.len(), 1);
-    assert_eq!(table.get(99), Some(now));
+    assert_eq!(table.get(99, None), Some(now));
 }
 
 #[test]
@@ -821,22 +897,25 @@ fn last_fired_eviction_reservation_preserves_old_slot_until_commit() {
     let mut table = LastFiredTable::with_capacity(1);
     let debounce = Duration::from_millis(100);
     let t0 = Instant::now();
-    assert_eq!(table.try_insert(10, t0, debounce), InsertOutcome::Inserted);
+    assert_eq!(
+        table.try_insert(10, None, t0, debounce),
+        InsertOutcome::Inserted
+    );
 
     let later = t0 + Duration::from_millis(200);
     let reservation = table
-        .try_reserve(99, later, debounce)
+        .try_reserve(99, None, later, debounce)
         .expect("old entry should be reservable for eviction");
 
-    assert_eq!(table.get(10), Some(t0));
-    assert!(table.get(99).is_none());
+    assert_eq!(table.get(10, None), Some(t0));
+    assert!(table.get(99, None).is_none());
 
     assert_eq!(
         table.commit_reserved(reservation),
         InsertOutcome::EvictedOldest { evicted_pid: 10 }
     );
-    assert!(table.get(10).is_none());
-    assert_eq!(table.get(99), Some(later));
+    assert!(table.get(10, None).is_none());
+    assert_eq!(table.get(99, None), Some(later));
     assert_eq!(table.take_evictions(), 1);
 }
 
@@ -845,7 +924,7 @@ fn last_fired_table_prune_bounded_wcet() {
     let mut table = LastFiredTable::with_capacity(MAX_LAST_FIRED_CAPACITY);
     let t0 = Instant::now();
     for pid in 0..MAX_LAST_FIRED_CAPACITY as u32 {
-        table.try_insert(pid.saturating_add(2), t0, Duration::ZERO);
+        table.try_insert(pid.saturating_add(2), None, t0, Duration::ZERO);
     }
     assert_eq!(table.len(), MAX_LAST_FIRED_CAPACITY);
 
@@ -872,13 +951,13 @@ fn on_stall_refuses_when_debounce_table_at_capacity_with_fresh_entries() {
     rec.shrink_last_fired_for_test(2);
 
     for pid in 10..12u32 {
-        match rec.on_stall(pid, BeatOrigin::KernelAttested, false, 0) {
+        match rec.on_stall(pid, BeatOrigin::KernelAttested, false, None, 0) {
             RecoveryOutcome::Spawned { .. } => {}
             other => panic!("expected Spawned for pid {pid}, got {other:?}"),
         }
     }
 
-    match rec.on_stall(99, BeatOrigin::KernelAttested, false, 0) {
+    match rec.on_stall(99, BeatOrigin::KernelAttested, false, None, 0) {
         RecoveryOutcome::RefusedDebounceCapacity { pid } => assert_eq!(pid, 99),
         other => panic!("expected RefusedDebounceCapacity, got {other:?}"),
     }
@@ -913,13 +992,13 @@ fn outstanding_probe_exhaustion_refuses_before_spawning_child() {
     .with_outstanding_capacity(CAPACITY);
 
     for &pid in cluster.iter().take(BoundedIndex::<u32>::MAX_PROBE) {
-        match rec.on_stall(pid, BeatOrigin::KernelAttested, false, 0) {
+        match rec.on_stall(pid, BeatOrigin::KernelAttested, false, None, 0) {
             RecoveryOutcome::Spawned { .. } => {}
             other => panic!("expected Spawned for clustered pid {pid}, got {other:?}"),
         }
     }
 
-    match rec.on_stall(refused_pid, BeatOrigin::KernelAttested, false, 0) {
+    match rec.on_stall(refused_pid, BeatOrigin::KernelAttested, false, None, 0) {
         RecoveryOutcome::RefusedOutstandingCapacity { pid } => assert_eq!(pid, refused_pid),
         other => panic!("expected RefusedOutstandingCapacity, got {other:?}"),
     }
@@ -940,7 +1019,7 @@ fn outstanding_probe_exhaustion_refuses_before_spawning_child() {
 fn try_reap_no_truncation_within_cap() {
     let mut rec = Recovery::new_exec("true".to_string(), vec![], Duration::from_secs(10));
     for pid in 1u32..=3 {
-        rec.on_stall(pid, BeatOrigin::KernelAttested, false, 0);
+        rec.on_stall(pid, BeatOrigin::KernelAttested, false, None, 0);
     }
     std::thread::sleep(Duration::from_millis(50));
     let outcomes = rec.try_reap(0);
@@ -960,7 +1039,7 @@ fn try_reap_no_truncation_within_cap() {
 fn try_reap_caps_and_cursor_advances() {
     let mut rec = Recovery::new_exec("true".to_string(), vec![], Duration::from_secs(10));
     for pid in 1u32..=5 {
-        rec.on_stall(pid, BeatOrigin::KernelAttested, false, 0);
+        rec.on_stall(pid, BeatOrigin::KernelAttested, false, None, 0);
     }
     rec.shrink_reap_max_for_test(2);
     std::thread::sleep(Duration::from_millis(100));
@@ -987,7 +1066,7 @@ fn try_reap_caps_and_cursor_advances() {
 fn try_reap_truncation_counter_increments_and_resets() {
     let mut rec = Recovery::new_exec("true".to_string(), vec![], Duration::from_secs(10));
     for pid in 1u32..=4 {
-        rec.on_stall(pid, BeatOrigin::KernelAttested, false, 0);
+        rec.on_stall(pid, BeatOrigin::KernelAttested, false, None, 0);
     }
     rec.shrink_reap_max_for_test(2);
     std::thread::sleep(Duration::from_millis(100));

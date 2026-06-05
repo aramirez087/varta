@@ -350,6 +350,13 @@ impl Recovery {
         self.last_fired.take_invariant_violations()
     }
 
+    /// Take and reset the count of stale debounce windows dropped because a
+    /// slot's pinned generation proved its PID had been recycled. Surfaced as
+    /// `varta_recovery_debounce_recycle_resets_total`.
+    pub fn take_last_fired_recycle_resets(&mut self) -> u64 {
+        self.last_fired.take_recycle_resets()
+    }
+
     /// Test-only: shrink the [`LastFiredTable`] to `cap` slots.
     #[cfg(test)]
     pub(crate) fn shrink_last_fired_for_test(&mut self, cap: usize) {
@@ -513,11 +520,19 @@ impl Recovery {
     /// `cross_namespace_agent` is `true` iff the stalled agent's
     /// kernel-attested PID namespace differs from the observer's. When
     /// true and `allow_cross_namespace` is false, recovery is refused.
+    ///
+    /// `generation` is the kernel-attested start-time token pinned by the
+    /// stalled slot (`Some` only for `KernelAttested` Linux agents; `None`
+    /// otherwise). The per-pid debounce ledger is keyed by `(pid, generation)`
+    /// so a PID recycled to a new process within a previous fire's debounce
+    /// window is **not** suppressed — the new process gets its own recovery.
+    /// `None` generation preserves the prior bare-PID debounce behaviour.
     pub fn on_stall(
         &mut self,
         pid: u32,
         origin: BeatOrigin,
         cross_namespace_agent: bool,
+        generation: Option<u64>,
         observer_ns: u64,
     ) -> RecoveryOutcome {
         // --- SAFETY GATE START ---
@@ -576,7 +591,7 @@ impl Recovery {
         let prune_threshold = self.debounce.saturating_mul(10);
         self.last_fired.prune_expired(now, prune_threshold);
 
-        if let Some(prev) = self.last_fired.get(pid) {
+        if let Some(prev) = self.last_fired.get(pid, generation) {
             if now.saturating_duration_since(prev) < self.debounce {
                 return RecoveryOutcome::Debounced;
             }
@@ -607,7 +622,9 @@ impl Recovery {
             }
         };
 
-        let Some(last_fired_reservation) = self.last_fired.try_reserve(pid, now, self.debounce)
+        let Some(last_fired_reservation) =
+            self.last_fired
+                .try_reserve(pid, generation, now, self.debounce)
         else {
             self.outstanding.release_reservation(reservation);
             self.refused_debounce_capacity = self.refused_debounce_capacity.saturating_add(1);

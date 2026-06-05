@@ -176,6 +176,11 @@ pub enum Event {
         /// `Some(_)` value that differs from the observer's namespace inode
         /// indicates a cross-namespace agent and gates recovery refusal.
         pid_ns_inode: Option<u64>,
+        /// Kernel-attested process *generation* (start-time) token pinned by
+        /// the slot's first beat. `Some` only for `KernelAttested` Linux
+        /// agents; `None` otherwise. Threaded into `Recovery::on_stall` so the
+        /// debounce ledger can tell a recycled PID from the original process.
+        generation: Option<u64>,
         /// Observer-local timestamp (ns since [`Observer`] start) when this
         /// stall event was produced.
         observer_ns: u64,
@@ -784,13 +789,14 @@ impl Observer {
         self.tracker.drain_stalled_slots(
             now_ns,
             self.threshold_ns,
-            |pid, last_nonce, last_ns, origin, pid_ns_inode| {
+            |pid, last_nonce, last_ns, origin, pid_ns_inode, generation| {
                 self.stall_queue.push(Some(Event::Stall {
                     pid,
                     last_nonce,
                     last_ns,
                     origin,
                     pid_ns_inode,
+                    generation,
                     observer_ns: now_ns,
                 }));
             },

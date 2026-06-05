@@ -478,6 +478,12 @@ pub struct PromExporter {
     /// `MAX_LAST_FIRED_CAPACITY` on this signal); a refusal is
     /// suppression (operators alert on this signal).
     recovery_last_fired_evictions_total: u64,
+    /// Total stale debounce windows dropped because a slot's pinned
+    /// generation proved its PID had been recycled to a new process.
+    /// Surfaced as `varta_recovery_debounce_recycle_resets_total`; a
+    /// non-zero value means recovery was correctly **not** suppressed for
+    /// a recycled PID (the genuine new process got its own recovery).
+    recovery_debounce_recycle_resets_total: u64,
     /// Total [`crate::recovery::LastFiredTable`] invariant-violation
     /// fall-throughs — defensive `.get()`/`.get_mut()` else-branches
     /// that should be unreachable in correct operation.  Surfaced as
@@ -726,6 +732,7 @@ impl PromExporter {
             recovery_outcomes_total: [0; RECOVERY_OUTCOME_LABELS.len()],
             recovery_refused_total: [0; RECOVERY_REFUSED_REASON_LABELS.len()],
             recovery_last_fired_evictions_total: 0,
+            recovery_debounce_recycle_resets_total: 0,
             recovery_invariant_violations_total: 0,
             origin_conflict_total: 0,
             frame_namespace_mismatch_total: 0,
@@ -1008,6 +1015,15 @@ impl PromExporter {
     pub fn record_recovery_last_fired_evictions(&mut self, count: u64) {
         self.recovery_last_fired_evictions_total = self
             .recovery_last_fired_evictions_total
+            .saturating_add(count);
+    }
+
+    /// Record one or more debounce-ledger recycle resets — stale windows
+    /// dropped because a slot's pinned generation proved a PID recycle.
+    /// Surfaced as `varta_recovery_debounce_recycle_resets_total`.
+    pub fn record_recovery_debounce_recycle_resets(&mut self, count: u64) {
+        self.recovery_debounce_recycle_resets_total = self
+            .recovery_debounce_recycle_resets_total
             .saturating_add(count);
     }
 

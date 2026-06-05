@@ -58,7 +58,7 @@ fn stall_counter_enables_eviction_after_drain() {
     // Time advances past threshold — every slot stalls.
     let now_ns = threshold_ns * 20;
     let mut stalled = 0u32;
-    t.drain_stalled_slots(now_ns, threshold_ns, |_, _, _, _, _| stalled += 1);
+    t.drain_stalled_slots(now_ns, threshold_ns, |_, _, _, _, _, _| stalled += 1);
     assert_eq!(stalled, cap as u32);
     assert_eq!(t.stall_emitted_count, cap);
 
@@ -78,7 +78,7 @@ fn stall_counter_decrements_on_refresh() {
         t.record(&frame(1, 1), 0, threshold_ns, ORIGIN, None),
         Update::Inserted
     );
-    t.drain_stalled_slots(threshold_ns * 2, threshold_ns, |_, _, _, _, _| {});
+    t.drain_stalled_slots(threshold_ns * 2, threshold_ns, |_, _, _, _, _, _| {});
     assert_eq!(t.stall_emitted_count, 1);
 
     // New beat with strictly increasing nonce → refresh and clear flag.
@@ -105,7 +105,7 @@ fn find_evictable_slot_scan_is_bounded_to_window() {
     }
     // Stall everything.
     let now_ns = threshold_ns * 20;
-    t.drain_stalled_slots(now_ns, threshold_ns, |_, _, _, _, _| {});
+    t.drain_stalled_slots(now_ns, threshold_ns, |_, _, _, _, _, _| {});
     assert_eq!(t.stall_emitted_count, cap);
 
     // Each new-pid insert evicts one slot. Cursor must advance by ≤ window.
@@ -136,7 +136,7 @@ fn eviction_scan_window_is_plumbed_through() {
     }
     // Stall everything so every slot is eviction-eligible.
     let now_ns = threshold_ns * 20;
-    t.drain_stalled_slots(now_ns, threshold_ns, |_, _, _, _, _| {});
+    t.drain_stalled_slots(now_ns, threshold_ns, |_, _, _, _, _, _| {});
     assert_eq!(t.stall_emitted_count, cap);
     // Force an eviction attempt and confirm the cursor advanced by ≤ window.
     let start = t.eviction_scan_cursor;
@@ -196,7 +196,7 @@ fn stall_emitted_count_invariant_holds_across_random_ops() {
             1 => {
                 // Advance and drain (may flip flags to true).
                 now_ns = now_ns.saturating_add(threshold_ns * 2);
-                t.drain_stalled_slots(now_ns, threshold_ns, |_, _, _, _, _| {});
+                t.drain_stalled_slots(now_ns, threshold_ns, |_, _, _, _, _, _| {});
             }
             _ => {
                 // No-op — let other ops dominate.
@@ -229,7 +229,7 @@ fn scan_truncated_counter_increments_on_dry_scan() {
     // eviction threshold so no slot qualifies as a victim. This forces
     // the strict scan to engage and exit empty-handed — the only case
     // where the truncated counter should tick.
-    t.drain_stalled_slots(threshold_ns * 2, threshold_ns, |_, _, _, _, _| {});
+    t.drain_stalled_slots(threshold_ns * 2, threshold_ns, |_, _, _, _, _, _| {});
     assert_eq!(t.stall_emitted_count, 32);
     let _ = t.record(
         &frame(99_999, 1),
@@ -359,7 +359,7 @@ fn higher_trust_origin_replacement_clears_prior_stall_latch() {
         ),
         Update::Inserted
     );
-    t.drain_stalled_slots(120, threshold_ns, |_, _, _, _, _| {});
+    t.drain_stalled_slots(120, threshold_ns, |_, _, _, _, _, _| {});
     assert_eq!(t.stall_emitted_count, 1);
 
     assert_eq!(
@@ -400,7 +400,7 @@ fn terminal_panic_nonce_does_not_poison_regular_stream() {
     );
 
     let mut stalled_nonce = None;
-    t.drain_stalled_slots(120, threshold_ns, |p, last_nonce, _, _, _| {
+    t.drain_stalled_slots(120, threshold_ns, |p, last_nonce, _, _, _, _| {
         if p == pid {
             stalled_nonce = Some(last_nonce);
         }
@@ -542,7 +542,7 @@ fn invariant_violations_stays_zero_under_random_ops() {
             }
             1 => {
                 now_ns = now_ns.saturating_add(threshold_ns * 2);
-                t.drain_stalled_slots(now_ns, threshold_ns, |_, _, _, _, _| {});
+                t.drain_stalled_slots(now_ns, threshold_ns, |_, _, _, _, _, _| {});
             }
             2 => {
                 let pid = (next() % 96) as u32 + 1;
@@ -586,7 +586,7 @@ fn drain_stalled_slots_emits_pinned_origin() {
     );
 
     let mut seen: Vec<(u32, BeatOrigin)> = Vec::new();
-    t.drain_stalled_slots(threshold_ns * 2, threshold_ns, |pid, _, _, origin, _| {
+    t.drain_stalled_slots(threshold_ns * 2, threshold_ns, |pid, _, _, origin, _, _| {
         seen.push((pid, origin));
     });
     seen.sort_by_key(|(p, _)| *p);
@@ -925,8 +925,17 @@ fn pid_recycle_resets_slot_instead_of_dropping_low_nonce() {
         ),
         Update::Inserted
     );
-    // A goes silent and the observer latches a stall for it.
-    t.drain_stalled_slots(threshold_ns * 2, threshold_ns, |_, _, _, _, _| {});
+    // A goes silent and the observer latches a stall for it. A is still
+    // alive here (the recycle happens below, via a fresh beat), so the
+    // generation-recycle probe must say "not recycled" — supplied as an
+    // explicit mock so this pure-compute tracker test never touches
+    // `/proc` (keeps the miri "no FFI" step green under isolation).
+    t.drain_stalled_slots_with_generation_check(
+        threshold_ns * 2,
+        threshold_ns,
+        |_, _| false,
+        |_, _, _, _, _, _| {},
+    );
     assert_eq!(t.stall_emitted_count, 1);
 
     // OS recycles PID 1234 → fresh Agent B, generation G2, nonce restarts at 1.
@@ -985,7 +994,7 @@ fn stall_generation_mismatch_retires_slot_without_emitting_recovery_event() {
             assert_eq!(pinned_generation, 111);
             true
         },
-        |_, _, _, _, _| emitted += 1,
+        |_, _, _, _, _, _| emitted += 1,
     );
 
     assert_eq!(
@@ -1039,7 +1048,7 @@ fn stall_generation_unknown_still_emits_stall() {
         threshold_ns * 2,
         threshold_ns,
         |_, _| false,
-        |pid, nonce, _, origin, ns| emitted.push((pid, nonce, origin, ns)),
+        |pid, nonce, _, origin, ns, _| emitted.push((pid, nonce, origin, ns)),
     );
 
     assert_eq!(

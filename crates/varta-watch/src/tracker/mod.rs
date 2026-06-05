@@ -897,14 +897,17 @@ impl Tracker {
     /// `threshold_ns` **and** the observer has not yet surfaced a stall
     /// event for the current silence run (`stall_emitted == false`).
     /// Qualifying slots are marked `stall_emitted = true` and the callback
-    /// is invoked with `(pid, last_nonce, last_ns, origin, pid_ns_inode)` —
-    /// all within the same mutable borrow, closing the TOCTOU window that
-    /// existed between the former `iter_stalled` / `mark_stall_emitted` pair.
+    /// is invoked with
+    /// `(pid, last_nonce, last_ns, origin, pid_ns_inode, generation)` — all
+    /// within the same mutable borrow, closing the TOCTOU window that existed
+    /// between the former `iter_stalled` / `mark_stall_emitted` pair. The
+    /// trailing `generation` is the slot's pinned start-time token, carried so
+    /// the recovery debounce ledger can distinguish a recycled PID.
     pub fn drain_stalled_slots(
         &mut self,
         now_ns: u64,
         threshold_ns: u64,
-        mut cb: impl FnMut(u32, u64, u64, BeatOrigin, Option<u64>),
+        mut cb: impl FnMut(u32, u64, u64, BeatOrigin, Option<u64>, Option<u64>),
     ) {
         self.drain_stalled_slots_with_generation_check(
             now_ns,
@@ -924,7 +927,7 @@ impl Tracker {
         now_ns: u64,
         threshold_ns: u64,
         mut generation_recycled: impl FnMut(u32, u64) -> bool,
-        mut cb: impl FnMut(u32, u64, u64, BeatOrigin, Option<u64>),
+        mut cb: impl FnMut(u32, u64, u64, BeatOrigin, Option<u64>, Option<u64>),
     ) {
         if self.len > self.entries.len() {
             self.invariant_violations = self.invariant_violations.saturating_add(1);
@@ -967,8 +970,9 @@ impl Tracker {
                 slot.last_ns,
                 slot.origin,
                 slot.pid_ns_inode,
+                slot.generation,
             );
-            cb(event.0, event.1, event.2, event.3, event.4);
+            cb(event.0, event.1, event.2, event.3, event.4, event.5);
             idx += 1;
         }
         #[cfg(debug_assertions)]

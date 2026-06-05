@@ -18,7 +18,23 @@ pub(super) const MAX_LAST_FIRED_CAPACITY: usize = 4096;
 #[derive(Clone, Copy)]
 pub(super) struct LastFiredSlot {
     pub(super) pid: u32,
+    /// Process *generation* token (kernel-attested start-time) pinned by the
+    /// stalled slot whose recovery fired. `None` when the origin carried no
+    /// kernel attestation (remote `OperatorAttestedTransport`, non-Linux).
+    /// Distinguishes a recycled PID from the original process — see
+    /// [`same_lineage`].
+    pub(super) generation: Option<u64>,
     pub(super) fired_at: Instant,
+}
+
+/// Two start-time generation tokens describe the **same** process lineage
+/// unless both are `Some(_)` and differ — in which case the OS recycled the
+/// PID to a new process. `None` on either side is "generation unknown" and is
+/// treated leniently (same lineage, never a recycle signal), mirroring the
+/// tracker `Slot` generation semantics in `tracker/mod.rs`.
+#[inline]
+fn same_lineage(stored: Option<u64>, incoming: Option<u64>) -> bool {
+    !matches!((stored, incoming), (Some(a), Some(b)) if a != b)
 }
 
 /// Outcome of [`LastFiredTable::try_insert`].
@@ -51,6 +67,7 @@ enum ReservationKind {
 pub(super) struct LastFiredReservation {
     idx: usize,
     pid: u32,
+    generation: Option<u64>,
     fired_at: Instant,
     kind: ReservationKind,
 }
@@ -92,6 +109,11 @@ pub(super) struct LastFiredTable {
     pub(super) evictions: u64,
     /// Monotonic count of impossible-by-construction conditions.
     pub(super) invariant_violations: u64,
+    /// Monotonic count of stale debounce windows dropped because a slot's
+    /// pinned generation proved its PID had been recycled to a new process.
+    /// Surfaced as `varta_recovery_debounce_recycle_resets_total`; a non-zero
+    /// value means recovery was correctly *not* suppressed for a recycled PID.
+    pub(super) recycle_resets: u64,
 }
 
 impl LastFiredTable {
@@ -105,21 +127,41 @@ impl LastFiredTable {
             occupied: 0,
             evictions: 0,
             invariant_violations: 0,
+            recycle_resets: 0,
         }
     }
 
-    pub(super) fn get(&self, pid: u32) -> Option<Instant> {
+    /// Return the most recent fire time for `pid` **iff** the stored slot
+    /// belongs to the same process generation as `generation`.
+    ///
+    /// When a slot exists for `pid` but its pinned generation proves a PID
+    /// recycle (`Some != Some`), the stale debounce window is dropped:
+    /// `recycle_resets` is incremented and `None` is returned so the caller
+    /// treats the recycled PID as a fresh agent and does **not** suppress its
+    /// recovery. `None` generation on either side is lenient (see
+    /// [`same_lineage`]) — preserving the pre-generation bare-PID behaviour for
+    /// origins without kernel attestation.
+    pub(super) fn get(&mut self, pid: u32, generation: Option<u64>) -> Option<Instant> {
+        let mut found: Option<(Instant, Option<u64>)> = None;
         for s in self.slots.iter().flatten() {
             if s.pid == pid {
-                return Some(s.fired_at);
+                found = Some((s.fired_at, s.generation));
+                break;
             }
         }
-        None
+        let (fired_at, stored_generation) = found?;
+        if same_lineage(stored_generation, generation) {
+            Some(fired_at)
+        } else {
+            self.recycle_resets = self.recycle_resets.saturating_add(1);
+            None
+        }
     }
 
     pub(super) fn try_reserve(
         &mut self,
         pid: u32,
+        generation: Option<u64>,
         now: Instant,
         debounce: Duration,
     ) -> Option<LastFiredReservation> {
@@ -149,6 +191,7 @@ impl LastFiredTable {
             return Some(LastFiredReservation {
                 idx,
                 pid,
+                generation,
                 fired_at: now,
                 kind: ReservationKind::Existing,
             });
@@ -158,6 +201,7 @@ impl LastFiredTable {
             return Some(LastFiredReservation {
                 idx,
                 pid,
+                generation,
                 fired_at: now,
                 kind: ReservationKind::Empty,
             });
@@ -176,6 +220,7 @@ impl LastFiredTable {
                 return Some(LastFiredReservation {
                     idx,
                     pid,
+                    generation,
                     fired_at: now,
                     kind: ReservationKind::EvictOldest { evicted_pid },
                 });
@@ -197,6 +242,7 @@ impl LastFiredTable {
             ReservationKind::Existing => {
                 *slot = Some(LastFiredSlot {
                     pid: reservation.pid,
+                    generation: reservation.generation,
                     fired_at: reservation.fired_at,
                 });
                 InsertOutcome::Inserted
@@ -209,6 +255,7 @@ impl LastFiredTable {
                 }
                 *slot = Some(LastFiredSlot {
                     pid: reservation.pid,
+                    generation: reservation.generation,
                     fired_at: reservation.fired_at,
                 });
                 InsertOutcome::Inserted
@@ -220,6 +267,7 @@ impl LastFiredTable {
                 }
                 *slot = Some(LastFiredSlot {
                     pid: reservation.pid,
+                    generation: reservation.generation,
                     fired_at: reservation.fired_at,
                 });
                 self.evictions = self.evictions.saturating_add(1);
@@ -232,10 +280,11 @@ impl LastFiredTable {
     pub(super) fn try_insert(
         &mut self,
         pid: u32,
+        generation: Option<u64>,
         now: Instant,
         debounce: Duration,
     ) -> InsertOutcome {
-        match self.try_reserve(pid, now, debounce) {
+        match self.try_reserve(pid, generation, now, debounce) {
             Some(reservation) => self.commit_reserved(reservation),
             None => InsertOutcome::RefusedCapacity,
         }
@@ -266,6 +315,12 @@ impl LastFiredTable {
     pub(super) fn take_invariant_violations(&mut self) -> u64 {
         let n = self.invariant_violations;
         self.invariant_violations = 0;
+        n
+    }
+
+    pub(super) fn take_recycle_resets(&mut self) -> u64 {
+        let n = self.recycle_resets;
+        self.recycle_resets = 0;
         n
     }
 }

@@ -131,6 +131,7 @@ fn prom_exporter_reports_stalls_total_per_pid() {
         observer_ns: 0,
         origin: varta_watch::BeatOrigin::KernelAttested,
         pid_ns_inode: None,
+        generation: None,
     })
     .unwrap();
     let body = http_get(&mut prom, addr, "/metrics");
@@ -261,6 +262,7 @@ fn file_exporter_appends_one_line_per_event() {
             observer_ns: 0,
             origin: varta_watch::BeatOrigin::KernelAttested,
             pid_ns_inode: None,
+            generation: None,
         },
         Event::Decode(DecodeError::BadMagic, 0),
     ];

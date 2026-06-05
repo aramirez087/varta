@@ -929,6 +929,7 @@ fn run(cfg: Config) -> std::io::Result<()> {
                 pid,
                 origin,
                 pid_ns_inode,
+                generation,
                 observer_ns,
                 ..
             } = &ev
@@ -943,7 +944,13 @@ fn run(cfg: Config) -> std::io::Result<()> {
                         (observer_ns_inode, *pid_ns_inode),
                         (Some(a), Some(b)) if a != b
                     );
-                    let outcome = rec.on_stall(*pid, *origin, cross_namespace_agent, *observer_ns);
+                    let outcome = rec.on_stall(
+                        *pid,
+                        *origin,
+                        cross_namespace_agent,
+                        *generation,
+                        *observer_ns,
+                    );
                     #[cfg(feature = "prometheus-exporter")]
                     if let Some(pe) = prom_export.as_mut() {
                         pe.record_recovery_outcome(&outcome, outcome.duration_ns());
@@ -1318,12 +1325,16 @@ fn run(cfg: Config) -> std::io::Result<()> {
         // `book/src/architecture/observer-liveness.md`.
         if let Some(rec) = recovery.as_mut() {
             let evictions = rec.take_last_fired_evictions();
+            let recycle_resets = rec.take_last_fired_recycle_resets();
             let invariants = rec.take_last_fired_invariant_violations();
             let outstanding_probe_exhausted = rec.take_outstanding_probe_exhausted();
             #[cfg(feature = "prometheus-exporter")]
             if let Some(pe) = prom_export.as_mut() {
                 if evictions > 0 {
                     pe.record_recovery_last_fired_evictions(evictions);
+                }
+                if recycle_resets > 0 {
+                    pe.record_recovery_debounce_recycle_resets(recycle_resets);
                 }
                 if invariants > 0 {
                     pe.record_recovery_invariant_violations(invariants);
@@ -1338,6 +1349,7 @@ fn run(cfg: Config) -> std::io::Result<()> {
                 // out (Class-A builds).  The counters still drain so
                 // `LastFiredTable`'s internal accumulators stay bounded.
                 let _ = evictions;
+                let _ = recycle_resets;
                 let _ = invariants;
                 let _ = outstanding_probe_exhausted;
             }

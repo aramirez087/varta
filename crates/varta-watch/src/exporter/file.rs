@@ -357,6 +357,7 @@ impl Exporter for FileExporter {
                 observer_ns,
                 origin: _,
                 pid_ns_inode: _,
+                generation: _,
             } => writeln!(
                 self.sink,
                 "{observer_ns}\tstall\t{pid}\t{last_nonce}\tstall\t-",

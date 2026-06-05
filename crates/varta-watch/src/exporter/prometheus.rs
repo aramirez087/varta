@@ -227,6 +227,22 @@ impl super::PromExporter {
             "varta_recovery_last_fired_evictions_total {}",
             self.recovery_last_fired_evictions_total
         );
+        // varta_recovery_debounce_recycle_resets_total — stale debounce
+        // windows dropped because a slot's pinned generation proved its
+        // PID had been recycled.  A non-zero value means recovery was
+        // correctly NOT suppressed for a genuinely new process that
+        // inherited a recently-recovered PID.  Always emit so `absent()`
+        // alert rules stay green-on-green.
+        self.body_buf.push_str(
+            "# HELP varta_recovery_debounce_recycle_resets_total Stale debounce windows dropped because a slot's pinned generation proved a PID recycle; recovery was not suppressed for the new process.\n",
+        );
+        self.body_buf
+            .push_str("# TYPE varta_recovery_debounce_recycle_resets_total counter\n");
+        let _ = writeln!(
+            self.body_buf,
+            "varta_recovery_debounce_recycle_resets_total {}",
+            self.recovery_debounce_recycle_resets_total
+        );
         // varta_recovery_invariant_violations_total — defensive
         // fall-throughs in `LastFiredTable`.  Non-zero values mean a
         // code bug, not load.  Same alerting posture as
