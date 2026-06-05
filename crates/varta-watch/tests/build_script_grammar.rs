@@ -193,6 +193,17 @@ self_watchdog_secs = 0
 }
 
 #[test]
+fn audit_rotation_budget_ms_above_max_is_rejected() {
+    let bad = "\
+socket = /tmp/x.sock
+threshold_ms = 5000
+audit_rotation_budget_ms = 251
+";
+    let err = parse_kv(bad).expect_err("audit_rotation_budget_ms=251 must error");
+    assert!(err.contains("audit_rotation_budget_ms"), "got: {err}");
+}
+
+#[test]
 fn recovery_audit_sync_every_zero_is_rejected() {
     let bad = "\
 socket = /tmp/x.sock

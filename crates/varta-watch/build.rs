@@ -242,6 +242,17 @@ pub fn parse_kv(input: &str) -> Result<ParsedConfig, String> {
         if n == 0 {
             return Err("audit_rotation_budget_ms must be >= 1".into());
         }
+        // Keep `250` in sync with config::types::MAX_AUDIT_ROTATION_BUDGET_MS
+        // (= MAINTENANCE_STAGE_ABORT_MS / 2; build.rs cannot import crate
+        // consts). A budget at/above the Maintenance-stage self-watchdog abort
+        // lets a normal rotation overrun the watchdog and process::abort() a
+        // healthy observer on the first real rotation.
+        if n > 250 {
+            return Err(
+                "audit_rotation_budget_ms must be <= 250 (Maintenance-stage self-watchdog headroom)"
+                    .into(),
+            );
+        }
     }
     if let Some(v) = out.singletons.get("self_watchdog_secs") {
         // Keep the `1` in sync with config::types::MIN_SELF_WATCHDOG_SECS

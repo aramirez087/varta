@@ -37,9 +37,10 @@ impl super::types::Config {
         self,
     ) -> Result<super::types::Config, super::types::ConfigError> {
         use super::types::{
-            ConfigError, MAX_ITERATION_BUDGET_MS, MAX_READ_TIMEOUT_MS, MAX_RECOVERY_CAPTURE_BYTES,
-            MAX_SCRAPE_BUDGET_MS, MIN_ITERATION_BUDGET_MS, MIN_SCRAPE_BUDGET_MS,
-            MIN_SELF_WATCHDOG_SECS, MIN_SHUTDOWN_GRACE_MS, MIN_THRESHOLD_MS,
+            ConfigError, MAX_AUDIT_ROTATION_BUDGET_MS, MAX_ITERATION_BUDGET_MS,
+            MAX_READ_TIMEOUT_MS, MAX_RECOVERY_CAPTURE_BYTES, MAX_SCRAPE_BUDGET_MS,
+            MIN_ITERATION_BUDGET_MS, MIN_SCRAPE_BUDGET_MS, MIN_SELF_WATCHDOG_SECS,
+            MIN_SHUTDOWN_GRACE_MS, MIN_THRESHOLD_MS,
         };
 
         if self.threshold < std::time::Duration::from_millis(MIN_THRESHOLD_MS) {
@@ -151,6 +152,16 @@ impl super::types::Config {
         if self.audit_rotation_budget_ms == 0 {
             return Err(ConfigError::CompileTimeConfigInvalid {
                 reason: "audit rotation budget must be nonzero",
+            });
+        }
+        // A rotation budget at/above the Maintenance-stage self-watchdog abort
+        // lets a normal rotation overrun the watchdog and self-abort a healthy
+        // observer. Mirror the argv parser's ceiling so the compile-time-config
+        // path enforces the same invariant.
+        if self.audit_rotation_budget_ms > MAX_AUDIT_ROTATION_BUDGET_MS {
+            return Err(ConfigError::AuditRotationBudgetTooLarge {
+                value: self.audit_rotation_budget_ms as u64,
+                max: MAX_AUDIT_ROTATION_BUDGET_MS as u64,
             });
         }
 
@@ -280,6 +291,17 @@ mod tests {
         assert!(matches!(
             cfg.validate_runtime(),
             Err(ConfigError::SelfWatchdogTooLow { value: 0, min: 1 })
+        ));
+    }
+
+    #[test]
+    fn validate_runtime_rejects_audit_rotation_budget_too_large() {
+        let mut cfg = valid_config();
+        cfg.audit_rotation_budget_ms = super::super::types::MAX_AUDIT_ROTATION_BUDGET_MS + 1;
+
+        assert!(matches!(
+            cfg.validate_runtime(),
+            Err(ConfigError::AuditRotationBudgetTooLarge { .. })
         ));
     }
 

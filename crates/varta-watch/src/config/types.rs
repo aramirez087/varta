@@ -38,6 +38,31 @@ const _: () = assert!(
     "read-timeout ceiling must stay below the Poll-stage self-watchdog abort",
 );
 
+/// Hard self-watchdog abort threshold for the `Maintenance` iteration stage,
+/// in milliseconds. `STAGE_ABORT_NS[IterStage::Maintenance]` in `main.rs`
+/// references this constant so the two cannot drift (mirrors how
+/// [`POLL_STAGE_ABORT_MS`] feeds `STAGE_ABORT_NS[IterStage::Poll]`).
+pub const MAINTENANCE_STAGE_ABORT_MS: u64 = 500;
+
+/// Upper bound for `--audit-rotation-budget-ms`. `drive_audit_rotation` runs
+/// inside the `Maintenance` stage and is *designed* to spend up to its full
+/// per-tick budget before yielding (see `audit/rotation.rs`), so the budget
+/// MUST stay safely below [`MAINTENANCE_STAGE_ABORT_MS`]; otherwise a healthy
+/// observer rotating its audit log on a slow disk trips the per-stage
+/// self-watchdog and `process::abort()`s — a host reboot under `--hw-watchdog`.
+/// Half the abort threshold leaves headroom for the co-resident Maintenance
+/// work (eviction drains, the 10 ms `flush_audit_pending`) plus the watchdog's
+/// tick granularity, exactly as [`MAX_READ_TIMEOUT_MS`] does for the Poll
+/// stage. 250 ms is also far below the *default*-build full-iteration deadline
+/// (`--self-watchdog-secs`, min 1 s), so the bound protects both feature
+/// profiles (the per-stage abort itself is `prometheus-exporter`-gated).
+pub const MAX_AUDIT_ROTATION_BUDGET_MS: u32 = (MAINTENANCE_STAGE_ABORT_MS / 2) as u32;
+
+const _: () = assert!(
+    (MAX_AUDIT_ROTATION_BUDGET_MS as u64) < MAINTENANCE_STAGE_ABORT_MS,
+    "audit-rotation budget ceiling must stay below the Maintenance-stage self-watchdog abort",
+);
+
 /// Minimum allowed value for `--threshold-ms`. A threshold of 0 ms would
 /// cause every agent to be perpetually stalled, triggering recovery commands
 /// on every poll cycle.
@@ -420,7 +445,10 @@ pub struct Config {
     /// state is preserved and the next tick resumes.  Increments
     /// `varta_audit_rotation_budget_exceeded_total` on overrun.  Set by
     /// `--audit-rotation-budget-ms`; defaults to
-    /// [`DEFAULT_AUDIT_ROTATION_BUDGET_MS`].  `0` is rejected.
+    /// [`DEFAULT_AUDIT_ROTATION_BUDGET_MS`].  Accepted range
+    /// `1..=`[`MAX_AUDIT_ROTATION_BUDGET_MS`]: `0` perpetually defers rotation
+    /// and a value at/above the Maintenance-stage self-watchdog abort
+    /// `process::abort()`s a healthy observer.
     pub audit_rotation_budget_ms: u32,
     /// [test-hooks only] Sleep for this many milliseconds on the first poll
     /// iteration, simulating a wedged loop.  Used by the self-watchdog
@@ -617,6 +645,17 @@ pub enum ConfigError {
         /// The maximum allowed value, in milliseconds.
         max: u64,
     },
+    /// `--audit-rotation-budget-ms` exceeded [`MAX_AUDIT_ROTATION_BUDGET_MS`].
+    /// `drive_audit_rotation` is spent inside the `Maintenance` stage and runs
+    /// up to its full budget per tick, so a budget at/above the Maintenance
+    /// self-watchdog abort lets a normal rotation `process::abort()` a healthy
+    /// observer.
+    AuditRotationBudgetTooLarge {
+        /// The value provided, in milliseconds.
+        value: u64,
+        /// The maximum allowed value, in milliseconds.
+        max: u64,
+    },
     /// `--clock-source boottime` was requested but the host kernel has no
     /// equivalent of Linux's `CLOCK_BOOTTIME`. Currently fires on every
     /// non-Linux target (macOS, *BSD).
@@ -763,6 +802,12 @@ impl core::fmt::Display for ConfigError {
                 "--read-timeout-ms: {value} ms exceeds the maximum {max} ms \
                  (must stay below the {POLL_STAGE_ABORT_MS} ms Poll-stage self-watchdog abort)"
             ),
+            ConfigError::AuditRotationBudgetTooLarge { value, max } => write!(
+                f,
+                "--audit-rotation-budget-ms: {value} ms exceeds the maximum {max} ms \
+                 (must stay below the {MAINTENANCE_STAGE_ABORT_MS} ms Maintenance-stage \
+                 self-watchdog abort)"
+            ),
             ConfigError::ClockSourceUnsupported { source, platform } => {
                 let hint = match source {
                     crate::clock::ClockSource::Boottime => {
@@ -837,6 +882,10 @@ impl core::fmt::Display for ConfigError {
             ConfigError::ReadTimeoutTooLarge { value, max } => write!(
                 f,
                 "read timeout out of range: {value} ms exceeds {max} ms ({REF})"
+            ),
+            ConfigError::AuditRotationBudgetTooLarge { value, max } => write!(
+                f,
+                "audit rotation budget out of range: {value} ms exceeds {max} ms ({REF})"
             ),
             ConfigError::ThresholdTooLow { value, min } => {
                 write!(f, "threshold below minimum: {value} ms < {min} ms ({REF})")

@@ -336,8 +336,10 @@ OPTIONAL:
                                      preserved and the next tick
                                      resumes. Overruns increment
                                      varta_audit_rotation_budget_exceeded_total.
-                                     Default 50. 0 is rejected at parse
-                                     time.
+                                     Default 50. Range 1-250 ms; a value at or
+                                     above the Maintenance-stage self-watchdog
+                                     abort would let a normal rotation abort a
+                                     healthy observer.
     --recovery-capture-stdio       Capture child stdout/stderr non-
                                      blockingly so its length and
                                      truncation status appear in the audit

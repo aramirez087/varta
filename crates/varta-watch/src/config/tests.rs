@@ -150,6 +150,69 @@ fn self_watchdog_below_minimum_is_rejected() {
     );
 }
 
+/// `--audit-rotation-budget-ms` must be rejected once it would reach the
+/// Maintenance-stage self-watchdog abort. `drive_audit_rotation` runs up to its
+/// full budget inside the Maintenance stage every tick, so a budget at/above
+/// that abort lets a normal rotation `process::abort()` a healthy observer (a
+/// host reboot under `--hw-watchdog`). Regression for the previously
+/// upper-unbounded `--audit-rotation-budget-ms` (only `0` was rejected).
+#[test]
+fn audit_rotation_budget_above_ceiling_is_rejected() {
+    let too_big = super::types::MAX_AUDIT_ROTATION_BUDGET_MS + 1;
+    let too_big_s = too_big.to_string();
+    match Config::from_args(args(&[
+        "--socket",
+        "/tmp/x.sock",
+        "--threshold-ms",
+        "100",
+        "--audit-rotation-budget-ms",
+        &too_big_s,
+    ])) {
+        Err(ConfigError::AuditRotationBudgetTooLarge { value, max }) => {
+            assert_eq!(value, u64::from(too_big));
+            assert_eq!(max, u64::from(super::types::MAX_AUDIT_ROTATION_BUDGET_MS));
+            assert!(
+                u64::from(super::types::MAX_AUDIT_ROTATION_BUDGET_MS)
+                    < super::types::MAINTENANCE_STAGE_ABORT_MS,
+                "the ceiling must stay below the Maintenance-stage self-watchdog abort"
+            );
+        }
+        other => panic!("expected AuditRotationBudgetTooLarge, got {other:?}"),
+    }
+
+    // The ceiling value itself parses cleanly.
+    let max_s = super::types::MAX_AUDIT_ROTATION_BUDGET_MS.to_string();
+    let cfg = Config::from_args(args(&[
+        "--socket",
+        "/tmp/x.sock",
+        "--threshold-ms",
+        "100",
+        "--audit-rotation-budget-ms",
+        &max_s,
+    ]))
+    .expect("ceiling value must parse");
+    assert_eq!(
+        cfg.audit_rotation_budget_ms,
+        super::types::MAX_AUDIT_ROTATION_BUDGET_MS
+    );
+
+    // `0` stays rejected as `BadInteger` — the lower-bound contract is unchanged.
+    assert!(matches!(
+        Config::from_args(args(&[
+            "--socket",
+            "/tmp/x.sock",
+            "--threshold-ms",
+            "100",
+            "--audit-rotation-budget-ms",
+            "0",
+        ])),
+        Err(ConfigError::BadInteger {
+            flag: "--audit-rotation-budget-ms",
+            ..
+        })
+    ));
+}
+
 #[cfg(feature = "prometheus-exporter")]
 #[test]
 fn parses_full_flag_surface() {

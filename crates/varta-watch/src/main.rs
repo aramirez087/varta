@@ -110,8 +110,8 @@ static CURRENT_STAGE: AtomicU8 = AtomicU8::new(u8::MAX);
 const STAGE_ABORT_NS: [u64; 6] = [
     2_000 * 1_000_000, // DrainPending: 2 s (5× 20 ms soft budget)
     varta_watch::config::POLL_STAGE_ABORT_MS * 1_000_000, // Poll: capped vs MAX_READ_TIMEOUT_MS
-    500 * 1_000_000,   // Maintenance:  500 ms (50× 10 ms)
-    1_000 * 1_000_000, // RecoveryReap: 1 s (50× 20 ms)
+    varta_watch::config::MAINTENANCE_STAGE_ABORT_MS * 1_000_000, // Maintenance: capped vs MAX_AUDIT_ROTATION_BUDGET_MS
+    1_000 * 1_000_000,                                           // RecoveryReap: 1 s (50× 20 ms)
     2_000 * 1_000_000, // ServePending: 2 s (10× 200 ms structural cap)
     1_000 * 1_000_000, // Housekeeping: 1 s (100× 10 ms)
 ];
