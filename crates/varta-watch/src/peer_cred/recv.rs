@@ -252,7 +252,7 @@ pub(crate) fn recv_authenticated(fd: i32) -> RecvResult {
 
         if plat::ctrl_truncated(&mhdr) {
             #[cfg(target_os = "linux")]
-            plat::close_pidfds_after_recv(&mhdr);
+            plat::close_received_fds(&mhdr);
             return RecvResult::CtrlTruncated(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "ancillary data truncated by kernel (ANCILLARY_BUFFER_SIZE too small)",
@@ -261,7 +261,7 @@ pub(crate) fn recv_authenticated(fd: i32) -> RecvResult {
 
         if n as usize != VLP_FRAME_LEN {
             #[cfg(target_os = "linux")]
-            plat::close_pidfds_after_recv(&mhdr);
+            plat::close_received_fds(&mhdr);
             return RecvResult::ShortRead;
         }
 
@@ -404,6 +404,120 @@ mod tests {
     fn zero_peer_pid_collapses_to_socket_mode_only() {
         assert_eq!(origin_for_peer_pid(0), BeatOrigin::SocketModeOnly);
         assert_ne!(origin_for_peer_pid(0), BeatOrigin::KernelAttested);
+    }
+
+    /// Regression (fd-exhaustion DoS): a peer datagram carrying an `SCM_RIGHTS`
+    /// ancillary message must not leak the passed file descriptor into the
+    /// long-lived observer. Before the fix the cmsg walk matched only
+    /// `SCM_CREDENTIALS`/`SCM_PIDFD`, so peer-injected fds were silently
+    /// installed by `recvmsg` and never closed — any same-UID process could
+    /// exhaust the observer's fd table by sending well-formed beats with fds
+    /// attached, disabling recovery while the process still appeared live.
+    ///
+    /// The datagram is sent in-process (sender and observer share this PID), so
+    /// the kernel attests a nonzero peer PID and the beat is accepted normally;
+    /// the discriminating assertion is that the observer's open-fd count does
+    /// not grow across the `recv`.
+    #[cfg(all(target_os = "linux", not(feature = "force-socketmode-fallback")))]
+    #[test]
+    fn scm_rights_fds_are_reclaimed_not_leaked() {
+        use super::plat;
+        use super::{enable_credential_passing, recv_authenticated, RecvResult};
+        use std::os::unix::io::AsRawFd;
+        use std::os::unix::net::UnixDatagram;
+
+        extern "C" {
+            fn sendmsg(fd: i32, msg: *const plat::Msghdr, flags: i32) -> isize;
+        }
+
+        // One `SCM_RIGHTS` cmsg carrying a single fd: aligned cmsghdr (16) +
+        // one i32 fd, padded to the next 8-byte boundary (24 total).
+        #[repr(C, align(8))]
+        struct ScmRightsCmsg {
+            hdr: plat::Cmsghdr,
+            fd: i32,
+            _pad: i32,
+        }
+
+        fn open_fd_count() -> usize {
+            std::fs::read_dir("/proc/self/fd")
+                .expect("read /proc/self/fd")
+                .count()
+        }
+
+        let path =
+            std::env::temp_dir().join(format!("varta-scmrights-{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+
+        let observer = UnixDatagram::bind(&path).expect("bind observer");
+        enable_credential_passing(observer.as_raw_fd()).expect("enable credential passing");
+
+        let sender = UnixDatagram::unbound().expect("sender socket");
+        sender.connect(&path).expect("connect sender");
+
+        // The fd whose recvmsg-installed duplicate must be reclaimed. We keep
+        // `passed` open for the whole test; only its duplicate in the observer
+        // is the leak candidate.
+        let passed = std::fs::File::open("/dev/null").expect("open /dev/null");
+
+        let mut beat = [0u8; super::VLP_FRAME_LEN];
+        let mut iov = plat::Iovec {
+            iov_base: beat.as_mut_ptr() as *mut core::ffi::c_void,
+            iov_len: beat.len(),
+        };
+        let mut cmsg = ScmRightsCmsg {
+            hdr: plat::Cmsghdr {
+                // CMSG_LEN(sizeof(int)) on 64-bit Linux = 16 + 4 = 20.
+                cmsg_len: core::mem::size_of::<plat::Cmsghdr>() + core::mem::size_of::<i32>(),
+                cmsg_level: plat::SOL_SOCKET,
+                cmsg_type: plat::SCM_RIGHTS,
+            },
+            fd: passed.as_raw_fd(),
+            _pad: 0,
+        };
+        let mhdr = plat::Msghdr {
+            msg_name: core::ptr::null_mut(),
+            msg_namelen: 0,
+            _pad1: 0,
+            msg_iov: &mut iov,
+            msg_iovlen: 1,
+            msg_control: &mut cmsg as *mut ScmRightsCmsg as *mut core::ffi::c_void,
+            msg_controllen: core::mem::size_of::<ScmRightsCmsg>(),
+            msg_flags: 0,
+            _pad2: 0,
+        };
+
+        // SAFETY: `mhdr` describes the 32-byte `beat` iovec and an in-bounds
+        // `SCM_RIGHTS` control buffer carrying one live fd; all buffers outlive
+        // the call. `sendmsg(2)` only reads them.
+        let sent = unsafe { sendmsg(sender.as_raw_fd(), &mhdr, 0) };
+        assert_eq!(
+            sent,
+            super::VLP_FRAME_LEN as isize,
+            "sendmsg should send the beat"
+        );
+
+        let before = open_fd_count();
+        let result = recv_authenticated(observer.as_raw_fd());
+
+        // Consume `result` by value before measuring: on Linux 6.5+ the kernel
+        // also attaches an `SCM_PIDFD`, which `recv_authenticated` legitimately
+        // returns (still open) inside the result. Dropping it here closes that
+        // pidfd so the count isolates the peer-injected `SCM_RIGHTS` leak.
+        let (data, peer_pid) = match result {
+            RecvResult::Authenticated { data, peer_pid, .. } => (data, peer_pid),
+            _ => panic!("expected an authenticated beat"),
+        };
+        let after = open_fd_count();
+
+        assert_eq!(data, beat, "beat payload should survive intact");
+        assert_ne!(peer_pid, 0, "in-process send is kernel-attested");
+        assert_eq!(
+            after, before,
+            "observer leaked a peer-injected SCM_RIGHTS fd (before={before}, after={after})"
+        );
+
+        let _ = std::fs::remove_file(&path);
     }
 
     #[cfg(target_os = "macos")]

@@ -55,6 +55,10 @@ pub(crate) const SO_PASSPIDFD: i32 = 76;
 pub(crate) const SCM_CREDENTIALS: i32 = 2;
 /// `SCM_PIDFD` ancillary type carrying one pidfd (`int`).
 pub(crate) const SCM_PIDFD: i32 = 0x04;
+/// `SCM_RIGHTS` ancillary type carrying one or more passed file descriptors.
+/// Varta never sends fds, so any `SCM_RIGHTS` a peer attaches is unsolicited
+/// and must be reclaimed — see [`close_scm_rights_payload`].
+pub(crate) const SCM_RIGHTS: i32 = 0x01;
 /// Set by the kernel when ancillary data was truncated (buffer too small).
 /// Linux `<bits/socket.h>`: `MSG_CTRUNC = 0x08`. (`0x20` is `MSG_TRUNC`, the
 /// *data*-truncation flag — using it here both missed genuine credential-cmsg
@@ -182,30 +186,85 @@ pub(crate) fn peer_pid_after_recv(
                     pidfd = Some(unsafe { PeerPidFd::from_raw(fd) });
                 }
             }
+            // A peer can attach `SCM_RIGHTS` to any datagram; the kernel
+            // installs those descriptors into the observer on `recvmsg`
+            // regardless of socket options, and `MSG_CMSG_CLOEXEC` only marks
+            // them close-on-exec rather than closing them. Reclaim them in this
+            // same walk so the success, UID-mismatch, and no-credential return
+            // paths all leave no peer-injected fd behind.
+            SCM_RIGHTS => close_scm_rights_payload(hdr, data_ptr),
             _ => {}
         }
     });
     cred.map(|(pid, uid)| (pid, uid, pidfd))
 }
 
-/// Best-effort cleanup used when recvmsg reported truncated ancillary data
-/// before normal credential extraction could take ownership of `SCM_PIDFD`.
-pub(crate) fn close_pidfds_after_recv(mhdr: &Msghdr) {
-    scan_linux_cmsgs(mhdr, |hdr, data_ptr| {
-        if hdr.cmsg_level != SOL_SOCKET || hdr.cmsg_type != SCM_PIDFD {
-            return;
-        }
-        let payload_len = hdr
-            .cmsg_len
-            .saturating_sub(<LinuxCmsg as super::super::cmsg::CmsgPlatform>::cmsg_hdr_size());
-        if payload_len < core::mem::size_of::<i32>() {
-            return;
-        }
-        // SAFETY: payload length was checked above.
-        let fd = unsafe { data_ptr.cast::<i32>().read_unaligned() };
+/// Close every file descriptor carried by an `SCM_RIGHTS` cmsg.
+///
+/// Varta never sends ancillary file descriptors, so any `SCM_RIGHTS` a peer
+/// attaches to a datagram is unsolicited. File-descriptor passing is
+/// sender-driven: `recvmsg(2)` installs the passed fds into the observer
+/// independently of `SO_PASSCRED`/`SO_PASSPIDFD`, and `MSG_CMSG_CLOEXEC` only
+/// sets `FD_CLOEXEC` — it does not close them. Left open, they accumulate in
+/// the long-lived single-threaded observer until `RLIMIT_NOFILE` is reached,
+/// after which `recvmsg`, `/metrics` accepts, `/proc` reads, and audit-log
+/// rotation begin failing — silently disabling recovery supervision while the
+/// process still appears live. Reclaim them immediately so every fd acquired on
+/// the beat path is owned and bounded.
+fn close_scm_rights_payload(hdr: &Cmsghdr, data_ptr: *const u8) {
+    let payload_len = hdr
+        .cmsg_len
+        .saturating_sub(<LinuxCmsg as super::super::cmsg::CmsgPlatform>::cmsg_hdr_size());
+    let fd_count = payload_len / core::mem::size_of::<i32>();
+    for i in 0..fd_count {
+        // SAFETY: the cmsg walker proved the whole cmsg (header + `payload_len`
+        // bytes) lies inside the kernel-supplied ancillary buffer, so the i32
+        // at byte offset `i * 4` is in bounds. `read_unaligned` because the
+        // cmsg payload ABI only promises byte validity.
+        let fd = unsafe {
+            data_ptr
+                .add(i * core::mem::size_of::<i32>())
+                .cast::<i32>()
+                .read_unaligned()
+        };
         if fd >= 0 {
-            // SAFETY: take ownership long enough to close on drop.
+            // SAFETY: recvmsg installed this descriptor into our fd table; take
+            // ownership long enough to close it on drop. `PeerPidFd` is reused
+            // purely as a close-on-drop handle here.
             let _owned = unsafe { PeerPidFd::from_raw(fd) };
+        }
+    }
+}
+
+/// Reclaim every file descriptor the kernel installed from this datagram's
+/// ancillary data. Used on the early-drop paths (`MSG_CTRUNC`, short read) that
+/// return before [`peer_pid_after_recv`] can take ownership of the pidfd.
+///
+/// Closes both the kernel-attested `SCM_PIDFD` (which the credential path would
+/// otherwise have consumed) and any peer-injected `SCM_RIGHTS` descriptors, so
+/// a malformed-size or truncated datagram cannot leak fds into the observer.
+pub(crate) fn close_received_fds(mhdr: &Msghdr) {
+    scan_linux_cmsgs(mhdr, |hdr, data_ptr| {
+        if hdr.cmsg_level != SOL_SOCKET {
+            return;
+        }
+        match hdr.cmsg_type {
+            SCM_PIDFD => {
+                let payload_len = hdr.cmsg_len.saturating_sub(
+                    <LinuxCmsg as super::super::cmsg::CmsgPlatform>::cmsg_hdr_size(),
+                );
+                if payload_len < core::mem::size_of::<i32>() {
+                    return;
+                }
+                // SAFETY: payload length was checked above.
+                let fd = unsafe { data_ptr.cast::<i32>().read_unaligned() };
+                if fd >= 0 {
+                    // SAFETY: take ownership long enough to close on drop.
+                    let _owned = unsafe { PeerPidFd::from_raw(fd) };
+                }
+            }
+            SCM_RIGHTS => close_scm_rights_payload(hdr, data_ptr),
+            _ => {}
         }
     });
 }
