@@ -36,9 +36,72 @@ pub(crate) use ns_inode::{observer_pid_namespace_inode, read_pid_namespace_inode
 pub(crate) use recv::{enable_credential_passing, recv_authenticated};
 pub(crate) use start_time::read_pid_start_time;
 pub(crate) use types::observer_uid;
-pub use types::{BeatOrigin, RecvResult};
+pub use types::{BeatOrigin, PeerPidFd, RecvResult};
+
+/// Read PID namespace and start-time metadata for a kernel-attested peer.
+///
+/// When Linux supplied a pidfd with the datagram, `/proc/<pid>` metadata is
+/// trusted only if the pidfd proves the original sender is still live both
+/// before and after the reads. If the sender has already exited, the numeric
+/// PID may have been recycled, so returning `(None, None)` is safer than
+/// pinning namespace/generation from the wrong process.
+pub(crate) fn read_peer_identity(
+    peer_pid: u32,
+    peer_pidfd: Option<&PeerPidFd>,
+) -> (Option<u64>, Option<u64>) {
+    #[cfg(target_os = "linux")]
+    if let Some(pidfd) = peer_pidfd {
+        if pidfd.is_live() != Some(true) {
+            return (None, None);
+        }
+        let ns = read_pid_namespace_inode(peer_pid);
+        let generation = read_pid_start_time(peer_pid);
+        if pidfd.is_live() == Some(true) {
+            return (ns, generation);
+        }
+        return (None, None);
+    }
+
+    let _ = peer_pidfd;
+    (
+        read_pid_namespace_inode(peer_pid),
+        read_pid_start_time(peer_pid),
+    )
+}
 
 mod cmsg;
 
 mod platform;
 use platform as plat;
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+    use std::os::unix::io::IntoRawFd;
+
+    #[test]
+    fn read_peer_identity_without_pidfd_preserves_proc_fallback() {
+        let (_ns, generation) = read_peer_identity(std::process::id(), None);
+        assert!(
+            generation.is_some(),
+            "self /proc stat should expose a start-time generation"
+        );
+    }
+
+    #[test]
+    fn read_peer_identity_with_non_live_pidfd_refuses_proc_metadata() {
+        // A regular file polls readable immediately, which exercises the same
+        // "not proven live" branch as an exited pidfd. PeerPidFd takes
+        // ownership and closes the descriptor on drop.
+        let fd = std::fs::File::open("/dev/null")
+            .expect("open /dev/null")
+            .into_raw_fd();
+        let pidfd = unsafe { PeerPidFd::from_raw(fd) };
+
+        assert_eq!(
+            read_peer_identity(std::process::id(), Some(&pidfd)),
+            (None, None),
+            "unverified pidfd state must not allow /proc identity pinning"
+        );
+    }
+}

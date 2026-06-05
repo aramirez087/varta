@@ -175,9 +175,11 @@ unsafe impl super::super::cmsg::CmsgPlatform for BsdCmsg {
 }
 
 /// Extract peer PID and effective UID after a successful `recvmsg` on BSD.
-pub(crate) fn peer_pid_after_recv(_fd: i32, mhdr: &Msghdr) -> Option<(u32, u32)> {
-    super::super::cmsg::find_credential::<BsdCmsg>(mhdr)
+pub(crate) fn peer_pid_after_recv(_fd: i32, mhdr: &Msghdr) -> Option<(u32, u32, NonePidFd)> {
+    super::super::cmsg::find_credential::<BsdCmsg>(mhdr).map(|(pid, uid)| (pid, uid, None))
 }
+
+type NonePidFd = Option<super::super::types::PeerPidFd>;
 
 /// Build a zero-initialised `Msghdr` for use as the `recvmsg(2)` argument.
 pub(crate) fn msghdr_for_recv(

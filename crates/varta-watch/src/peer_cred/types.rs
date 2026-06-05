@@ -14,6 +14,29 @@ extern "C" {
     fn getuid() -> u32;
 }
 
+#[cfg(target_os = "linux")]
+extern "C" {
+    fn close(fd: i32) -> i32;
+    fn poll(fds: *mut PollFd, nfds: usize, timeout: i32) -> i32;
+}
+
+#[cfg(target_os = "linux")]
+#[repr(C)]
+struct PollFd {
+    fd: i32,
+    events: i16,
+    revents: i16,
+}
+
+#[cfg(target_os = "linux")]
+const POLLIN: i16 = 0x0001;
+#[cfg(target_os = "linux")]
+const POLLERR: i16 = 0x0008;
+#[cfg(target_os = "linux")]
+const POLLHUP: i16 = 0x0010;
+#[cfg(target_os = "linux")]
+const POLLNVAL: i16 = 0x0020;
+
 /// Cached observer UID — called once at startup, then read from the static.
 /// On platforms where `getuid()` isn't available as a direct symbol (e.g.
 /// musl), caching avoids per-datagram syscall overhead and portability issues.
@@ -25,6 +48,65 @@ pub(crate) fn observer_uid() -> u32 {
     // mutable shared state — the only "unsafe" aspect is the FFI boundary
     // itself.
     *UID.get_or_init(|| unsafe { getuid() })
+}
+
+/// Stable kernel handle for a Linux datagram sender.
+///
+/// On Linux kernels that support `SO_PASSPIDFD`, `recvmsg(2)` can attach an
+/// `SCM_PIDFD` file descriptor alongside `SCM_CREDENTIALS`. The numeric PID
+/// from credentials is still the wire identity, but the pidfd lets the
+/// observer prove that `/proc/<pid>` still names the same task before trusting
+/// namespace or start-time metadata. The descriptor is closed automatically.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub struct PeerPidFd {
+    fd: i32,
+}
+
+impl PeerPidFd {
+    /// Take ownership of a pidfd returned by the kernel in an `SCM_PIDFD`
+    /// ancillary message.
+    ///
+    /// # Safety
+    ///
+    /// `fd` must be a valid, owned pidfd. After this call, the returned
+    /// [`PeerPidFd`] owns it and will close it on drop.
+    #[cfg(target_os = "linux")]
+    pub(crate) unsafe fn from_raw(fd: i32) -> Self {
+        Self { fd }
+    }
+
+    /// Return `Some(true)` only when polling the pidfd proves the task has not
+    /// exited yet. `Some(false)` means the pidfd is readable/hung up (the task
+    /// exited); `None` means the kernel refused the poll and the caller should
+    /// avoid trusting pid-derived `/proc` metadata.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn is_live(&self) -> Option<bool> {
+        let mut pfd = PollFd {
+            fd: self.fd,
+            events: POLLIN,
+            revents: 0,
+        };
+        // SAFETY: `pfd` points to one valid `pollfd` entry. Timeout 0 makes
+        // this a non-blocking liveness probe.
+        let rc = unsafe { poll(&mut pfd, 1, 0) };
+        if rc < 0 {
+            return None;
+        }
+        if pfd.revents & (POLLIN | POLLERR | POLLHUP | POLLNVAL) != 0 {
+            Some(false)
+        } else {
+            Some(true)
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for PeerPidFd {
+    fn drop(&mut self) {
+        // SAFETY: `self.fd` is owned by this wrapper. Close errors cannot be
+        // usefully recovered on the receive path.
+        let _ = unsafe { close(self.fd) };
+    }
 }
 
 /// Classification of a received beat's transport origin.
@@ -119,6 +201,10 @@ pub enum RecvResult {
         /// (peer exited, `ptrace_may_access` denial, `/proc` not mounted), or
         /// for UDP transports where `peer_pid` is 0.
         peer_pid_ns_inode: Option<u64>,
+        /// Linux pidfd for the sending task, when the kernel supplied
+        /// `SCM_PIDFD`. Used to validate that deferred `/proc/<pid>` reads
+        /// still refer to the datagram sender rather than a recycled PID.
+        peer_pidfd: Option<PeerPidFd>,
         /// Transport-class classification of the beat.
         origin: BeatOrigin,
         /// Received frame payload (always 32 bytes).

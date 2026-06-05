@@ -304,6 +304,11 @@ mod miri_cmsg_tests {
         cmsg_align(cmsg_hdr_size() + mem::size_of::<plat::Ucred>())
     }
 
+    /// CMSG_SPACE for one integer fd payload (`SCM_PIDFD`) on Linux.
+    fn cmsg_space_i32() -> usize {
+        cmsg_align(cmsg_hdr_size() + mem::size_of::<i32>())
+    }
+
     /// 8-byte-aligned scratch buffer for cmsg walker tests.
     ///
     /// Plain `[u8; N]` arrays guarantee only 1-byte alignment. Miri flags
@@ -342,6 +347,36 @@ mod miri_cmsg_tests {
         slice[ucred_off + 8..ucred_off + 12].copy_from_slice(&gid.to_ne_bytes());
     }
 
+    fn write_scm_pidfd(buf: &mut [u8], offset: usize, fd: i32) {
+        let hdr_size = cmsg_hdr_size();
+        let total = cmsg_space_i32();
+        let slice = &mut buf[offset..offset + total];
+        slice.fill(0);
+
+        let cmsg_len: usize = hdr_size + mem::size_of::<i32>();
+        slice[..mem::size_of::<usize>()].copy_from_slice(&cmsg_len.to_ne_bytes());
+        slice[mem::size_of::<usize>()..mem::size_of::<usize>() + 4]
+            .copy_from_slice(&plat::SOL_SOCKET.to_ne_bytes());
+        slice[mem::size_of::<usize>() + 4..mem::size_of::<usize>() + 8]
+            .copy_from_slice(&plat::SCM_PIDFD.to_ne_bytes());
+
+        let fd_off = hdr_size;
+        slice[fd_off..fd_off + 4].copy_from_slice(&fd.to_ne_bytes());
+    }
+
+    fn assert_pid_uid_no_pidfd(
+        result: Option<(u32, u32, Option<super::super::types::PeerPidFd>)>,
+        pid: u32,
+        uid: u32,
+    ) {
+        let (got_pid, got_uid, got_pidfd) = result.expect("expected credentials");
+        assert_eq!((got_pid, got_uid), (pid, uid));
+        assert!(
+            got_pidfd.is_none(),
+            "credential-only cmsg must not fabricate pidfd"
+        );
+    }
+
     /// Build a `plat::Msghdr` that points into `anc_buf` with `controllen` bytes
     /// of valid ancillary data.
     fn make_mhdr(anc_buf: &[u8], controllen: usize) -> plat::Msghdr {
@@ -363,7 +398,7 @@ mod miri_cmsg_tests {
         let buf = [];
         let mhdr = make_mhdr(&buf, 0);
         let result = plat::peer_pid_after_recv(0, &mhdr);
-        assert_eq!(result, None);
+        assert!(result.is_none());
     }
 
     #[test]
@@ -373,7 +408,27 @@ mod miri_cmsg_tests {
         let controllen = cmsg_space_ucred();
         let mhdr = make_mhdr(&abuf.0, controllen);
         let result = plat::peer_pid_after_recv(0, &mhdr);
-        assert_eq!(result, Some((1234, 1000)));
+        assert_pid_uid_no_pidfd(result, 1234, 1000);
+    }
+
+    #[test]
+    fn credentials_with_scm_pidfd_returns_owned_pidfd() {
+        use std::os::unix::io::IntoRawFd;
+
+        let mut abuf = AlignedBuf([0u8; 512]);
+        write_scm_credentials(&mut abuf.0, 0, 1234, 1000, 100);
+        // Any owned fd is enough for this parser-level test; PeerPidFd takes
+        // ownership and closes it when `result` is dropped.
+        let fd = std::fs::File::open("/dev/null")
+            .expect("open /dev/null")
+            .into_raw_fd();
+        write_scm_pidfd(&mut abuf.0, cmsg_space_ucred(), fd);
+        let controllen = cmsg_space_ucred() + cmsg_space_i32();
+        let mhdr = make_mhdr(&abuf.0, controllen);
+        let result = plat::peer_pid_after_recv(0, &mhdr);
+        let (pid, uid, pidfd) = result.expect("expected credentials");
+        assert_eq!((pid, uid), (1234, 1000));
+        assert!(pidfd.is_some(), "SCM_PIDFD cmsg must be surfaced");
     }
 
     #[test]
@@ -392,7 +447,7 @@ mod miri_cmsg_tests {
         let controllen = cmsg_space_ucred();
         let mhdr = make_mhdr(buf, controllen);
         let result = plat::peer_pid_after_recv(0, &mhdr);
-        assert_eq!(result, None, "truncated cmsg must not produce a pid");
+        assert!(result.is_none(), "truncated cmsg must not produce a pid");
     }
 
     #[test]
@@ -412,7 +467,7 @@ mod miri_cmsg_tests {
         let controllen = cmsg_space_ucred();
         let mhdr = make_mhdr(buf, controllen);
         let result = plat::peer_pid_after_recv(0, &mhdr);
-        assert_eq!(result, None, "unknown cmsg_type must not produce a pid");
+        assert!(result.is_none(), "unknown cmsg_type must not produce a pid");
     }
 
     #[test]
@@ -438,7 +493,7 @@ mod miri_cmsg_tests {
         let controllen = space * 2;
         let mhdr = make_mhdr(buf, controllen);
         let result = plat::peer_pid_after_recv(0, &mhdr);
-        assert_eq!(result, Some((5678, 2000)));
+        assert_pid_uid_no_pidfd(result, 5678, 2000);
     }
 
     #[test]
@@ -451,7 +506,7 @@ mod miri_cmsg_tests {
         let controllen = 128;
         let mhdr = make_mhdr(&abuf.0, controllen);
         let result = plat::peer_pid_after_recv(0, &mhdr);
-        assert_eq!(result, Some((999, 42)));
+        assert_pid_uid_no_pidfd(result, 999, 42);
     }
 
     /// Drives the unified walker through the BSD-family arm
@@ -746,6 +801,6 @@ mod miri_cmsg_tests {
         // Must return None — cmsg_len < needed; must terminate (test would
         // hang otherwise).
         let result = plat::peer_pid_after_recv(0, &mhdr);
-        assert_eq!(result, None);
+        assert!(result.is_none());
     }
 }

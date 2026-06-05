@@ -486,6 +486,7 @@ impl Observer {
                     peer_pid,
                     peer_uid: _,
                     peer_pid_ns_inode,
+                    peer_pidfd,
                     origin,
                     data,
                 } => {
@@ -578,23 +579,21 @@ impl Observer {
                             // recv-time condition: kernel-attested peers
                             // (`peer_pid != 0`) only; non-UDS transports keep
                             // their `None` (they report `peer_pid == 0`).
-                            let peer_pid_ns_inode = if peer_pid != 0 {
-                                crate::peer_cred::read_pid_namespace_inode(peer_pid)
+                            let (peer_pid_ns_inode, peer_generation) = if peer_pid != 0 {
+                                crate::peer_cred::read_peer_identity(peer_pid, peer_pidfd.as_ref())
                             } else {
-                                peer_pid_ns_inode
+                                (peer_pid_ns_inode, None)
                             };
-                            // Resolve the peer's process *generation* token
-                            // (start-time) alongside the namespace inode and on
-                            // the same kernel-attested `peer_pid`. Same deferral
-                            // rationale: only after the global limiter admits the
-                            // frame, so a flood cannot force a /proc read per
-                            // packet. `None` for non-attested transports keeps
-                            // their prior PID-only identity (no recycle gate).
-                            let peer_generation = if peer_pid != 0 {
-                                crate::peer_cred::read_pid_start_time(peer_pid)
-                            } else {
-                                None
-                            };
+                            // Resolve the peer's process identity
+                            // (PID-namespace inode + start-time generation)
+                            // alongside the same kernel-attested `peer_pid`.
+                            // On Linux 6.5+ the recv layer also supplies a
+                            // pidfd; `read_peer_identity` then trusts /proc
+                            // only if that pidfd proves the original sender
+                            // is still live before and after the reads. This
+                            // prevents a fast PID recycle from pinning
+                            // namespace/generation metadata from the new
+                            // process to a datagram sent by the old one.
                             // Cross-namespace gate (Linux only). When the
                             // kernel-attested peer's PID namespace inode
                             // differs from the observer's, the frame.pid

@@ -211,8 +211,11 @@ unsafe impl super::super::cmsg::CmsgPlatform for IllumosCmsg {
 
 /// Extract peer PID and effective UID after a successful `recvmsg` on
 /// illumos / Solaris via the `SCM_UCRED` ancillary-data walker.
-pub(crate) fn peer_pid_after_recv(_fd: i32, mhdr: &Msghdr) -> Option<(u32, u32)> {
-    super::super::cmsg::find_credential::<IllumosCmsg>(mhdr)
+pub(crate) fn peer_pid_after_recv(
+    _fd: i32,
+    mhdr: &Msghdr,
+) -> Option<(u32, u32, Option<super::super::types::PeerPidFd>)> {
+    super::super::cmsg::find_credential::<IllumosCmsg>(mhdr).map(|(pid, uid)| (pid, uid, None))
 }
 
 /// Build a zero-initialised `Msghdr` for use as the `recvmsg(2)` argument.

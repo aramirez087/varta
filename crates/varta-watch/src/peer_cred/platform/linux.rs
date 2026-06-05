@@ -9,6 +9,8 @@
 use core::ffi::c_void;
 use core::mem;
 
+use crate::peer_cred::types::PeerPidFd;
+
 // --- structs --------------------------------------------------------------
 
 #[repr(C)]
@@ -48,9 +50,15 @@ pub(crate) struct Ucred {
 
 pub(crate) const SOL_SOCKET: i32 = 1;
 pub(crate) const SO_PASSCRED: i32 = 16;
+/// `SO_PASSPIDFD` asks Linux 6.5+ to attach an `SCM_PIDFD` cmsg per datagram.
+pub(crate) const SO_PASSPIDFD: i32 = 76;
 pub(crate) const SCM_CREDENTIALS: i32 = 2;
+/// `SCM_PIDFD` ancillary type carrying one pidfd (`int`).
+pub(crate) const SCM_PIDFD: i32 = 0x04;
 /// Set by the kernel when ancillary data was truncated (buffer too small).
 pub(crate) const MSG_CTRUNC: i32 = 0x20;
+/// Close received file descriptors atomically during `recvmsg(2)`.
+pub(crate) const MSG_CMSG_CLOEXEC: i32 = 0x4000_0000;
 
 // --- FFI ------------------------------------------------------------------
 
@@ -138,10 +146,79 @@ unsafe impl super::super::cmsg::CmsgPlatform for LinuxCmsg {
     }
 }
 
-/// Extract peer PID and UID after a successful `recvmsg` — on Linux this is
-/// done via ancillary-data parsing.
-pub(crate) fn peer_pid_after_recv(_fd: i32, mhdr: &Msghdr) -> Option<(u32, u32)> {
-    super::super::cmsg::find_credential::<LinuxCmsg>(mhdr)
+/// Extract peer PID, UID, and optional pidfd after a successful `recvmsg`.
+pub(crate) fn peer_pid_after_recv(
+    _fd: i32,
+    mhdr: &Msghdr,
+) -> Option<(u32, u32, Option<PeerPidFd>)> {
+    let mut cred = None;
+    let mut pidfd = None;
+    scan_linux_cmsgs(mhdr, |hdr, data_ptr| {
+        if hdr.cmsg_level != SOL_SOCKET {
+            return;
+        }
+        let payload_len = hdr
+            .cmsg_len
+            .saturating_sub(<LinuxCmsg as super::super::cmsg::CmsgPlatform>::cmsg_hdr_size());
+        match hdr.cmsg_type {
+            SCM_CREDENTIALS => {
+                if payload_len >= core::mem::size_of::<Ucred>() {
+                    // SAFETY: payload length was checked above and the cmsg
+                    // walker proved the bytes are inside the kernel-supplied
+                    // ancillary buffer.
+                    let uc = unsafe { &*(data_ptr as *const Ucred) };
+                    cred = Some((uc.pid as u32, uc.uid));
+                }
+            }
+            SCM_PIDFD => {
+                if payload_len >= core::mem::size_of::<i32>() {
+                    // SAFETY: payload length was checked above. Use
+                    // `read_unaligned` because the cmsg payload ABI only
+                    // promises byte validity; alignment is cheap to avoid.
+                    let fd = unsafe { data_ptr.cast::<i32>().read_unaligned() };
+                    if fd >= 0 {
+                        // SAFETY: the fd was installed into this process by
+                        // recvmsg as an owned SCM_PIDFD descriptor.
+                        pidfd = Some(unsafe { PeerPidFd::from_raw(fd) });
+                    }
+                }
+            }
+            _ => {}
+        }
+    });
+    cred.map(|(pid, uid)| (pid, uid, pidfd))
+}
+
+/// Best-effort cleanup used when recvmsg reported truncated ancillary data
+/// before normal credential extraction could take ownership of `SCM_PIDFD`.
+pub(crate) fn close_pidfds_after_recv(mhdr: &Msghdr) {
+    scan_linux_cmsgs(mhdr, |hdr, data_ptr| {
+        if hdr.cmsg_level != SOL_SOCKET || hdr.cmsg_type != SCM_PIDFD {
+            return;
+        }
+        let payload_len = hdr
+            .cmsg_len
+            .saturating_sub(<LinuxCmsg as super::super::cmsg::CmsgPlatform>::cmsg_hdr_size());
+        if payload_len < core::mem::size_of::<i32>() {
+            return;
+        }
+        // SAFETY: payload length was checked above.
+        let fd = unsafe { data_ptr.cast::<i32>().read_unaligned() };
+        if fd >= 0 {
+            // SAFETY: take ownership long enough to close on drop.
+            let _owned = unsafe { PeerPidFd::from_raw(fd) };
+        }
+    });
+}
+
+fn scan_linux_cmsgs(mhdr: &Msghdr, mut cb: impl FnMut(&Cmsghdr, *const u8)) {
+    // SAFETY: `mhdr` was populated by recvmsg, so msg_control/msg_controllen
+    // describe initialized ancillary bytes. The iterator bounds-checks every
+    // header before yielding it.
+    let iter = unsafe { super::super::cmsg::CmsgIter::<LinuxCmsg>::new(mhdr) };
+    for (hdr, data_ptr) in iter {
+        cb(hdr, data_ptr);
+    }
 }
 
 /// Build a zero-initialised `Msghdr` for use as the `recvmsg(2)` argument.

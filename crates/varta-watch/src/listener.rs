@@ -735,6 +735,7 @@ mod udp_impl {
                             peer_uid: 0,
                             // UDP carries no kernel-attested namespace identity.
                             peer_pid_ns_inode: None,
+                            peer_pidfd: None,
                             origin,
                             data: buf,
                         };

@@ -94,13 +94,15 @@ pub(crate) const ANCILLARY_BUFFER_SIZE: usize = 16;
 /// The syscall outcomes are produced by three small unsafe shims and then
 /// combined by [`super::super::macos_fallback::pid_uid_from_results`],
 /// which is pure logic and independently tested.
-pub(crate) fn peer_pid_after_recv(fd: i32, _mhdr: &Msghdr) -> Option<(u32, u32)> {
+pub(crate) fn peer_pid_after_recv(
+    fd: i32,
+    _mhdr: &Msghdr,
+) -> Option<(u32, u32, Option<super::super::types::PeerPidFd>)> {
     let token = get_token(fd);
     let pid = get_peer_pid(fd);
     let cred = get_peer_cred(fd);
-    Some(super::super::macos_fallback::pid_uid_from_results(
-        token, pid, cred,
-    ))
+    let (pid, uid) = super::super::macos_fallback::pid_uid_from_results(token, pid, cred);
+    Some((pid, uid, None))
 }
 
 fn get_token(fd: i32) -> super::super::macos_fallback::TokenResult {

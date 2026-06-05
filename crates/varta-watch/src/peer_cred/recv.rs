@@ -75,6 +75,33 @@ pub(crate) fn enable_credential_passing(fd: i32) -> io::Result<()> {
         if ret != 0 {
             return Err(io::Error::last_os_error());
         }
+
+        // Linux 6.5+ can attach a pidfd (`SCM_PIDFD`) to each datagram. That
+        // closes the PID-reuse race around deferred `/proc/<pid>` metadata
+        // reads: a pidfd remains tied to the original sending task even if
+        // the numeric PID is recycled before the observer reaches `/proc`.
+        //
+        // Older kernels return ENOPROTOOPT/EINVAL for this socket option; keep
+        // `SO_PASSCRED` as the hard requirement and treat pidfd as an
+        // opportunistic strengthening rather than a startup blocker.
+        const ENOPROTOOPT: i32 = 92;
+        const EINVAL: i32 = 22;
+        let pidfd_ret = unsafe {
+            plat::setsockopt(
+                fd,
+                level,
+                plat::SO_PASSPIDFD,
+                core::ptr::addr_of!(one) as *const core::ffi::c_void,
+                core::mem::size_of::<i32>() as u32,
+            )
+        };
+        if pidfd_ret != 0 {
+            let err = io::Error::last_os_error();
+            match err.raw_os_error() {
+                Some(ENOPROTOOPT | EINVAL) => {}
+                _ => return Err(err),
+            }
+        }
         Ok(())
     }
 
@@ -202,7 +229,11 @@ pub(crate) fn recv_authenticated(fd: i32) -> RecvResult {
             // guards in `plat`. `&mut mhdr` is the single exclusive borrow for
             // the duration of the call. The return value is checked below:
             // `< 0` is errno, `>= 0` is byte count.
-            let ret = unsafe { plat::recvmsg(fd, &mut mhdr, 0) };
+            #[cfg(target_os = "linux")]
+            let flags = plat::MSG_CMSG_CLOEXEC;
+            #[cfg(not(target_os = "linux"))]
+            let flags = 0;
+            let ret = unsafe { plat::recvmsg(fd, &mut mhdr, flags) };
             if ret < 0 {
                 let err = io::Error::last_os_error();
                 match err.kind() {
@@ -217,6 +248,8 @@ pub(crate) fn recv_authenticated(fd: i32) -> RecvResult {
         };
 
         if plat::ctrl_truncated(&mhdr) {
+            #[cfg(target_os = "linux")]
+            plat::close_pidfds_after_recv(&mhdr);
             return RecvResult::CtrlTruncated(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "ancillary data truncated by kernel (ANCILLARY_BUFFER_SIZE too small)",
@@ -227,8 +260,8 @@ pub(crate) fn recv_authenticated(fd: i32) -> RecvResult {
             return RecvResult::ShortRead;
         }
 
-        let (peer_pid, peer_uid) = match plat::peer_pid_after_recv(fd, &mhdr) {
-            Some((pid, uid)) => (pid, uid),
+        let (peer_pid, peer_uid, peer_pidfd) = match plat::peer_pid_after_recv(fd, &mhdr) {
+            Some((pid, uid, pidfd)) => (pid, uid, pidfd),
             None => {
                 return RecvResult::IoError(io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -260,6 +293,7 @@ pub(crate) fn recv_authenticated(fd: i32) -> RecvResult {
             peer_pid,
             peer_uid,
             peer_pid_ns_inode: None,
+            peer_pidfd,
             // Derived from attestation — NOT hardcoded. A zero `peer_pid`
             // (macOS getsockopt sentinel) downgrades to SocketModeOnly so the
             // recovery gate refuses a beat whose `frame.pid` was never bound
@@ -320,6 +354,7 @@ pub(crate) fn recv_authenticated(fd: i32) -> RecvResult {
             peer_pid: 0,
             peer_uid: 0,
             peer_pid_ns_inode: None,
+            peer_pidfd: None,
             origin: BeatOrigin::SocketModeOnly,
             data,
         };
@@ -396,6 +431,7 @@ mod tests {
                 peer_pid,
                 peer_uid: _,
                 peer_pid_ns_inode: _,
+                peer_pidfd: _,
                 origin,
                 data,
             } => {

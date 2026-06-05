@@ -11,9 +11,6 @@
 //! returns `Some(..)` for a buffer that doesn't actually contain a
 //! well-formed `SCM_CREDENTIALS` cmsg.
 
-#![cfg(any(fuzzing, test))]
-#![cfg(target_os = "linux")]
-
 use super::cmsg::find_credential;
 // Access via the `pub(super) use linux::*` re-export in `super::platform`
 // rather than `super::platform::linux::*` directly — the inner module is

@@ -681,6 +681,7 @@ impl BeatListener for SecureUdpListener {
                         peer_pid: 0,
                         peer_uid: 0,
                         peer_pid_ns_inode: None,
+                        peer_pidfd: None,
                         origin,
                         data: plaintext,
                     };
@@ -734,6 +735,7 @@ impl BeatListener for SecureUdpListener {
                 // Secure UDP authenticates wire bytes cryptographically but
                 // carries no kernel-attested namespace identity.
                 peer_pid_ns_inode: None,
+                peer_pidfd: None,
                 origin,
                 data: plaintext,
             };

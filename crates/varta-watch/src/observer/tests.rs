@@ -317,6 +317,7 @@ impl ScriptedListener {
                 peer_pid: pid,
                 peer_uid: 0,
                 peer_pid_ns_inode: None,
+                peer_pidfd: None,
                 origin: BeatOrigin::KernelAttested,
                 data,
             });
@@ -339,6 +340,7 @@ impl ScriptedListener {
                 peer_pid,
                 peer_uid: 0,
                 peer_pid_ns_inode: None,
+                peer_pidfd: None,
                 origin,
                 data,
             });
