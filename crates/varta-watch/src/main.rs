@@ -1285,6 +1285,17 @@ fn run(cfg: Config) -> std::io::Result<()> {
             }
         }
 
+        // Tracker PID recycles (slot reset after a start-time mismatch).
+        let tracker_pid_recycles = observer.drain_pid_recycles();
+        if tracker_pid_recycles > 0 {
+            #[cfg(feature = "prometheus-exporter")]
+            if let Some(pe) = prom_export.as_mut() {
+                pe.record_tracker_pid_recycles(tracker_pid_recycles);
+            }
+            #[cfg(not(feature = "prometheus-exporter"))]
+            let _ = tracker_pid_recycles;
+        }
+
         let tracker_invariants = observer.drain_invariant_violations();
         if tracker_invariants > 0 {
             #[cfg(feature = "prometheus-exporter")]
