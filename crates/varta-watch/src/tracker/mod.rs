@@ -549,12 +549,20 @@ impl Tracker {
                     (None, Some(_)) => true,
                     _ => false,
                 };
+                // First-generation-wins mirrors namespace: pin the start-time
+                // token once `/proc` becomes readable, but only on an accepted
+                // nonce — out-of-order frames must not mutate slot identity.
+                let generation_upgrade =
+                    matches!((slot.generation, peer_generation), (None, Some(_)));
                 if frame.nonce == NONCE_TERMINAL {
                     if !slot.refresh_terminal(frame, now_ns, status) {
                         return Update::OutOfOrder;
                     }
                     if namespace_upgrade {
                         slot.pid_ns_inode = peer_pid_ns_inode;
+                    }
+                    if generation_upgrade {
+                        slot.generation = peer_generation;
                     }
                     if slot.clear_stall_emitted() {
                         self.stall_emitted_count = self.stall_emitted_count.saturating_sub(1);
@@ -571,6 +579,9 @@ impl Tracker {
                 }
                 if namespace_upgrade {
                     slot.pid_ns_inode = peer_pid_ns_inode;
+                }
+                if generation_upgrade {
+                    slot.generation = peer_generation;
                 }
                 if slot.clear_stall_emitted() {
                     self.stall_emitted_count = self.stall_emitted_count.saturating_sub(1);

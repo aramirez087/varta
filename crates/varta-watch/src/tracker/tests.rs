@@ -1082,3 +1082,80 @@ fn same_generation_increasing_nonce_is_plain_refresh() {
     );
     assert_eq!(t.take_pid_recycles(), 0);
 }
+
+/// `None → Some` upgrade on a same-pid beat pins the now-known generation
+/// and falls through to refresh. Forgiving when `/proc/<pid>/stat` was
+/// briefly unreadable at first contact.
+#[test]
+fn generation_none_to_some_upgrades_in_place() {
+    let mut t = Tracker::new(8, EvictionPolicy::Strict, DEFAULT_EVICTION_SCAN_WINDOW);
+    let threshold_ns = 100;
+    let _ = t.record_with_generation(&frame(7, 1), 0, threshold_ns, ORIGIN, Some(10), None);
+    assert_eq!(t.entries[0].generation, None);
+    let r = t.record_with_generation(&frame(7, 2), 10, threshold_ns, ORIGIN, Some(10), Some(111));
+    assert_eq!(r, Update::Refreshed);
+    assert_eq!(t.entries[0].generation, Some(111));
+    assert_eq!(t.take_pid_recycles(), 0);
+}
+
+/// `None → Some` generation upgrade must commit only with an accepted nonce.
+#[test]
+fn generation_none_to_some_out_of_order_does_not_pin() {
+    let mut t = Tracker::new(8, EvictionPolicy::Strict, DEFAULT_EVICTION_SCAN_WINDOW);
+    let threshold_ns = 100;
+    let _ = t.record_with_generation(&frame(7, 10), 0, threshold_ns, ORIGIN, Some(10), None);
+    let replay =
+        t.record_with_generation(&frame(7, 5), 10, threshold_ns, ORIGIN, Some(10), Some(999));
+    assert_eq!(replay, Update::OutOfOrder);
+    assert_eq!(
+        t.entries[0].generation, None,
+        "out-of-order frame must not pin the generation token"
+    );
+    assert_eq!(t.take_pid_recycles(), 0);
+
+    let fresh =
+        t.record_with_generation(&frame(7, 11), 20, threshold_ns, ORIGIN, Some(10), Some(123));
+    assert_eq!(fresh, Update::Refreshed);
+    assert_eq!(t.entries[0].generation, Some(123));
+}
+
+/// Transient `None` on first beat must not disable recycle once generation
+/// is pinned on a later accepted beat from the same process.
+#[test]
+fn transient_generation_none_then_recycle_still_resets() {
+    let mut t = Tracker::new(8, EvictionPolicy::Strict, DEFAULT_EVICTION_SCAN_WINDOW);
+    let threshold_ns = 100;
+    assert_eq!(
+        t.record_with_generation(&frame(1234, 1), 0, threshold_ns, ORIGIN, Some(10), None,),
+        Update::Inserted
+    );
+    assert_eq!(
+        t.record_with_generation(
+            &frame(1234, 5000),
+            10,
+            threshold_ns,
+            ORIGIN,
+            Some(10),
+            Some(111),
+        ),
+        Update::Refreshed
+    );
+    assert_eq!(t.entries[0].generation, Some(111));
+
+    let recycled = t.record_with_generation(
+        &frame(1234, 1),
+        20,
+        threshold_ns,
+        ORIGIN,
+        Some(10),
+        Some(222),
+    );
+    assert_eq!(
+        recycled,
+        Update::Inserted,
+        "recycle must fire once generation is pinned"
+    );
+    assert_eq!(t.take_pid_recycles(), 1);
+    assert_eq!(t.entries[0].generation, Some(222));
+    assert_eq!(t.entries[0].last_nonce, 1);
+}

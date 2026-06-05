@@ -80,8 +80,22 @@ namespace inode, and silence timer all re-pinned) and the event is counted as
 origin / namespace / nonce checks — a recycled process legitimately differs on
 all of them. A `None` on either side ("generation unknown": non-Linux, UDP, or
 unreadable `/proc`) is treated leniently and never triggers a reset, so prior
-PID-only behaviour is preserved exactly. Replay protection is untouched: a low
-nonce under the **same** generation is still dropped as out-of-order.
+PID-only behaviour is preserved exactly. When the slot's pinned generation is
+`None` and a later beat carries `Some(_)` with an **accepted** nonce, the token
+is pinned in place (same rule as the namespace-inode `None → Some` upgrade) so
+a subsequent recycle can compare `(Some(G1), Some(G2))` instead of staying
+stuck at `None`. Out-of-order frames must not pin generation. Replay protection
+is untouched: a low nonce under the **same** generation is still dropped as
+out-of-order.
+
+**Cost.** Recycle detection requires re-reading the generation on *every*
+admitted `KernelAttested` beat — there is no way to observe PID reuse without
+re-stat-ing the peer. This adds one `/proc/<pid>/stat` `open`/`read`/`close`
+(three syscalls, allocation-free) per beat, on top of the existing
+`/proc/<pid>/ns/pid` namespace read. The read is deferred until after the
+global rate limiter admits the frame, so a flood cannot force a `/proc` read
+per packet. Non-Linux and non-attested transports skip the read entirely
+(`read_pid_start_time` returns `None`).
 
 ## Mitigation by deployment style
 
