@@ -33,7 +33,7 @@ pub(super) struct LastFiredSlot {
 /// treated leniently (same lineage, never a recycle signal), mirroring the
 /// tracker `Slot` generation semantics in `tracker/mod.rs`.
 #[inline]
-fn same_lineage(stored: Option<u64>, incoming: Option<u64>) -> bool {
+pub(super) fn same_lineage(stored: Option<u64>, incoming: Option<u64>) -> bool {
     !matches!((stored, incoming), (Some(a), Some(b)) if a != b)
 }
 

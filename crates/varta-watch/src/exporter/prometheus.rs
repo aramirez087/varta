@@ -243,6 +243,35 @@ impl super::PromExporter {
             "varta_recovery_debounce_recycle_resets_total {}",
             self.recovery_debounce_recycle_resets_total
         );
+        // varta_recovery_outstanding_recycle_resets_total — stale recovery
+        // children reclaimed because a slot's pinned generation proved a PID
+        // recycle while the previous lineage's child was still in flight.
+        // A non-zero value means recovery was correctly NOT suppressed for the
+        // recycled PID's new occupant.  Always emit so `absent()` stays green.
+        self.body_buf.push_str(
+            "# HELP varta_recovery_outstanding_recycle_resets_total Stale recovery children reclaimed because a slot's pinned generation proved a PID recycle; recovery was not suppressed for the new process.\n",
+        );
+        self.body_buf
+            .push_str("# TYPE varta_recovery_outstanding_recycle_resets_total counter\n");
+        let _ = writeln!(
+            self.body_buf,
+            "varta_recovery_outstanding_recycle_resets_total {}",
+            self.recovery_outstanding_recycle_resets_total
+        );
+        // varta_recovery_spawn_budget_exceeded_total — observer ticks whose
+        // per-tick recovery-spawn budget engaged, staggering a mass
+        // simultaneous stall instead of fork-bombing the single-threaded poll
+        // loop (and tripping the self-watchdog).  Always emit.
+        self.body_buf.push_str(
+            "# HELP varta_recovery_spawn_budget_exceeded_total Observer ticks whose per-tick recovery-spawn budget engaged, deferring remaining stalls to a later tick.\n",
+        );
+        self.body_buf
+            .push_str("# TYPE varta_recovery_spawn_budget_exceeded_total counter\n");
+        let _ = writeln!(
+            self.body_buf,
+            "varta_recovery_spawn_budget_exceeded_total {}",
+            self.recovery_spawn_budget_exceeded_total
+        );
         // varta_recovery_invariant_violations_total — defensive
         // fall-throughs in `LastFiredTable`.  Non-zero values mean a
         // code bug, not load.  Same alerting posture as

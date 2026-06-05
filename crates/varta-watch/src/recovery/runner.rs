@@ -17,6 +17,12 @@ pub(super) struct Outstanding {
     pub(super) child: Child,
     pub(super) spawned_at: Instant,
     pub(super) killed: bool,
+    /// Process-start-time generation token of the stalled agent this child was
+    /// spawned for. Pins the slot's *lineage* so a recycled PID (same number,
+    /// new process) can be detected in `on_stall` and not silently Debounced.
+    /// `None` = generation unknown (non-Linux / `/proc` race) → treated
+    /// leniently (bare-PID behaviour), mirroring the debounce ledger.
+    pub(super) generation: Option<u64>,
     /// Wall-clock ms at spawn time; recorded into the audit log on
     /// completion alongside the monotonic duration.
     pub(super) wallclock_at_spawn_ms: u64,
@@ -68,9 +74,11 @@ impl Recovery {
     /// Extracted from `on_stall`; only called after all safety gates pass.
     /// Handles template substitution, env isolation, capture setup, and
     /// outstanding-table insertion. Emits the spawn audit record on success.
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn spawn_exec_child(
         &mut self,
         pid: u32,
+        generation: Option<u64>,
         wallclock_ms: u64,
         now: Instant,
         observer_ns: u64,
@@ -107,6 +115,7 @@ impl Recovery {
                                 child,
                                 spawned_at: now,
                                 killed: false,
+                                generation,
                                 wallclock_at_spawn_ms: wallclock_ms,
                                 stdout_handle: out_handle,
                                 stderr_handle: err_handle,

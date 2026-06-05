@@ -47,6 +47,24 @@ use runner::Outstanding;
 /// fairness: pids not visited this tick are visited first next tick.
 const REAP_MAX_PER_TICK: usize = 64;
 
+/// Maximum recovery children `fork(2)`+`exec`'d in one observer poll tick.
+///
+/// The sibling of [`REAP_MAX_PER_TICK`] for the *spawn* side. A mass
+/// simultaneous stall (a shared dependency dies and the whole fleet stops
+/// beating at once, or a VM live-migration / suspend-resume forward clock jump
+/// trips every tracked slot's threshold in a single pass) queues up to
+/// `tracker_capacity` stall events. Without this cap the `DrainPending` stage
+/// would `fork`+`exec` all of them back-to-back — head-of-line-blocking the
+/// single-threaded poll loop and, at a few ms per spawn, overrunning the 2 s
+/// `STAGE_ABORT_NS[DrainPending]` ceiling into a spurious `process::abort()`
+/// (and a host reboot under `--hw-watchdog`) at the exact moment the fleet is
+/// in trouble. The remainder stays queued (the `stall_queue`/`stall_cursor`
+/// cursor resumes next tick) and recovery is staggered across ticks — which
+/// also defuses the thundering-herd of simultaneous recovery commands.
+/// Smaller than [`REAP_MAX_PER_TICK`] because `fork`+`exec` is far costlier
+/// than the non-blocking `waitpid(WNOHANG)` the reap side performs.
+pub const RECOVERY_SPAWN_MAX_PER_TICK: usize = 16;
+
 /// How the recovery command is executed when an agent stalls.
 ///
 /// One mode is available:
@@ -206,6 +224,18 @@ pub struct Recovery {
     pub(crate) reap_truncated_total: u64,
     /// Per-tick reap cap.
     pub(crate) reap_max: usize,
+    /// Stale-lineage recovery children whose pid slot was reclaimed after a
+    /// PID recycle (see [`Self::on_stall`]). They were `kill(2)`'d and moved
+    /// off the pid-keyed [`OutstandingTable`] so the recycled pid's new
+    /// occupant can be recovered immediately; they are reaped non-blockingly
+    /// here across later ticks (mirrors the timeout-kill → later-reap split).
+    pub(in crate::recovery) reaping_orphans: Vec<(u32, Outstanding)>,
+    /// Count of outstanding slots reclaimed because a slot's pinned generation
+    /// proved its PID had been recycled to a new process while the previous
+    /// lineage's recovery child was still in flight. Surfaced as
+    /// `varta_recovery_outstanding_recycle_resets_total`; a non-zero value
+    /// means recovery was correctly *not* suppressed for the recycled PID.
+    pub(crate) outstanding_recycle_resets: u64,
 }
 
 impl Recovery {
@@ -256,6 +286,8 @@ impl Recovery {
             reap_cursor: 0,
             reap_truncated_total: 0,
             reap_max: REAP_MAX_PER_TICK,
+            reaping_orphans: Vec::new(),
+            outstanding_recycle_resets: 0,
         }
     }
 
@@ -355,6 +387,16 @@ impl Recovery {
     /// `varta_recovery_debounce_recycle_resets_total`.
     pub fn take_last_fired_recycle_resets(&mut self) -> u64 {
         self.last_fired.take_recycle_resets()
+    }
+
+    /// Take and reset the count of outstanding-child slots reclaimed because a
+    /// slot's pinned generation proved its PID had been recycled while the
+    /// previous lineage's recovery child was still in flight. Surfaced as
+    /// `varta_recovery_outstanding_recycle_resets_total`.
+    pub fn take_outstanding_recycle_resets(&mut self) -> u64 {
+        let n = self.outstanding_recycle_resets;
+        self.outstanding_recycle_resets = 0;
+        n
     }
 
     /// Test-only: shrink the [`LastFiredTable`] to `cap` slots.
@@ -598,7 +640,18 @@ impl Recovery {
         }
 
         if self.outstanding.contains(pid) {
-            if let Some(outcome) = self.reap_finished_child(pid, observer_ns) {
+            let stored_generation = self.outstanding.get(pid).and_then(|o| o.generation);
+            if !debounce::same_lineage(stored_generation, generation) {
+                // The OS recycled this PID to a new process while the previous
+                // lineage's recovery child is still tracked. That child belongs
+                // to a now-dead process; without reclaiming its slot, the
+                // genuinely-stalled new occupant `B` would be silently
+                // Debounced and never recovered — the same user-visible failure
+                // bug-346 fixed for the debounce ledger, via the sibling path
+                // the OutstandingTable left open. Reclaim the stale slot and
+                // fall through to spawn recovery for the new lineage.
+                self.reclaim_recycled_outstanding(pid);
+            } else if let Some(outcome) = self.reap_finished_child(pid, observer_ns) {
                 self.pending_outcomes.push(outcome);
             } else {
                 return RecoveryOutcome::Debounced;
@@ -642,12 +695,69 @@ impl Recovery {
         let wallclock_ms = RecoveryAuditLog::wallclock_ms_now();
         self.spawn_exec_child(
             pid,
+            generation,
             wallclock_ms,
             now,
             observer_ns,
             reservation,
             last_fired_reservation,
         )
+    }
+
+    /// Reclaim the outstanding slot for a recycled PID.
+    ///
+    /// The tracked child belongs to a process that has exited (its PID was
+    /// recycled). We `kill(2)` it — leaving it running would let a recovery
+    /// template that substitutes `{pid}` act on the *new* occupant of the
+    /// recycled PID — then move it off the pid-keyed [`OutstandingTable`] into
+    /// [`Self::reaping_orphans`] so the slot is free for the new lineage
+    /// immediately. The killed child is reaped non-blockingly on later ticks
+    /// (its terminal `complete` audit row is emitted then), exactly like the
+    /// timeout-kill path; we never block the poll loop on `wait(2)` here.
+    fn reclaim_recycled_outstanding(&mut self, pid: u32) {
+        self.outstanding_recycle_resets = self.outstanding_recycle_resets.saturating_add(1);
+        if let Some(mut entry) = self.outstanding.remove(pid) {
+            if !entry.killed {
+                // Best-effort: an already-exited child returns InvalidInput;
+                // either way the orphan reaper finishes the lifecycle.
+                let _ = entry.child.kill();
+                entry.killed = true;
+            }
+            self.reaping_orphans.push((pid, entry));
+        }
+    }
+
+    /// Non-blocking reap of [`Self::reaping_orphans`] — children reclaimed from
+    /// recycled PID slots. Emits each one's terminal `complete` audit row on
+    /// exit (mirroring [`Self::reap_finished_child`]) and drops it; still-running
+    /// orphans are retained for a later tick. Runs every [`Self::try_reap`].
+    fn drain_orphan_reaps(&mut self, observer_ns: u64) {
+        let mut i = 0;
+        while i < self.reaping_orphans.len() {
+            // Non-blocking: Ok(None) means still running — keep for a later tick.
+            let exit_status = match self.reaping_orphans[i].1.child.try_wait() {
+                Ok(None) => {
+                    i += 1;
+                    continue;
+                }
+                Ok(Some(status)) => Some(status),
+                Err(_) => None,
+            };
+            let (orphan_pid, entry) = self.reaping_orphans.swap_remove(i);
+            let child_pid = entry.child.id();
+            self.emit_complete_audit(
+                orphan_pid,
+                child_pid,
+                crate::audit::CompleteOutcome::Killed,
+                exit_status.as_ref(),
+                entry.spawned_at,
+                entry.wallclock_at_spawn_ms,
+                entry.stdout_len,
+                entry.stderr_len,
+                entry.truncated,
+                observer_ns,
+            );
+        }
     }
 
     /// Drain completed or timeout-exceeded children.
@@ -662,6 +772,9 @@ impl Recovery {
     pub fn try_reap(&mut self, observer_ns: u64) -> Vec<RecoveryOutcome> {
         let mut outcomes = Vec::new();
         outcomes.append(&mut self.pending_outcomes);
+
+        // Reap stale-lineage children reclaimed from recycled PID slots.
+        self.drain_orphan_reaps(observer_ns);
 
         self.reap_scratch.clear();
         self.reap_scratch.extend(self.outstanding.iter_pids());
@@ -763,6 +876,12 @@ impl Drop for Recovery {
                 entry.child
             })
             .collect();
+        // Stale-lineage orphans (already killed in reclaim) must also be reaped
+        // before Drop returns so no recovery child is leaked at shutdown.
+        for (_, mut entry) in self.reaping_orphans.drain(..) {
+            let _ = entry.child.kill();
+            children.push(entry.child);
+        }
 
         let deadline = Instant::now() + self.shutdown_grace;
         while !children.is_empty() && Instant::now() < deadline {

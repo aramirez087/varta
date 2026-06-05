@@ -235,10 +235,23 @@ impl RecoveryAuditLog {
                     {
                         Ok(f) => f,
                         Err(e) => {
+                            // The live file was already renamed to `.1` and the
+                            // sink still points at that inode. Giving up here
+                            // (Idle + needs_rotation=false) would strand every
+                            // future record in the rotated `.1` generation with
+                            // no live file and no boot boundary — an offline
+                            // verifier later reads `.1` as two generations
+                            // spliced without a boot anchor (forgery signal on a
+                            // clean log). Instead stay in Finalizing with
+                            // rotation still armed and Defer: open() failures
+                            // (EMFILE/ENFILE/ENOSPC/EACCES) are typically
+                            // transient, and a later tick re-drains (a no-op when
+                            // empty), re-snapshots `final_chain` from the current
+                            // `prev_chain`, and retries the open. The sink stays
+                            // consistently on `.1` until the swap succeeds, so
+                            // the hash chain remains linear throughout.
                             self.pending_err = Some(e);
-                            self.rotation_progress = RotationProgress::Idle;
-                            self.needs_rotation = false;
-                            return RotationOutcome::Complete;
+                            return RotationOutcome::Deferred;
                         }
                     };
                     use super::writer::{DurableSink, FileSink};

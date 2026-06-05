@@ -202,6 +202,18 @@ func InstallSignalHandlerSecureUDP(host string, port int, key []byte) error {
 	}
 	em := &emitter{
 		emit: func() {
+			// Serialize the nonce-advancing path. The signal goroutine
+			// (installSignals) and the Run defer/recover wrapper can both
+			// invoke this concurrently — a worker goroutine panics at the same
+			// instant a terminating signal arrives. Without the lock both
+			// callers read the same iv counter and seal two distinct frames
+			// under one ChaCha20-Poly1305 nonce: keystream reuse (XOR-recovers
+			// both plaintexts) and Poly1305 forgery. The lock also guards the
+			// salt/pid fork-recovery mutation below. Go delivers signals via a
+			// normal goroutine (signal.Notify), so a mutex here is safe — there
+			// is no async-signal-safety constraint as in the Rust hook.
+			state.mu.Lock()
+			defer state.mu.Unlock()
 			pid := os.Getpid()
 			if pid != state.pid {
 				if _, rerr := rand.Read(state.salt[:]); rerr != nil {
@@ -216,6 +228,8 @@ func InstallSignalHandlerSecureUDP(host string, port int, key []byte) error {
 			if sealErr != nil {
 				return
 			}
+			// Advance at seal time, not write time: once a counter has sealed a
+			// frame it must never seal another, even if the Write below drops.
 			state.counter++
 			_, _ = conn.Write(wire[:])
 		},
@@ -227,7 +241,13 @@ func InstallSignalHandlerSecureUDP(host string, port int, key []byte) error {
 }
 
 // secureState holds the mutable IV state for the secure-UDP emitter.
+//
+// `mu` serializes the emit closure: the signal goroutine and the Run
+// defer/recover wrapper share one emitter and can fire concurrently, so the
+// iv counter (and the fork-recovery salt/pid) must be mutated under a lock to
+// guarantee every sealed frame uses a unique ChaCha20-Poly1305 nonce.
 type secureState struct {
+	mu      sync.Mutex
 	salt    [16]byte
 	pid     int
 	counter uint32

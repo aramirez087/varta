@@ -56,7 +56,10 @@ pub(crate) const SCM_CREDENTIALS: i32 = 2;
 /// `SCM_PIDFD` ancillary type carrying one pidfd (`int`).
 pub(crate) const SCM_PIDFD: i32 = 0x04;
 /// Set by the kernel when ancillary data was truncated (buffer too small).
-pub(crate) const MSG_CTRUNC: i32 = 0x20;
+/// Linux `<bits/socket.h>`: `MSG_CTRUNC = 0x08`. (`0x20` is `MSG_TRUNC`, the
+/// *data*-truncation flag — using it here both missed genuine credential-cmsg
+/// truncation and misclassified any oversized datagram as `CtrlTruncated`.)
+pub(crate) const MSG_CTRUNC: i32 = 0x08;
 /// Close received file descriptors atomically during `recvmsg(2)`.
 pub(crate) const MSG_CMSG_CLOEXEC: i32 = 0x4000_0000;
 
@@ -253,6 +256,43 @@ const _: () = assert!(mem::size_of::<Msghdr>() == 56);
 // tradeoff: we avoid the libc crate to satisfy the zero-dependency constraint,
 // but field-order / padding mistakes would silently corrupt I/O. These guards
 // catch divergence on any kernel/libc version during tests.
+#[cfg(test)]
+mod ctrunc_tests {
+    use super::{ctrl_truncated, Msghdr, MSG_CTRUNC};
+
+    fn mhdr_with_flags(flags: i32) -> Msghdr {
+        Msghdr {
+            msg_name: core::ptr::null_mut(),
+            msg_namelen: 0,
+            _pad1: 0,
+            msg_iov: core::ptr::null_mut(),
+            msg_iovlen: 0,
+            msg_control: core::ptr::null_mut(),
+            msg_controllen: 0,
+            msg_flags: flags,
+            _pad2: 0,
+        }
+    }
+
+    /// Regression for the swapped constant: Linux `MSG_CTRUNC` (ancillary
+    /// truncation) is `0x08`; `0x20` is `MSG_TRUNC` (data truncation). The old
+    /// `0x20` value both missed genuine credential-cmsg truncation and
+    /// misclassified any oversized datagram as `CtrlTruncated`.
+    #[test]
+    fn ctrl_truncated_uses_msg_ctrunc_not_msg_trunc() {
+        const MSG_TRUNC: i32 = 0x20;
+        assert_eq!(MSG_CTRUNC, 0x08, "MSG_CTRUNC must be 0x08, not MSG_TRUNC");
+        // Oversized data only (MSG_TRUNC) is NOT ancillary truncation.
+        assert!(!ctrl_truncated(&mhdr_with_flags(MSG_TRUNC)));
+        // Genuine ancillary truncation (MSG_CTRUNC) is detected.
+        assert!(ctrl_truncated(&mhdr_with_flags(MSG_CTRUNC)));
+        // Both flags set: still reported as ancillary truncation.
+        assert!(ctrl_truncated(&mhdr_with_flags(MSG_TRUNC | MSG_CTRUNC)));
+        // No flags: not truncated.
+        assert!(!ctrl_truncated(&mhdr_with_flags(0)));
+    }
+}
+
 #[cfg(test)]
 mod layout_tests {
     use super::{Cmsghdr, Iovec, Msghdr, Ucred};

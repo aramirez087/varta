@@ -280,16 +280,51 @@ public static class SignalHandler
     internal sealed class SecureEmitter : Emitter
     {
         private readonly byte[] _key;
-        private readonly byte[] _iv;
+        private byte[] _iv;
+        private readonly int _installPid;
 
         public SecureEmitter(Socket socket, byte[] key32, byte[] iv8) : base(socket)
         {
             _key = key32;
             _iv = iv8;
+            _installPid = Environment.ProcessId;
+        }
+
+        // Test seam: spoof the install-time PID so the fork-recovery branch in
+        // EmitFrame can be exercised without an actual fork(2).
+        internal SecureEmitter(Socket socket, byte[] key32, byte[] iv8, int installPidForTest)
+            : base(socket)
+        {
+            _key = key32;
+            _iv = iv8;
+            _installPid = installPidForTest;
         }
 
         protected override void EmitFrame(ReadOnlySpan<byte> plaintext32)
         {
+            // Fork-safety (mirrors the Rust/Go secure panic emitters and this
+            // type's documented contract). Emit() is one-shot per process, so
+            // counter 0 is the only counter ever used in a given process — a
+            // unique IV per process is therefore sufficient. But a fork(2)
+            // child inherits the parent's IV and its own fresh `_fired` flag,
+            // so parent and child could each seal a Critical frame under the
+            // same (key, iv, counter=0) ChaCha20-Poly1305 nonce — catastrophic
+            // keystream + Poly1305 reuse. Detect the fork by PID change and
+            // re-read OS entropy so the child's nonce space is disjoint. Fail
+            // closed if the RNG is unavailable rather than reuse the parent's.
+            if (Environment.ProcessId != _installPid)
+            {
+                byte[] freshIv = new byte[AeadCodec.IvRandomBytes];
+                try
+                {
+                    RandomNumberGenerator.Fill(freshIv);
+                }
+                catch
+                {
+                    return;
+                }
+                _iv = freshIv;
+            }
             Span<byte> wire = stackalloc byte[AeadCodec.SharedFrameBytes];
             AeadCodec.EncodeShared(_key, _iv, ivCounter: 0, plaintext32, wire);
             Socket.Send(wire, SocketFlags.None);

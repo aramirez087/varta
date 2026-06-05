@@ -484,6 +484,19 @@ pub struct PromExporter {
     /// non-zero value means recovery was correctly **not** suppressed for
     /// a recycled PID (the genuine new process got its own recovery).
     recovery_debounce_recycle_resets_total: u64,
+    /// Total outstanding-child slots reclaimed because a slot's pinned
+    /// generation proved its PID had been recycled while the previous
+    /// lineage's recovery child was still in flight. Surfaced as
+    /// `varta_recovery_outstanding_recycle_resets_total`; a non-zero value
+    /// means recovery was correctly **not** suppressed for the new process.
+    recovery_outstanding_recycle_resets_total: u64,
+    /// Total observer ticks whose [`crate::recovery::RECOVERY_SPAWN_MAX_PER_TICK`]
+    /// per-tick recovery-spawn budget engaged, deferring the remaining queued
+    /// stalls to a later tick. Surfaced as
+    /// `varta_recovery_spawn_budget_exceeded_total`; a non-zero value means a
+    /// mass simultaneous stall was staggered rather than fork-bombing the
+    /// single-threaded poll loop.
+    recovery_spawn_budget_exceeded_total: u64,
     /// Total [`crate::recovery::LastFiredTable`] invariant-violation
     /// fall-throughs — defensive `.get()`/`.get_mut()` else-branches
     /// that should be unreachable in correct operation.  Surfaced as
@@ -733,6 +746,8 @@ impl PromExporter {
             recovery_refused_total: [0; RECOVERY_REFUSED_REASON_LABELS.len()],
             recovery_last_fired_evictions_total: 0,
             recovery_debounce_recycle_resets_total: 0,
+            recovery_outstanding_recycle_resets_total: 0,
+            recovery_spawn_budget_exceeded_total: 0,
             recovery_invariant_violations_total: 0,
             origin_conflict_total: 0,
             frame_namespace_mismatch_total: 0,
@@ -1024,6 +1039,26 @@ impl PromExporter {
     pub fn record_recovery_debounce_recycle_resets(&mut self, count: u64) {
         self.recovery_debounce_recycle_resets_total = self
             .recovery_debounce_recycle_resets_total
+            .saturating_add(count);
+    }
+
+    /// Record one or more outstanding-table recycle resets — stale recovery
+    /// children reclaimed because a slot's pinned generation proved a PID
+    /// recycle while the previous child was still in flight.
+    /// Surfaced as `varta_recovery_outstanding_recycle_resets_total`.
+    pub fn record_recovery_outstanding_recycle_resets(&mut self, count: u64) {
+        self.recovery_outstanding_recycle_resets_total = self
+            .recovery_outstanding_recycle_resets_total
+            .saturating_add(count);
+    }
+
+    /// Record one or more per-tick recovery-spawn-budget engagements — ticks
+    /// where a mass stall exceeded [`crate::recovery::RECOVERY_SPAWN_MAX_PER_TICK`]
+    /// and the remainder was deferred to a later tick.
+    /// Surfaced as `varta_recovery_spawn_budget_exceeded_total`.
+    pub fn record_recovery_spawn_budget_exceeded(&mut self, count: u64) {
+        self.recovery_spawn_budget_exceeded_total = self
+            .recovery_spawn_budget_exceeded_total
             .saturating_add(count);
     }
 

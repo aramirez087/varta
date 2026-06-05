@@ -762,7 +762,11 @@ fn run(cfg: Config) -> std::io::Result<()> {
     let mut wdt_handle: Option<std::thread::JoinHandle<()>> = None;
 
     if let Some(deadline) = wdt_deadline {
-        let deadline_ns = deadline.as_nanos() as u64;
+        // Saturate at u64::MAX ns: a large `--self-watchdog-secs` (operator intent
+        // = lenient deadline) whose nanos exceed u64::MAX must NOT wrap a bare
+        // `as u64` cast to a tiny value and self-abort a healthy observer.
+        // Matches the saturating-cast pattern at log.rs / reaper.rs.
+        let deadline_ns = deadline.as_nanos().min(u64::MAX as u128) as u64;
         let secs = deadline.as_secs();
         // Sleep period for the watchdog thread.  Bounded above by 500 ms
         // (the historical cadence) and below by half_interval/2 when systemd
@@ -915,6 +919,12 @@ fn run(cfg: Config) -> std::io::Result<()> {
         // Surface every pending stall immediately; this prevents a batch of
         // N simultaneous stalls from taking N full poll cycles (each of which
         // includes Prometheus serving / file I/O / reaping).
+        // Per-tick recovery spawn budget: a mass simultaneous stall must not
+        // fork+exec the whole fleet in one DrainPending stage (head-of-line
+        // block + 2 s self-watchdog abort). Count only actual spawn attempts;
+        // cheap Debounced/Refused outcomes never consume the budget. The
+        // remainder stays queued (the stall_queue cursor resumes next tick).
+        let mut spawns_this_tick = 0usize;
         while let Some(ev) = observer.poll_pending() {
             if let Some(fe) = file_export.as_mut() {
                 if let Err(e) = fe.record(&ev) {
@@ -950,6 +960,11 @@ fn run(cfg: Config) -> std::io::Result<()> {
                         cross_namespace_agent,
                         *generation,
                         *observer_ns,
+                    );
+                    // Computed before the match below moves `outcome`.
+                    let did_spawn = matches!(
+                        outcome,
+                        RecoveryOutcome::Spawned { .. } | RecoveryOutcome::SpawnFailed(_)
                     );
                     #[cfg(feature = "prometheus-exporter")]
                     if let Some(pe) = prom_export.as_mut() {
@@ -1053,14 +1068,38 @@ fn run(cfg: Config) -> std::io::Result<()> {
                             unreachable!("on_stall returned a reap-only recovery outcome")
                         }
                     }
+
+                    if did_spawn {
+                        spawns_this_tick += 1;
+                        if spawns_this_tick >= varta_watch::recovery::RECOVERY_SPAWN_MAX_PER_TICK {
+                            // Budget reached: leave the remaining queued stalls
+                            // for the next tick (the stall_queue cursor resumes)
+                            // so a mass stall can't fork the whole fleet in one
+                            // DrainPending stage and trip the self-watchdog.
+                            #[cfg(feature = "prometheus-exporter")]
+                            if let Some(pe) = prom_export.as_mut() {
+                                pe.record_recovery_spawn_budget_exceeded(1);
+                            }
+                            break;
+                        }
+                    }
                 }
             }
         }
 
         // Record drain_pending stage, then reset timer for the poll phase.
+        // Stage *publication* (CURRENT_STAGE / LAST_STAGE_ENTRY_NS) is
+        // unconditional under the feature so the per-stage self-watchdog
+        // advances past DrainPending even when `--prom-addr` is unset
+        // (prom_export == None); only the histogram needs the live exporter.
+        // Without this split, CURRENT_STAGE was stuck at DrainPending for the
+        // whole iteration and Check 2 timed every stage against the wrong
+        // ceiling and mislabeled aborts.
         #[cfg(feature = "prometheus-exporter")]
-        if let Some(pe) = prom_export.as_mut() {
-            pe.record_stage_duration(IterStage::DrainPending, stage_start.elapsed());
+        {
+            if let Some(pe) = prom_export.as_mut() {
+                pe.record_stage_duration(IterStage::DrainPending, stage_start.elapsed());
+            }
             stage_start = Instant::now();
             if let Some(a) = LAST_STAGE_ENTRY_NS.get(IterStage::Poll as usize) {
                 a.store(observer_now_ns(), Ordering::Relaxed);
@@ -1112,9 +1151,12 @@ fn run(cfg: Config) -> std::io::Result<()> {
         };
 
         // Record poll stage, then reset timer for the maintenance phase.
+        // Publication unconditional under the feature (see DrainPending above).
         #[cfg(feature = "prometheus-exporter")]
-        if let Some(pe) = prom_export.as_mut() {
-            pe.record_stage_duration(IterStage::Poll, stage_start.elapsed());
+        {
+            if let Some(pe) = prom_export.as_mut() {
+                pe.record_stage_duration(IterStage::Poll, stage_start.elapsed());
+            }
             stage_start = Instant::now();
             if let Some(a) = LAST_STAGE_ENTRY_NS.get(IterStage::Maintenance as usize) {
                 a.store(observer_now_ns(), Ordering::Relaxed);
@@ -1326,6 +1368,7 @@ fn run(cfg: Config) -> std::io::Result<()> {
         if let Some(rec) = recovery.as_mut() {
             let evictions = rec.take_last_fired_evictions();
             let recycle_resets = rec.take_last_fired_recycle_resets();
+            let outstanding_recycle_resets = rec.take_outstanding_recycle_resets();
             let invariants = rec.take_last_fired_invariant_violations();
             let outstanding_probe_exhausted = rec.take_outstanding_probe_exhausted();
             #[cfg(feature = "prometheus-exporter")]
@@ -1335,6 +1378,9 @@ fn run(cfg: Config) -> std::io::Result<()> {
                 }
                 if recycle_resets > 0 {
                     pe.record_recovery_debounce_recycle_resets(recycle_resets);
+                }
+                if outstanding_recycle_resets > 0 {
+                    pe.record_recovery_outstanding_recycle_resets(outstanding_recycle_resets);
                 }
                 if invariants > 0 {
                     pe.record_recovery_invariant_violations(invariants);
@@ -1350,6 +1396,7 @@ fn run(cfg: Config) -> std::io::Result<()> {
                 // `LastFiredTable`'s internal accumulators stay bounded.
                 let _ = evictions;
                 let _ = recycle_resets;
+                let _ = outstanding_recycle_resets;
                 let _ = invariants;
                 let _ = outstanding_probe_exhausted;
             }
@@ -1427,9 +1474,12 @@ fn run(cfg: Config) -> std::io::Result<()> {
         }
 
         // Record maintenance stage, then reset timer for the recovery_reap phase.
+        // Publication unconditional under the feature (see DrainPending above).
         #[cfg(feature = "prometheus-exporter")]
-        if let Some(pe) = prom_export.as_mut() {
-            pe.record_stage_duration(IterStage::Maintenance, stage_start.elapsed());
+        {
+            if let Some(pe) = prom_export.as_mut() {
+                pe.record_stage_duration(IterStage::Maintenance, stage_start.elapsed());
+            }
             stage_start = Instant::now();
             if let Some(a) = LAST_STAGE_ENTRY_NS.get(IterStage::RecoveryReap as usize) {
                 a.store(observer_now_ns(), Ordering::Relaxed);
@@ -1480,30 +1530,37 @@ fn run(cfg: Config) -> std::io::Result<()> {
             }
         }
 
+        // Publish the recovery_reap → serve_pending → housekeeping transitions
+        // unconditionally under the feature (see DrainPending above); only the
+        // serve_pending WORK and its histograms need the live exporter.
         #[cfg(feature = "prometheus-exporter")]
-        if let Some(pe) = prom_export.as_mut() {
+        {
             // Record recovery_reap stage before entering serve_pending.
-            pe.record_stage_duration(IterStage::RecoveryReap, stage_start.elapsed());
+            if let Some(pe) = prom_export.as_mut() {
+                pe.record_stage_duration(IterStage::RecoveryReap, stage_start.elapsed());
+            }
             if let Some(a) = LAST_STAGE_ENTRY_NS.get(IterStage::ServePending as usize) {
                 a.store(observer_now_ns(), Ordering::Relaxed);
             }
             CURRENT_STAGE.store(IterStage::ServePending as u8, Ordering::Release);
 
-            // Bracket serve_pending so its wall time is observable
-            // independently of beat-path latency.  See
-            // `book/src/architecture/observer-liveness.md` ("Why /metrics is on
-            // the poll thread") — keeping it on the main thread is a
-            // load-bearing invariant, and the separate histogram is the
-            // observability primitive that lets scrape-storm alarms fire
-            // without polluting beat-path alarms.
-            let serve_start = Instant::now();
-            if let Err(e) = pe.serve_pending() {
-                varta_error_rl!(LogKind::PromServe, "/metrics serve error: {e}");
+            if let Some(pe) = prom_export.as_mut() {
+                // Bracket serve_pending so its wall time is observable
+                // independently of beat-path latency.  See
+                // `book/src/architecture/observer-liveness.md` ("Why /metrics is
+                // on the poll thread") — keeping it on the main thread is a
+                // load-bearing invariant, and the separate histogram is the
+                // observability primitive that lets scrape-storm alarms fire
+                // without polluting beat-path alarms.
+                let serve_start = Instant::now();
+                if let Err(e) = pe.serve_pending() {
+                    varta_error_rl!(LogKind::PromServe, "/metrics serve error: {e}");
+                }
+                pe.record_loop_tick();
+                let serve_elapsed = serve_start.elapsed();
+                pe.record_serve_pending_duration(serve_elapsed);
+                pe.record_stage_duration(IterStage::ServePending, serve_elapsed);
             }
-            pe.record_loop_tick();
-            let serve_elapsed = serve_start.elapsed();
-            pe.record_serve_pending_duration(serve_elapsed);
-            pe.record_stage_duration(IterStage::ServePending, serve_elapsed);
             stage_start = Instant::now(); // housekeeping starts after serve_pending
             if let Some(a) = LAST_STAGE_ENTRY_NS.get(IterStage::Housekeeping as usize) {
                 a.store(observer_now_ns(), Ordering::Relaxed);

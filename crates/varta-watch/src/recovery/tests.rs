@@ -85,6 +85,96 @@ fn reaped_outcome_carries_duration_for_metrics() {
     }
 }
 
+/// PID-recycle gap on the [`OutstandingTable`] — the sibling of bug-346 (which
+/// fixed the same gap on the debounce ledger). When the OS recycles a PID to a
+/// new process while the previous lineage's recovery child is still tracked,
+/// the genuinely-stalled new occupant must NOT be silently Debounced: the stale
+/// slot is reclaimed (its child killed + moved to the non-blocking orphan
+/// reaper) and a fresh recovery spawns for the new lineage.
+#[test]
+fn recycled_pid_reclaims_outstanding_slot_and_recovers_new_lineage() {
+    // Long debounce so a same-lineage re-stall is provably suppressed; the
+    // recycle path must bypass it. The G1 child is long-running (`sleep`) so it
+    // is STILL OUTSTANDING at recycle time — the exact condition under which the
+    // pre-fix code returned Debounced (a `true` child that exited would be
+    // reaped by the same-lineage path and mask the bug).
+    let mut rec = Recovery::new_exec(
+        "sleep".to_string(),
+        vec!["30".to_string()],
+        Duration::from_secs(60),
+    );
+
+    // Lineage G1 stalls -> recovery child spawned; slot keyed on bare pid 1000.
+    match rec.on_stall(1000, BeatOrigin::KernelAttested, false, Some(1), 0) {
+        RecoveryOutcome::Spawned { .. } => {}
+        other => panic!("expected Spawned for first lineage, got {other:?}"),
+    }
+    assert!(rec.outstanding.contains(1000));
+
+    // Control: a SAME-lineage re-stall inside the debounce window is suppressed.
+    assert!(
+        matches!(
+            rec.on_stall(1000, BeatOrigin::KernelAttested, false, Some(1), 0),
+            RecoveryOutcome::Debounced
+        ),
+        "same-lineage re-stall must be debounced"
+    );
+    assert_eq!(rec.outstanding_recycle_resets, 0);
+
+    // PID 1000 recycled to a new process (generation G2) which genuinely
+    // stalls. Pre-fix this returned Debounced (slot still occupied by G1's
+    // child); post-fix the stale slot is reclaimed and a fresh recovery spawns.
+    match rec.on_stall(1000, BeatOrigin::KernelAttested, false, Some(2), 0) {
+        RecoveryOutcome::Spawned { .. } => {}
+        other => panic!("recycled PID must get a fresh recovery, got {other:?}"),
+    }
+    assert_eq!(
+        rec.outstanding_recycle_resets, 1,
+        "recycle reset counter must increment exactly once"
+    );
+    assert_eq!(
+        rec.reaping_orphans.len(),
+        1,
+        "the stale lineage's child must be moved to the orphan reaper"
+    );
+    assert!(
+        rec.outstanding.contains(1000),
+        "the new lineage now occupies the slot"
+    );
+
+    // The orphaned child is reaped non-blockingly across later ticks.
+    let deadline = Instant::now() + Duration::from_millis(500);
+    while !rec.reaping_orphans.is_empty() && Instant::now() < deadline {
+        let _ = rec.try_reap(0);
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        rec.reaping_orphans.is_empty(),
+        "orphaned child must be reaped and removed (no leak)"
+    );
+}
+
+/// Generation-unknown (`None`) must stay lenient — bare-PID behaviour — so the
+/// recycle reclaim never fires when start-time tokens are unavailable
+/// (non-Linux, or a `/proc` race). A same-pid re-stall with `None` generation
+/// while a child is outstanding is Debounced, exactly as before.
+#[test]
+fn unknown_generation_does_not_trigger_recycle_reclaim() {
+    let mut rec = Recovery::new_exec("sleep".to_string(), vec!["30".to_string()], Duration::ZERO);
+    match rec.on_stall(2000, BeatOrigin::KernelAttested, false, None, 0) {
+        RecoveryOutcome::Spawned { .. } => {}
+        other => panic!("expected Spawned, got {other:?}"),
+    }
+    // Second stall, still generation-unknown, child still running -> Debounced,
+    // NOT a recycle reclaim.
+    assert!(matches!(
+        rec.on_stall(2000, BeatOrigin::KernelAttested, false, None, 0),
+        RecoveryOutcome::Debounced
+    ));
+    assert_eq!(rec.outstanding_recycle_resets, 0);
+    assert!(rec.reaping_orphans.is_empty());
+}
+
 #[test]
 fn exec_mode_substitutes_pid_in_args() {
     let mut rec = Recovery::with_mode(
