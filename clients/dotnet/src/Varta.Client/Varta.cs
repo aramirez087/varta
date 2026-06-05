@@ -167,23 +167,32 @@ public sealed class Varta : IDisposable
         catch (SocketException ex)
         {
             var outcome = ErrnoClassifier.Classify(ex);
-            if (outcome.IsDropped)
+            if (!outcome.IsDropped)
             {
-                _consecutiveDropped = SaturatingIncrementU32(_consecutiveDropped);
-                if (allowRetry && _reconnectAfter > 0 && _consecutiveDropped >= _reconnectAfter)
+                // Failed: reset like a Sent so a transient error does not
+                // arm a spurious reconnect on the next drop.
+                _consecutiveDropped = 0;
+                return outcome;
+            }
+            _consecutiveDropped = SaturatingIncrementU32(_consecutiveDropped);
+            if (allowRetry && _reconnectAfter > 0 && _consecutiveDropped >= _reconnectAfter)
+            {
+                try
                 {
-                    _consecutiveDropped = 0;
-                    try
-                    {
-                        _transport.Reconnect();
-                        _connectPid = Environment.ProcessId;
-                        return TrySendWithReconnectAfter(allowRetry: false);
-                    }
-                    catch
-                    {
-                        // Reconnect failed — surface the original dropped outcome.
-                    }
+                    _transport.Reconnect();
+                    _connectPid = Environment.ProcessId;
                 }
+                catch
+                {
+                    // Failed reconnect leaves the counter saturated so the
+                    // next Dropped beat re-crosses the threshold and retries
+                    // immediately, rather than re-arming a full
+                    // reconnectAfter-beat window.
+                    return outcome;
+                }
+                // Reset only on a successful reconnect.
+                _consecutiveDropped = 0;
+                return TrySendWithReconnectAfter(allowRetry: false);
             }
             return outcome;
         }
@@ -215,6 +224,7 @@ public sealed class Varta : IDisposable
         lock (_lock)
         {
             _reconnectAfter = n;
+            _consecutiveDropped = 0;
         }
     }
 
@@ -255,6 +265,8 @@ public sealed class Varta : IDisposable
     {
         lock (_lock) { _connectPid = pid; }
     }
+
+    internal static Varta FromTransportForTest(IBeatTransport transport) => new(transport);
 
     internal ulong NonceForTest
     {

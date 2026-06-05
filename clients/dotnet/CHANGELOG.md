@@ -6,6 +6,21 @@ here. Versioning is independent of the Rust workspace and follows
 
 ## [Unreleased]
 
+### Fixed
+
+- Auto-reconnect (`SetReconnectAfter`) now resets the consecutive-dropped
+  counter only after a *successful* `Reconnect()`, matching the frozen
+  cross-client contract (Rust `varta-client`). Previously the counter was
+  zeroed before the reconnect attempt, so a failed reconnect during a
+  sustained observer outage re-armed a full `reconnectAfter`-beat window
+  instead of retrying on the very next dropped beat.
+- `Beat` now resets the consecutive-dropped counter on a `Failed` outcome
+  (not only on `Sent`), so a transient unexpected error no longer leaves a
+  spurious reconnect armed for the next drop.
+- `SetReconnectAfter` now resets the consecutive-dropped counter, so a
+  re-armed threshold gates future drops rather than firing on a
+  previously-saturated counter (parity with the other clients).
+
 ## [0.1.0] — initial release
 
 - First-class .NET client peer of `crates/varta-client`, published as

@@ -1,4 +1,6 @@
+using System.Net.Sockets;
 using System.Runtime.InteropServices;
+using Varta.Internal.Transport;
 using Varta.Tests.Helpers;
 using Xunit;
 
@@ -7,6 +9,52 @@ namespace Varta.Tests;
 public class VartaAgentTests
 {
     private static bool UnixOnly => !RuntimeInformation.IsOSPlatform(OSPlatform.Windows);
+
+    /// <summary>
+    /// Always drops on send; reconnect always throws. Drives the
+    /// auto-reconnect threshold logic deterministically without sockets.
+    /// </summary>
+    private sealed class DropAndFailReconnect : IBeatTransport
+    {
+        public int Reconnects;
+
+        public int Send(ReadOnlySpan<byte> frame32) =>
+            throw new SocketException((int)SocketError.WouldBlock);
+
+        public void Reconnect()
+        {
+            Reconnects++;
+            throw new SocketException((int)SocketError.ConnectionRefused);
+        }
+
+        public void Dispose() { }
+    }
+
+    [Fact]
+    public void FailedReconnect_PreservesConsecutiveDropped_ForImmediateRetry()
+    {
+        // A failed auto-reconnect must NOT disarm the counter: once the
+        // threshold is crossed, every subsequent Dropped beat retries the
+        // reconnect immediately rather than re-arming a full window. Mirrors
+        // the Rust regression and the frozen cross-client contract (reset
+        // only on a successful reconnect).
+        var transport = new DropAndFailReconnect();
+        using var agent = global::Varta.Varta.FromTransportForTest(transport);
+        agent.SetReconnectAfter(2);
+
+        // First drop: 0 -> 1, below threshold, no reconnect attempted.
+        Assert.True(agent.Beat(Status.Ok).IsDropped);
+        Assert.Equal(0, transport.Reconnects);
+
+        // Second drop: crosses the threshold; reconnect attempted and
+        // FAILS, so the counter must stay saturated at 2.
+        Assert.True(agent.Beat(Status.Ok).IsDropped);
+        Assert.Equal(1, transport.Reconnects);
+
+        // Third drop: threshold still crossed → reconnect retried immediately.
+        Assert.True(agent.Beat(Status.Ok).IsDropped);
+        Assert.Equal(2, transport.Reconnects);
+    }
 
     [SkipOnWindowsFact]
     public void Beat_OnUds_SendsValidFrame()

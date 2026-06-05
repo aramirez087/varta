@@ -12,8 +12,29 @@ import {
   classifySendError,
   DropReason,
 } from "../src/outcome.js";
+import type { BeatTransport } from "../src/transport.js";
 import { decode, NONCE_TERMINAL, Status } from "../src/vlp.js";
 import { bindUdpRecorder } from "./helpers.js";
+
+// Always drops on send; reconnect always throws. Drives the
+// auto-reconnect threshold logic deterministically without sockets.
+class DropAndFailReconnect implements BeatTransport {
+  reconnects = 0;
+  send(_buf: Buffer): void {
+    const e = new Error("mock EAGAIN") as NodeJS.ErrnoException;
+    e.code = "EAGAIN";
+    e.errno = 11;
+    throw e;
+  }
+  reconnect(): void {
+    this.reconnects += 1;
+    const e = new Error("mock ECONNREFUSED") as NodeJS.ErrnoException;
+    e.code = "ECONNREFUSED";
+    e.errno = 111;
+    throw e;
+  }
+  close(): void {}
+}
 
 function errnoErr(code: string, errno: number): NodeJS.ErrnoException {
   const e = new Error(`mock ${code}`) as NodeJS.ErrnoException;
@@ -162,6 +183,30 @@ test("nonce sequence is monotonic and starts at 1", async () => {
   } finally {
     await listener.close();
   }
+});
+
+test("failed reconnect preserves consecutiveDropped for immediate retry", () => {
+  // A failed auto-reconnect must NOT disarm the counter: once the
+  // threshold is crossed, every subsequent Dropped beat retries the
+  // reconnect immediately rather than re-arming a full window. Mirrors
+  // the Rust regression and the frozen cross-client contract (reset only
+  // on a successful reconnect).
+  const transport = new DropAndFailReconnect();
+  const agent = Varta.fromTransport(transport);
+  agent.setReconnectAfter(2);
+
+  // First drop: 0 -> 1, below threshold, no reconnect attempted.
+  assert.equal(agent.beat(Status.Ok).kind, "dropped");
+  assert.equal(transport.reconnects, 0);
+
+  // Second drop: crosses the threshold; reconnect attempted and FAILS,
+  // so the counter must stay saturated at 2.
+  assert.equal(agent.beat(Status.Ok).kind, "dropped");
+  assert.equal(transport.reconnects, 1);
+
+  // Third drop: threshold still crossed → reconnect retried immediately.
+  assert.equal(agent.beat(Status.Ok).kind, "dropped");
+  assert.equal(transport.reconnects, 2);
 });
 
 test("__setNonceForTest at NONCE_TERMINAL - 1 triggers wrap to 0", async () => {

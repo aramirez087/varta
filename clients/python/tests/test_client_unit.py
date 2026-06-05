@@ -230,6 +230,46 @@ def test_set_reconnect_after_zero_disables() -> None:
     assert transport.reconnect_calls == 0
 
 
+class _DropAndFailReconnect(BeatTransport):
+    """Always drops on send; reconnect always fails."""
+
+    def __init__(self) -> None:
+        self.reconnect_calls = 0
+
+    def send(self, buf: bytes) -> int:
+        raise BlockingIOError()
+
+    def reconnect(self) -> None:
+        self.reconnect_calls += 1
+        raise OSError(errno.ECONNREFUSED, "refused")
+
+
+def test_failed_reconnect_preserves_consecutive_dropped_for_immediate_retry() -> None:
+    # A failed auto-reconnect must NOT disarm the counter: once the
+    # threshold is crossed, every subsequent Dropped beat retries the
+    # reconnect immediately rather than re-arming a full window. Mirrors
+    # the Rust regression of the same name and the frozen cross-client
+    # contract (reset only on a successful reconnect).
+    transport = _DropAndFailReconnect()
+    agent = Varta(transport)
+    agent.set_reconnect_after(2)
+
+    # First drop: 0 -> 1, below threshold, no reconnect attempted.
+    assert agent.beat(Status.OK).is_dropped
+    assert agent._consecutive_dropped == 1
+    assert transport.reconnect_calls == 0
+
+    # Second drop: crosses the threshold; reconnect attempted and FAILS,
+    # so the counter must stay saturated at 2.
+    assert agent.beat(Status.OK).is_dropped
+    assert transport.reconnect_calls == 1
+    assert agent._consecutive_dropped == 2
+
+    # Third drop: threshold still crossed → reconnect retried immediately.
+    assert agent.beat(Status.OK).is_dropped
+    assert transport.reconnect_calls == 2
+
+
 # ---------------------------------------------------------------------------
 # BeatError + BeatOutcome plumbing.
 # ---------------------------------------------------------------------------

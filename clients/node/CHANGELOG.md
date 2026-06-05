@@ -4,6 +4,17 @@ All notable changes to the Node.js client live here. Versions follow
 [Semantic Versioning](https://semver.org). The wire protocol version is
 governed independently — see `book/src/spec/vlp.md` in the workspace.
 
+## [Unreleased]
+
+### Fixed
+
+- Auto-reconnect (`setReconnectAfter`) now resets the consecutive-dropped
+  counter only after a *successful* `reconnect()`, matching the frozen
+  cross-client contract (Rust `varta-client`). Previously the counter was
+  zeroed before the reconnect attempt, so a failed reconnect during a
+  sustained observer outage re-armed a full `reconnectAfter`-beat window
+  instead of retrying on the very next dropped beat.
+
 ## [0.2.2] — 2026-05-29
 
 ### Fixed
