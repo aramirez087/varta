@@ -20,7 +20,12 @@
 
 #[cfg(target_os = "linux")]
 extern "C" {
-    fn open(path: *const core::ffi::c_char, oflag: core::ffi::c_int) -> core::ffi::c_int;
+    // `open(2)` is variadic in libc — `int open(const char *, int, ...)`, the
+    // trailing `mode` arg consumed only when `O_CREAT`/`O_TMPFILE` is set. The
+    // extern decl must match that variadic ABI; a fixed 2-arg signature is UB
+    // (Miri: "calling a variadic function with a non-variadic caller-side
+    // signature"). We pass no variadic arg because O_RDONLY takes no mode.
+    fn open(path: *const core::ffi::c_char, oflag: core::ffi::c_int, ...) -> core::ffi::c_int;
     // `buf: *mut u8` matches the existing `read` declaration in
     // `nonblock_fd.rs`; a `*mut c_void` here trips `clashing_extern_declarations`
     // (CI runs clippy with `-D warnings`).
@@ -53,7 +58,7 @@ pub(crate) fn read_pid_start_time(pid: u32) -> Option<u64> {
     let mut path = [0u8; 32];
     write_proc_pid_stat(&mut path, pid)?;
     // SAFETY: `path` is NUL-terminated by `write_proc_pid_stat`. `O_RDONLY`
-    // takes no mode argument, so the non-variadic declaration is ABI-correct.
+    // takes no mode argument, so passing no variadic arg is ABI-correct.
     let fd = unsafe {
         open(
             path.as_ptr() as *const core::ffi::c_char,
