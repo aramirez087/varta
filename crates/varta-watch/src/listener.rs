@@ -663,6 +663,9 @@ mod udp_impl {
 
     use super::BeatListener;
 
+    const VLP_FRAME_LEN: usize = 32;
+    const VLP_FRAME_RECV_CAP: usize = VLP_FRAME_LEN + 1;
+
     /// UDP listener for network-based observers.
     ///
     /// Receives 32-byte VLP frames over UDP from remote agents. Created via
@@ -722,14 +725,16 @@ mod udp_impl {
 
     impl BeatListener for UdpListener {
         fn recv(&mut self) -> RecvResult {
-            let mut buf = [0u8; 32];
+            let mut buf_with_slack = [0u8; VLP_FRAME_RECV_CAP];
             let origin = match self.recovery_trust {
                 super::TransportTrust::Operator => BeatOrigin::OperatorAttestedTransport,
                 super::TransportTrust::Untrusted => BeatOrigin::NetworkUnverified,
             };
             loop {
-                match self.sock.recv(&mut buf) {
-                    Ok(32) => {
+                match self.sock.recv(&mut buf_with_slack) {
+                    Ok(VLP_FRAME_LEN) => {
+                        let mut data = [0u8; VLP_FRAME_LEN];
+                        data.copy_from_slice(&buf_with_slack[..VLP_FRAME_LEN]);
                         return RecvResult::Authenticated {
                             peer_pid: 0,
                             peer_uid: 0,
@@ -737,7 +742,7 @@ mod udp_impl {
                             peer_pid_ns_inode: None,
                             peer_pidfd: None,
                             origin,
-                            data: buf,
+                            data,
                         };
                     }
                     Ok(_) => {
@@ -762,6 +767,51 @@ mod udp_impl {
             let n = self.truncated_count;
             self.truncated_count = 0;
             n
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use std::net::UdpSocket;
+        use std::time::{Duration, Instant};
+
+        use varta_vlp::{Frame, Status};
+
+        use super::*;
+
+        #[test]
+        fn rejects_overlong_valid_frame_prefix() {
+            let mut listener =
+                UdpListener::bind("127.0.0.1:0".parse().unwrap()).expect("bind listener");
+            let target = listener.sock.local_addr().expect("listener local addr");
+            let sender = UdpSocket::bind("127.0.0.1:0").expect("sender bind");
+
+            let mut valid_prefix = [0u8; VLP_FRAME_LEN];
+            Frame::new(Status::Ok, 77_777, 1, 1, 0).encode(&mut valid_prefix);
+            let mut overlong = [0u8; VLP_FRAME_RECV_CAP];
+            overlong[..VLP_FRAME_LEN].copy_from_slice(&valid_prefix);
+            overlong[VLP_FRAME_LEN] = 0xEE;
+
+            sender.send_to(&overlong, target).expect("send overlong");
+
+            let deadline = Instant::now() + Duration::from_millis(500);
+            loop {
+                match listener.recv() {
+                    RecvResult::WouldBlock if Instant::now() < deadline => {
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                    RecvResult::ShortRead => break,
+                    RecvResult::Authenticated { .. } => {
+                        panic!("overlong datagram with valid VLP prefix must be rejected")
+                    }
+                    RecvResult::WouldBlock => panic!("listener did not receive test datagram"),
+                    RecvResult::CtrlTruncated(e) | RecvResult::IoError(e) => {
+                        panic!("unexpected receive error: {e}")
+                    }
+                }
+            }
+
+            assert_eq!(listener.drain_truncated(), 1);
         }
     }
 }

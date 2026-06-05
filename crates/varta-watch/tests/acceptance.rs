@@ -368,7 +368,7 @@ fn observer_rejects_spoofed_pid_frame() {
     }
 }
 
-/// Send datagrams shorter than 32 bytes to the observer and verify they are
+/// Send datagrams with non-32-byte sizes to the observer and verify they are
 /// silently counted as truncated without crashing or emitting beat events.
 #[cfg_attr(miri, ignore)] // JUSTIFY: miri cannot model Unix datagram bind/send/recv syscalls
 #[test]
@@ -420,6 +420,76 @@ fn observer_counts_truncated_datagrams() {
         "all truncated should have been drained in loop"
     );
     assert!(!saw_beat, "truncated datagrams must not emit Beat events");
+}
+
+/// Regression: a datagram whose first 32 bytes are a valid VLP frame but
+/// which carries trailing bytes must not be accepted as a normal beat.
+#[cfg_attr(miri, ignore)] // JUSTIFY: miri cannot model Unix datagram bind/send/recv syscalls
+#[test]
+fn observer_rejects_overlong_datagram_with_valid_frame_prefix() {
+    let path = unique_uds_path("overlong");
+    let mut observer = Observer::bind(
+        path.as_path(),
+        Duration::from_secs(60),
+        0o600,
+        Duration::from_millis(100),
+        0,
+        64,
+        EvictionPolicy::Strict,
+        DEFAULT_EVICTION_SCAN_WINDOW,
+        None,
+        0,
+        0,
+        ClockSource::Monotonic,
+        &pre_thread(),
+    )
+    .expect("bind observer");
+    let client = client_socket(path.as_path());
+
+    let pid = std::process::id();
+    let nonce = 9_999;
+    let payload = 0xFEED;
+    let mut valid_prefix = [0u8; 32];
+    make_frame(pid, nonce, Status::Ok, payload).encode(&mut valid_prefix);
+    let mut overlong = [0u8; 33];
+    overlong[..32].copy_from_slice(&valid_prefix);
+    overlong[32] = 0xEE;
+    client.send(&overlong).expect("send overlong frame");
+
+    let deadline = Duration::from_secs(2);
+    let stop = Instant::now() + deadline;
+    let mut saw_beat = false;
+    let mut saw_truncated = false;
+    while Instant::now() < stop {
+        if let Some(ev) = observer.poll() {
+            match ev {
+                Event::Beat {
+                    pid: p,
+                    nonce: n,
+                    payload: pl,
+                    ..
+                } if p == pid && n == nonce && pl == payload => {
+                    saw_beat = true;
+                    break;
+                }
+                _ => {}
+            }
+        }
+        if observer.drain_truncated() > 0 {
+            saw_truncated = true;
+            break;
+        }
+        thread::sleep(Duration::from_millis(1));
+    }
+
+    assert!(
+        saw_truncated,
+        "overlong valid-prefix datagram must count as truncated"
+    );
+    assert!(
+        !saw_beat,
+        "overlong valid-prefix datagram must not emit a Beat"
+    );
 }
 
 /// Verify that `Tracker::new(capacity)` clamps to [`MAX_CAPACITY`]

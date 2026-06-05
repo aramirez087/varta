@@ -212,7 +212,7 @@ pub enum RecvResult {
     },
     /// The read timed out (`EAGAIN` / `EWOULDBLOCK`).
     WouldBlock,
-    /// A short (non-32-byte) read — dropped.
+    /// A wrong-size (non-32-byte) datagram — dropped.
     ShortRead,
     /// Fatal I/O error.  Also surfaced when the kernel fails to attach
     /// `SCM_CREDENTIALS` despite `SO_PASSCRED` being set — that case is

@@ -387,6 +387,71 @@ fn send_wire(target: SocketAddr, wire: &[u8]) {
 }
 
 #[test]
+fn overlong_shared_prefix_is_truncated_before_decrypt() {
+    let key_bytes = [0x24u8; 32];
+    let mut listener = bind_with_keys(vec![Key::from_bytes(key_bytes)]);
+    let target = listener.test_local_addr();
+
+    let mut plaintext = [0u8; 32];
+    Frame::new(Status::Ok, 24_024, 1, 1, 0).encode(&mut plaintext);
+    let shared = build_shared_frame(&Key::from_bytes(key_bytes), test_iv(), 1, &plaintext);
+    let mut overlong = [0u8; SECURE_FRAME_RECV_CAP];
+    overlong[..SECURE_FRAME_LEN].copy_from_slice(&shared);
+    overlong[SECURE_FRAME_LEN..].fill(0xEE);
+
+    send_wire(target, &overlong);
+
+    assert!(
+        matches!(recv_one(&mut listener), RecvResult::ShortRead),
+        "overlong shared-key datagram must be rejected as wrong-size"
+    );
+    assert_eq!(listener.drain_truncated(), 1);
+    assert_eq!(
+        listener.drain_aead_attempts(),
+        0,
+        "wrong-size datagrams must be rejected before AEAD"
+    );
+    assert_eq!(listener.drain_decrypt_failures(), 0);
+    assert_eq!(listener.sender_state_len(), 0);
+}
+
+#[test]
+fn overlong_master_prefix_is_truncated_before_decrypt() {
+    let master_bytes = [0x42u8; 32];
+    let master = Key::from_bytes(master_bytes);
+    let mut listener = SecureUdpListener::bind_with_master(
+        "127.0.0.1:0".parse().unwrap(),
+        vec![],
+        Key::from_bytes(master_bytes),
+    )
+    .expect("bind");
+    let target = listener.test_local_addr();
+
+    let agent_pid = 42_042;
+    let mut plaintext = [0u8; 32];
+    Frame::new(Status::Ok, agent_pid, 1, 1, 0).encode(&mut plaintext);
+    let master_wire = build_master_frame(&master, agent_pid, test_iv(), 1, &plaintext);
+    let mut overlong = [0u8; SECURE_FRAME_RECV_CAP];
+    overlong[..SECURE_FRAME_MASTER_LEN].copy_from_slice(&master_wire);
+    overlong[SECURE_FRAME_MASTER_LEN] = 0xEE;
+
+    send_wire(target, &overlong);
+
+    assert!(
+        matches!(recv_one(&mut listener), RecvResult::ShortRead),
+        "overlong master-key datagram must be rejected as wrong-size"
+    );
+    assert_eq!(listener.drain_truncated(), 1);
+    assert_eq!(
+        listener.drain_aead_attempts(),
+        0,
+        "wrong-size datagrams must be rejected before AEAD"
+    );
+    assert_eq!(listener.drain_decrypt_failures(), 0);
+    assert_eq!(listener.sender_state_len(), 0);
+}
+
+#[test]
 fn full_table_existing_identity_is_accepted_without_eviction() {
     let key_bytes = [0x5Au8; 32];
     let mut listener = bind_with_keys(vec![Key::from_bytes(key_bytes)]);

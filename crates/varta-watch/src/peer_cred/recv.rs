@@ -11,6 +11,9 @@ use std::io;
 use super::plat;
 use super::{observer_uid, BeatOrigin, RecvResult};
 
+const VLP_FRAME_LEN: usize = 32;
+const VLP_FRAME_RECV_CAP: usize = VLP_FRAME_LEN + 1;
+
 /// Classify a kernel-attested UDS beat by the PID the kernel attributed to it.
 ///
 /// A nonzero `peer_pid` means the kernel named a concrete sending process, so
@@ -199,15 +202,15 @@ pub(crate) fn recv_authenticated(fd: i32) -> RecvResult {
         )
     ))]
     {
-        let mut data = [0u8; 32];
+        let mut data_with_slack = [0u8; VLP_FRAME_RECV_CAP];
 
         #[repr(align(8))]
         struct AncBuf([u8; plat::ANCILLARY_BUFFER_SIZE]);
         let mut anc = AncBuf([0u8; plat::ANCILLARY_BUFFER_SIZE]);
 
         let mut iov = plat::Iovec {
-            iov_base: data.as_mut_ptr() as *mut core::ffi::c_void,
-            iov_len: 32,
+            iov_base: data_with_slack.as_mut_ptr() as *mut core::ffi::c_void,
+            iov_len: data_with_slack.len(),
         };
 
         let mut mhdr = plat::msghdr_for_recv(
@@ -218,8 +221,8 @@ pub(crate) fn recv_authenticated(fd: i32) -> RecvResult {
 
         let n = loop {
             // SAFETY: `recvmsg(2)` reads from `fd` and writes:
-            //   - up to `iov.iov_len` (= 32) bytes into the `data` stack array
-            //     via `iov.iov_base`;
+            //   - up to `iov.iov_len` (= 33) bytes into the `data_with_slack`
+            //     stack array via `iov.iov_base`;
             //   - up to `ANCILLARY_BUFFER_SIZE` bytes of ancillary data into
             //     the `anc` stack array via `mhdr.msg_control`;
             //   - the actual control length into `mhdr.msg_controllen` and the
@@ -256,9 +259,14 @@ pub(crate) fn recv_authenticated(fd: i32) -> RecvResult {
             ));
         }
 
-        if n as usize != 32 {
+        if n as usize != VLP_FRAME_LEN {
+            #[cfg(target_os = "linux")]
+            plat::close_pidfds_after_recv(&mhdr);
             return RecvResult::ShortRead;
         }
+
+        let mut data = [0u8; VLP_FRAME_LEN];
+        data.copy_from_slice(&data_with_slack[..VLP_FRAME_LEN]);
 
         let (peer_pid, peer_uid, peer_pidfd) = match plat::peer_pid_after_recv(fd, &mhdr) {
             Some((pid, uid, pidfd)) => (pid, uid, pidfd),
@@ -327,12 +335,20 @@ pub(crate) fn recv_authenticated(fd: i32) -> RecvResult {
             fn recv(fd: i32, buf: *mut core::ffi::c_void, len: usize, flags: i32) -> isize;
         }
 
-        let mut data = [0u8; 32];
+        let mut data_with_slack = [0u8; VLP_FRAME_RECV_CAP];
         let n = loop {
-            // SAFETY: `recv(2)` writes up to `len` bytes into `data`, a
-            // stack-allocated 32-byte array. The buffer outlives the call.
+            // SAFETY: `recv(2)` writes up to `len` bytes into
+            // `data_with_slack`, a stack-allocated 33-byte array. The buffer
+            // outlives the call.
             // Return value: `< 0` is errno, `>= 0` is byte count.
-            let ret = unsafe { recv(fd, data.as_mut_ptr() as *mut core::ffi::c_void, 32, 0) };
+            let ret = unsafe {
+                recv(
+                    fd,
+                    data_with_slack.as_mut_ptr() as *mut core::ffi::c_void,
+                    data_with_slack.len(),
+                    0,
+                )
+            };
             if ret < 0 {
                 let err = io::Error::last_os_error();
                 match err.kind() {
@@ -346,9 +362,12 @@ pub(crate) fn recv_authenticated(fd: i32) -> RecvResult {
             break ret as isize;
         };
 
-        if n as usize != 32 {
+        if n as usize != VLP_FRAME_LEN {
             return RecvResult::ShortRead;
         }
+
+        let mut data = [0u8; VLP_FRAME_LEN];
+        data.copy_from_slice(&data_with_slack[..VLP_FRAME_LEN]);
 
         return RecvResult::Authenticated {
             peer_pid: 0,

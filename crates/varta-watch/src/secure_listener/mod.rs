@@ -43,6 +43,9 @@ const SECURE_FRAME_LEN: usize = crypto::SECURE_FRAME_BYTES;
 /// Wire size of a master-key VLP frame.
 const SECURE_FRAME_MASTER_LEN: usize = SECURE_FRAME_MASTER_BYTES;
 
+/// Receive capacity with one byte of slack to detect overlong datagrams.
+const SECURE_FRAME_RECV_CAP: usize = SECURE_FRAME_MASTER_LEN + 1;
+
 /// Maximum number of unique senders tracked simultaneously. Prevents
 /// unbounded memory growth from short-lived agents (cron jobs, CI runners).
 const MAX_SENDER_STATES: usize = 1024;
@@ -544,8 +547,9 @@ impl SecureUdpListener {
 impl BeatListener for SecureUdpListener {
     fn recv(&mut self) -> RecvResult {
         // Sized for the larger master-key frame; a 60-byte shared-key datagram
-        // fills only the first 60 bytes and nread discriminates the path.
-        let mut buf = [0u8; SECURE_FRAME_MASTER_LEN];
+        // fills only the first 60 bytes and nread discriminates the path. The
+        // extra byte makes overlong datagrams observable before decryption.
+        let mut buf = [0u8; SECURE_FRAME_RECV_CAP];
         loop {
             // Periodic eviction sweep for stale senders
             let now = Instant::now();
