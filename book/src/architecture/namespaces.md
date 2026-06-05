@@ -51,6 +51,38 @@ comparison short-circuits to "match". UDP listeners set `peer_pid_ns_inode =
 None` because there is no kernel attestation; the existing UDP recovery
 refusal gate is the relevant protection there.
 
+## PID recycling within a namespace (generation token)
+
+A PID is not a stable identity even *within* one namespace: the kernel
+recycles it once the holding process exits. If agent A (PID 1234) dies and the
+OS reuses 1234 for a fresh agent B, B's first beat carries `nonce = 1` while
+the observer's slot for PID 1234 still holds A's high-water nonce. Without
+extra signal, B's low-nonce beats are rejected as out-of-order, the slot's
+`last_ns` freezes, a **false stall** fires, and recovery is misdirected against
+the healthy new process — all with no attacker involved. On Linux UDS
+(`KernelAttested`) recovery is *permitted*, so this can kill or restart an
+unrelated bystander; on macOS UDS (`SocketModeOnly`) and all UDP
+(`NetworkUnverified`) recovery is already refused, so the residual there is
+limited to monitoring accuracy.
+
+The fix binds slot identity to **`(pid, generation)`**, where `generation` is
+the kernel-attested process start-time — field 22 (`starttime`) of
+`/proc/<pid>/stat`, read via `crate::peer_cred::read_pid_start_time(peer_pid)`
+(allocation-free, one `open`/`read`/`close` into a stack buffer, parsed from
+the last `)` so a `comm` containing spaces or parentheses cannot fool it). Two
+processes that share a PID value cannot share a start-time, because the first
+holds the PID until it exits.
+
+When a beat for an already-tracked pid carries a **different** `Some(_)`
+generation, the slot is reset to a fresh agent (nonce baseline, origin,
+namespace inode, and silence timer all re-pinned) and the event is counted as
+`varta_tracker_pid_recycle_total`. The generation check runs **before** the
+origin / namespace / nonce checks — a recycled process legitimately differs on
+all of them. A `None` on either side ("generation unknown": non-Linux, UDP, or
+unreadable `/proc`) is treated leniently and never triggers a reset, so prior
+PID-only behaviour is preserved exactly. Replay protection is untouched: a low
+nonce under the **same** generation is still dropped as out-of-order.
+
 ## Mitigation by deployment style
 
 | Deployment | Default behaviour | Operator action |
@@ -67,6 +99,7 @@ refusal gate is the relevant protection there.
 |---|---|
 | `varta_frame_namespace_mismatch_total` (counter) | Kernel-attested frames dropped at receive (peer ns ≠ observer ns). |
 | `varta_tracker_namespace_conflict_total` (counter) | Beats dropped because the slot's pinned ns inode disagreed with the beat's (first-namespace-wins). |
+| `varta_tracker_pid_recycle_total` (counter) | Slots reset because a kernel-attested process start-time mismatch proved the pid was recycled to a new process (recycle-safe identity). |
 | `varta_recovery_refused_total{reason="cross_namespace_agent"}` (counter) | Stalls refused at recovery time because the slot's ns inode differed from the observer's. |
 | `varta_recovery_outcomes_total{outcome="refused_cross_namespace"}` (counter) | Same event, broken down on the outcome axis. |
 | Audit log record with `reason=cross_namespace_agent` | TSV record in `--recovery-audit-file`. |
@@ -84,6 +117,8 @@ rules stay green-on-green until the first event.
   `--allow-cross-namespace-agents`.
 - `Observer::drain_cross_namespace_drops() -> u64` — counter drain.
 - `Observer::drain_namespace_conflicts() -> u64` — counter drain.
+- `Observer::drain_pid_recycles() -> u64` — counter drain (PID-recycle slot resets).
+- `Tracker::record_with_generation(frame, now_ns, threshold_ns, origin, peer_pid_ns_inode, peer_generation)` — the generation-aware record path; `Tracker::record(..)` is a shim passing `peer_generation = None`.
 - `Tracker::pid_ns_inode_of(pid: u32) -> Option<Option<u64>>` — observer-side
   introspection.
 - `Recovery::with_allow_cross_namespace(bool) -> Self` — same opt-out at the

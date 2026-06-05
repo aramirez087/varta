@@ -895,3 +895,190 @@ fn pid_index_occupied_restored_on_tombstone_reuse() {
         idx.len()
     );
 }
+
+// ---------------------- PID-recycle gate tests (bug-341) --------------
+//
+// A numeric PID is not a stable process identity — the OS recycles it once
+// the holding process dies. Without a generation token, a fresh agent that
+// reuses a dead agent's PID inherits the dead slot's high `last_nonce`, so its
+// low-nonce beats are rejected as `OutOfOrder`, `last_ns` freezes, a false
+// stall fires, and recovery is misdirected against the healthy new process.
+// The kernel-attested process start-time (generation) disambiguates this.
+
+/// The core fix: a known pid beating with a DIFFERENT attested generation is a
+/// recycle. The slot resets to the new agent (low nonce accepted, `last_ns`
+/// advanced, stall latch cleared) instead of false-stalling it.
+#[test]
+fn pid_recycle_resets_slot_instead_of_dropping_low_nonce() {
+    let mut t = Tracker::new(8, EvictionPolicy::Strict, DEFAULT_EVICTION_SCAN_WINDOW);
+    let threshold_ns = 100;
+
+    // Agent A: long-lived, generation G1, climbs to a high nonce.
+    assert_eq!(
+        t.record_with_generation(
+            &frame(1234, 5000),
+            0,
+            threshold_ns,
+            ORIGIN,
+            Some(10),
+            Some(111)
+        ),
+        Update::Inserted
+    );
+    // A goes silent and the observer latches a stall for it.
+    t.drain_stalled_slots(threshold_ns * 2, threshold_ns, |_, _, _, _, _| {});
+    assert_eq!(t.stall_emitted_count, 1);
+
+    // OS recycles PID 1234 → fresh Agent B, generation G2, nonce restarts at 1.
+    let recycled = t.record_with_generation(
+        &frame(1234, 1),
+        threshold_ns * 3,
+        threshold_ns,
+        ORIGIN,
+        Some(10),
+        Some(222),
+    );
+    assert_eq!(
+        recycled,
+        Update::Inserted,
+        "a recycled pid must be a fresh insert, not OutOfOrder"
+    );
+    assert_eq!(t.take_pid_recycles(), 1);
+    assert_eq!(t.take_pid_recycles(), 0);
+    // Slot identity now follows B: low nonce accepted, timer fresh, no stall.
+    assert_eq!(t.entries[0].last_nonce, 1);
+    assert_eq!(t.last_ns_of(1234), Some(threshold_ns * 3));
+    assert_eq!(
+        t.stall_emitted_count, 0,
+        "stall latch for the dead agent must clear"
+    );
+}
+
+/// Replay protection is preserved: a low nonce under the SAME generation is
+/// still `OutOfOrder` (it is a reorder/replay of the same process, not a
+/// recycle). The recycle counter must not move.
+#[test]
+fn same_generation_low_nonce_is_still_out_of_order() {
+    let mut t = Tracker::new(8, EvictionPolicy::Strict, DEFAULT_EVICTION_SCAN_WINDOW);
+    let threshold_ns = 100;
+    assert_eq!(
+        t.record_with_generation(
+            &frame(1234, 5000),
+            0,
+            threshold_ns,
+            ORIGIN,
+            Some(10),
+            Some(111)
+        ),
+        Update::Inserted
+    );
+    let replay = t.record_with_generation(
+        &frame(1234, 1),
+        10,
+        threshold_ns,
+        ORIGIN,
+        Some(10),
+        Some(111),
+    );
+    assert_eq!(replay, Update::OutOfOrder);
+    assert_eq!(t.take_pid_recycles(), 0);
+    assert_eq!(
+        t.entries[0].last_nonce, 5000,
+        "replay must not rewind the high-water nonce"
+    );
+}
+
+/// A `None` generation on either side ("unknown" — non-Linux / unattested
+/// transport / unreadable /proc) disables recycle detection, preserving the
+/// prior PID-only behaviour. The plain `record()` shim passes `None`, so a low
+/// nonce is rejected exactly as before.
+#[test]
+fn generation_none_disables_recycle_detection() {
+    let mut t = Tracker::new(8, EvictionPolicy::Strict, DEFAULT_EVICTION_SCAN_WINDOW);
+    let threshold_ns = 100;
+    // Via the shim → peer_generation = None.
+    assert_eq!(
+        t.record(&frame(1234, 5000), 0, threshold_ns, ORIGIN, None),
+        Update::Inserted
+    );
+    assert_eq!(
+        t.record(&frame(1234, 1), 10, threshold_ns, ORIGIN, None),
+        Update::OutOfOrder,
+        "with no generation token, prior PID-only semantics hold"
+    );
+    assert_eq!(t.take_pid_recycles(), 0);
+
+    // A pinned generation but an unknown current one also must not reset
+    // (Some -> None is the dying-process case, not a recycle signal).
+    let mut t2 = Tracker::new(8, EvictionPolicy::Strict, DEFAULT_EVICTION_SCAN_WINDOW);
+    let _ = t2.record_with_generation(&frame(7, 5000), 0, threshold_ns, ORIGIN, Some(1), Some(111));
+    assert_eq!(
+        t2.record_with_generation(&frame(7, 1), 10, threshold_ns, ORIGIN, Some(1), None),
+        Update::OutOfOrder
+    );
+    assert_eq!(t2.take_pid_recycles(), 0);
+}
+
+/// A recycle re-pins the namespace inode and origin from the NEW process,
+/// closing the stale-inode facet that lets the cross-namespace recovery gate
+/// misfire. The new agent's beat carries a different namespace inode, which a
+/// non-recycle path would reject as `NamespaceConflict`; the generation
+/// mismatch correctly takes precedence and resets the slot.
+#[test]
+fn recycle_repins_namespace_inode_over_namespace_conflict() {
+    let mut t = Tracker::new(8, EvictionPolicy::Strict, DEFAULT_EVICTION_SCAN_WINDOW);
+    let threshold_ns = 100;
+    let _ = t.record_with_generation(
+        &frame(1234, 5000),
+        0,
+        threshold_ns,
+        BeatOrigin::KernelAttested,
+        Some(4026531836),
+        Some(111),
+    );
+    // New process, new namespace inode AND new generation. The generation
+    // gate must win over the namespace-conflict gate and reset the slot.
+    let r = t.record_with_generation(
+        &frame(1234, 1),
+        10,
+        threshold_ns,
+        BeatOrigin::KernelAttested,
+        Some(4026531999),
+        Some(222),
+    );
+    assert_eq!(r, Update::Inserted);
+    assert_eq!(t.pid_ns_inode_of(1234), Some(Some(4026531999)));
+    assert_eq!(t.take_pid_recycles(), 1);
+    assert_eq!(
+        t.take_namespace_conflicts(),
+        0,
+        "a recycle is not a namespace conflict"
+    );
+}
+
+/// Same generation, same inode → ordinary refresh, no recycle counted.
+#[test]
+fn same_generation_increasing_nonce_is_plain_refresh() {
+    let mut t = Tracker::new(8, EvictionPolicy::Strict, DEFAULT_EVICTION_SCAN_WINDOW);
+    let threshold_ns = 100;
+    let _ = t.record_with_generation(
+        &frame(1234, 1),
+        0,
+        threshold_ns,
+        ORIGIN,
+        Some(10),
+        Some(111),
+    );
+    assert_eq!(
+        t.record_with_generation(
+            &frame(1234, 2),
+            10,
+            threshold_ns,
+            ORIGIN,
+            Some(10),
+            Some(111)
+        ),
+        Update::Refreshed
+    );
+    assert_eq!(t.take_pid_recycles(), 0);
+}

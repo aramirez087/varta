@@ -25,6 +25,7 @@
 mod macos_fallback;
 mod ns_inode;
 mod recv;
+mod start_time;
 mod types;
 
 #[cfg(any(fuzzing, test))]
@@ -33,6 +34,7 @@ pub mod fuzz_entry;
 
 pub(crate) use ns_inode::{observer_pid_namespace_inode, read_pid_namespace_inode};
 pub(crate) use recv::{enable_credential_passing, recv_authenticated};
+pub(crate) use start_time::read_pid_start_time;
 pub(crate) use types::observer_uid;
 pub use types::{BeatOrigin, RecvResult};
 

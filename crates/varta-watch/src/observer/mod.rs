@@ -583,6 +583,18 @@ impl Observer {
                             } else {
                                 peer_pid_ns_inode
                             };
+                            // Resolve the peer's process *generation* token
+                            // (start-time) alongside the namespace inode and on
+                            // the same kernel-attested `peer_pid`. Same deferral
+                            // rationale: only after the global limiter admits the
+                            // frame, so a flood cannot force a /proc read per
+                            // packet. `None` for non-attested transports keeps
+                            // their prior PID-only identity (no recycle gate).
+                            let peer_generation = if peer_pid != 0 {
+                                crate::peer_cred::read_pid_start_time(peer_pid)
+                            } else {
+                                None
+                            };
                             // Cross-namespace gate (Linux only). When the
                             // kernel-attested peer's PID namespace inode
                             // differs from the observer's, the frame.pid
@@ -610,12 +622,13 @@ impl Observer {
                                 }
                                 break;
                             }
-                            match self.tracker.record(
+                            match self.tracker.record_with_generation(
                                 &frame,
                                 now_ns,
                                 self.threshold_ns,
                                 origin,
                                 peer_pid_ns_inode,
+                                peer_generation,
                             ) {
                                 Update::Inserted | Update::Refreshed => {
                                     if first_event.is_none() {
@@ -878,6 +891,14 @@ impl Observer {
     /// `varta_tracker_namespace_conflict_total`.
     pub fn drain_namespace_conflicts(&mut self) -> u64 {
         self.tracker.take_namespace_conflicts()
+    }
+
+    /// Drain and reset the per-tracker PID-recycle counter — slots reset
+    /// because a kernel-attested process generation (start-time) mismatch
+    /// proved the pid had been recycled to a new process. Surfaced as
+    /// `varta_tracker_pid_recycle_total`.
+    pub fn drain_pid_recycles(&mut self) -> u64 {
+        self.tracker.take_pid_recycles()
     }
 
     /// Observer's own PID-namespace inode (Linux only; cached). Used by

@@ -152,6 +152,19 @@ pub struct Slot {
     /// represents a peer whose namespace became readable after a transient
     /// failure (e.g. peer died briefly between `recvmsg` and `readlink`).
     pub(crate) pid_ns_inode: Option<u64>,
+    /// Process *generation* token pinned at the slot's first beat — the
+    /// kernel-attested process start-time (Linux `/proc/<pid>/stat` field 22;
+    /// see [`crate::peer_cred::read_pid_start_time`]).
+    ///
+    /// `None` on non-Linux, for UDP transports (no kernel attestation), or
+    /// when `/proc/<peer_pid>/stat` was unreadable. A later beat carrying a
+    /// **different** `Some(_)` generation for the same pid means the OS
+    /// recycled the PID to a new process: the slot is reset to a fresh agent
+    /// rather than inheriting the dead process's nonce baseline / origin /
+    /// silence timer. `None` on either side is "generation unknown" and is
+    /// treated leniently (first-wins, never a recycle signal) — mirroring
+    /// [`Slot::pid_ns_inode`].
+    pub(crate) generation: Option<u64>,
     /// False iff this slot has never been written; observers treat the
     /// slot's other fields as undefined when `used == false`.
     pub(crate) used: bool,
@@ -167,6 +180,7 @@ impl Slot {
         status: Status,
         origin: BeatOrigin,
         peer_pid_ns_inode: Option<u64>,
+        peer_generation: Option<u64>,
     ) -> Self {
         let is_terminal = frame.nonce == NONCE_TERMINAL;
         Slot {
@@ -183,6 +197,7 @@ impl Slot {
             status,
             origin,
             pid_ns_inode: peer_pid_ns_inode,
+            generation: peer_generation,
             used: true,
             stall_emitted: false,
         }
@@ -319,6 +334,13 @@ pub struct Tracker {
     /// inode disagreed with the slot's pinned namespace (first-namespace-wins).
     /// Surfaced via [`Tracker::take_namespace_conflicts`] for Prometheus.
     namespace_conflicts: u64,
+    /// Count of slots reset because a kernel-attested process generation
+    /// (start-time) mismatch proved the slot's PID had been recycled to a new
+    /// process. Surfaced via [`Tracker::take_pid_recycles`] for Prometheus; a
+    /// non-zero value is the operator's signal that PID reuse is occurring and
+    /// that the slot identity correctly followed the new process rather than
+    /// false-stalling it.
+    pid_recycles: u64,
     /// Count of internal invariant violations encountered on the hot path —
     /// e.g. a [`PidIndex`] entry pointed at a slot index outside `entries`,
     /// or `find_evictable_slot` returned a stale index. Each violation is
@@ -374,6 +396,7 @@ impl Tracker {
             eviction_scan_truncated: 0,
             origin_conflicts: 0,
             namespace_conflicts: 0,
+            pid_recycles: 0,
             invariant_violations: 0,
         }
     }
@@ -410,6 +433,35 @@ impl Tracker {
         origin: BeatOrigin,
         peer_pid_ns_inode: Option<u64>,
     ) -> Update {
+        // Back-compat shim: callers without a kernel-attested process
+        // generation (tests, non-UDS paths) get the prior PID-only identity
+        // (`peer_generation = None` disables recycle detection).
+        self.record_with_generation(frame, now_ns, threshold_ns, origin, peer_pid_ns_inode, None)
+    }
+
+    /// Like [`Tracker::record`], but with the sending process's
+    /// kernel-attested *generation* token (start-time; see
+    /// [`crate::peer_cred::read_pid_start_time`]).
+    ///
+    /// When a beat arrives for an already-tracked pid whose pinned generation
+    /// is `Some(a)` and the incoming generation is `Some(b)` with `a != b`,
+    /// the OS has recycled the PID to a new process. The slot is reset to a
+    /// fresh agent (new nonce baseline, origin, namespace, silence timer) and
+    /// [`Update::Inserted`] is returned — rather than letting the new
+    /// process's low nonce be rejected as [`Update::OutOfOrder`], which would
+    /// freeze the slot's `last_ns`, false-stall the healthy new process, and
+    /// misdirect recovery against it. A `None` on either side is treated
+    /// leniently — "generation unknown", never a recycle signal — so
+    /// non-Linux and non-attested transports keep their prior behaviour.
+    pub fn record_with_generation(
+        &mut self,
+        frame: &Frame,
+        now_ns: u64,
+        threshold_ns: u64,
+        origin: BeatOrigin,
+        peer_pid_ns_inode: Option<u64>,
+        peer_generation: Option<u64>,
+    ) -> Update {
         let status = frame.status;
 
         if let Some(idx) = self.pid_to_index.get(frame.pid) {
@@ -425,12 +477,43 @@ impl Tracker {
                 return Update::CapacityExceeded;
             };
             if slot.used {
+                // PID-recycle gate. A kernel-attested generation mismatch
+                // means this pid now belongs to a different process. Reset the
+                // slot to the new agent BEFORE the origin / namespace / nonce
+                // checks below — every one of them assumes a slot-identity
+                // continuity that no longer holds. `None` on either side is
+                // "generation unknown" and falls through to the existing
+                // same-process logic (first-wins leniency, like `pid_ns_inode`).
+                if let (Some(pinned), Some(current)) = (slot.generation, peer_generation) {
+                    if pinned != current {
+                        if slot.stall_emitted {
+                            self.stall_emitted_count = self.stall_emitted_count.saturating_sub(1);
+                        }
+                        *slot = Slot::from_frame(
+                            frame,
+                            now_ns,
+                            status,
+                            origin,
+                            peer_pid_ns_inode,
+                            peer_generation,
+                        );
+                        self.pid_recycles = self.pid_recycles.saturating_add(1);
+                        return Update::Inserted;
+                    }
+                }
                 if slot.origin != origin {
                     if origin.can_replace(slot.origin) {
                         if slot.stall_emitted {
                             self.stall_emitted_count = self.stall_emitted_count.saturating_sub(1);
                         }
-                        *slot = Slot::from_frame(frame, now_ns, status, origin, peer_pid_ns_inode);
+                        *slot = Slot::from_frame(
+                            frame,
+                            now_ns,
+                            status,
+                            origin,
+                            peer_pid_ns_inode,
+                            peer_generation,
+                        );
                         return Update::Refreshed;
                     } else {
                         self.origin_conflicts = self.origin_conflicts.saturating_add(1);
@@ -512,7 +595,14 @@ impl Tracker {
                     self.capacity_exceeded = self.capacity_exceeded.saturating_add(1);
                     return Update::CapacityExceeded;
                 };
-                *slot_mut = Slot::from_frame(frame, now_ns, status, origin, peer_pid_ns_inode);
+                *slot_mut = Slot::from_frame(
+                    frame,
+                    now_ns,
+                    status,
+                    origin,
+                    peer_pid_ns_inode,
+                    peer_generation,
+                );
                 if self.pid_to_index.insert(frame.pid, evict_idx).is_err() {
                     // Probe budget exhausted — roll back the slot write so
                     // the table stays internally consistent and surface
@@ -570,6 +660,7 @@ impl Tracker {
             status,
             origin,
             peer_pid_ns_inode,
+            peer_generation,
         ));
         self.len += 1;
         Update::Inserted
@@ -813,6 +904,19 @@ impl Tracker {
     pub fn take_namespace_conflicts(&mut self) -> u64 {
         let count = self.namespace_conflicts;
         self.namespace_conflicts = 0;
+        count
+    }
+
+    /// Take and reset the PID-recycle counter.
+    ///
+    /// Surfaced as `varta_tracker_pid_recycle_total` by the Prometheus
+    /// exporter. A non-zero value means a tracked pid was reused by a new
+    /// process (kernel-attested start-time changed) and the slot identity
+    /// correctly followed the new process instead of false-stalling it.
+    /// Linux-only signal; on non-Linux platforms this counter stays at 0.
+    pub fn take_pid_recycles(&mut self) -> u64 {
+        let count = self.pid_recycles;
+        self.pid_recycles = 0;
         count
     }
 

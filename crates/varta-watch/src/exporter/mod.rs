@@ -502,6 +502,10 @@ pub struct PromExporter {
     /// (first-namespace-wins). Surfaced as
     /// `varta_tracker_namespace_conflict_total`.
     tracker_namespace_conflict_total: u64,
+    /// Slots reset because a kernel-attested process generation (start-time)
+    /// mismatch proved the pid had been recycled to a new process. Surfaced
+    /// as `varta_tracker_pid_recycle_total`.
+    tracker_pid_recycle_total: u64,
     /// Hot-path invariant violations recovered defensively by the tracker.
     /// Surfaced as `varta_tracker_invariant_violations_total`; non-zero
     /// values mean a `.get()` fall-through fired (stale index, OOB slot,
@@ -727,6 +731,7 @@ impl PromExporter {
             frame_namespace_mismatch_total: 0,
             frame_rejected_pid_above_max_total: 0,
             tracker_namespace_conflict_total: 0,
+            tracker_pid_recycle_total: 0,
             tracker_invariant_violations_total: 0,
             tracker_pid_index_probe_exhausted_total: 0,
             recovery_outstanding_probe_exhausted_total: 0,
@@ -977,6 +982,14 @@ impl PromExporter {
     pub fn record_tracker_namespace_conflicts(&mut self, count: u64) {
         self.tracker_namespace_conflict_total =
             self.tracker_namespace_conflict_total.saturating_add(count);
+    }
+
+    /// Record one or more PID recycles — slots reset because a kernel-attested
+    /// process generation (start-time) mismatch proved the pid had been reused
+    /// by a new process. See [`crate::tracker::Tracker::take_pid_recycles`].
+    /// Surfaced as `varta_tracker_pid_recycle_total`.
+    pub fn record_tracker_pid_recycles(&mut self, count: u64) {
+        self.tracker_pid_recycle_total = self.tracker_pid_recycle_total.saturating_add(count);
     }
 
     /// Record one or more tracker invariant violations recovered by the
