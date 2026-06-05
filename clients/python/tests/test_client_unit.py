@@ -271,6 +271,104 @@ def test_failed_reconnect_preserves_consecutive_dropped_for_immediate_retry() ->
 
 
 # ---------------------------------------------------------------------------
+# Commit-on-success: a Dropped or Failed send must NOT advance the committed
+# nonce/timestamp. Mirrors the Rust regressions in
+# crates/varta-client/src/client.rs::tests (dropped_beat_does_not_commit_*,
+# failed_beat_does_not_commit_*, reconnect_retry_commits_pending_nonce_only_*,
+# dropped_wrap_attempt_does_not_commit_nonce_wrap).
+# ---------------------------------------------------------------------------
+
+
+class _AlwaysDropTransport(BeatTransport):
+    """Every send drops (WouldBlock); reconnect is a no-op success."""
+
+    def __init__(self) -> None:
+        self.send_calls = 0
+
+    def send(self, buf: bytes) -> int:
+        self.send_calls += 1
+        raise BlockingIOError()
+
+    def reconnect(self) -> None:
+        pass
+
+
+class _AlwaysFailTransport(BeatTransport):
+    """Every send fails with a non-droppable errno (-> BeatOutcome.failed)."""
+
+    def send(self, buf: bytes) -> int:
+        raise OSError(errno.EACCES, "EACCES")
+
+    def reconnect(self) -> None:
+        pass
+
+
+def test_dropped_beat_does_not_commit_nonce_or_timestamp() -> None:
+    agent = Varta(_AlwaysDropTransport())
+    assert agent._nonce == 0
+    assert agent._last_timestamp == 0
+    out = agent.beat(Status.OK)
+    assert out.is_dropped
+    # Candidate nonce 1 / candidate timestamp were built and sent, but the
+    # send was rejected, so neither is committed.
+    assert agent._nonce == 0
+    assert agent._last_timestamp == 0
+    # The next beat reuses the same candidate (still 1), never 2.
+    assert agent.beat(Status.OK).is_dropped
+    assert agent._nonce == 0
+
+
+def test_failed_beat_does_not_commit_nonce_or_timestamp() -> None:
+    agent = Varta(_AlwaysFailTransport())
+    out = agent.beat(Status.OK)
+    assert out.is_failed
+    assert agent._nonce == 0
+    assert agent._last_timestamp == 0
+
+
+def test_first_successful_beat_after_drop_reuses_nonce_one() -> None:
+    # Drop once (reconnect disabled), then send. The accepted frame must carry
+    # nonce 1 — the dropped attempt did not burn it.
+    transport = _CountingTransport(drop_count=1)
+    agent = Varta(transport)
+    assert agent.beat(Status.OK).is_dropped
+    assert agent._nonce == 0
+    assert agent.beat(Status.OK).is_sent
+    assert agent._nonce == 1
+
+
+def test_reconnect_retry_commits_nonce_only_on_successful_retry() -> None:
+    # drop_count=2 + threshold=2: beat 2 reconnects and the retry succeeds, so
+    # the committed nonce is 1 (the un-burned candidate), not 2.
+    transport = _CountingTransport(drop_count=2)
+    agent = Varta(transport)
+    agent.set_reconnect_after(2)
+    assert agent.beat(Status.OK).is_dropped
+    assert agent._nonce == 0
+    assert agent.beat(Status.OK).is_sent
+    assert agent._nonce == 1
+
+
+def test_failed_reconnect_does_not_commit_nonce() -> None:
+    transport = _DropAndFailReconnect()
+    agent = Varta(transport)
+    agent.set_reconnect_after(1)
+    # Drop crosses threshold; reconnect raises -> dropped returned, no retry,
+    # so the nonce stays uncommitted.
+    assert agent.beat(Status.OK).is_dropped
+    assert agent._nonce == 0
+
+
+def test_dropped_wrap_attempt_does_not_commit_nonce_wrap() -> None:
+    agent = Varta(_AlwaysDropTransport())
+    agent._set_nonce_for_test(NONCE_TERMINAL - 1)
+    # The candidate wraps to 0, but the send drops, so the wrap is not
+    # committed and the warning does not fire for an un-sent frame.
+    assert agent.beat(Status.OK).is_dropped
+    assert agent._nonce == NONCE_TERMINAL - 1
+
+
+# ---------------------------------------------------------------------------
 # BeatError + BeatOutcome plumbing.
 # ---------------------------------------------------------------------------
 

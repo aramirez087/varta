@@ -20,17 +20,17 @@ import (
 // and ForkRecoveries. All Beat calls are serialised on an internal
 // mutex; the type is goroutine-safe but not lock-free.
 type Varta struct {
-	mu                  sync.Mutex
-	transport           transport.BeatTransport
-	buf                 [vlp.FrameBytes]byte
-	startMono           time.Time
-	nonce               uint64
-	consecutiveDropped  uint32
-	reconnectAfter      uint32
-	lastTimestamp       uint64
-	clockRegressions    uint64
-	connectPID          int
-	forkRecoveries      uint64
+	mu                 sync.Mutex
+	transport          transport.BeatTransport
+	buf                [vlp.FrameBytes]byte
+	startMono          time.Time
+	nonce              uint64
+	consecutiveDropped uint32
+	reconnectAfter     uint32
+	lastTimestamp      uint64
+	clockRegressions   uint64
+	connectPID         int
+	forkRecoveries     uint64
 }
 
 // Connect dials the observer's UDS at path and returns a ready agent.
@@ -104,11 +104,19 @@ func (v *Varta) Beat(status Status, payload uint32) BeatOutcome {
 		v.consecutiveDropped = 0
 	}
 
+	// Compute the nonce and timestamp CANDIDATES without mutating the
+	// committed counters; they advance only when Send accepts the datagram
+	// (commit-on-success). A Dropped or Failed attempt leaves the same
+	// candidate available for the next beat, so no invisible nonce/timestamp
+	// is burned on the wire. Mirrors crates/varta-client/src/client.rs
+	// (next_regular_nonce / commit_sent_frame).
+	var candidateNonce uint64
+	var wrappedNonce bool
 	if v.nonce < vlp.NonceTerminal-1 {
-		v.nonce++
+		candidateNonce = v.nonce + 1
 	} else {
-		warnNonceWrapOnce()
-		v.nonce = 0
+		candidateNonce = 0
+		wrappedNonce = true
 	}
 
 	elapsed := time.Since(v.startMono).Nanoseconds()
@@ -118,14 +126,20 @@ func (v *Varta) Beat(status Status, payload uint32) BeatOutcome {
 	rawElapsed := uint64(elapsed)
 	if rawElapsed < v.lastTimestamp {
 		v.clockRegressions = saturatingAdd(v.clockRegressions, 1)
-	} else {
-		v.lastTimestamp = rawElapsed
 	}
-	timestamp := v.lastTimestamp
+	candidateTimestamp := v.lastTimestamp
+	if rawElapsed > candidateTimestamp {
+		candidateTimestamp = rawElapsed
+	}
 
-	vlp.EncodeInto(&v.buf, status, uint32(pid), timestamp, v.nonce, payload)
+	vlp.EncodeInto(&v.buf, status, uint32(pid), candidateTimestamp, candidateNonce, payload)
 
 	outcome := v.sendBuffered()
+	if outcome.IsSent() {
+		v.commitSentFrame(candidateNonce, candidateTimestamp, wrappedNonce)
+		v.consecutiveDropped = 0
+		return outcome
+	}
 	if outcome.IsDropped() {
 		v.consecutiveDropped = saturatingAdd32(v.consecutiveDropped, 1)
 		if v.reconnectAfter > 0 && v.consecutiveDropped >= v.reconnectAfter {
@@ -138,12 +152,29 @@ func (v *Varta) Beat(status Status, payload uint32) BeatOutcome {
 			}
 			// Reset only on a successful reconnect.
 			v.consecutiveDropped = 0
-			return v.sendBuffered()
+			retry := v.sendBuffered()
+			if retry.IsSent() {
+				v.commitSentFrame(candidateNonce, candidateTimestamp, wrappedNonce)
+			}
+			return retry
 		}
 		return outcome
 	}
+	// Failed: leave nonce/timestamp uncommitted; reset the dropped run
+	// (matches the Rust BeatOutcome::Failed arm).
 	v.consecutiveDropped = 0
 	return outcome
+}
+
+// commitSentFrame advances the committed nonce/timestamp after the kernel
+// accepted the datagram. The one-shot wrap warning fires here so the
+// diagnostic is emitted only for a frame that actually reached the wire.
+func (v *Varta) commitSentFrame(nonce uint64, timestamp uint64, wrapped bool) {
+	v.nonce = nonce
+	v.lastTimestamp = timestamp
+	if wrapped {
+		warnNonceWrapOnce()
+	}
 }
 
 // Reconnect rebuilds the transport. Use after observer restarts.
@@ -238,4 +269,3 @@ func (v *Varta) SetNonceForTest(n uint64) {
 	defer v.mu.Unlock()
 	v.nonce = n
 }
-

@@ -143,11 +143,19 @@ export class Varta {
       this.consecutiveDropped = 0;
     }
 
+    // Compute the nonce and timestamp CANDIDATES without mutating the
+    // committed counters; they advance only when send accepts the datagram
+    // (commit-on-success). A Dropped or Failed attempt leaves the same
+    // candidate available for the next beat, so no invisible nonce/timestamp
+    // is burned on the wire. Mirrors crates/varta-client/src/client.rs
+    // (next_regular_nonce / commit_sent_frame).
+    let candidateNonce: bigint;
+    let wrappedNonce = false;
     if (this.nonce < NONCE_TERMINAL - 1n) {
-      this.nonce = this.nonce + 1n;
+      candidateNonce = this.nonce + 1n;
     } else {
-      warnNonceWrapping();
-      this.nonce = 0n;
+      candidateNonce = 0n;
+      wrappedNonce = true;
     }
 
     let rawElapsed = monotonicNs() - this.startNs;
@@ -156,12 +164,17 @@ export class Varta {
     if (rawElapsed < this.lastTimestamp) {
       this.clockRegressionsCount = satAddBig(this.clockRegressionsCount, 1n);
     }
-    const ts = rawElapsed > this.lastTimestamp ? rawElapsed : this.lastTimestamp;
-    this.lastTimestamp = ts;
+    const candidateTimestamp =
+      rawElapsed > this.lastTimestamp ? rawElapsed : this.lastTimestamp;
 
-    encodeInto(this.buf, status, pid, ts, this.nonce, payload);
+    encodeInto(this.buf, status, pid, candidateTimestamp, candidateNonce, payload);
 
     const outcome = this.sendFrame();
+    if (outcome.kind === "sent") {
+      this.commitSentFrame(candidateNonce, candidateTimestamp, wrappedNonce);
+      this.consecutiveDropped = 0;
+      return outcome;
+    }
     if (outcome.kind === "dropped") {
       this.consecutiveDropped = Math.min(
         this.consecutiveDropped + 1,
@@ -181,11 +194,17 @@ export class Varta {
         }
         // Reset only on a successful reconnect.
         this.consecutiveDropped = 0;
-        return this.sendFrame();
+        const retry = this.sendFrame();
+        if (retry.kind === "sent") {
+          this.commitSentFrame(candidateNonce, candidateTimestamp, wrappedNonce);
+        }
+        return retry;
       }
       return outcome;
     }
 
+    // Failed: leave nonce/timestamp uncommitted; reset the dropped run
+    // (matches the Rust BeatOutcome::Failed arm).
     this.consecutiveDropped = 0;
     return outcome;
   }
@@ -225,6 +244,19 @@ export class Varta {
     } catch (err) {
       return classifySendError(err as NodeJS.ErrnoException);
     }
+  }
+
+  // Advance the committed nonce/timestamp only after the kernel accepted the
+  // datagram. The one-shot wrap warning fires here so it is emitted only for a
+  // frame that actually reached the wire.
+  private commitSentFrame(
+    nonce: bigint,
+    timestamp: bigint,
+    wrapped: boolean,
+  ): void {
+    this.nonce = nonce;
+    this.lastTimestamp = timestamp;
+    if (wrapped) warnNonceWrapping();
   }
 
   // ─── test hooks (underscore-prefixed; not part of the public surface) ─

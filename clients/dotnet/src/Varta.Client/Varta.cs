@@ -130,6 +130,14 @@ public sealed class Varta : IDisposable
                 _forkRecoveries = SaturatingIncrement(_forkRecoveries);
             }
 
+            // Compute the nonce and timestamp CANDIDATES without committing
+            // them. They advance only when Send accepts the datagram
+            // (commit-on-success): a Dropped or Failed attempt leaves the same
+            // candidate available for the next beat, so no invisible
+            // nonce/timestamp is burned on the wire. Mirrors
+            // crates/varta-client/src/client.rs (next_regular_nonce /
+            // commit_sent_frame).
+            //
             // Monotonic ns since this Varta was constructed. Stopwatch.GetElapsedTime
             // is unaffected by NTP adjustments. TimeSpan.Ticks = 100 ns.
             ulong nowNs = (ulong)(Stopwatch.GetElapsedTime(_startTimestamp).Ticks * 100L);
@@ -138,29 +146,25 @@ public sealed class Varta : IDisposable
                 _clockRegressions = SaturatingIncrement(_clockRegressions);
                 nowNs = _lastTimestamp;
             }
-            _lastTimestamp = nowNs;
+            ulong candidateTimestamp = nowNs;
 
-            ulong nonce = _nonce;
-            if (_nonce < NonceTerminal - 1)
-            {
-                _nonce++;
-            }
-            else
-            {
-                _nonce = 0; // wraparound; observer treats this as a fresh sequence
-            }
+            ulong candidateNonce = _nonce;
+            // The committed _nonce becomes this on success; wraps past the
+            // reserved terminal sentinel back to 0.
+            ulong nextNonce = _nonce < NonceTerminal - 1 ? _nonce + 1 : 0;
 
-            Codec.EncodeInto(_scratch, status, (uint)currentPid, nowNs, nonce, payload);
+            Codec.EncodeInto(_scratch, status, (uint)currentPid, candidateTimestamp, candidateNonce, payload);
 
-            return TrySendWithReconnectAfter(allowRetry: true);
+            return TrySendWithReconnectAfter(allowRetry: true, nextNonce, candidateTimestamp);
         }
     }
 
-    private BeatOutcome TrySendWithReconnectAfter(bool allowRetry)
+    private BeatOutcome TrySendWithReconnectAfter(bool allowRetry, ulong nextNonce, ulong candidateTimestamp)
     {
         try
         {
             _transport.Send(_scratch);
+            CommitSentFrame(nextNonce, candidateTimestamp);
             _consecutiveDropped = 0;
             return BeatOutcome.Sent();
         }
@@ -170,7 +174,8 @@ public sealed class Varta : IDisposable
             if (!outcome.IsDropped)
             {
                 // Failed: reset like a Sent so a transient error does not
-                // arm a spurious reconnect on the next drop.
+                // arm a spurious reconnect on the next drop. The nonce and
+                // timestamp are left uncommitted for the next beat.
                 _consecutiveDropped = 0;
                 return outcome;
             }
@@ -192,10 +197,18 @@ public sealed class Varta : IDisposable
                 }
                 // Reset only on a successful reconnect.
                 _consecutiveDropped = 0;
-                return TrySendWithReconnectAfter(allowRetry: false);
+                return TrySendWithReconnectAfter(allowRetry: false, nextNonce, candidateTimestamp);
             }
             return outcome;
         }
+    }
+
+    // Advance the committed nonce/timestamp only after the kernel accepted the
+    // datagram (commit-on-success).
+    private void CommitSentFrame(ulong nextNonce, ulong timestamp)
+    {
+        _nonce = nextNonce;
+        _lastTimestamp = timestamp;
     }
 
     /// <summary>

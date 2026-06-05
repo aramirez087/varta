@@ -137,40 +137,51 @@ public final class Varta implements AutoCloseable {
                 }
             }
 
-            // 2) Monotonic timestamp + regression clamp.
+            // 2) Monotonic timestamp + regression clamp. Compute the candidate
+            // high-water WITHOUT committing it; commit-on-success advances it
+            // only when send accepts the datagram.
             long nowNs = System.nanoTime() - startNanos;
             if (nowNs < lastTimestamp) {
                 clockRegressions = saturatingInc(clockRegressions);
                 nowNs = lastTimestamp;
             }
-            lastTimestamp = nowNs;
+            long candidateTimestamp = nowNs;
 
-            // 3) Sentinel reservation: u64::MAX is reserved.
-            if (nowNs == 0xFFFF_FFFF_FFFF_FFFFL) {
-                nowNs = 0xFFFF_FFFF_FFFF_FFFEL;
+            // 3) Sentinel reservation: u64::MAX is reserved on the wire.
+            long wireTimestamp = nowNs;
+            if (wireTimestamp == 0xFFFF_FFFF_FFFF_FFFFL) {
+                wireTimestamp = 0xFFFF_FFFF_FFFF_FFFEL;
             }
 
-            // 4) Nonce sequencing.
-            long n = nonce;
-            if (n == NONCE_TERMINAL) {
+            // 4) Nonce sequencing — compute the wire nonce and the value the
+            // counter advances to WITHOUT committing either until send succeeds
+            // (commit-on-success). A Dropped or Failed attempt leaves the same
+            // candidate for the next beat, so no invisible nonce/timestamp is
+            // burned on the wire. Mirrors crates/varta-client/src/client.rs
+            // (next_regular_nonce / commit_sent_frame).
+            long candidateNonce = nonce;
+            long nextNonce;
+            if (candidateNonce == NONCE_TERMINAL) {
                 System.err.println("[varta] nonce wrapped past terminal; recycling from " + NONCE_MIN);
-                n = NONCE_MIN;
-                nonce = NONCE_MIN;
+                candidateNonce = NONCE_MIN;
+                nextNonce = NONCE_MIN;
             } else {
-                nonce = n + 1;
-                if (nonce == NONCE_TERMINAL && status != Status.CRITICAL) {
-                    // Avoid emitting terminal nonce on a non-Critical beat next call.
-                    nonce = NONCE_MIN;
+                nextNonce = candidateNonce + 1;
+                if (nextNonce == NONCE_TERMINAL && status != Status.CRITICAL) {
+                    // Avoid resting the counter on the reserved terminal sentinel.
+                    nextNonce = NONCE_MIN;
                 }
             }
 
             // 5) Encode + send. On a Dropped outcome, mirror the cross-client
             // contract: after `reconnectAfter` consecutive drops, reconnect and
             // retry once (recovery from an observer restart). The counter resets
-            // on any Sent or Failed outcome.
-            Codec.encodeInto(scratchBuf, status, currentPid, nowNs, n, payload, crc);
+            // on any Sent or Failed outcome. Nonce/timestamp commit only for a
+            // frame the kernel actually accepted.
+            Codec.encodeInto(scratchBuf, status, currentPid, wireTimestamp, candidateNonce, payload, crc);
             BeatOutcome outcome = sendScratch();
             if (outcome instanceof BeatOutcome.Sent) {
+                commitSentFrame(nextNonce, candidateTimestamp);
                 consecutiveDropped = 0;
                 return outcome;
             }
@@ -191,16 +202,30 @@ public final class Varta implements AutoCloseable {
                         // immediately, rather than re-arming a full
                         // reconnectAfter-beat window.
                         consecutiveDropped = 0;
-                        return sendScratch();
+                        BeatOutcome retry = sendScratch();
+                        if (retry instanceof BeatOutcome.Sent) {
+                            commitSentFrame(nextNonce, candidateTimestamp);
+                        }
+                        return retry;
                     }
                 }
                 return outcome;
             }
             // Failed: reset like a Sent so a transient error does not arm a
-            // spurious reconnect on the next drop.
+            // spurious reconnect on the next drop. Nonce/timestamp stay
+            // uncommitted for the next beat.
             consecutiveDropped = 0;
             return outcome;
         }
+    }
+
+    /**
+     * Advance the committed nonce/timestamp after the kernel accepted the
+     * datagram (commit-on-success).
+     */
+    private void commitSentFrame(long nextNonce, long timestamp) {
+        nonce = nextNonce;
+        lastTimestamp = timestamp;
     }
 
     /** Send the already-encoded scratch buffer once and classify the result. */

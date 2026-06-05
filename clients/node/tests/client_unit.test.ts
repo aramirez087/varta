@@ -223,3 +223,82 @@ test("__setNonceForTest at NONCE_TERMINAL - 1 triggers wrap to 0", async () => {
     await listener.close();
   }
 });
+
+// ---------------------------------------------------------------------------
+// Commit-on-success: a Dropped or Failed send must NOT advance the committed
+// nonce/timestamp. Mirrors the Rust regressions in
+// crates/varta-client/src/client.rs::tests and the Python / Go equivalents.
+// The accepted frame's wire nonce is the observable proof.
+// ---------------------------------------------------------------------------
+
+// Drops the first `drops` sends (EAGAIN), then captures the accepted buffer.
+class DropThenCapture implements BeatTransport {
+  remaining: number;
+  last?: Buffer;
+  constructor(drops: number) {
+    this.remaining = drops;
+  }
+  send(buf: Buffer): void {
+    if (this.remaining > 0) {
+      this.remaining -= 1;
+      throw errnoErr("EAGAIN", 11);
+    }
+    this.last = Buffer.from(buf);
+  }
+  reconnect(): void {}
+  close(): void {}
+}
+
+// Fails the first send (EACCES → failed), then captures the accepted buffer.
+class FailOnceThenCapture implements BeatTransport {
+  failed = false;
+  last?: Buffer;
+  send(buf: Buffer): void {
+    if (!this.failed) {
+      this.failed = true;
+      throw errnoErr("EACCES", 13);
+    }
+    this.last = Buffer.from(buf);
+  }
+  reconnect(): void {}
+  close(): void {}
+}
+
+test("dropped beats do not burn the nonce; first accepted frame carries nonce 1", () => {
+  const tr = new DropThenCapture(2);
+  const agent = Varta.fromTransport(tr);
+  assert.equal(agent.beat(Status.Ok).kind, "dropped");
+  assert.equal(agent.beat(Status.Ok).kind, "dropped");
+  assert.equal(agent.beat(Status.Ok).kind, "sent");
+  assert.ok(tr.last, "a frame was accepted");
+  assert.equal(decode(tr.last!).nonce, 1n);
+});
+
+test("failed beat does not burn the nonce", () => {
+  const tr = new FailOnceThenCapture();
+  const agent = Varta.fromTransport(tr);
+  assert.equal(agent.beat(Status.Ok).kind, "failed");
+  assert.equal(agent.beat(Status.Ok).kind, "sent");
+  assert.equal(decode(tr.last!).nonce, 1n);
+});
+
+test("reconnect retry commits nonce only on a successful retry", () => {
+  const tr = new DropThenCapture(2);
+  const agent = Varta.fromTransport(tr);
+  agent.setReconnectAfter(2);
+  assert.equal(agent.beat(Status.Ok).kind, "dropped");
+  // Second drop crosses the threshold; reconnect (no-op success) → retry sends.
+  assert.equal(agent.beat(Status.Ok).kind, "sent");
+  assert.equal(decode(tr.last!).nonce, 1n);
+});
+
+test("dropped wrap attempt does not commit the wrap", () => {
+  const tr = new DropThenCapture(1);
+  const agent = Varta.fromTransport(tr);
+  agent.__setNonceForTest(NONCE_TERMINAL - 1n);
+  // Wrap candidate is 0 but the send drops → wrap not committed.
+  assert.equal(agent.beat(Status.Ok).kind, "dropped");
+  // Next beat wraps for real and is accepted → wire nonce 0 (not 1).
+  assert.equal(agent.beat(Status.Ok).kind, "sent");
+  assert.equal(decode(tr.last!).nonce, 0n);
+});

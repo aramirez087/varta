@@ -291,30 +291,41 @@ class Varta:
             self._last_timestamp = 0
             self._consecutive_dropped = 0
 
+        # Compute the nonce and timestamp CANDIDATES without mutating the
+        # committed counters. They advance only when ``send(2)`` accepts the
+        # datagram (commit-on-success): a Dropped or Failed attempt leaves the
+        # same candidate available for the next beat, so no invisible
+        # nonce/timestamp is burned on the wire. Mirrors the Rust reference at
+        # ``crates/varta-client/src/client.rs`` (``next_regular_nonce`` /
+        # ``commit_sent_frame``).
         if self._nonce < NONCE_TERMINAL - 1:
-            self._nonce += 1
+            candidate_nonce = self._nonce + 1
+            wrapped_nonce = False
         else:
-            _warn_nonce_wrapping()
-            self._nonce = 0
+            candidate_nonce = 0
+            wrapped_nonce = True
 
         raw_elapsed = max(0, _monotonic_ns() - self._start_ns)
         if raw_elapsed > _U64_MAX:
             raw_elapsed = _U64_MAX
         if raw_elapsed < self._last_timestamp:
             self._clock_regressions = _saturating_add(self._clock_regressions, 1)
-        self._last_timestamp = max(self._last_timestamp, raw_elapsed)
-        timestamp = self._last_timestamp
+        candidate_timestamp = max(self._last_timestamp, raw_elapsed)
 
         encode_into(
             self._buf,
             status,
             pid & 0xFFFFFFFF,
-            timestamp,
-            self._nonce,
+            candidate_timestamp,
+            candidate_nonce,
             payload & 0xFFFFFFFF,
         )
 
         outcome = self._send_frame()
+        if outcome.is_sent:
+            self._commit_sent_frame(candidate_nonce, candidate_timestamp, wrapped_nonce)
+            self._consecutive_dropped = 0
+            return outcome
         if outcome.is_dropped:
             self._consecutive_dropped = _saturating_add(self._consecutive_dropped, 1)
             if (
@@ -331,9 +342,16 @@ class Varta:
                     return outcome
                 # Reset only on a successful reconnect.
                 self._consecutive_dropped = 0
-                return self._send_frame()
+                retry = self._send_frame()
+                if retry.is_sent:
+                    self._commit_sent_frame(
+                        candidate_nonce, candidate_timestamp, wrapped_nonce
+                    )
+                return retry
             return outcome
 
+        # Failed: leave nonce/timestamp uncommitted; reset the dropped run
+        # (matches the Rust ``BeatOutcome::Failed`` arm).
         self._consecutive_dropped = 0
         return outcome
 
@@ -381,6 +399,18 @@ class Varta:
             return BeatOutcome.sent()
         except OSError as exc:
             return classify_send_error(exc)
+
+    def _commit_sent_frame(
+        self, nonce: int, timestamp: int, wrapped: bool
+    ) -> None:
+        # Advance the committed nonce/timestamp only after the kernel accepted
+        # the datagram. The one-shot wrap warning fires here so the diagnostic
+        # is emitted only for a frame that actually reached the wire (mirrors
+        # the Rust ``dropped_wrap_attempt_does_not_commit_nonce_wrap`` contract).
+        self._nonce = nonce
+        self._last_timestamp = timestamp
+        if wrapped:
+            _warn_nonce_wrapping()
 
     # Test hooks (parity with the Rust `set_connect_pid_for_test` and
     # friends). Underscore-prefixed so they do not appear in public dir().

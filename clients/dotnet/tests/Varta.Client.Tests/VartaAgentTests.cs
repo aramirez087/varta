@@ -120,6 +120,105 @@ public class VartaAgentTests
         Assert.Equal(2ul, agent.NonceForTest);
     }
 
+    // -----------------------------------------------------------------------
+    // Commit-on-success: a Dropped or Failed send must NOT advance the
+    // committed nonce/timestamp. NonceForTest exposes the *next* nonce, so it
+    // stays at its current value until a frame is actually accepted. Mirrors
+    // the Rust regressions in crates/varta-client/src/client.rs::tests and the
+    // Python / Go / Node equivalents.
+    // -----------------------------------------------------------------------
+
+    /// <summary>Drops every send; reconnect succeeds (no-op).</summary>
+    private sealed class AlwaysDrop : IBeatTransport
+    {
+        public int Send(ReadOnlySpan<byte> frame32) =>
+            throw new SocketException((int)SocketError.WouldBlock);
+
+        public void Reconnect() { }
+
+        public void Dispose() { }
+    }
+
+    /// <summary>Fails every send with a non-droppable error → BeatOutcome.Failed.</summary>
+    private sealed class AlwaysFail : IBeatTransport
+    {
+        public int Send(ReadOnlySpan<byte> frame32) =>
+            throw new SocketException((int)SocketError.AccessDenied);
+
+        public void Reconnect() { }
+
+        public void Dispose() { }
+    }
+
+    /// <summary>Drops the first N sends, then accepts; reconnect succeeds.</summary>
+    private sealed class DropThenSend : IBeatTransport
+    {
+        private int _remaining;
+        public int Sends;
+
+        public DropThenSend(int drops) => _remaining = drops;
+
+        public int Send(ReadOnlySpan<byte> frame32)
+        {
+            Sends++;
+            if (_remaining > 0)
+            {
+                _remaining--;
+                throw new SocketException((int)SocketError.WouldBlock);
+            }
+            return frame32.Length;
+        }
+
+        public void Reconnect() { }
+
+        public void Dispose() { }
+    }
+
+    [Fact]
+    public void DroppedBeat_DoesNotCommitNonce()
+    {
+        using var agent = global::Varta.Varta.FromTransportForTest(new AlwaysDrop());
+        Assert.Equal(1ul, agent.NonceForTest);
+        Assert.True(agent.Beat(Status.Ok).IsDropped);
+        // Candidate nonce 1 was built and sent but rejected → not committed.
+        Assert.Equal(1ul, agent.NonceForTest);
+        Assert.True(agent.Beat(Status.Ok).IsDropped);
+        Assert.Equal(1ul, agent.NonceForTest);
+    }
+
+    [Fact]
+    public void FailedBeat_DoesNotCommitNonce()
+    {
+        using var agent = global::Varta.Varta.FromTransportForTest(new AlwaysFail());
+        Assert.True(agent.Beat(Status.Ok).IsFailed);
+        Assert.Equal(1ul, agent.NonceForTest);
+    }
+
+    [Fact]
+    public void FirstAcceptedBeatAfterDrop_ReusesNonceOne()
+    {
+        using var agent = global::Varta.Varta.FromTransportForTest(new DropThenSend(1));
+        Assert.True(agent.Beat(Status.Ok).IsDropped);
+        Assert.Equal(1ul, agent.NonceForTest); // not burned by the drop
+        Assert.True(agent.Beat(Status.Ok).IsSent);
+        // The accepted frame carried nonce 1; the next nonce is now 2.
+        Assert.Equal(2ul, agent.NonceForTest);
+    }
+
+    [Fact]
+    public void ReconnectRetry_CommitsNonceOnlyOnSuccessfulRetry()
+    {
+        var transport = new DropThenSend(2);
+        using var agent = global::Varta.Varta.FromTransportForTest(transport);
+        agent.SetReconnectAfter(2);
+        Assert.True(agent.Beat(Status.Ok).IsDropped);
+        Assert.Equal(1ul, agent.NonceForTest);
+        // Second drop crosses the threshold; reconnect succeeds, retry sends.
+        Assert.True(agent.Beat(Status.Ok).IsSent);
+        Assert.Equal(2ul, agent.NonceForTest);
+        Assert.Equal(3, transport.Sends); // 2 drops + 1 retry
+    }
+
     [Fact]
     public void Connect_OnWindows_ThrowsPlatformNotSupported()
     {
