@@ -327,71 +327,122 @@ impl RecoveryAuditLog {
             });
         }
 
+        // Fast path: scan only the last `TAIL_SCAN_BYTES`. For a file at or
+        // below the window this already covers the whole body; for the common
+        // small-record case it keeps the restart read cheap.
         let scan_len = TAIL_SCAN_BYTES.min(total);
         let scan_start = total - scan_len;
         file.seek(SeekFrom::Start(scan_start))?;
         let mut buf = vec![0u8; scan_len as usize];
         file.read_exact(&mut buf)?;
 
-        if buf.last() == Some(&b'\n') {
-            let view = &buf[..buf.len() - 1];
-            let last_line_start = view
-                .iter()
-                .rposition(|&b| b == b'\n')
-                .map(|p| p + 1)
-                .unwrap_or(0);
-            let last_line = &view[last_line_start..];
-            if let Some((seq, chain)) = parse_record(last_line) {
-                return Ok(TailProbe {
+        let data_start = AUDIT_HEADER_V2.len() as u64;
+        let (probe, recovered) = classify_tail(&buf, scan_start);
+        if recovered || scan_start <= data_start {
+            return Ok(probe);
+        }
+
+        // The tail window yielded no parseable record yet began *after* the
+        // data region: a single record larger than `TAIL_SCAN_BYTES` (e.g. a
+        // spawn record with long operator-configured program / source paths)
+        // can push the true tail entirely out of the window. Concluding "no
+        // prior record" here would roll `seq` back to 1, restart the hash
+        // chain from zero, or — in the no-trailing-newline case — truncate
+        // every durable record back to the bare header. That is precisely the
+        // silent record loss + chain break the v2 format guarantees against,
+        // so re-scan the whole data region before drawing that conclusion.
+        // `probe_tail` runs once at startup and the file is bounded by
+        // `max_bytes`, so the wider read is acceptable.
+        let scan_start = data_start;
+        let scan_len = total - scan_start;
+        file.seek(SeekFrom::Start(scan_start))?;
+        let mut buf = vec![0u8; scan_len as usize];
+        file.read_exact(&mut buf)?;
+        let (probe, _) = classify_tail(&buf, scan_start);
+        Ok(probe)
+    }
+}
+
+/// Derive a [`TailProbe`] from `buf`, the trailing bytes of an audit file that
+/// begin at absolute offset `scan_start`. Returns the probe plus a `recovered`
+/// flag: `true` only when a real prior record's `seq` + chain were parsed.
+///
+/// A `false` flag means the buffer produced a `seq`-0 / zero-chain reset (no
+/// parseable record visible in this window). The caller treats that as
+/// authoritative only once the window covers the whole data region; otherwise
+/// a record larger than the window may have hidden the true tail and the scan
+/// must be widened before the reset is trusted.
+fn classify_tail(buf: &[u8], scan_start: u64) -> (TailProbe, bool) {
+    if buf.last() == Some(&b'\n') {
+        let view = &buf[..buf.len() - 1];
+        let last_line_start = view
+            .iter()
+            .rposition(|&b| b == b'\n')
+            .map(|p| p + 1)
+            .unwrap_or(0);
+        let last_line = &view[last_line_start..];
+        if let Some((seq, chain)) = parse_record(last_line) {
+            return (
+                TailProbe {
                     last_seq: seq,
                     last_chain: chain,
                     reason: BootReason::Resume,
                     truncate_to: None,
                     has_v2_header: true,
-                });
-            }
-            return Ok(TailProbe {
+                },
+                true,
+            );
+        }
+        return (
+            TailProbe {
                 last_seq: 0,
                 last_chain: [0u8; 32],
                 reason: BootReason::SchemaDrift,
                 truncate_to: None,
                 has_v2_header: true,
-            });
-        }
+            },
+            false,
+        );
+    }
 
-        let last_nl = buf.iter().rposition(|&b| b == b'\n');
-        let truncate_to = match last_nl {
-            Some(rel) => Some(scan_start + (rel as u64) + 1),
-            None => Some(AUDIT_HEADER_V2.len() as u64),
-        };
+    let last_nl = buf.iter().rposition(|&b| b == b'\n');
+    let truncate_to = match last_nl {
+        Some(rel) => Some(scan_start + (rel as u64) + 1),
+        None => Some(AUDIT_HEADER_V2.len() as u64),
+    };
 
-        if let Some(rel) = last_nl {
-            let view = &buf[..rel];
-            let prev_start = view
-                .iter()
-                .rposition(|&b| b == b'\n')
-                .map(|p| p + 1)
-                .unwrap_or(0);
-            let prev_line = &view[prev_start..];
-            if let Some((seq, chain)) = parse_record(prev_line) {
-                return Ok(TailProbe {
+    if let Some(rel) = last_nl {
+        let view = &buf[..rel];
+        let prev_start = view
+            .iter()
+            .rposition(|&b| b == b'\n')
+            .map(|p| p + 1)
+            .unwrap_or(0);
+        let prev_line = &view[prev_start..];
+        if let Some((seq, chain)) = parse_record(prev_line) {
+            return (
+                TailProbe {
                     last_seq: seq,
                     last_chain: chain,
                     reason: BootReason::CorruptTail,
                     truncate_to,
                     has_v2_header: true,
-                });
-            }
+                },
+                true,
+            );
         }
+    }
 
-        Ok(TailProbe {
+    (
+        TailProbe {
             last_seq: 0,
             last_chain: [0u8; 32],
             reason: BootReason::CorruptTail,
             truncate_to,
             has_v2_header: true,
-        })
-    }
+        },
+        false,
+    )
 }
 
 fn is_cross_device_error(e: &io::Error) -> bool {
@@ -623,6 +674,160 @@ mod tests {
         assert!(body.contains("\tcorrupt_tail"));
         assert!(len_after > 0);
         let _ = len_before;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A cleanly-flushed audit file whose final, fully-durable record is larger
+    /// than `TAIL_SCAN_BYTES` must still resume from that record. The fixed
+    /// tail window cannot see the record's leading bytes, so the unfixed probe
+    /// rolled `seq` back to 1 and restarted the hash chain from zero on the
+    /// next restart — silent corruption of an otherwise-clean Class-C log, with
+    /// no crash required.
+    #[test]
+    fn large_durable_record_beyond_tail_window_resumes_not_resets() {
+        let dir = tmpdir("big-resume");
+        let path = dir.join("audit.log");
+
+        let (mut log, _) = RecoveryAuditLog::create(&path, cfg(None, 1)).expect("create");
+        // Record A: small. Record B: a spawn whose program path alone exceeds
+        // the tail window, so B's leading bytes sit before `total - 4096`.
+        let big_program = format!("/{}", "b".repeat(5000));
+        log.record_spawn(&crate::audit::SpawnRecord {
+            wallclock_ms: 1,
+            observer_ns: 1,
+            agent_pid: 1,
+            child_pid: 100,
+            mode: "exec",
+            program: "/bin/small",
+            source: "inline",
+            template_len: 1,
+        });
+        log.record_spawn(&crate::audit::SpawnRecord {
+            wallclock_ms: 2,
+            observer_ns: 2,
+            agent_pid: 2,
+            child_pid: 200,
+            mode: "exec",
+            program: &big_program,
+            source: "inline",
+            template_len: 2,
+        });
+        log.flush_pending(Duration::from_secs(5));
+        drop(log);
+
+        let body = std::fs::read_to_string(&path).expect("read");
+        let last_line = body
+            .lines()
+            .rfind(|l| !l.starts_with('#'))
+            .expect("a v2 record");
+        assert!(
+            last_line.len() > TAIL_SCAN_BYTES as usize,
+            "test precondition: record B ({} bytes) must exceed the tail window",
+            last_line.len()
+        );
+        let (seq_b, chain_b) = parse_record(last_line.as_bytes()).expect("B parses");
+        assert!(seq_b > 1, "B must be a real record past the boot");
+
+        let probe = RecoveryAuditLog::probe_tail(&path).expect("probe");
+        assert!(
+            matches!(probe.reason, BootReason::Resume),
+            "must resume from the large durable record, got {:?}",
+            probe.reason
+        );
+        assert_eq!(probe.last_seq, seq_b, "seq must not roll back");
+        assert_eq!(
+            probe.truncate_to, None,
+            "a clean file must not be truncated"
+        );
+        #[cfg(feature = "audit-chain")]
+        assert_eq!(probe.last_chain, chain_b, "chain must continue from B");
+        let _ = chain_b;
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A torn write whose unterminated fragment is itself larger than
+    /// `TAIL_SCAN_BYTES` must drop only the fragment and resume from the last
+    /// fully-durable record. The unfixed probe saw no newline in its window and
+    /// truncated the whole file back to the 32-byte header, destroying every
+    /// durable record — exactly the silent record loss the v2 chain forbids.
+    #[test]
+    fn torn_large_fragment_preserves_durable_records() {
+        let dir = tmpdir("big-torn");
+        let path = dir.join("audit.log");
+
+        let (mut log, _) = RecoveryAuditLog::create(&path, cfg(None, 1)).expect("create");
+        let big_program = format!("/{}", "b".repeat(5000));
+        log.record_spawn(&crate::audit::SpawnRecord {
+            wallclock_ms: 1,
+            observer_ns: 1,
+            agent_pid: 1,
+            child_pid: 100,
+            mode: "exec",
+            program: "/bin/small",
+            source: "inline",
+            template_len: 1,
+        });
+        log.record_spawn(&crate::audit::SpawnRecord {
+            wallclock_ms: 2,
+            observer_ns: 2,
+            agent_pid: 2,
+            child_pid: 200,
+            mode: "exec",
+            program: &big_program,
+            source: "inline",
+            template_len: 2,
+        });
+        log.flush_pending(Duration::from_secs(5));
+        drop(log);
+
+        // Snapshot the last fully-durable record (B) and the end-of-B offset.
+        let body = std::fs::read_to_string(&path).expect("read");
+        let last_line = body
+            .lines()
+            .rfind(|l| !l.starts_with('#'))
+            .expect("a v2 record");
+        let (seq_b, _chain_b) = parse_record(last_line.as_bytes()).expect("B parses");
+        let end_of_b = std::fs::metadata(&path).expect("meta").len();
+
+        // Append a torn fragment with no trailing newline, larger than the
+        // tail window so the window contains no newline at all.
+        {
+            let mut f = OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .expect("open append");
+            f.write_all(&vec![b'9'; 5000]).expect("torn write");
+        }
+
+        let probe = RecoveryAuditLog::probe_tail(&path).expect("probe");
+        assert!(
+            matches!(probe.reason, BootReason::CorruptTail),
+            "torn tail must be reported, got {:?}",
+            probe.reason
+        );
+        assert_eq!(
+            probe.last_seq, seq_b,
+            "must recover B's seq, not reset to 0"
+        );
+        assert_eq!(
+            probe.truncate_to,
+            Some(end_of_b),
+            "must truncate only the torn fragment, not back to the header"
+        );
+
+        // End-to-end: create() applies the truncation, then resumes. The big
+        // durable record must survive; only the torn fragment is dropped.
+        let (log2, w) = RecoveryAuditLog::create(&path, cfg(None, 1)).expect("re-create");
+        assert!(w.corrupt_tail);
+        drop(log2);
+        let body = std::fs::read_to_string(&path).expect("read");
+        assert!(
+            body.contains(&big_program),
+            "the large durable record must not be destroyed"
+        );
+        assert!(!body.contains("99999"), "the torn fragment must be removed");
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 
