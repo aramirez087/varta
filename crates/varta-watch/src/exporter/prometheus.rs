@@ -333,13 +333,13 @@ impl super::PromExporter {
             "varta_tracker_namespace_conflict_total {}",
             self.tracker_namespace_conflict_total
         );
-        // varta_tracker_pid_recycle_total — slots reset because a
-        // kernel-attested process generation (start-time) mismatch proved the
-        // pid had been recycled to a new process. The slot identity correctly
-        // followed the new process instead of false-stalling it. Linux-only
-        // signal; a non-zero value means PID reuse is happening on this host.
+        // varta_tracker_pid_recycle_total — stale slot identities reset or
+        // retired because a kernel-attested process generation (start-time)
+        // mismatch proved the pid had been recycled to a new process.
+        // Linux-only signal; a non-zero value means PID reuse is happening on
+        // this host.
         self.body_buf.push_str(
-            "# HELP varta_tracker_pid_recycle_total Slots reset because a kernel-attested process start-time mismatch proved the pid was recycled to a new process (recycle-safe identity).\n",
+            "# HELP varta_tracker_pid_recycle_total Stale slot identities reset or retired because a kernel-attested process start-time mismatch proved the pid was recycled to a new process (recycle-safe identity).\n",
         );
         self.body_buf
             .push_str("# TYPE varta_tracker_pid_recycle_total counter\n");

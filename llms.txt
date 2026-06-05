@@ -40,4 +40,5 @@ In addition to the Rust reference client, official client libraries exist under 
 
 ## Links
 - Website: https://varta.sh
-- Repository: https://github.com/aramirez087/varta
+- Repository: https://github.com/aramirez087/Varta
+- Guides: https://varta.sh/book/guides/

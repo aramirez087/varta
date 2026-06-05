@@ -334,12 +334,12 @@ pub struct Tracker {
     /// inode disagreed with the slot's pinned namespace (first-namespace-wins).
     /// Surfaced via [`Tracker::take_namespace_conflicts`] for Prometheus.
     namespace_conflicts: u64,
-    /// Count of slots reset because a kernel-attested process generation
-    /// (start-time) mismatch proved the slot's PID had been recycled to a new
-    /// process. Surfaced via [`Tracker::take_pid_recycles`] for Prometheus; a
-    /// non-zero value is the operator's signal that PID reuse is occurring and
-    /// that the slot identity correctly followed the new process rather than
-    /// false-stalling it.
+    /// Count of stale slot identities retired or reset because a
+    /// kernel-attested process generation (start-time) mismatch proved the
+    /// slot's PID had been recycled to a new process. Surfaced via
+    /// [`Tracker::take_pid_recycles`] for Prometheus; a non-zero value is the
+    /// operator's signal that PID reuse is occurring and that stale slot state
+    /// did not drive recovery against the recycled process.
     pid_recycles: u64,
     /// Count of internal invariant violations encountered on the hot path —
     /// e.g. a [`PidIndex`] entry pointed at a slot index outside `entries`,
@@ -776,6 +776,47 @@ impl Tracker {
         None
     }
 
+    /// Remove a stale slot from the dense slot table and repair the pid index.
+    ///
+    /// Used when stall-time generation revalidation proves the PID now belongs
+    /// to a different process. The stale slot must disappear before recovery
+    /// sees it; otherwise a dead agent's old `KernelAttested` origin can fire
+    /// against a healthy recycled PID.
+    fn retire_slot_at(&mut self, idx: usize) {
+        if idx >= self.len || idx >= self.entries.len() {
+            self.invariant_violations = self.invariant_violations.saturating_add(1);
+            return;
+        }
+
+        let removed = self.entries[idx];
+        let _ = self.pid_to_index.remove(removed.pid);
+        if removed.stall_emitted {
+            self.stall_emitted_count = self.stall_emitted_count.saturating_sub(1);
+        }
+
+        let Some(last_idx) = self.len.checked_sub(1) else {
+            self.invariant_violations = self.invariant_violations.saturating_add(1);
+            return;
+        };
+        if idx != last_idx {
+            let Some(&moved) = self.entries.get(last_idx) else {
+                self.invariant_violations = self.invariant_violations.saturating_add(1);
+                return;
+            };
+            self.entries[idx] = moved;
+            if self.pid_to_index.insert(moved.pid, idx).is_err() {
+                self.invariant_violations = self.invariant_violations.saturating_add(1);
+            }
+        }
+        let _ = self.entries.pop();
+        self.len = self.len.saturating_sub(1);
+        if self.len == 0 {
+            self.eviction_scan_cursor = 0;
+        } else {
+            self.eviction_scan_cursor %= self.len;
+        }
+    }
+
     /// Take and reset the eviction counter. Returns the number of slots
     /// reclaimed since the last call.
     pub fn take_evictions(&mut self) -> u64 {
@@ -865,30 +906,70 @@ impl Tracker {
         threshold_ns: u64,
         mut cb: impl FnMut(u32, u64, u64, BeatOrigin, Option<u64>),
     ) {
-        // Clamp the slice to actual `entries` length so the slice
-        // expression cannot panic even if `len` somehow exceeded it
-        // (invariant violation — counted, never panicked on).
-        let upper = self.len.min(self.entries.len());
-        if upper < self.len {
+        self.drain_stalled_slots_with_generation_check(
+            now_ns,
+            threshold_ns,
+            |pid, pinned_generation| {
+                matches!(
+                    crate::peer_cred::read_pid_start_time(pid),
+                    Some(current_generation) if current_generation != pinned_generation
+                )
+            },
+            &mut cb,
+        );
+    }
+
+    fn drain_stalled_slots_with_generation_check(
+        &mut self,
+        now_ns: u64,
+        threshold_ns: u64,
+        mut generation_recycled: impl FnMut(u32, u64) -> bool,
+        mut cb: impl FnMut(u32, u64, u64, BeatOrigin, Option<u64>),
+    ) {
+        if self.len > self.entries.len() {
             self.invariant_violations = self.invariant_violations.saturating_add(1);
         }
-        if let Some(slice) = self.entries.get_mut(..upper) {
-            for slot in slice {
-                if !slot.used || slot.stall_emitted {
-                    continue;
-                }
-                if now_ns.saturating_sub(slot.last_ns) >= threshold_ns {
-                    slot.stall_emitted = true;
-                    self.stall_emitted_count = self.stall_emitted_count.saturating_add(1);
-                    cb(
-                        slot.pid,
-                        slot.last_observed_nonce,
-                        slot.last_ns,
-                        slot.origin,
-                        slot.pid_ns_inode,
-                    );
+
+        let mut idx = 0usize;
+        while idx < self.len {
+            let Some(slot) = self.entries.get(idx) else {
+                self.invariant_violations = self.invariant_violations.saturating_add(1);
+                break;
+            };
+            if !slot.used || slot.stall_emitted {
+                idx += 1;
+                continue;
+            }
+            if now_ns.saturating_sub(slot.last_ns) < threshold_ns {
+                idx += 1;
+                continue;
+            }
+
+            if slot.origin == BeatOrigin::KernelAttested {
+                if let Some(pinned_generation) = slot.generation {
+                    if generation_recycled(slot.pid, pinned_generation) {
+                        self.retire_slot_at(idx);
+                        self.pid_recycles = self.pid_recycles.saturating_add(1);
+                        continue;
+                    }
                 }
             }
+
+            let Some(slot) = self.entries.get_mut(idx) else {
+                self.invariant_violations = self.invariant_violations.saturating_add(1);
+                break;
+            };
+            slot.stall_emitted = true;
+            self.stall_emitted_count = self.stall_emitted_count.saturating_add(1);
+            let event = (
+                slot.pid,
+                slot.last_observed_nonce,
+                slot.last_ns,
+                slot.origin,
+                slot.pid_ns_inode,
+            );
+            cb(event.0, event.1, event.2, event.3, event.4);
+            idx += 1;
         }
         #[cfg(debug_assertions)]
         self.debug_assert_stall_count();
@@ -922,8 +1003,8 @@ impl Tracker {
     ///
     /// Surfaced as `varta_tracker_pid_recycle_total` by the Prometheus
     /// exporter. A non-zero value means a tracked pid was reused by a new
-    /// process (kernel-attested start-time changed) and the slot identity
-    /// correctly followed the new process instead of false-stalling it.
+    /// process (kernel-attested start-time changed) and stale slot identity
+    /// was reset or retired before it could false-stall the new process.
     /// Linux-only signal; on non-Linux platforms this counter stays at 0.
     pub fn take_pid_recycles(&mut self) -> u64 {
         let count = self.pid_recycles;

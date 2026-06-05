@@ -1,0 +1,1337 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+  <meta name="color-scheme" content="dark">
+  <title>Varta — Zero-overhead health protocol for distributed local agents</title>
+  <meta name="description"
+    content="32-byte heartbeats over Unix Domain Sockets and UDP. No dependencies. No allocations. Sub-microsecond.">
+  <meta name="theme-color" content="#09090b">
+  <link rel="canonical" href="https://varta.sh/">
+  <link rel="alternate" type="application/llms+txt" href="/llms.txt">
+  <!-- varta:analytics -->
+<!-- Privacy-friendly analytics by Plausible -->
+<script async src="https://plausible.io/js/pa-YyA03_Ow6U040l0wzUwht.js"></script>
+<script>
+  window.plausible=window.plausible||function(){(plausible.q=plausible.q||[]).push(arguments)},plausible.init=plausible.init||function(i){plausible.o=i||{}};
+  plausible.init()
+</script>
+
+  <!-- Open Graph / Facebook -->
+  <meta property="og:type" content="website">
+  <meta property="og:url" content="https://varta.sh/">
+  <meta property="og:site_name" content="Varta">
+  <meta property="og:title" content="Varta — Zero-overhead health protocol for distributed local agents">
+  <meta property="og:description" content="32-byte heartbeats over Unix Domain Sockets and UDP. No dependencies. No allocations. Sub-microsecond.">
+  <meta property="og:image" content="https://varta.sh/assets/og.png">
+  <meta property="og:image:width" content="1200">
+  <meta property="og:image:height" content="630">
+  <meta property="og:image:alt" content="Varta — agent sends a 32-byte frame over UDS or UDP to an observer, which exports Prometheus metrics.">
+
+  <!-- Twitter -->
+  <meta name="twitter:card" content="summary_large_image">
+  <meta name="twitter:url" content="https://varta.sh/">
+  <meta name="twitter:title" content="Varta — Zero-overhead health protocol for distributed local agents">
+  <meta name="twitter:description" content="32-byte heartbeats over Unix Domain Sockets and UDP. No dependencies. No allocations. Sub-microsecond.">
+  <meta name="twitter:image" content="https://varta.sh/assets/og.png">
+  <meta name="twitter:image:alt" content="Varta — agent sends a 32-byte frame over UDS or UDP to an observer, which exports Prometheus metrics.">
+  <link rel="icon" href="/favicon.svg?v=4" type="image/svg+xml">
+  <link rel="shortcut icon" href="/favicon.svg?v=4" type="image/svg+xml">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link rel="preload" as="style"
+    href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap">
+  <link rel="stylesheet"
+    href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap"
+    media="print" onload="this.media='all'">
+  <noscript>
+    <link rel="stylesheet"
+      href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap">
+  </noscript>
+  <style>
+/* ============================================================
+   Varta Landing Page — Style
+   Aesthetic: Terminal-hacker meets retro-arcade. Polished, not gritty.
+   ============================================================ */
+
+/* --- Tokens --- */
+:root {
+  --bg: #09090b;
+  --bg-surface: #18181b;
+  --bg-elevated: #27272a;
+  --border: #27272a;
+  --text-primary: #f4f4f5;
+  --text-secondary: #a1a1aa;
+  --text-dim: #52525b;
+  --accent: #ff4757;
+  --accent-dim: #ff2e43;
+  --accent-glow: rgba(255, 71, 87, 0.15);
+  --success: #10b981;
+  --danger: #ef4444;
+  --warning: #f59e0b;
+  --font-display: 'Plus Jakarta Sans', system-ui, -apple-system, sans-serif;
+  --font-body: 'Plus Jakarta Sans', system-ui, -apple-system, sans-serif;
+  --font-mono: 'JetBrains Mono', 'Fira Code', monospace;
+  --max-width: 1100px;
+  --section-pad: 5.5rem;
+}
+
+/* --- Reset --- */
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+html {
+  color-scheme: dark;
+  scroll-behavior: smooth;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  scroll-padding-top: 5rem;
+}
+
+body {
+  font-family: var(--font-body);
+  font-size: 1rem;
+  line-height: 1.7;
+  color: var(--text-primary);
+  background: var(--bg);
+  background-image:
+    linear-gradient(rgba(255, 255, 255, 0.015) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(255, 255, 255, 0.015) 1px, transparent 1px);
+  background-size: 50px 50px;
+  background-position: center;
+  position: relative;
+  overflow-x: hidden;
+}
+
+a { color: var(--accent); text-decoration: none; }
+a:hover { text-decoration: underline; }
+code { font-family: var(--font-mono); font-size: 0.88em; }
+
+/* --- Accessibility helpers --- */
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+#main:focus { outline: none; }
+
+.skip-link {
+  position: fixed;
+  top: -100px;
+  left: 1rem;
+  z-index: 200;
+  background: var(--accent);
+  color: #fff;
+  padding: 0.6rem 1rem;
+  border-radius: 6px;
+  font-family: var(--font-mono);
+  font-size: 0.8rem;
+  font-weight: 600;
+  text-decoration: none;
+  transition: top 0.2s ease;
+}
+.skip-link:focus-visible {
+  top: 1rem;
+  outline: 2px solid #fff;
+  outline-offset: 2px;
+  text-decoration: none;
+}
+
+/* --- Focus visible (default) --- */
+:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 3px;
+  border-radius: 4px;
+}
+
+button, a {
+  touch-action: manipulation;
+  -webkit-tap-highlight-color: rgba(255, 71, 87, 0.18);
+}
+
+/* --- Nav --- */
+.nav {
+  position: sticky;
+  top: 0;
+  z-index: 100;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  width: 100%;
+  margin: 0 auto;
+  padding: 1rem 2rem;
+  background: transparent;
+  transition: background-color 0.3s cubic-bezier(0.16, 1, 0.3, 1),
+              backdrop-filter 0.3s cubic-bezier(0.16, 1, 0.3, 1),
+              border-color 0.3s cubic-bezier(0.16, 1, 0.3, 1),
+              width 0.3s cubic-bezier(0.16, 1, 0.3, 1),
+              padding 0.3s cubic-bezier(0.16, 1, 0.3, 1),
+              box-shadow 0.3s cubic-bezier(0.16, 1, 0.3, 1);
+  border-bottom: 1px solid transparent;
+}
+
+.nav.scrolled {
+  background: rgba(9, 9, 11, 0.85);
+  backdrop-filter: blur(16px);
+  -webkit-backdrop-filter: blur(16px);
+  border-bottom-color: var(--border);
+}
+
+.nav-wordmark {
+  font-family: var(--font-mono);
+  font-weight: 700;
+  font-size: 1rem;
+  letter-spacing: 0.15em;
+  color: var(--text-primary);
+  text-decoration: none;
+}
+
+.nav-wordmark:hover { color: var(--accent); text-decoration: none; }
+
+.nav-links {
+  display: flex;
+  align-items: center;
+  gap: 1.75rem;
+}
+
+.nav-links a {
+  font-family: var(--font-mono);
+  font-size: 0.8rem;
+  font-weight: 500;
+  color: var(--text-secondary);
+  text-decoration: none;
+  transition: color 0.15s;
+  white-space: nowrap;
+}
+
+.nav-links a:hover { color: var(--accent); text-decoration: none; }
+.nav-links svg { opacity: 0.6; transition: opacity 0.15s; }
+.nav-links a:hover svg { opacity: 1; }
+
+.nav-menu {
+  display: flex;
+  align-items: center;
+  gap: 1.75rem;
+}
+
+.nav-toggle {
+  display: none;
+  flex-direction: column;
+  gap: 4px;
+  background: transparent;
+  border: 0;
+  cursor: pointer;
+  padding: 6px;
+}
+.nav-toggle span {
+  display: block;
+  width: 22px;
+  height: 2px;
+  background: var(--text-primary);
+  border-radius: 1px;
+  transition: transform 0.18s ease, opacity 0.18s ease;
+  transform-origin: center;
+}
+
+@media (min-width: 641px) {
+  .nav {
+    top: 1.25rem;
+    max-width: var(--max-width);
+    width: calc(100% - 3rem);
+    border-radius: 9999px;
+    border: 1px solid transparent;
+  }
+  .nav.scrolled {
+    width: calc(100% - 4rem);
+    border-color: rgba(255, 255, 255, 0.08);
+    box-shadow: 
+      0 10px 30px rgba(0, 0, 0, 0.3),
+      0 1px 0 rgba(255, 255, 255, 0.05) inset;
+    padding: 0.65rem 2.25rem;
+  }
+}
+
+/* --- Hero --- */
+.hero {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 3rem;
+  align-items: center;
+  max-width: var(--max-width);
+  margin: 0 auto;
+  padding: 6rem 2rem 5rem;
+  position: relative;
+}
+
+.hero::before {
+  content: "";
+  position: absolute;
+  top: -2rem;
+  bottom: -2rem;
+  left: 50%;
+  transform: translateX(-50%);
+  width: 100vw;
+  background:
+    linear-gradient(to bottom, var(--bg) 0%, transparent 18%, transparent 65%, var(--bg) 100%),
+    linear-gradient(to right, var(--bg) 0%, transparent 35%, transparent 65%, var(--bg) 100%),
+    url('assets/varta.webp') no-repeat center center;
+  background-size: cover;
+  opacity: 0.45;
+  z-index: -1;
+  pointer-events: none;
+}
+
+.hero::after {
+  content: "";
+  position: absolute;
+  top: 15%;
+  left: 10%;
+  width: 350px;
+  height: 350px;
+  background: radial-gradient(circle, rgba(255, 71, 87, 0.1) 0%, transparent 70%);
+  z-index: -2;
+  filter: blur(30px);
+  pointer-events: none;
+}
+
+.hero-wordmark {
+  font-family: var(--font-display);
+  font-size: 3.2rem;
+  font-weight: 700;
+  line-height: 1.1;
+  color: var(--text-primary);
+  text-shadow:
+    0 0 30px var(--accent-glow),
+    0 0 60px rgba(224, 108, 117, 0.06);
+  margin-bottom: 1.5rem;
+  letter-spacing: -0.02em;
+  text-wrap: balance;
+}
+
+.hero-tagline {
+  font-size: 1.7rem;
+  font-weight: 700;
+  line-height: 1.3;
+  color: var(--text-primary);
+  margin-bottom: 0.75rem;
+  text-wrap: balance;
+  max-width: 22ch;
+}
+
+.hero-sub {
+  font-size: 0.95rem;
+  color: var(--text-secondary);
+  line-height: 1.6;
+  margin-bottom: 1.25rem;
+  max-width: 420px;
+}
+
+.hero-audience {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  margin-bottom: 1.25rem;
+  max-width: 480px;
+}
+
+.audience-pill {
+  font-family: var(--font-mono);
+  font-size: 0.68rem;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  color: var(--text-secondary);
+  background: rgba(24, 24, 27, 0.65);
+  border: 1px solid var(--border);
+  border-radius: 9999px;
+  padding: 0.35rem 0.75rem;
+  line-height: 1.3;
+}
+
+.hero-proof {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  margin-bottom: 1.75rem;
+}
+
+.proof-badge {
+  font-family: var(--font-mono);
+  font-size: 0.68rem;
+  font-weight: 600;
+  color: var(--text-dim);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 0.3rem 0.55rem;
+  text-decoration: none;
+  transition: color 0.15s, border-color 0.15s;
+}
+
+.proof-badge:hover {
+  color: var(--accent);
+  border-color: var(--accent-dim);
+  text-decoration: none;
+}
+
+.cta-primary {
+  display: inline-flex;
+  align-items: center;
+  font-family: var(--font-mono);
+  font-size: 0.85rem;
+  font-weight: 500;
+  color: var(--text-primary);
+  background: rgba(24, 24, 27, 0.65);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 0;
+  overflow: hidden;
+  cursor: pointer;
+  transition: border-color 0.3s cubic-bezier(0.16, 1, 0.3, 1),
+              box-shadow 0.3s cubic-bezier(0.16, 1, 0.3, 1);
+  position: relative;
+}
+
+.cta-primary:hover {
+  border-color: var(--accent-dim);
+  box-shadow: 
+    0 4px 20px rgba(0, 0, 0, 0.2),
+    0 0 15px var(--accent-glow);
+}
+
+.cta-prompt {
+  color: var(--text-dim);
+  padding: 0.6rem 0 0.6rem 1.1rem;
+  user-select: none;
+}
+
+.cta-code {
+  color: var(--text-primary);
+  padding: 0.6rem 0.75rem 0.6rem 0.4rem;
+}
+
+.cta-divider {
+  width: 1px;
+  align-self: stretch;
+  background: var(--border);
+  transition: background 0.3s;
+}
+
+.cta-icon-wrapper {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0.6rem 1rem;
+  color: var(--text-secondary);
+  transition: color 0.3s ease, background-color 0.3s ease;
+}
+
+.cta-primary:hover .cta-divider {
+  background: var(--accent-dim);
+}
+
+.cta-primary:hover .cta-icon-wrapper {
+  color: var(--accent);
+  background: rgba(255, 71, 87, 0.04);
+}
+
+.cta-icon-wrapper .check-icon {
+  display: none;
+  color: var(--success);
+}
+
+.cta-hint {
+  position: absolute;
+  bottom: -1.5rem;
+  left: 50%;
+  transform: translateX(-50%);
+  font-size: 0.65rem;
+  color: var(--text-dim);
+  opacity: 0;
+  transition: opacity 0.2s;
+  white-space: nowrap;
+  pointer-events: none;
+}
+
+.cta-primary:hover .cta-hint {
+  opacity: 1;
+}
+
+/* Copied state */
+.cta-primary.copied {
+  border-color: var(--success);
+}
+
+.cta-primary.copied .cta-divider {
+  background: var(--success);
+}
+
+.cta-primary.copied .cta-icon-wrapper {
+  background: rgba(16, 185, 129, 0.05);
+}
+
+.cta-primary.copied .copy-icon {
+  display: none;
+}
+
+.cta-primary.copied .check-icon {
+  display: block;
+}
+
+.cta-secondary {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  font-family: var(--font-mono);
+  font-size: 0.85rem;
+  font-weight: 500;
+  color: var(--text-secondary);
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 0.6rem 1.1rem;
+  transition: color 0.15s, border-color 0.15s, background 0.15s;
+}
+
+.cta-secondary:hover {
+  color: var(--text-primary);
+  border-color: var(--text-dim);
+  background: rgba(255, 255, 255, 0.02);
+  text-decoration: none;
+}
+
+/* --- Terminal Mockup --- */
+.hero-terminal {
+  background: rgba(26, 26, 26, 0.65);
+  backdrop-filter: blur(16px);
+  -webkit-backdrop-filter: blur(16px);
+  border: 1px solid rgba(45, 45, 45, 0.8);
+  border-radius: 10px;
+  overflow: hidden;
+  box-shadow:
+    0 0 0 1px rgba(45, 45, 45, 0.8),
+    0 0 40px var(--accent-glow),
+    0 20px 60px rgba(0, 0, 0, 0.4);
+}
+
+.terminal-bar {
+  display: flex;
+  align-items: center;
+  padding: 0.7rem 1rem;
+  background: rgba(36, 36, 36, 0.65);
+  border-bottom: 1px solid rgba(45, 45, 45, 0.8);
+}
+
+.terminal-dots {
+  display: flex;
+  gap: 6px;
+}
+
+.terminal-dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+}
+
+.terminal-dot--red { background: #ef4444; }
+.terminal-dot--yellow { background: #eab308; }
+.terminal-dot--green { background: #22c55e; }
+
+.terminal-title {
+  flex: 1;
+  text-align: center;
+  font-family: var(--font-mono);
+  font-size: 0.7rem;
+  color: var(--text-dim);
+}
+
+.terminal-spacer { display: none; }
+
+.terminal-body {
+  padding: 1.2rem 1.4rem;
+  font-family: var(--font-mono);
+  font-size: 0.82rem;
+  line-height: 1.9;
+  overflow-x: auto;
+  overflow-y: auto;
+  height: 280px;
+  overscroll-behavior: contain;
+  scrollbar-width: thin;
+  scrollbar-color: var(--text-dim) transparent;
+}
+
+.terminal-line { white-space: nowrap; }
+
+.t-prompt { color: var(--text-dim); }
+.t-cmd { color: var(--text-primary); font-weight: 700; }
+.t-flag { color: var(--accent-dim); }
+.t-num { color: var(--accent); }
+.t-info { color: rgba(82, 82, 91, 0.65); }
+.t-ok { color: var(--success); font-weight: 700; }
+.t-warn { color: var(--warning); font-weight: 700; }
+.t-path { color: var(--text-secondary); }
+
+.t-cursor {
+  color: var(--accent);
+  animation: blink 1s step-end infinite;
+}
+
+@keyframes blink {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0; }
+}
+
+/* --- Dividers --- */
+.divider {
+  border: none;
+  border-top: 1px solid var(--border);
+  max-width: var(--max-width);
+  margin: 0 auto;
+}
+
+/* --- Sections --- */
+.section {
+  max-width: var(--max-width);
+  margin: 0 auto;
+  padding: var(--section-pad) 2rem;
+  scroll-margin-top: 5.5rem;
+}
+
+.section-label {
+  font-family: var(--font-mono);
+  font-size: 0.75rem;
+  font-weight: 500;
+  color: var(--text-dim);
+  text-transform: uppercase;
+  letter-spacing: 0.15em;
+  margin-bottom: 0.6rem;
+}
+
+.section-title {
+  font-family: var(--font-display);
+  font-size: clamp(1.6rem, 2.6vw, 2.2rem);
+  font-weight: 700;
+  line-height: 1.15;
+  letter-spacing: -0.01em;
+  color: var(--text-primary);
+  margin-bottom: 2.5rem;
+  max-width: 32ch;
+  text-wrap: balance;
+}
+
+/* --- Steps --- */
+.steps {
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 1.5rem;
+}
+
+.step {
+  display: flex;
+  gap: 1.25rem;
+  align-items: flex-start;
+  padding: 1.25rem 1.5rem;
+  background: rgba(24, 24, 27, 0.45);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  transition: border-color 0.3s cubic-bezier(0.16, 1, 0.3, 1),
+              background-color 0.3s cubic-bezier(0.16, 1, 0.3, 1),
+              transform 0.3s cubic-bezier(0.16, 1, 0.3, 1),
+              box-shadow 0.3s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+.step:hover {
+  border-color: var(--accent-dim);
+  background: rgba(24, 24, 27, 0.7);
+  transform: translateY(-2px);
+  box-shadow: 
+    0 10px 30px rgba(0, 0, 0, 0.25),
+    0 0 20px rgba(255, 71, 87, 0.05);
+}
+
+.step-num {
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 32px;
+  height: 32px;
+  border-radius: 50%;
+  background: transparent;
+  border: 1.5px solid var(--accent);
+  color: var(--accent);
+  font-family: var(--font-mono);
+  font-size: 0.85rem;
+  font-weight: 700;
+  box-shadow: 0 0 10px rgba(255, 71, 87, 0.1);
+}
+
+.step-title {
+  font-size: 1.15rem;
+  font-weight: 700;
+  margin-bottom: 0.4rem;
+  color: var(--text-primary);
+}
+
+.step-content p {
+  color: var(--text-secondary);
+  font-size: 0.95rem;
+  line-height: 1.6;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.step-content { min-width: 0; }
+
+.step-content code {
+  color: var(--accent);
+  background: var(--bg-elevated);
+  padding: 0.1em 0.4em;
+  border-radius: 3px;
+  font-size: 0.82em;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
+.code-block {
+  margin-top: 0.9rem;
+  padding: 0.9rem 1.1rem;
+  background: rgba(9, 9, 11, 0.7);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  overflow-x: auto;
+  font-family: var(--font-mono);
+  font-size: 0.78rem;
+  line-height: 1.55;
+  color: var(--text-secondary);
+  scrollbar-width: thin;
+  scrollbar-color: var(--text-dim) transparent;
+  min-width: 0;
+  max-width: 100%;
+}
+.code-block code {
+  color: inherit;
+  background: none;
+  padding: 0;
+  font-size: inherit;
+  display: block;
+  white-space: pre;
+  overflow-wrap: normal;
+}
+
+@media (min-width: 769px) {
+  .steps {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 2rem;
+  }
+  .step {
+    flex-direction: column;
+    gap: 1.25rem;
+    padding: 1.75rem 1.5rem;
+  }
+}
+
+/* --- Metrics --- */
+.metrics {
+  display: flex;
+  gap: 4rem;
+  flex-wrap: wrap;
+}
+
+.metric {
+  display: flex;
+  flex-direction: column;
+  flex: 1 1 220px;
+  padding: 1.4rem 1.5rem;
+  background: linear-gradient(180deg, rgba(36, 36, 36, 0.55), rgba(26, 26, 26, 0.35));
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  transition: border-color 0.2s ease, transform 0.2s ease, box-shadow 0.2s ease;
+}
+
+.metric:hover {
+  border-color: var(--accent-dim);
+  transform: translateY(-2px);
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.35), 0 0 24px var(--accent-glow);
+}
+.metric:hover .metric-value { color: var(--accent); }
+
+.metric-label {
+  font-family: var(--font-mono);
+  font-size: 0.7rem;
+  font-weight: 500;
+  color: var(--text-dim);
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+  margin-bottom: 0.4rem;
+}
+
+.metric-value {
+  font-family: var(--font-mono);
+  font-size: 2.4rem;
+  font-weight: 700;
+  color: var(--text-primary);
+  line-height: 1.1;
+  margin-bottom: 0.3rem;
+  font-variant-numeric: tabular-nums;
+}
+
+.metric-sub {
+  font-size: 0.85rem;
+  color: var(--text-secondary);
+}
+
+.metrics-footnote {
+  margin-top: 2rem;
+  font-family: var(--font-mono);
+  font-size: 0.72rem;
+  color: var(--text-dim);
+}
+
+.metrics-footnote code {
+  color: var(--text-dim);
+  font-size: 1em;
+}
+
+/* --- Crate List --- */
+.hero-cta {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 1rem;
+}
+
+.hero-buttons {
+  display: flex;
+  gap: 1rem;
+  align-items: center;
+}
+
+.cta-github {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+  font-family: var(--font-mono);
+  font-size: 0.85rem;
+  font-weight: 500;
+  color: var(--text-secondary);
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 0.6rem 1.1rem;
+  text-decoration: none;
+  transition: color 0.15s, border-color 0.15s, background 0.15s;
+}
+
+.cta-github:hover {
+  color: var(--text-primary);
+  border-color: var(--text-dim);
+  background: rgba(255, 255, 255, 0.02);
+}
+
+.crate-list {
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+}
+
+.crate-row {
+  display: grid;
+  grid-template-columns: auto 1fr auto;
+  grid-template-rows: auto auto;
+  align-items: center;
+  gap: 0.25rem 0.75rem;
+  padding: 1.25rem 1.5rem;
+  background: rgba(24, 24, 27, 0.45);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  text-decoration: none;
+  transition: background-color 0.3s cubic-bezier(0.16, 1, 0.3, 1),
+              border-color 0.3s cubic-bezier(0.16, 1, 0.3, 1),
+              transform 0.3s cubic-bezier(0.16, 1, 0.3, 1),
+              box-shadow 0.3s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+.crate-row:hover {
+  background: rgba(24, 24, 27, 0.7);
+  border-color: var(--accent-dim);
+  transform: translateX(4px);
+  text-decoration: none;
+  box-shadow: 
+    0 10px 30px rgba(0, 0, 0, 0.25),
+    0 0 20px rgba(255, 71, 87, 0.05);
+}
+
+.crate-name {
+  font-family: var(--font-mono);
+  font-size: 1rem;
+  font-weight: 700;
+  color: var(--accent);
+  grid-column: 1;
+  grid-row: 1;
+}
+
+.crate-dots {
+  grid-column: 2;
+  grid-row: 1;
+  border-bottom: 1px dotted var(--border);
+  margin-bottom: 0.25em;
+  opacity: 0.4;
+}
+
+.crate-arrow {
+  font-family: var(--font-mono);
+  font-size: 0.95rem;
+  color: var(--text-dim);
+  grid-column: 3;
+  grid-row: 1;
+  transition: color 0.3s cubic-bezier(0.16, 1, 0.3, 1),
+              transform 0.3s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+.crate-row:hover .crate-arrow {
+  color: var(--accent);
+  transform: translateX(4px);
+}
+
+.crate-desc {
+  grid-column: 1 / -1;
+  grid-row: 2;
+  font-size: 0.88rem;
+  color: var(--text-secondary);
+  margin-top: 0.3rem;
+  line-height: 1.5;
+}
+
+.crate-version {
+  display: inline-block;
+  font-family: var(--font-mono);
+  font-size: 0.7rem;
+  font-weight: 600;
+  color: var(--text-dim);
+  background: var(--bg-elevated);
+  padding: 0.1em 0.55em;
+  border-radius: 3px;
+  margin-right: 0.15em;
+  letter-spacing: 0.04em;
+  vertical-align: 0.18em;
+  transition: color 0.3s cubic-bezier(0.16, 1, 0.3, 1),
+              background-color 0.3s cubic-bezier(0.16, 1, 0.3, 1);
+}
+.crate-row:hover .crate-version {
+  color: var(--accent);
+  background: rgba(255, 71, 87, 0.1);
+}
+
+/* --- Footer --- */
+.footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  max-width: var(--max-width);
+  margin: 0 auto;
+  padding: 2rem;
+  border-top: 1px solid var(--border);
+  font-family: var(--font-mono);
+  font-size: 0.75rem;
+  color: var(--text-dim);
+}
+
+.footer-links {
+  display: flex;
+  gap: 1.5rem;
+}
+
+.footer-links a {
+  color: var(--text-dim);
+  transition: color 0.15s;
+}
+
+.footer-links a:hover { color: var(--accent); }
+
+/* --- Scroll Reveal --- */
+.reveal {
+  opacity: 0;
+  transform: translateY(20px);
+  transition: opacity 0.6s ease, transform 0.6s ease;
+}
+
+.reveal.visible {
+  opacity: 1;
+  transform: translateY(0);
+}
+
+/* --- Responsive --- */
+@media (max-width: 768px) {
+  :root { --section-pad: 3.5rem; }
+
+  .nav { padding: 0.75rem 1.25rem; }
+
+  .nav-links { gap: 0.5rem; }
+  .nav-links a { font-size: 0.75rem; }
+
+  .hero {
+    grid-template-columns: 1fr;
+    padding: 3.5rem 1.25rem 3rem;
+    gap: 2.5rem;
+  }
+
+  .hero::before { display: none; }
+
+  .hero-wordmark { font-size: 2.2rem; }
+  .hero-tagline { font-size: 1.25rem; }
+
+  .hero-cta { flex-direction: column; align-items: flex-start; gap: 1rem; }
+
+  .section-title { font-size: 1.5rem; margin-bottom: 1.75rem; }
+
+  .terminal-body { font-size: 0.7rem; padding: 1rem; height: 240px; }
+  .terminal-line {
+    white-space: pre-wrap;
+    word-break: break-word;
+    padding-left: 0.9rem;
+    text-indent: -0.9rem;
+  }
+
+  .metric { padding: 1.1rem 1.2rem; }
+
+  .section { padding: var(--section-pad) 1.25rem; }
+
+  .step { padding: 1.1rem 1.1rem; gap: 0.85rem; }
+  .step-num { width: 28px; height: 28px; font-size: 0.78rem; }
+
+  .code-block {
+    font-size: 0.68rem;
+    padding: 0.7rem 0.85rem;
+    border-radius: 5px;
+  }
+  .code-block code {
+    white-space: pre-wrap;
+    word-break: break-word;
+  }
+
+  .metrics { gap: 2.5rem; }
+  .metric-value { font-size: 1.8rem; }
+
+  .footer {
+    flex-direction: column;
+    gap: 0.75rem;
+    text-align: center;
+    padding: 1.5rem 1.25rem;
+  }
+}
+
+@media (min-width: 769px) and (max-width: 1024px) {
+  .hero { gap: 2rem; padding: 5rem 2rem 4rem; }
+  .hero-wordmark { font-size: 2.4rem; }
+  .hero-tagline { font-size: 1.4rem; }
+  .metrics { gap: 3rem; }
+}
+
+/* --- Mobile nav drawer --- */
+@media (max-width: 640px) {
+  .nav-toggle { display: inline-flex; }
+
+  .nav-links { gap: 0.5rem; }
+
+  .nav-menu {
+    position: fixed;
+    top: 56px;
+    left: 0;
+    right: 0;
+    flex-direction: column;
+    align-items: stretch;
+    gap: 0;
+    background: rgba(10, 10, 10, 0.96);
+    backdrop-filter: blur(12px);
+    -webkit-backdrop-filter: blur(12px);
+    border-bottom: 1px solid var(--border);
+    padding: 0.5rem 1.25rem 1rem;
+    transform: translateY(-110%);
+    opacity: 0;
+    visibility: hidden;
+    transition: transform 0.22s ease, opacity 0.22s ease, visibility 0s linear 0.22s;
+    pointer-events: none;
+  }
+
+  .nav-menu.open {
+    transform: translateY(0);
+    opacity: 1;
+    visibility: visible;
+    pointer-events: auto;
+    transition: transform 0.22s ease, opacity 0.22s ease, visibility 0s linear 0s;
+  }
+
+  .nav-menu a {
+    padding: 0.75rem 0;
+    font-size: 0.95rem;
+    border-bottom: 1px solid var(--border);
+  }
+  .nav-menu a:last-child { border-bottom: 0; }
+
+  .nav-toggle[aria-expanded="true"] span:nth-child(1) {
+    transform: translateY(6px) rotate(45deg);
+  }
+  .nav-toggle[aria-expanded="true"] span:nth-child(2) { opacity: 0; }
+  .nav-toggle[aria-expanded="true"] span:nth-child(3) {
+    transform: translateY(-6px) rotate(-45deg);
+  }
+}
+
+/* --- Reduced motion --- */
+@media (prefers-reduced-motion: reduce) {
+  html { scroll-behavior: auto; }
+
+  *, *::before, *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+  }
+
+  .t-cursor { animation: none; }
+  .reveal { opacity: 1; transform: none; }
+  .metric:hover,
+  .step:hover,
+  .crate-row:hover { transform: none; }
+}
+
+  </style>
+
+  <!-- JSON-LD Structured Data -->
+  <script type="application/ld+json">
+  {
+    "@context": "https://schema.org",
+    "@type": "SoftwareSourceCode",
+    "name": "Varta",
+    "description": "Zero-overhead health protocol for distributed local agents and network clusters. 32-byte heartbeats over Unix Domain Sockets and UDP.",
+    "codeRepository": "https://github.com/aramirez087/Varta",
+    "programmingLanguage": "Rust",
+    "license": "MIT",
+    "url": "https://varta.sh",
+    "applicationCategory": "DeveloperApplication",
+    "operatingSystem": "Linux, macOS"
+  }
+  </script>
+</head>
+
+<body>
+  <a class="skip-link" href="#main">Skip to content</a>
+
+  <nav class="nav" id="nav">
+    <a href="/" class="nav-wordmark">VARTA</a>
+    <div class="nav-links">
+      <div class="nav-menu" id="nav-menu">
+        <a href="#how">How it works</a>
+        <a href="#performance">Performance</a>
+        <a href="#crates">Crates</a>
+        <a href="/book/guides/">Guides</a>
+        <a href="/book">Documentation</a>
+      </div>
+      <a href="https://github.com/aramirez087/Varta" target="_blank" rel="noopener" aria-label="GitHub" class="nav-github">
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true" focusable="false">
+          <path
+            d="M12 0C5.37 0 0 5.37 0 12c0 5.31 3.435 9.795 8.205 11.385.6.105.825-.255.825-.57 0-.285-.015-1.23-.015-2.235-3.015.555-3.795-.735-4.035-1.41-.135-.345-.72-1.41-1.23-1.695-.42-.225-1.02-.78-.015-.795.945-.015 1.62.87 1.845 1.23 1.08 1.815 2.805 1.305 3.495.99.105-.78.42-1.305.765-1.605-2.67-.3-5.46-1.335-5.46-5.925 0-1.305.465-2.385 1.23-3.225-.12-.3-.54-1.53.12-3.18 0 0 1.005-.315 3.3 1.23.96-.27 1.98-.405 3-.405s2.04.135 3 .405c2.295-1.56 3.3-1.23 3.3-1.23.66 1.65.24 2.88.12 3.18.765.84 1.23 1.905 1.23 3.225 0 4.605-2.805 5.625-5.475 5.925.435.375.81 1.095.81 2.22 0 1.605-.015 2.895-.015 3.3 0 .315.225.69.825.57A12.02 12.02 0 0024 12c0-6.63-5.37-12-12-12z" />
+        </svg>
+      </a>
+      <button class="nav-toggle" id="nav-toggle" aria-label="Menu" aria-expanded="false" aria-controls="nav-menu">
+        <span></span><span></span><span></span>
+      </button>
+    </div>
+  </nav>
+
+  <main id="main" tabindex="-1">
+    <!-- HERO -->
+    <section class="hero">
+      <div class="hero-copy">
+        <div class="hero-wordmark" aria-hidden="true">VARTA</div>
+        <h1 class="hero-tagline">Zero-overhead health protocol for distributed local agents and network clusters.</h1>
+        <p class="hero-sub">32-byte heartbeats over Unix Domain Sockets and UDP. No dependencies. No allocations.
+          Built for people who care about their p99s.</p>
+        <div class="hero-audience" aria-label="Who Varta is for">
+          <span class="audience-pill">SRE &amp; platform — stall &rarr; recovery &rarr; Prometheus</span>
+          <span class="audience-pill">Safety-critical — Class-A binary, compile-time config</span>
+          <span class="audience-pill">Polyglot fleets — Rust, Python, Go, Node, .NET, JVM</span>
+        </div>
+        <div class="hero-proof" aria-label="Published packages">
+          <a class="proof-badge" href="https://crates.io/crates/varta-client" target="_blank" rel="noopener">crates.io</a>
+          <a class="proof-badge" href="https://pypi.org/project/varta/" target="_blank" rel="noopener">PyPI</a>
+          <a class="proof-badge" href="https://www.npmjs.com/package/@varta-health/client" target="_blank" rel="noopener">npm</a>
+          <a class="proof-badge" href="https://github.com/aramirez087/Varta" target="_blank" rel="noopener">GitHub</a>
+          <a class="proof-badge" href="/book/guides/">comparisons</a>
+        </div>
+        <div class="hero-cta">
+          <button class="cta-primary" id="copy-cargo" data-copy="cargo add varta-client" aria-label="Copy Cargo Install Command">
+            <span class="cta-prompt" aria-hidden="true">$</span>
+            <span class="cta-code">cargo add varta-client</span>
+            <span class="cta-divider" aria-hidden="true"></span>
+            <span class="cta-icon-wrapper" aria-hidden="true">
+              <svg class="copy-icon" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" focusable="false"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+              <svg class="check-icon" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" focusable="false"><polyline points="20 6 9 17 4 12"></polyline></svg>
+            </span>
+            <span class="cta-hint">click to copy</span>
+            <span class="sr-only" id="copy-status" aria-live="polite"></span>
+          </button>
+          <div class="hero-buttons">
+            <a href="/book" class="cta-secondary">Read the Book &rarr;</a>
+            <a href="https://github.com/aramirez087/Varta" target="_blank" rel="noopener" class="cta-github">
+              <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true" focusable="false">
+                <path d="M12 0C5.37 0 0 5.37 0 12c0 5.31 3.435 9.795 8.205 11.385.6.105.825-.255.825-.57 0-.285-.015-1.23-.015-2.235-3.015.555-3.795-.735-4.035-1.41-.135-.345-.72-1.41-1.23-1.695-.42-.225-1.02-.78-.015-.795.945-.015 1.62.87 1.845 1.23 1.08 1.815 2.805 1.305 3.495.99.105-.78.42-1.305.765-1.605-2.67-.3-5.46-1.335-5.46-5.925 0-1.305.465-2.385 1.23-3.225-.12-.3-.54-1.53.12-3.18 0 0 1.005-.315 3.3 1.23.96-.27 1.98-.405 3-.405s2.04.135 3 .405c2.295-1.56 3.3-1.23 3.3-1.23.66 1.65.24 2.88.12 3.18.765.84 1.23 1.905 1.23 3.225 0 4.605-2.805 5.625-5.475 5.925.435.375.81 1.095.81 2.22 0 1.605-.015 2.895-.015 3.3 0 .315.225.69.825.57A12.02 12.02 0 0024 12c0-6.63-5.37-12-12-12z" />
+              </svg>
+              GitHub
+            </a>
+          </div>
+        </div>
+      </div>
+      <div class="hero-terminal" aria-hidden="true">
+        <div class="terminal-bar">
+          <div class="terminal-dots">
+            <span class="terminal-dot terminal-dot--red"></span>
+            <span class="terminal-dot terminal-dot--yellow"></span>
+            <span class="terminal-dot terminal-dot--green"></span>
+          </div>
+          <span class="terminal-title">varta-watch</span>
+          <span class="terminal-spacer" aria-hidden="true"></span>
+        </div>
+        <div class="terminal-body" id="terminal-body">
+          <div class="terminal-output" id="terminal-output">
+            <div class="terminal-line"><span class="t-prompt">$</span> <span class="t-cmd">varta-watch</span> <span
+                class="t-flag">--socket</span> /tmp/varta.sock <span class="t-flag">--udp-port</span> <span class="t-num">9000</span> <span class="t-flag">--key-file</span> <span class="t-path">/tmp/varta.key</span></div>
+            <div class="terminal-line"><span class="t-info">&bull;</span> listening on <span
+                class="t-path">/tmp/varta.sock</span> &amp; <span class="t-path">0.0.0.0:9000 (secure UDP)</span></div>
+            <div class="terminal-line"><span class="t-info">&bull;</span> pid <span class="t-num">4821</span> &mdash;
+              status: <span class="t-ok">Ok</span> &mdash; last beat: <span class="t-num">12ms</span> ago</div>
+            <div class="terminal-line"><span class="t-info">&bull;</span> pid <span class="t-num">4821</span> &mdash;
+              status: <span class="t-ok">Ok</span> &mdash; last beat: <span class="t-num">8ms</span> ago</div>
+            <div class="terminal-line"><span class="t-warn">&bull;</span> pid <span class="t-num">4821</span> &mdash;
+              <span class="t-warn">STALL DETECTED</span> &mdash; silence: <span class="t-num">2104ms</span>
+            </div>
+            <div class="terminal-line"><span class="t-warn">&rarr;</span> running recovery: <span class="t-cmd">systemctl
+                restart my-agent</span></div>
+            <div class="terminal-line"><span class="t-info">&bull;</span> metrics &rarr; <span
+                class="t-path">http://127.0.0.1:9100/metrics</span></div>
+            <div class="terminal-line terminal-line--cursor"><span class="t-prompt">$</span><span
+                class="t-cursor">_</span></div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <hr class="divider">
+
+    <!-- PERFORMANCE -->
+    <section class="section" id="performance">
+      <p class="section-label">01 &mdash; Benchmarks</p>
+      <h2 class="section-title">Built for tight p99 budgets.</h2>
+      <div class="metrics">
+        <div class="metric">
+          <span class="metric-label">P99 Latency</span>
+          <span class="metric-value"><span class="counter" data-target="1166" data-suffix="&nbsp;ns">0&nbsp;ns</span></span>
+          <span class="metric-sub">sub-microsecond</span>
+        </div>
+        <div class="metric">
+          <span class="metric-label">CPU (50 agents)</span>
+          <span class="metric-value"><span class="counter" data-target="0.0535" data-suffix="%"
+              data-decimals="4">0%</span></span>
+          <span class="metric-sub">nearly invisible</span>
+        </div>
+        <div class="metric">
+          <span class="metric-label">Binary Overhead</span>
+          <span class="metric-value"><span class="counter" data-target="4.1" data-suffix="&nbsp;KB" data-decimals="1">0
+              KB</span></span>
+          <span class="metric-sub">minimal footprint</span>
+        </div>
+      </div>
+      <p class="metrics-footnote">Measured on Apple Silicon &middot; Rust 1.93.1 &middot; <code>varta-bench</code></p>
+    </section>
+
+    <hr class="divider">
+
+    <!-- HOW IT WORKS -->
+    <section class="section" id="how">
+      <p class="section-label">02 &mdash; Pipeline</p>
+      <h2 class="section-title">From heartbeat to recovery.</h2>
+      <ol class="steps">
+        <li class="step">
+          <span class="step-num">1</span>
+          <div class="step-content">
+            <h3 class="step-title">Connect</h3>
+            <p><code>Varta::connect()</code> opens a non-blocking Unix Datagram socket (or <code>connect_udp()</code> for networks). One allocation. That&rsquo;s it.</p>
+          </div>
+        </li>
+        <li class="step">
+          <span class="step-num">2</span>
+          <div class="step-content">
+            <h3 class="step-title">Beat</h3>
+            <p><code>agent.beat(Status::Ok, payload)</code> encodes 32 bytes on the stack and calls
+              <code>send(2)</code>. Returns <code>Sent</code>, <code>Dropped</code>, or <code>Failed</code>.
+            </p>
+            <pre class="code-block"><code>use varta_client::{Varta, Status};
+
+let agent = Varta::connect("/tmp/varta.sock")?;
+loop {
+    agent.beat(Status::Ok, queue_depth)?;
+    std::thread::sleep(Duration::from_millis(500));
+}</code></pre>
+          </div>
+        </li>
+        <li class="step">
+          <span class="step-num">3</span>
+          <div class="step-content">
+            <h3 class="step-title">Observe</h3>
+            <p><code>varta-watch</code> polls the socket, tracks per-pid state machines, detects stalls, runs recovery
+              commands, exports Prometheus metrics.</p>
+          </div>
+        </li>
+      </ol>
+    </section>
+
+    <hr class="divider">
+
+    <!-- CRATES -->
+    <section class="section" id="crates">
+      <p class="section-label">03 &mdash; Workspace</p>
+      <h2 class="section-title">Three crates. Zero deps.</h2>
+      <div class="crate-list">
+        <a href="/book/spec/vlp.html" class="crate-row">
+          <span class="crate-name">varta-vlp</span>
+          <span class="crate-dots"></span>
+          <span class="crate-arrow">&rarr;</span>
+          <span class="crate-desc"><span class="crate-version">v0.2.0</span> &mdash; 32-byte wire protocol &mdash; Frame, Status, encode/decode, AEAD crypto</span>
+        </a>
+        <a href="/book/architecture/vlp-transports.html#agent-side-varta-client" class="crate-row">
+          <span class="crate-name">varta-client</span>
+          <span class="crate-dots"></span>
+          <span class="crate-arrow">&rarr;</span>
+          <span class="crate-desc"><span class="crate-version">v0.2.0</span> &mdash; Agent API &mdash; Varta::connect(), beat(), secure UDP, optional panic hook</span>
+        </a>
+        <a href="/book/operations/install.html" class="crate-row">
+          <span class="crate-name">varta-watch</span>
+          <span class="crate-dots"></span>
+          <span class="crate-arrow">&rarr;</span>
+          <span class="crate-desc"><span class="crate-version">v0.2.0</span> &mdash; Observer binary &mdash; stall detection, recovery, secure UDP listener, Prometheus</span>
+        </a>
+      </div>
+    </section>
+  </main>
+
+  <footer class="footer">
+    <span>Varta &middot; MIT or Apache-2.0</span>
+    <span class="footer-links">
+      <a href="/book/guides/prometheus-setup.html">Prometheus guide</a>
+      <a href="https://github.com/aramirez087/Varta" target="_blank" rel="noopener">GitHub</a>
+      <a href="https://crates.io/crates/varta-client" target="_blank" rel="noopener">crates.io</a>
+    </span>
+  </footer>
+
+  <script src="script.js" defer></script>
+</body>
+
+</html>

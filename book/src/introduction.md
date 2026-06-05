@@ -1,5 +1,7 @@
 # Introduction
 
+**Website:** [varta.sh](https://varta.sh) · **Guides:** [comparisons & Prometheus setup](guides/index.md)
+
 **Varta** is a zero-dependency, zero-allocation health protocol for
 distributed local agents and networked clusters. Agents emit a fixed
 32-byte heartbeat over a Unix domain socket (or UDP, with AEAD); an

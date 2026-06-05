@@ -48,8 +48,8 @@ dev = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/aramirez087/Varta"
-Documentation = "https://github.com/aramirez087/Varta/tree/main/book/src/spec"
+Homepage = "https://varta.sh"
+Documentation = "https://varta.sh/book/"
 Source = "https://github.com/aramirez087/Varta/tree/main/clients/python"
 Issues = "https://github.com/aramirez087/Varta/issues"
 Changelog = "https://github.com/aramirez087/Varta/blob/main/clients/python/CHANGELOG.md"

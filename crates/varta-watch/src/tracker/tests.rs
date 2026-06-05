@@ -954,6 +954,103 @@ fn pid_recycle_resets_slot_instead_of_dropping_low_nonce() {
     );
 }
 
+/// The beat-time recycle gate is not enough by itself. If the original
+/// kernel-attested process dies silently and the OS recycles its PID before
+/// the stall threshold elapses, there may be no new Varta beat to carry the
+/// new generation. Stall emission must revalidate the pinned generation and
+/// retire the stale slot instead of surfacing a recovery-eligible stall for
+/// the recycled PID.
+#[test]
+fn stall_generation_mismatch_retires_slot_without_emitting_recovery_event() {
+    let mut t = Tracker::new(8, EvictionPolicy::Strict, DEFAULT_EVICTION_SCAN_WINDOW);
+    let threshold_ns = 100;
+    assert_eq!(
+        t.record_with_generation(
+            &frame(1234, 5000),
+            0,
+            threshold_ns,
+            BeatOrigin::KernelAttested,
+            Some(10),
+            Some(111),
+        ),
+        Update::Inserted
+    );
+
+    let mut emitted = 0u32;
+    t.drain_stalled_slots_with_generation_check(
+        threshold_ns * 2,
+        threshold_ns,
+        |pid, pinned_generation| {
+            assert_eq!(pid, 1234);
+            assert_eq!(pinned_generation, 111);
+            true
+        },
+        |_, _, _, _, _| emitted += 1,
+    );
+
+    assert_eq!(
+        emitted, 0,
+        "stale generation must not emit a recovery-eligible stall"
+    );
+    assert_eq!(t.len(), 0, "the stale slot must be retired");
+    assert_eq!(t.last_ns_of(1234), None);
+    assert_eq!(t.take_pid_recycles(), 1);
+
+    assert_eq!(
+        t.record_with_generation(
+            &frame(1234, 1),
+            threshold_ns * 3,
+            threshold_ns,
+            BeatOrigin::KernelAttested,
+            Some(10),
+            Some(222),
+        ),
+        Update::Inserted,
+        "a later beat from the recycled pid must insert cleanly"
+    );
+    assert_eq!(
+        t.take_pid_recycles(),
+        0,
+        "stall-time retirement must not double-count on the later beat"
+    );
+    assert_eq!(t.entries[0].generation, Some(222));
+    assert_eq!(t.entries[0].last_nonce, 1);
+}
+
+/// A missing generation read at stall time is fail-open. `/proc` can vanish
+/// because the agent died before recovery; that is still a valid stall signal
+/// for restart-style recovery commands. Only a concrete different generation
+/// proves PID recycling.
+#[test]
+fn stall_generation_unknown_still_emits_stall() {
+    let mut t = Tracker::new(8, EvictionPolicy::Strict, DEFAULT_EVICTION_SCAN_WINDOW);
+    let threshold_ns = 100;
+    let _ = t.record_with_generation(
+        &frame(1234, 7),
+        0,
+        threshold_ns,
+        BeatOrigin::KernelAttested,
+        Some(10),
+        Some(111),
+    );
+
+    let mut emitted = Vec::new();
+    t.drain_stalled_slots_with_generation_check(
+        threshold_ns * 2,
+        threshold_ns,
+        |_, _| false,
+        |pid, nonce, _, origin, ns| emitted.push((pid, nonce, origin, ns)),
+    );
+
+    assert_eq!(
+        emitted,
+        vec![(1234, 7, BeatOrigin::KernelAttested, Some(10))]
+    );
+    assert_eq!(t.len(), 1);
+    assert_eq!(t.stall_emitted_count, 1);
+    assert_eq!(t.take_pid_recycles(), 0);
+}
+
 /// Replay protection is preserved: a low nonce under the SAME generation is
 /// still `OutOfOrder` (it is a reorder/replay of the same process, not a
 /// recycle). The recycle counter must not move.

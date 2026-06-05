@@ -1,0 +1,748 @@
+<!DOCTYPE HTML>
+<html lang="en" class="light sidebar-visible" dir="ltr">
+    <head>
+        <!-- Book generated using mdBook -->
+        <meta charset="UTF-8">
+        <title>Peer Authentication - The Varta Book</title>
+
+
+        <!-- Custom HTML head -->
+
+        <meta name="description" content="">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <meta name="theme-color" content="#ffffff">
+
+        <link rel="icon" href="../favicon-6198c6f5.svg">
+        <link rel="shortcut icon" href="../favicon-e32d82eb.png">
+        <link rel="stylesheet" href="../css/variables-8adf115d.css">
+        <link rel="stylesheet" href="../css/general-2459343d.css">
+        <link rel="stylesheet" href="../css/chrome-ae938929.css">
+        <link rel="stylesheet" href="../css/print-9e4910d8.css" media="print">
+
+        <!-- Fonts -->
+        <link rel="stylesheet" href="../fonts/fonts-9644e21d.css">
+
+        <!-- Highlight.js Stylesheets -->
+        <link rel="stylesheet" id="mdbook-highlight-css" href="../highlight-493f70e1.css">
+        <link rel="stylesheet" id="mdbook-tomorrow-night-css" href="../tomorrow-night-4c0ae647.css">
+        <link rel="stylesheet" id="mdbook-ayu-highlight-css" href="../ayu-highlight-3fdfc3ac.css">
+
+        <!-- Custom theme stylesheets -->
+
+
+        <!-- Provide site root and default themes to javascript -->
+        <script>
+            const path_to_root = "../";
+            const default_light_theme = "light";
+            const default_dark_theme = "navy";
+            window.path_to_searchindex_js = "../searchindex-76c5ea20.js";
+        </script>
+        <!-- Start loading toc.js asap -->
+        <script src="../toc-3f8cf947.js"></script>
+    <script defer data-domain="varta.sh" src="https://plausible.io/js/script.js"></script>
+<!-- Privacy-friendly analytics by Plausible -->
+<script async src="https://plausible.io/js/pa-YyA03_Ow6U040l0wzUwht.js"></script>
+<script>
+  window.plausible=window.plausible||function(){(plausible.q=plausible.q||[]).push(arguments)},plausible.init=plausible.init||function(i){plausible.o=i||{}};
+  plausible.init()
+</script>
+</head>
+    <body>
+    <div id="mdbook-help-container">
+        <div id="mdbook-help-popup">
+            <h2 class="mdbook-help-title">Keyboard shortcuts</h2>
+            <div>
+                <p>Press <kbd>←</kbd> or <kbd>→</kbd> to navigate between chapters</p>
+                <p>Press <kbd>S</kbd> or <kbd>/</kbd> to search in the book</p>
+                <p>Press <kbd>?</kbd> to show this help</p>
+                <p>Press <kbd>Esc</kbd> to hide this help</p>
+            </div>
+        </div>
+    </div>
+    <div id="mdbook-body-container">
+        <!-- Work around some values being stored in localStorage wrapped in quotes -->
+        <script>
+            try {
+                let theme = localStorage.getItem('mdbook-theme');
+                let sidebar = localStorage.getItem('mdbook-sidebar');
+
+                if (theme.startsWith('"') && theme.endsWith('"')) {
+                    localStorage.setItem('mdbook-theme', theme.slice(1, theme.length - 1));
+                }
+
+                if (sidebar.startsWith('"') && sidebar.endsWith('"')) {
+                    localStorage.setItem('mdbook-sidebar', sidebar.slice(1, sidebar.length - 1));
+                }
+            } catch (e) { }
+        </script>
+
+        <!-- Set the theme before any content is loaded, prevents flash -->
+        <script>
+            const default_theme = window.matchMedia("(prefers-color-scheme: dark)").matches ? default_dark_theme : default_light_theme;
+            let theme;
+            try { theme = localStorage.getItem('mdbook-theme'); } catch(e) { }
+            if (theme === null || theme === undefined) { theme = default_theme; }
+            const html = document.documentElement;
+            html.classList.remove('light')
+            html.classList.add(theme);
+            html.classList.add("js");
+        </script>
+
+        <input type="checkbox" id="mdbook-sidebar-toggle-anchor" class="hidden">
+
+        <!-- Hide / unhide sidebar before it is displayed -->
+        <script>
+            let sidebar = null;
+            const sidebar_toggle = document.getElementById("mdbook-sidebar-toggle-anchor");
+            if (document.body.clientWidth >= 1080) {
+                try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
+                sidebar = sidebar || 'visible';
+            } else {
+                sidebar = 'hidden';
+                sidebar_toggle.checked = false;
+            }
+            if (sidebar === 'visible') {
+                sidebar_toggle.checked = true;
+            } else {
+                html.classList.remove('sidebar-visible');
+            }
+        </script>
+
+        <nav id="mdbook-sidebar" class="sidebar" aria-label="Table of contents">
+            <!-- populated by js -->
+            <mdbook-sidebar-scrollbox class="sidebar-scrollbox"></mdbook-sidebar-scrollbox>
+            <noscript>
+                <iframe class="sidebar-iframe-outer" src="../toc.html"></iframe>
+            </noscript>
+            <div id="mdbook-sidebar-resize-handle" class="sidebar-resize-handle">
+                <div class="sidebar-resize-indicator"></div>
+            </div>
+        </nav>
+
+        <div id="mdbook-page-wrapper" class="page-wrapper">
+
+            <div class="page">
+                <div id="mdbook-menu-bar-hover-placeholder"></div>
+                <div id="mdbook-menu-bar" class="menu-bar sticky">
+                    <div class="left-buttons">
+                        <label id="mdbook-sidebar-toggle" class="icon-button" for="mdbook-sidebar-toggle-anchor" title="Toggle Table of Contents" aria-label="Toggle Table of Contents" aria-controls="mdbook-sidebar">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M0 96C0 78.3 14.3 64 32 64H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32C14.3 128 0 113.7 0 96zM0 256c0-17.7 14.3-32 32-32H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32c-17.7 0-32-14.3-32-32zM448 416c0 17.7-14.3 32-32 32H32c-17.7 0-32-14.3-32-32s14.3-32 32-32H416c17.7 0 32 14.3 32 32z"/></svg></span>
+                        </label>
+                        <button id="mdbook-theme-toggle" class="icon-button" type="button" title="Change theme" aria-label="Change theme" aria-haspopup="true" aria-expanded="false" aria-controls="mdbook-theme-list">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M371.3 367.1c27.3-3.9 51.9-19.4 67.2-42.9L600.2 74.1c12.6-19.5 9.4-45.3-7.6-61.2S549.7-4.4 531.1 9.6L294.4 187.2c-24 18-38.2 46.1-38.4 76.1L371.3 367.1zm-19.6 25.4l-116-104.4C175.9 290.3 128 339.6 128 400c0 3.9 .2 7.8 .6 11.6c1.8 17.5-10.2 36.4-27.8 36.4H96c-17.7 0-32 14.3-32 32s14.3 32 32 32H240c61.9 0 112-50.1 112-112c0-2.5-.1-5-.2-7.5z"/></svg></span>
+                        </button>
+                        <ul id="mdbook-theme-list" class="theme-popup" aria-label="Themes" role="menu">
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-default_theme">Auto</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-light">Light</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-rust">Rust</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-coal">Coal</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-navy">Navy</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-ayu">Ayu</button></li>
+                        </ul>
+                        <button id="mdbook-search-toggle" class="icon-button" type="button" title="Search (`/`)" aria-label="Toggle Searchbar" aria-expanded="false" aria-keyshortcuts="/ s" aria-controls="mdbook-searchbar">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M416 208c0 45.9-14.9 88.3-40 122.7L502.6 457.4c12.5 12.5 12.5 32.8 0 45.3s-32.8 12.5-45.3 0L330.7 376c-34.4 25.2-76.8 40-122.7 40C93.1 416 0 322.9 0 208S93.1 0 208 0S416 93.1 416 208zM208 352c79.5 0 144-64.5 144-144s-64.5-144-144-144S64 128.5 64 208s64.5 144 144 144z"/></svg></span>
+                        </button>
+                    </div>
+
+                    <h1 class="menu-title">The Varta Book</h1>
+
+                    <div class="right-buttons">
+                        <a href="../print.html" title="Print this book" aria-label="Print this book">
+                            <span class=fa-svg id="print-button"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M128 0C92.7 0 64 28.7 64 64v96h64V64H354.7L384 93.3V160h64V93.3c0-17-6.7-33.3-18.7-45.3L400 18.7C388 6.7 371.7 0 354.7 0H128zM384 352v32 64H128V384 368 352H384zm64 32h32c17.7 0 32-14.3 32-32V256c0-35.3-28.7-64-64-64H64c-35.3 0-64 28.7-64 64v96c0 17.7 14.3 32 32 32H64v64c0 35.3 28.7 64 64 64H384c35.3 0 64-28.7 64-64V384zm-16-88c-13.3 0-24-10.7-24-24s10.7-24 24-24s24 10.7 24 24s-10.7 24-24 24z"/></svg></span>
+                        </a>
+                        <a href="https://github.com/aramirez087/Varta" title="Git repository" aria-label="Git repository">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 496 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M165.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6zm-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3zm44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9zM244.8 8C106.1 8 0 113.3 0 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C428.2 457.8 496 362.9 496 252 496 113.3 383.5 8 244.8 8zM97.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1zm-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7zm32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1zm-11.4-14.7c-1.6 1-1.6 3.6 0 5.9 1.6 2.3 4.3 3.3 5.6 2.3 1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2z"/></svg></span>
+                        </a>
+                        <a href="https://github.com/aramirez087/Varta/edit/main/book/src/architecture/peer-authentication.md" title="Suggest an edit" aria-label="Suggest an edit" rel="edit">
+                            <span class=fa-svg id="git-edit-button"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M421.7 220.3l-11.3 11.3-22.6 22.6-205 205c-6.6 6.6-14.8 11.5-23.8 14.1L30.8 511c-8.4 2.5-17.5 .2-23.7-6.1S-1.5 489.7 1 481.2L38.7 353.1c2.6-9 7.5-17.2 14.1-23.8l205-205 22.6-22.6 11.3-11.3 33.9 33.9 62.1 62.1 33.9 33.9zM96 353.9l-9.3 9.3c-.9 .9-1.6 2.1-2 3.4l-25.3 86 86-25.3c1.3-.4 2.5-1.1 3.4-2l9.3-9.3H112c-8.8 0-16-7.2-16-16V353.9zM453.3 19.3l39.4 39.4c25 25 25 65.5 0 90.5l-14.5 14.5-22.6 22.6-11.3 11.3-33.9-33.9-62.1-62.1L314.3 67.7l11.3-11.3 22.6-22.6 14.5-14.5c25-25 65.5-25 90.5 0z"/></svg></span>
+                        </a>
+
+                    </div>
+                </div>
+
+                <div id="mdbook-search-wrapper" class="hidden">
+                    <form id="mdbook-searchbar-outer" class="searchbar-outer">
+                        <div class="search-wrapper">
+                            <input type="search" id="mdbook-searchbar" name="searchbar" placeholder="Search this book ..." aria-controls="mdbook-searchresults-outer" aria-describedby="searchresults-header">
+                            <div class="spinner-wrapper">
+                                <span class=fa-svg id="fa-spin"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M304 48c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zm0 416c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zM48 304c26.5 0 48-21.5 48-48s-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48zm464-48c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zM142.9 437c18.7-18.7 18.7-49.1 0-67.9s-49.1-18.7-67.9 0s-18.7 49.1 0 67.9s49.1 18.7 67.9 0zm0-294.2c18.7-18.7 18.7-49.1 0-67.9S93.7 56.2 75 75s-18.7 49.1 0 67.9s49.1 18.7 67.9 0zM369.1 437c18.7 18.7 49.1 18.7 67.9 0s18.7-49.1 0-67.9s-49.1-18.7-67.9 0s-18.7 49.1 0 67.9z"/></svg></span>
+                            </div>
+                        </div>
+                    </form>
+                    <div id="mdbook-searchresults-outer" class="searchresults-outer hidden">
+                        <div id="mdbook-searchresults-header" class="searchresults-header"></div>
+                        <ul id="mdbook-searchresults">
+                        </ul>
+                    </div>
+                </div>
+
+                <!-- Apply ARIA attributes after the sidebar and the sidebar toggle button are added to the DOM -->
+                <script>
+                    document.getElementById('mdbook-sidebar-toggle').setAttribute('aria-expanded', sidebar === 'visible');
+                    document.getElementById('mdbook-sidebar').setAttribute('aria-hidden', sidebar !== 'visible');
+                    Array.from(document.querySelectorAll('#mdbook-sidebar a')).forEach(function(link) {
+                        link.setAttribute('tabIndex', sidebar === 'visible' ? 0 : -1);
+                    });
+                </script>
+
+                <div id="mdbook-content" class="content">
+                    <main>
+                        <h1 id="peer-authentication"><a class="header" href="#peer-authentication">Peer Authentication</a></h1>
+<p>Varta’s observer trusts the kernel, not the wire. Two layers of defence
+in-depth ensure that process identity cannot be spoofed by anything that
+can reach the Unix Domain Socket.</p>
+<h2 id="layer-1-socket-file-permissions---socket-mode"><a class="header" href="#layer-1-socket-file-permissions---socket-mode">Layer 1: socket file permissions (<code>--socket-mode</code>)</a></h2>
+<p>After <code>bind(2)</code>, the observer <code>chmod</code>s the socket file to <code>0600</code> by
+default (owner read and write only).  Only processes running under the
+same UID as the observer can <code>connect(2)</code> to the socket.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Flag</th><th>Default</th><th>Format</th><th>Behaviour</th></tr>
+</thead>
+<tbody>
+<tr><td><code>--socket-mode</code></td><td><code>0600</code></td><td>Octal (e.g. <code>0660</code>)</td><td>File mode applied via <code>chmod(2)</code> after bind.  Pass <code>0660</code> to allow group access.</td></tr>
+</tbody>
+</table>
+</div>
+<h2 id="layer-2-kernel-credential-verification"><a class="header" href="#layer-2-kernel-credential-verification">Layer 2: kernel credential verification</a></h2>
+<h3 id="linux"><a class="header" href="#linux">Linux</a></h3>
+<p>The observer sets <code>SO_PASSCRED</code> on the socket after binding.  Every
+<code>recvmsg(2)</code> call then receives a <code>SCM_CREDENTIALS</code> ancillary message
+containing a <code>struct ucred { pid, uid, gid }</code> populated by the kernel.
+The observer compares <code>ucred.pid</code> against <code>frame.pid</code> from the VLP wire
+format.  If they disagree the frame is silently dropped and
+<code>varta_frame_auth_failures_total</code> is incremented.  The <code>ucred.uid</code>
+field is implicitly trusted by Layer 1 (<code>--socket-mode 0600</code> already
+restricts access to the owning UID), but could be checked as a
+fail-safe if a permission bypass is ever discovered.</p>
+<h3 id="macos"><a class="header" href="#macos">macOS</a></h3>
+<p>macOS exposes <code>LOCAL_PEERTOKEN</code> / <code>LOCAL_PEERPID</code> for connected local
+sockets, but Varta’s production UDS transport is a pathname
+<code>SOCK_DGRAM</code> observer socket receiving from unconnected clients. On that
+socket shape, Darwin returns <code>ENOTCONN</code> for the peer-token and peer-pid
+queries after <code>recvmsg(2)</code>, so the observer cannot bind <code>frame.pid</code> to a
+kernel-attested sender.</p>
+<p>The implementation still attempts the Darwin peer queries so connected
+test fixtures catch constant or ABI drift, but pathname UDS beats
+resolve to the PID-0 sentinel and are tagged <code>BeatOrigin::SocketModeOnly</code>.
+Recovery is intentionally refused for those beats.</p>
+<p>The Darwin queries are:</p>
+<ol>
+<li><code>LOCAL_PEERPID</code> (0x0002) — returns the peer’s PID directly.</li>
+<li><code>LOCAL_PEERCRED</code> (0x0001) — returns a <code>struct xucred</code> with the
+peer’s UID in <code>cr_uid</code>.</li>
+<li><code>LOCAL_PEERTOKEN</code> (0x0006) — returns an <code>audit_token_t</code> containing
+the peer’s PID and effective UID on connected local sockets.</li>
+</ol>
+<h3 id="freebsd-dragonfly-bsd-netbsd"><a class="header" href="#freebsd-dragonfly-bsd-netbsd">FreeBSD, DragonFly BSD, NetBSD</a></h3>
+<p>On FreeBSD-family platforms, the observer sets <code>LOCAL_CREDS</code> on the
+socket (value <code>0x0002</code> on FreeBSD/DragonFly, <code>0x0001</code> on NetBSD).  Every
+<code>recvmsg(2)</code> then receives a <code>SCM_CREDS</code> ancillary message containing a
+<code>struct cmsgcred { cmcred_pid, cmcred_uid, cmcred_euid, cmcred_gid, ... }</code>
+populated by the kernel.  The observer extracts <code>cmcred_pid</code> and
+<code>cmcred_euid</code> and performs the same PID + UID verification as on Linux.</p>
+<p>The ancillary buffer is sized at 256 bytes — sufficient for the 84-byte
+<code>cmsgcred</code> with generous headroom for future kernel extensions.</p>
+<h3 id="illumos--solaris"><a class="header" href="#illumos--solaris">illumos / Solaris</a></h3>
+<p>On illumos and Solaris the observer sets <code>SO_RECVUCRED</code> (value <code>0x0400</code>,
+level <code>SOL_SOCKET = 0xffff</code>) on the socket.  Every <code>recvmsg(2)</code> then
+receives a <code>SCM_UCRED</code> ancillary message whose payload is an <strong>opaque
+<code>ucred_t</code></strong>.  The layout of <code>ucred_t</code> is not a stable ABI contract, so
+field extraction goes through the <code>ucred_getpid(3C)</code> and <code>ucred_geteuid(3C)</code>
+accessor functions from the system’s C library rather than a direct struct
+cast.</p>
+<p>This is a genuine per-datagram credential mechanism: the kernel attests
+the sender’s identity on each <code>recvmsg(2)</code>, not just at connection time.
+The ancillary buffer is sized at 1 024 bytes to accommodate the additional
+audit and MAC-label attributes that illumos attaches under Trusted Solaris
+/ labelled-zone configurations.</p>
+<p><strong><code>ucred_t</code> lifetime invariant.</strong> Both <code>ucred_getpid(3C)</code> and
+<code>ucred_geteuid(3C)</code> are called inside <code>extract_pid_uid</code> while the cmsg
+buffer is still on the <code>recv_authenticated</code> stack frame.  Neither call
+stores the pointer past its return; the buffer is released after the call
+completes.</p>
+<p><strong>Zone isolation.</strong> <code>ucred_getzoneid(3C)</code> is available for extracting the
+Solaris zone-id of the sender (analogous to the Linux PID-namespace inode).
+Cross-zone detection is a planned follow-up; for now, <code>peer_pid_ns_inode</code>
+is <code>None</code> on illumos/Solaris, which disables the cross-container recovery
+refusal.  See <code>book/src/architecture/namespaces.md</code> for the planned gate.</p>
+<h3 id="platform-support-summary"><a class="header" href="#platform-support-summary">Platform support summary</a></h3>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Platform</th><th>Mechanism</th><th>Per-datagram?</th><th>Recovery-eligible?</th></tr>
+</thead>
+<tbody>
+<tr><td>Linux</td><td><code>SO_PASSCRED</code> + <code>SCM_CREDENTIALS</code> (<code>struct ucred</code>)</td><td>Yes</td><td>Yes</td></tr>
+<tr><td>macOS pathname UDS</td><td>socket file permissions only (<code>LOCAL_PEERTOKEN</code> requires a connected local socket)</td><td><strong>No</strong></td><td><strong>No</strong></td></tr>
+<tr><td>FreeBSD / DragonFly / NetBSD</td><td><code>LOCAL_CREDS</code> + <code>SCM_CREDS</code> (<code>struct cmsgcred</code>)</td><td>Yes</td><td>Yes</td></tr>
+<tr><td>illumos / Solaris</td><td><code>SO_RECVUCRED</code> + <code>SCM_UCRED</code> + <code>ucred_t</code> (opaque)</td><td>Yes</td><td>Yes</td></tr>
+<tr><td>OpenBSD, AIX, HP-UX, other Unix</td><td>none — <code>--socket-mode 0600</code> only</td><td><strong>No</strong></td><td><strong>No</strong></td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="socket-mode-only-fallback"><a class="header" href="#socket-mode-only-fallback">Socket-mode-only fallback</a></h3>
+<p>On platforms that do not provide per-datagram kernel credential passing
+for Varta’s pathname UDS transport (currently: macOS, OpenBSD, and any
+other Unix not listed above), <code>varta-watch</code>
+falls back to a plain <code>recv(2)</code> receive path and tags each beat with
+<code>BeatOrigin::SocketModeOnly</code>.</p>
+<p><strong>Trust model for SocketModeOnly beats.</strong> The only defence is filesystem
+permissions (<code>--socket-mode 0600</code>, the default).  Any process running
+under the same UID as the observer can reach the socket and forge
+<code>frame.pid</code>.  Recovery commands <strong>must not and do not fire</strong> for these
+beats — the recovery gate at <code>recovery.rs::on_stall</code> refuses with
+<code>RecoveryOutcome::RefusedSocketModeOnly</code> and increments the Prometheus
+counter <code>varta_recovery_refused_total{reason="socket_mode_only"}</code>.  The
+audit log records the refusal with <code>reason=socket_mode_only</code>.</p>
+<p>At startup, <code>varta-watch</code> emits a warning on stderr when compiled for a
+socket-mode-only platform:</p>
+<pre><code>[WARN] per-datagram PID verification is unavailable on this platform.
+The only defence is --socket-mode (default 0600). Any process under the
+same UID can impersonate any PID. Beats will be tagged SocketModeOnly;
+recovery commands will not fire.
+</code></pre>
+<h2 id="udp-transport-authentication"><a class="header" href="#udp-transport-authentication">UDP transport authentication</a></h2>
+<p>For network-based agents that emit beats over UDP, the trust model is
+<strong>cryptographic</strong>, not kernel-attested.  UDP has no peer-credential
+mechanism on any platform — <code>recvmsg(2)</code> cannot tell the observer who
+sent a datagram, only where it claims to be from.  Varta therefore
+requires authentication at the AEAD layer, and refuses to bind an
+unauthenticated UDP listener without two layers of explicit opt-in.</p>
+<h3 id="compile-time-features-cratesvarta-watchcargotoml"><a class="header" href="#compile-time-features-cratesvarta-watchcargotoml">Compile-time features (<code>crates/varta-watch/Cargo.toml</code>)</a></h3>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Cargo feature</th><th>What it enables</th><th>Production posture</th></tr>
+</thead>
+<tbody>
+<tr><td><code>secure-udp</code></td><td><code>SecureUdpListener</code> (ChaCha20-Poly1305 AEAD + per-sender replay)</td><td><strong>Recommended</strong></td></tr>
+<tr><td><code>unsafe-plaintext-udp</code></td><td><code>UdpListener</code> (no authentication)</td><td><strong>Forbidden in production</strong></td></tr>
+<tr><td><code>udp-core</code></td><td>Internal — shared UDP socket wiring</td><td>(transitive)</td></tr>
+</tbody>
+</table>
+</div>
+<p>A build that does not include <code>unsafe-plaintext-udp</code> cannot link the
+plaintext path at all.  Passing <code>--udp-port</code> without keys to such a build
+hard-errors at startup; there is no warn-and-continue path.</p>
+<h3 id="runtime-selection-rules"><a class="header" href="#runtime-selection-rules">Runtime selection rules</a></h3>
+<p>When <code>--udp-port</code> is set, the observer chooses exactly one listener:</p>
+<ol>
+<li>If <code>--features secure-udp</code> is compiled in <strong>and</strong> <code>--key-file</code>,
+<code>--accepted-key-file</code>, or <code>--master-key-file</code> resolve to usable key
+material, bind <code>SecureUdpListener</code>.</li>
+<li>Otherwise, only the plaintext path remains.  It is bound <em>only</em> if
+both <code>--features unsafe-plaintext-udp</code> is compiled in <strong>and</strong>
+<code>--i-accept-plaintext-udp</code> was passed on the command line.</li>
+<li>Any other configuration is a hard error (<code>InvalidInput</code>).</li>
+</ol>
+<p>When the plaintext path is taken, a high-visibility <code>varta_warn!</code> is
+emitted at startup naming the bound address, so the choice appears in
+SIEM / syslog logs:</p>
+<blockquote>
+<p><code>UDP on &lt;addr&gt; is running WITHOUT authentication (--i-accept-plaintext-udp).</code>
+<code>Any device with network reach to this port can inject heartbeats, suppress</code>
+<code>stall detection, or trigger false recovery commands. NOT for production /</code>
+<code>safety-critical use.</code></p>
+</blockquote>
+<p><code>--i-accept-plaintext-udp</code> is intentionally verbose: an operator who
+types it is making an explicit statement that this build is for
+development or testing, not for a hospital VLAN.</p>
+<h3 id="why-no-kernel-level-udp-credentials"><a class="header" href="#why-no-kernel-level-udp-credentials">Why no kernel-level UDP credentials</a></h3>
+<p>Unix Domain Sockets can carry <code>SCM_CREDENTIALS</code> / <code>SCM_CREDS</code>
+per-datagram on supported kernels.  UDP carries none of those.  Even on a single
+host where <code>--udp-bind-addr 127.0.0.1</code> is used, any local process can
+send to that port — there is no equivalent of <code>--socket-mode 0600</code> for
+network sockets.  AEAD is the only durable defence.</p>
+<h2 id="recovery-eligibility-and-transport-origin-gating"><a class="header" href="#recovery-eligibility-and-transport-origin-gating">Recovery eligibility and transport-origin gating</a></h2>
+<p>Recovery commands (<code>--recovery-exec</code> and <code>--recovery-exec-file</code>) take the
+<strong>stalled agent’s <code>frame.pid</code></strong> and substitute it into
+the spawned process (<code>kill -9 {pid}</code>, <code>systemctl restart agent@{pid}.service</code>,
+etc.).  That makes recovery a privileged action that targets an arbitrary
+process by id — and means the wire-level <code>frame.pid</code> must be tied back to
+the <em>real</em> sending process, not just to whoever holds an AEAD key.</p>
+<h3 id="the-trust-invariant"><a class="header" href="#the-trust-invariant">The trust invariant</a></h3>
+<p>A recovery command MUST NEVER fire for a pid whose beat lifetime is not
+<strong>kernel-attested</strong>.  In practice that means:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Transport</th><th>Kernel-attested?</th><th>Recovery-eligible by default?</th></tr>
+</thead>
+<tbody>
+<tr><td>UDS on Linux / supported BSDs / illumos / Solaris</td><td>Yes — <code>SO_PASSCRED</code> / <code>SCM_CREDS</code> / <code>SCM_UCRED</code></td><td><strong>Yes</strong></td></tr>
+<tr><td>UDS on macOS pathname sockets / OpenBSD / other socket-mode-only targets</td><td>No — socket file permissions only</td><td>No</td></tr>
+<tr><td>Plaintext UDP</td><td>No — <code>peer_pid</code> is always 0</td><td>No</td></tr>
+<tr><td>Secure UDP</td><td>No — frame is <em>cryptographically</em> authenticated but the kernel does not attest the sending process; a holder of the AEAD key (or a per-agent key derived from a leaked master key) can forge a beat for any pid</td><td>No</td></tr>
+</tbody>
+</table>
+</div>
+<p>Internally each beat is tagged with a <code>BeatOrigin</code>
+(<code>KernelAttested</code>, <code>OperatorAttestedTransport</code>, <code>SocketModeOnly</code>, or
+<code>NetworkUnverified</code>).  The tracker handles origin races monotonically by
+trust: a stronger origin can replace a weaker preemption attempt for the
+same pid, while weaker conflicting beats are rejected as
+<code>Event::OriginConflict</code> (counter: <code>varta_origin_conflict_total</code>). This
+prevents an attacker on an untrusted transport from pinning a pid before a
+kernel-attested agent can prove liveness.</p>
+<h3 id="two-layer-enforcement"><a class="header" href="#two-layer-enforcement">Two-layer enforcement</a></h3>
+<ol>
+<li>
+<p><strong>Startup hard-error.</strong>  If any <code>--recovery-exec</code> / <code>--recovery-exec-file</code>
+is configured <em>and</em> <code>--udp-port</code>
+is set, the daemon refuses to start with
+<code>ConfigError::RecoveryRequiresAuthenticatedTransport</code>.  Operators must
+pass <code>--i-accept-recovery-on-unauthenticated-transport</code> to proceed.
+The flag is verbose by design (matches the <code>--i-accept-&lt;risk&gt;</code>
+convention) and shows up in <code>cargo tree</code> / startup banners.</p>
+</li>
+<li>
+<p><strong>Runtime origin gate.</strong>  Even with the accept flag, <code>Recovery::on_stall</code>
+refuses to spawn the recovery command when the stalled slot’s pinned
+origin is <code>NetworkUnverified</code>.  The refusal returns the typed
+<code>RecoveryOutcome::RefusedUnauthenticatedSource { pid }</code>, increments
+<code>varta_recovery_refused_total{reason="unauthenticated_transport"}</code>, and
+emits a structured <code>refused</code> record into the recovery audit log
+(<code>--recovery-audit-file</code>).  To enable UDP-origin recovery the operator
+must construct the <code>Recovery</code> with
+<code>with_allow_unauthenticated_source(true)</code> — a second, conscious choice
+on top of the startup flag.</p>
+</li>
+</ol>
+<h3 id="why-secure-udp-isnt-enough"><a class="header" href="#why-secure-udp-isnt-enough">Why secure-UDP isn’t enough</a></h3>
+<p>The secure-UDP master-key mode binds <code>frame.pid</code> to the 4-byte PID prefix
+in <code>iv_random[0..4]</code> and derives a per-agent key from the master key.
+That is a useful <em>cryptographic</em> binding for the UDP threat model — a
+holder of a single derived agent key cannot forge frames for <em>other</em>
+pids.  But the binding lives at the protocol layer, not at the kernel
+layer:</p>
+<ul>
+<li>A leak of the <strong>shared key</strong> lets anyone forge any pid.</li>
+<li>A leak of the <strong>master key</strong> lets anyone derive any agent key.</li>
+<li>A leak of <strong>any per-agent key</strong> still lets that agent forge its own pid
+to misbehave (e.g. stop sending → trigger recovery against its own pid
+during legitimate maintenance windows).</li>
+</ul>
+<p>Kernel attestation has no such failure mode: the kernel knows which
+process owns the socket fd, and that knowledge cannot be forged by any
+amount of key material.  This is why Varta classifies all UDP variants
+(plain and secure) as <code>NetworkUnverified</code> for the recovery-eligibility
+decision.</p>
+<h2 id="recovery-command-authentication-boundary"><a class="header" href="#recovery-command-authentication-boundary">Recovery command authentication boundary</a></h2>
+<p><code>--recovery-exec</code> and <code>--recovery-exec-file</code> invoke the program directly
+via <code>execvp(2)</code> — no shell, no metacharacter interpretation, no injection
+surface.  The stalled pid is appended as the final argument: never
+interpolated into a command string.</p>
+<p>Shell-mode recovery (<code>--recovery-cmd</code> / <code>--recovery-cmd-file</code>) was
+<strong>permanently removed</strong>.  All builds — SRE, Class-A, and default — use
+exec-only recovery.  No opt-in flag is required; exec-mode is the only
+available recovery mode.</p>
+<h2 id="prometheus-metrics-endpoint-exposure"><a class="header" href="#prometheus-metrics-endpoint-exposure">Prometheus <code>/metrics</code> endpoint exposure</a></h2>
+<p>The <code>/metrics</code> endpoint is HTTP/1.0 with <strong>mandatory bearer-token
+authentication</strong>.  When <code>--prom-addr</code> is set, <code>--prom-token-file</code> is
+required: the observer refuses to start without it.  Every scrape must
+send <code>Authorization: Bearer &lt;hex&gt;</code> where <code>&lt;hex&gt;</code> is the lowercase 64-byte
+hex form of the file’s 32 random bytes (the format produced by
+<code>openssl rand -hex 32</code>).  Missing or wrong tokens get
+<code>HTTP/1.0 401 Unauthorized</code> and bump <code>varta_prom_auth_failures_total</code>.</p>
+<p>The token file is loaded through the same hardened validator that
+guards <code>--key-file</code> (see “Secret-file validation” below): regular file,
+no symlinks, owned by the observer UID, mode <code>0o600</code> or stricter,
+opened with <code>O_NOFOLLOW</code>.</p>
+<p>The endpoint also retains four DoS-protection layers from earlier work,
+so that a hostile scraper cannot exhaust file descriptors or starve the
+observer’s poll loop even before the auth check runs:</p>
+<ol>
+<li><strong>Serve budget</strong> — at most <code>PROM_MAX_CONNECTIONS_PER_SERVE=8</code> accepted
+connections per outer poll tick, and a 100 ms wall-clock deadline.</li>
+<li><strong>Drain budget</strong> — after the serve budget is exhausted, an
+additional <code>PROM_MAX_DRAIN_PER_SERVE=50</code> connections may be accepted
+and immediately closed, so the kernel accept queue does not back up.</li>
+<li><strong>Per-source-IP token bucket</strong> — every accepted connection (in both
+serve and drain phases) decrements a per-IP token bucket sized by
+<code>--prom-rate-limit-burst</code> (default 10) and refilled at
+<code>--prom-rate-limit-per-sec</code> (default 5).  Connections from an IP
+whose bucket is empty are closed without serving and counted as
+<code>varta_prom_connections_dropped_total{reason="rate_limit"}</code>.</li>
+<li><strong>Per-IP table cap</strong> — the per-IP map is bounded to 1024 entries;
+when full, stale entries (no activity in 60 s) are evicted first,
+then if necessary the oldest entry is force-evicted and counted as
+<code>varta_prom_connections_dropped_total{reason="ip_table_full"}</code>.</li>
+</ol>
+<h3 id="token-comparison-is-constant-time"><a class="header" href="#token-comparison-is-constant-time">Token comparison is constant-time</a></h3>
+<p>The exporter compares the presented and expected tokens via
+<code>varta_vlp::ct_eq</code> — the same constant-time XOR-and-OR routine that
+guards Poly1305 tag verification.  This prevents byte-by-byte timing
+oracles from leaking the prefix of the token to a remote scraper.</p>
+<h3 id="bind-address-recommendation"><a class="header" href="#bind-address-recommendation">Bind-address recommendation</a></h3>
+<p>The bearer token is the authoritative authentication boundary.  Loopback
+bind (<code>127.0.0.1:&lt;port&gt;</code> or <code>[::1]:&lt;port&gt;</code>) behind a reverse proxy
+remains the recommended posture for defense in depth, but is no longer
+the <em>only</em> defense.  The observer still emits a startup <code>varta_warn!</code>
+whenever the bound address is non-loopback, so the exposure is visible
+in audit logs.</p>
+<h3 id="prometheus-scrape-config"><a class="header" href="#prometheus-scrape-config">Prometheus scrape config</a></h3>
+<p>The standard <code>authorization:</code> block injects the bearer token verbatim:</p>
+<pre><code class="language-yaml">scrape_configs:
+  - job_name: 'varta'
+    static_configs:
+      - targets: ['varta-host:9100']
+    authorization:
+      type: Bearer
+      credentials_file: /etc/prometheus/varta-prom.token
+</code></pre>
+<p>The <code>credentials_file</code> should be the <strong>same</strong> content as
+<code>--prom-token-file</code> on the observer; Prometheus reads it with the same
+0600-or-stricter expectation.</p>
+<h2 id="secret-file-validation"><a class="header" href="#secret-file-validation">Secret-file validation</a></h2>
+<p>Every file containing key material — <code>--key-file</code>, <code>--accepted-key-file</code>,
+<code>--master-key-file</code>, and the new <code>--prom-token-file</code> — flows through
+<code>validate_secret_file</code> in <code>varta-watch/src/config.rs</code>.  The validator
+enforces:</p>
+<ol>
+<li>The path is <strong>not a symlink</strong> (<code>symlink_metadata</code> + <code>is_symlink</code>).</li>
+<li>The path resolves to a <strong>regular file</strong> (not a directory, FIFO,
+block/char device, etc.).</li>
+<li>The mode is <strong><code>0o600</code> or stricter</strong> (<code>mode &amp; 0o077 == 0</code>).</li>
+<li>The file is <strong>owned by the observer’s UID</strong> (kernel-attested via
+<code>stat.uid</code>, not derived from the env).</li>
+<li>The file is opened with <strong><code>O_NOFOLLOW</code></strong> to close the TOCTOU window
+between the metadata check and the read.</li>
+</ol>
+<p>A failure on any of these aborts startup with a typed <code>ConfigError</code>
+naming the failing constraint (<code>insecure permissions ...</code>, <code>must not be a symlink</code>, <code>owned by uid X, expected uid Y</code>, etc.).</p>
+<h2 id="why-environment-variable-keys-are-gone"><a class="header" href="#why-environment-variable-keys-are-gone">Why environment-variable keys are gone</a></h2>
+<p>Earlier releases offered <code>--key-env &lt;NAME&gt;</code> as a key-source fallback.
+That flag is <strong>removed</strong>.  Passing it now returns
+<code>ConfigError::RemovedFlag</code> with an inline migration hint pointing at
+<code>--key-file</code>.  The motivation:</p>
+<ul>
+<li>On Linux, <code>/proc/&lt;pid&gt;/environ</code> is readable by any process running
+under the same UID; a peer with a UDS connection to the observer
+(which already has UID-restricted access) can read the master key out
+of the observer’s own environment.</li>
+<li>In containers, <code>docker inspect &lt;container&gt;</code> exposes every environment
+variable to anyone with read access to the Docker socket — typically
+all members of the <code>docker</code> group, which is often a superset of the
+in-container UID.</li>
+<li><code>systemd-journald</code> captures process environment on demand for crash
+reports; an env-var key ends up in <code>/var/log/journal</code> indefinitely.</li>
+</ul>
+<p>File-based keys avoid all three exposures and slot into the same
+ownership/permission model as TLS private keys, SSH host keys, and any
+other long-lived secret an operator already knows how to manage.</p>
+<p>The <code>Key</code> type in <code>varta_vlp::crypto</code> also lost its <code>Copy</code> derive and
+gained a <code>Drop</code> impl that volatile-zeros the secret bytes before the
+allocation is returned to the stack, closing a small but real leak
+surface in core dumps and ASLR-defeated speculative reads.</p>
+<h2 id="shutdown-grace-and-systemd"><a class="header" href="#shutdown-grace-and-systemd">Shutdown grace and systemd</a></h2>
+<p><code>--shutdown-grace-ms</code> (default 5000, minimum 100) bounds the time
+<code>Recovery::drop</code> blocks waiting for outstanding recovery children to
+exit after issuing SIGKILL during shutdown.  Children that outlive the
+grace are abandoned to PID 1 for reaping; the observer process exits
+either way, so the bound on shutdown latency is deterministic.</p>
+<p>In a systemd unit, <code>TimeoutStopSec</code> must be <strong>at least
+<code>shutdown_grace_ms + 2 s</code></strong> (roughly: grace + reap margin) to ensure
+that systemd does not SIGKILL the observer mid-grace and leak an
+unreaped recovery child:</p>
+<pre><code class="language-ini">[Service]
+Environment=VARTA_SHUTDOWN_GRACE_MS=5000
+ExecStart=/usr/local/bin/varta-watch --shutdown-grace-ms ${VARTA_SHUTDOWN_GRACE_MS} ...
+TimeoutStopSec=7s
+KillMode=mixed
+</code></pre>
+<p><code>KillMode=mixed</code> is recommended: systemd sends SIGTERM to the main
+observer process only; the observer then runs its own Drop sequence to
+kill+reap any recovery children it had spawned.  This is what the
+shutdown-grace tunable is designed around.</p>
+<h2 id="recovery-command-environment-isolation"><a class="header" href="#recovery-command-environment-isolation">Recovery command environment isolation</a></h2>
+<p>When <code>--recovery-env KEY=VALUE</code> is specified (repeatable), the recovery
+child process runs with a sanitized environment:</p>
+<ol>
+<li>The child’s environment is cleared entirely.</li>
+<li><code>PATH</code> is set to <code>/usr/bin:/bin</code> (sufficient to locate common tools).</li>
+<li>Only the explicitly-listed <code>KEY=VALUE</code> pairs are exported.</li>
+</ol>
+<p>Without <code>--recovery-env</code>, the child inherits <code>PATH=/usr/bin:/bin</code> only
+(secure default since 2026-05-14).  This eliminates <code>LD_PRELOAD</code>, <code>IFS</code>,
+and other environment-injection vectors from recovery children entirely.</p>
+<h2 id="exec-safety"><a class="header" href="#exec-safety">Exec safety</a></h2>
+<p>The <code>{pid}</code> substitution in <code>--recovery-exec</code> args is safe: a <code>u32</code> PID
+formatted as a decimal string contains only the characters <code>0</code>–<code>9</code> and
+can never carry shell metacharacters (<code>;</code>, <code>|</code>, <code>&amp;</code>, <code>$</code>, <code>`</code>, etc.).
+Furthermore, since exec-mode never passes arguments through a shell,
+metacharacter interpretation is structurally impossible.</p>
+<h2 id="metrics"><a class="header" href="#metrics">Metrics</a></h2>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Metric</th><th>Type</th><th>Description</th></tr>
+</thead>
+<tbody>
+<tr><td><code>varta_frame_auth_failures_total</code></td><td>counter</td><td>Incremented every time a frame’s claimed PID does not match the kernel-verified sender PID (Linux only).</td></tr>
+<tr><td><code>varta_beats_total{pid="..."}</code></td><td>counter</td><td>Per-PID total of accepted beats (only incremented after authentication passes).</td></tr>
+<tr><td><code>varta_prom_connections_dropped_total{reason="..."}</code></td><td>counter</td><td><code>/metrics</code> connections accepted but closed before serving.  Reasons: <code>drain</code> (serve budget exhausted), <code>rate_limit</code> (per-IP token bucket empty), <code>ip_table_full</code> (per-IP state map force-evicted).</td></tr>
+<tr><td><code>varta_prom_auth_failures_total</code></td><td>counter</td><td><code>/metrics</code> scrapes that arrived without <code>Authorization: Bearer &lt;hex&gt;</code> or with a wrong token.  Always emitted on every scrape (even at zero), so <code>absent()</code> alert rules stay green-on-green until the first incident.</td></tr>
+<tr><td><code>varta_recovery_refused_total{reason="..."}</code></td><td>counter</td><td>Recovery commands NOT spawned because of a structural safety gate. Only reason currently defined: <code>unauthenticated_transport</code> (stalled slot’s pinned origin was <code>NetworkUnverified</code> and the operator did not enable UDP-origin recovery). Emitted at zero on every scrape.</td></tr>
+<tr><td><code>varta_origin_conflict_total</code></td><td>counter</td><td>Beats dropped because the beat’s transport origin was weaker than the slot’s pinned origin. Non-zero values indicate either operator misconfiguration (same pid emitted from two transports) or an active spoofing attempt.</td></tr>
+</tbody>
+</table>
+</div>
+<h2 id="trust-model-summary"><a class="header" href="#trust-model-summary">Trust model summary</a></h2>
+<pre><code> Process ── connect(2) to UDS ──┐
+                                   ├─ [FAIL]  Kernel blocks (Layer 1: --socket-mode 0600, wrong UID)
+                                   ├─ [PASS]  Layer 2: SO_PASSCRED → ucred.pid (Linux)
+                                   │          Layer 2: LOCAL_CREDS → cmsgcred.pid (FreeBSD, DragonFly, NetBSD)
+                                   │          ├─ [PID MISMATCH] → Drop frame + bump counter
+                                   │          ├─ [UID MISMATCH] → Drop frame as IoError
+                                   │          └─ [PID MATCH + UID MATCH] →
+                                   ↓
+                              [SUCCESS]  Observer trusts the PID → tracks,
+                                         surfaces stalls, triggers --recovery-exec
+                                         with {pid} as the final argument.
+</code></pre>
+<p>The trust boundary is the kernel: a frame is only accepted if the kernel
+attests that the sending process’s PID matches the one encoded in the
+VLP frame and that the sending process runs under the observer’s UID.
+On Linux this is enforced per-datagram via <code>SO_PASSCRED</code>; on FreeBSD /
+DragonFly / NetBSD via <code>LOCAL_CREDS</code> + <code>SCM_CREDS</code>.  macOS pathname
+datagram sockets and platforms without kernel-level credential passing fall
+back to <code>--socket-mode 0600</code>.</p>
+<h2 id="security-limitations"><a class="header" href="#security-limitations">Security limitations</a></h2>
+<h3 id="no-forward-secrecy"><a class="header" href="#no-forward-secrecy">No forward secrecy</a></h3>
+<p>The KDF derives per-agent and per-epoch keys from a single master key.
+An epoch key can decrypt frames from past epochs if the agent key is
+compromised. True forward secrecy requires bidirectional ephemeral key
+exchange (e.g. X25519), which is incompatible with the connectionless,
+one-way heartbeat model.</p>
+<p>When the master key is rotated, all agents must be updated atomically.
+The observer reads the master key once at startup from <code>--master-key-file</code>. To
+rotate keys, restart the observer with the new master key file. SIGHUP-based
+hot-reload is planned for a future release.</p>
+<h3 id="panic-hook-entropy-policy-secure-udp"><a class="header" href="#panic-hook-entropy-policy-secure-udp">Panic-hook entropy policy (secure UDP)</a></h3>
+<p><code>install_panic_handler_secure_udp</code> reads all IV material at install time
+(<code>getrandom(2)</code> on Linux, <code>getentropy(3)</code> on macOS/BSD, falling back to
+<code>/dev/urandom</code>): an 8-byte prefix for the installing process plus a 16-byte
+salt for forked children. If a forked child panics, the hook derives a
+child-specific IV prefix with HKDF-SHA256 over the pre-read salt, PID,
+timestamp, and AEAD counter. No file I/O or OS entropy call occurs inside the
+panic handler itself (async-signal-safety).</p>
+<p><strong>Fail-closed default:</strong> if the entropy chain fails — common in chrooted
+environments without a mounted <code>/dev</code> — the function returns
+<code>Err(PanicInstallError::EntropyUnavailable)</code> and the hook is NOT registered.
+This prevents a panic-time Critical frame from reusing a deterministic IV
+under the same AEAD key, which would be a catastrophic nonce-reuse failure.</p>
+<p><strong>Degraded-entropy opt-in:</strong> use
+<code>install_panic_handler_secure_udp_accept_degraded_entropy</code> to fall back to a
+non-cryptographic IV prefix and fork salt derived from PID, TID, monotonic
+time, and counters (SipHash-2-4). This always succeeds but accepts nonce-reuse
+risk if the fallback inputs collide. The verbose function name is intentional
+structural enforcement matching the project’s <code>--i-accept-&lt;risk&gt;</code> convention.</p>
+<h3 id="little-endian-only"><a class="header" href="#little-endian-only">Little-endian only</a></h3>
+<p>The VLP wire format uses little-endian integer encoding natively.
+Protocol correctness depends on the host being little-endian (all tier-1
+targets — x86_64 and aarch64 — satisfy this). Building on a big-endian
+host is a compile error. See <code>book/src/architecture/vlp-frame.md</code> for design
+rationale.</p>
+<h3 id="panic-hook-key-lifetime--accepted-residual"><a class="header" href="#panic-hook-key-lifetime--accepted-residual">Panic-hook key lifetime — accepted residual</a></h3>
+<p>The secure-UDP panic handler (<code>install_panic_handler_secure_udp</code>,
+<code>install_panic_handler_secure_udp_accept_degraded_entropy</code>) captures a <code>Key</code>
+by move into a <code>Box&lt;dyn Fn&gt;</code> registered via <code>std::panic::set_hook</code>. The Box
+is the <strong>single owner</strong> of the captured <code>Key</code> for the lifetime of the
+process — <code>Key</code> is <code>!Clone</code> (see <code>crates/varta-vlp/src/crypto/mod.rs</code>), so
+no duplicate of the secret bytes can exist anywhere else in the address
+space.</p>
+<p>The <code>!Clone</code> invariant pins the <em>count</em> of in-memory copies to one. The
+remaining concern is the <em>lifetime</em> of that one copy on process exit:</p>
+<ul>
+<li><strong>Normal hook replacement</strong> (<code>std::panic::take_hook</code>): the prior Box is
+dropped, the captured <code>Key</code>’s <code>ZeroizeOnDrop</code> fires, and the 32 secret
+bytes are wiped before the heap page is returned to the allocator. OK.</li>
+<li><strong><code>panic = "unwind"</code> profile, normal process exit</strong>: the panic-hook Box
+is leaked by the runtime — <code>Drop</code> is <strong>not</strong> called on registry-held
+objects at exit. The captured <code>Key</code> bytes persist in heap memory until
+the kernel reclaims the page. Linux does not zero pages on reclaim
+(memory contents are reused; zero-on-allocation guarantees apply only
+to <em>new</em> allocations into the same process).</li>
+<li><strong><code>panic = "abort"</code> profile</strong>: the panic-hook closure never runs, but
+<code>set_hook</code> still owns the Box — same residual as the normal-exit case.
+Additionally, no <code>Drop</code> runs anywhere during <code>abort()</code>.</li>
+</ul>
+<p>This residual is <strong>accepted</strong>: there is no async-signal-safe mechanism
+that can reliably wipe a heap-resident secret at process exit. <code>atexit</code>
+handlers do not run on <code>abort()</code>, are not async-signal-safe, and race the
+panic hook firing. <code>mlock</code> / <code>memfd_secret</code> cannot prevent the kernel
+from copying the page during scheduler context switches or core dumps.
+The minimum-surface design is to keep the captured <code>Key</code> alive in a
+single Box and treat the OS process boundary as the security boundary:
+inspecting the memory of a live process requires <code>ptrace</code> or
+<code>/proc/&lt;pid&gt;/mem</code> privileges, at which point all in-memory secrets in
+any design are accessible.</p>
+<hr>
+<h2 id="cross-references"><a class="header" href="#cross-references">Cross-references</a></h2>
+<ul>
+<li><a href="safety-profiles.html">Safety profiles</a> — compile-time feature gating for dangerous recovery paths; production-safe build verification recipe</li>
+<li><a href="observer-liveness.html">Observer liveness</a> — defending against <code>varta-watch</code> itself crashing or hanging</li>
+<li><a href="vlp-transports.html">VLP transports</a> — transport-level trust classification and <code>BeatOrigin</code> semantics</li>
+</ul>
+
+                    </main>
+
+                    <nav class="nav-wrapper" aria-label="Page navigation">
+                        <!-- Mobile navigation buttons -->
+                            <a rel="prev" href="../architecture/recovery-shell-removal.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
+                            </a>
+
+                            <a rel="next prefetch" href="../architecture/namespaces.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                            </a>
+
+                        <div style="clear: both"></div>
+                    </nav>
+                </div>
+            </div>
+
+            <nav class="nav-wide-wrapper" aria-label="Page navigation">
+                    <a rel="prev" href="../architecture/recovery-shell-removal.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
+                    </a>
+
+                    <a rel="next prefetch" href="../architecture/namespaces.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                    </a>
+            </nav>
+
+        </div>
+
+        <template id=fa-eye><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M288 32c-80.8 0-145.5 36.8-192.6 80.6C48.6 156 17.3 208 2.5 243.7c-3.3 7.9-3.3 16.7 0 24.6C17.3 304 48.6 356 95.4 399.4C142.5 443.2 207.2 480 288 480s145.5-36.8 192.6-80.6c46.8-43.5 78.1-95.4 93-131.1c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C433.5 68.8 368.8 32 288 32zM432 256c0 79.5-64.5 144-144 144s-144-64.5-144-144s64.5-144 144-144s144 64.5 144 144zM288 192c0 35.3-28.7 64-64 64c-11.5 0-22.3-3-31.6-8.4c-.2 2.8-.4 5.5-.4 8.4c0 53 43 96 96 96s96-43 96-96s-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6z"/></svg></span></template>
+        <template id=fa-eye-slash><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M38.8 5.1C28.4-3.1 13.3-1.2 5.1 9.2S-1.2 34.7 9.2 42.9l592 464c10.4 8.2 25.5 6.3 33.7-4.1s6.3-25.5-4.1-33.7L525.6 386.7c39.6-40.6 66.4-86.1 79.9-118.4c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C465.5 68.8 400.8 32 320 32c-68.2 0-125 26.3-169.3 60.8L38.8 5.1zM223.1 149.5C248.6 126.2 282.7 112 320 112c79.5 0 144 64.5 144 144c0 24.9-6.3 48.3-17.4 68.7L408 294.5c5.2-11.8 8-24.8 8-38.5c0-53-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6c0 10.2-2.4 19.8-6.6 28.3l-90.3-70.8zm223.1 298L373 389.9c-16.4 6.5-34.3 10.1-53 10.1c-79.5 0-144-64.5-144-144c0-6.9 .5-13.6 1.4-20.2L83.1 161.5C60.3 191.2 44 220.8 34.5 243.7c-3.3 7.9-3.3 16.7 0 24.6c14.9 35.7 46.2 87.7 93 131.1C174.5 443.2 239.2 480 320 480c47.8 0 89.9-12.9 126.2-32.5z"/></svg></span></template>
+        <template id=fa-copy><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M502.6 70.63l-61.25-61.25C435.4 3.371 427.2 0 418.7 0H255.1c-35.35 0-64 28.66-64 64l.0195 256C192 355.4 220.7 384 256 384h192c35.2 0 64-28.8 64-64V93.25C512 84.77 508.6 76.63 502.6 70.63zM464 320c0 8.836-7.164 16-16 16H255.1c-8.838 0-16-7.164-16-16L239.1 64.13c0-8.836 7.164-16 16-16h128L384 96c0 17.67 14.33 32 32 32h47.1V320zM272 448c0 8.836-7.164 16-16 16H63.1c-8.838 0-16-7.164-16-16L47.98 192.1c0-8.836 7.164-16 16-16H160V128H63.99c-35.35 0-64 28.65-64 64l.0098 256C.002 483.3 28.66 512 64 512h192c35.2 0 64-28.8 64-64v-32h-47.1L272 448z"/></svg></span></template>
+        <template id=fa-play><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 384 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M73 39c-14.8-9.1-33.4-9.4-48.5-.9S0 62.6 0 80V432c0 17.4 9.4 33.4 24.5 41.9s33.7 8.1 48.5-.9L361 297c14.3-8.7 23-24.2 23-41s-8.7-32.2-23-41L73 39z"/></svg></span></template>
+        <template id=fa-clock-rotate-left><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M75 75L41 41C25.9 25.9 0 36.6 0 57.9V168c0 13.3 10.7 24 24 24H134.1c21.4 0 32.1-25.9 17-41l-30.8-30.8C155 85.5 203 64 256 64c106 0 192 86 192 192s-86 192-192 192c-40.8 0-78.6-12.7-109.7-34.4c-14.5-10.1-34.4-6.6-44.6 7.9s-6.6 34.4 7.9 44.6C151.2 495 201.7 512 256 512c141.4 0 256-114.6 256-256S397.4 0 256 0C185.3 0 121.3 28.7 75 75zm181 53c-13.3 0-24 10.7-24 24V256c0 6.4 2.5 12.5 7 17l72 72c9.4 9.4 24.6 9.4 33.9 0s9.4-24.6 0-33.9l-65-65V152c0-13.3-10.7-24-24-24z"/></svg></span></template>
+
+
+
+        <script>
+            window.playground_copyable = true;
+        </script>
+
+
+        <script src="../elasticlunr-ef4e11c1.min.js"></script>
+        <script src="../mark-09e88c2c.min.js"></script>
+        <script src="../searcher-c2a407aa.js"></script>
+
+        <script src="../clipboard-1626706a.min.js"></script>
+        <script src="../highlight-abc7f01d.js"></script>
+        <script src="../book-a0b12cfe.js"></script>
+
+        <!-- Custom JS scripts -->
+        <script src="../mermaid-eefea253.min.js"></script>
+        <script src="../mermaid-init-ccf746f1.js"></script>
+
+
+
+    </div>
+    </body>
+</html>

@@ -10,7 +10,7 @@
     <Version>0.1.0</Version>
     <Authors>Varta authors</Authors>
     <Description>Zero-overhead health protocol client for distributed local agents (Varta VLP v0.2). Emits 32-byte heartbeats over Unix domain sockets, plaintext UDP, or ChaCha20-Poly1305 secure UDP.</Description>
-    <PackageProjectUrl>https://github.com/aramirez087/Varta</PackageProjectUrl>
+    <PackageProjectUrl>https://varta.sh</PackageProjectUrl>
     <RepositoryUrl>https://github.com/aramirez087/Varta</RepositoryUrl>
     <RepositoryType>git</RepositoryType>
     <PackageLicenseExpression>MIT OR Apache-2.0</PackageLicenseExpression>

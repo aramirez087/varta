@@ -1,5 +1,7 @@
 # Monitoring & Alerting
 
+**Quick walkthrough:** [Prometheus setup guide](../guides/prometheus-setup.md)
+
 `varta-watch` ships with a turn-key Prometheus + Grafana + Alertmanager
 bundle. The artefacts live under [`observability/`](https://github.com/aramirez087/Varta/tree/main/observability)
 in the repo; this chapter is the operator-facing prose tying them

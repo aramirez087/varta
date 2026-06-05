@@ -60,7 +60,7 @@
     "url": "git+https://github.com/aramirez087/Varta.git",
     "directory": "clients/node"
   },
-  "homepage": "https://github.com/aramirez087/Varta/tree/main/clients/node",
+  "homepage": "https://varta.sh",
   "bugs": {
     "url": "https://github.com/aramirez087/Varta/issues"
   },

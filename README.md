@@ -1,4 +1,12 @@
 <p align="center">
+  <strong><a href="https://varta.sh">varta.sh</a></strong>
+  &nbsp;&middot;&nbsp;
+  <a href="https://varta.sh/book/">Documentation</a>
+  &nbsp;&middot;&nbsp;
+  <a href="https://varta.sh/book/guides/">Guides</a>
+</p>
+
+<p align="center">
   <a href="https://github.com/aramirez087/Varta/actions/workflows/ci.yml">
     <img src="https://github.com/aramirez087/Varta/actions/workflows/ci.yml/badge.svg" alt="CI Status">
   </a>

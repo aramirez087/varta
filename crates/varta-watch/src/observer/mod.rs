@@ -893,10 +893,10 @@ impl Observer {
         self.tracker.take_namespace_conflicts()
     }
 
-    /// Drain and reset the per-tracker PID-recycle counter — slots reset
-    /// because a kernel-attested process generation (start-time) mismatch
-    /// proved the pid had been recycled to a new process. Surfaced as
-    /// `varta_tracker_pid_recycle_total`.
+    /// Drain and reset the per-tracker PID-recycle counter — stale slot
+    /// identities reset or retired because a kernel-attested process
+    /// generation (start-time) mismatch proved the pid had been recycled to a
+    /// new process. Surfaced as `varta_tracker_pid_recycle_total`.
     pub fn drain_pid_recycles(&mut self) -> u64 {
         self.tracker.take_pid_recycles()
     }

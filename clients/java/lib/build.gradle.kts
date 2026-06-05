@@ -78,7 +78,7 @@ publishing {
             pom {
                 name.set("Varta JVM client")
                 description.set("Zero-dependency JVM client for the Varta health protocol (VLP v0.2).")
-                url.set("https://github.com/aramirez087/Varta")
+                url.set("https://varta.sh")
                 licenses {
                     license {
                         name.set("MIT License")

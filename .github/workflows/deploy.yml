@@ -51,7 +51,6 @@ jobs:
           # Copy landing page assets into root
           cp index.html _site/
           cp script.js _site/
-          cp sitemap.xml _site/ 2>/dev/null || true
           cp robots.txt _site/ 2>/dev/null || true
           cp llms.txt _site/ 2>/dev/null || true
           cp favicon.svg _site/ 2>/dev/null || true
@@ -59,6 +58,15 @@ jobs:
           cp -r assets _site/assets
           # Place the compiled book at /book
           cp -r book/book _site/book
+
+      - name: inject analytics
+        env:
+          CLOUDFLARE_BEACON_TOKEN: ${{ secrets.CLOUDFLARE_BEACON_TOKEN }}
+          PLAUSIBLE_DOMAIN: ${{ secrets.PLAUSIBLE_DOMAIN }}
+        run: bash scripts/inject-analytics.sh _site
+
+      - name: generate sitemap
+        run: bash scripts/generate-sitemap.sh _site _site/sitemap.xml
 
       - name: install redirect
         run: |

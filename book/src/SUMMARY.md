@@ -5,6 +5,15 @@
 
 ---
 
+# Guides
+
+- [Guides overview](guides/index.md)
+- [Varta vs systemd WatchdogSec](guides/varta-vs-systemd-watchdog.md)
+- [Varta vs HTTP health checks](guides/varta-vs-http-health.md)
+- [Prometheus setup walkthrough](guides/prometheus-setup.md)
+
+---
+
 # Specification
 
 - [VLP — Base Frame](spec/vlp.md)

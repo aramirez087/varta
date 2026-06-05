@@ -984,9 +984,10 @@ impl PromExporter {
             self.tracker_namespace_conflict_total.saturating_add(count);
     }
 
-    /// Record one or more PID recycles — slots reset because a kernel-attested
-    /// process generation (start-time) mismatch proved the pid had been reused
-    /// by a new process. See [`crate::tracker::Tracker::take_pid_recycles`].
+    /// Record one or more PID recycles — stale slot identities reset or
+    /// retired because a kernel-attested process generation (start-time)
+    /// mismatch proved the pid had been reused by a new process. See
+    /// [`crate::tracker::Tracker::take_pid_recycles`].
     /// Surfaced as `varta_tracker_pid_recycle_total`.
     pub fn record_tracker_pid_recycles(&mut self, count: u64) {
         self.tracker_pid_recycle_total = self.tracker_pid_recycle_total.saturating_add(count);

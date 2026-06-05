@@ -1,0 +1,619 @@
+<!DOCTYPE HTML>
+<html lang="en" class="light sidebar-visible" dir="ltr">
+    <head>
+        <!-- Book generated using mdBook -->
+        <meta charset="UTF-8">
+        <title>VLP — Secure Transport - The Varta Book</title>
+
+
+        <!-- Custom HTML head -->
+
+        <meta name="description" content="">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <meta name="theme-color" content="#ffffff">
+
+        <link rel="icon" href="../favicon-6198c6f5.svg">
+        <link rel="shortcut icon" href="../favicon-e32d82eb.png">
+        <link rel="stylesheet" href="../css/variables-8adf115d.css">
+        <link rel="stylesheet" href="../css/general-2459343d.css">
+        <link rel="stylesheet" href="../css/chrome-ae938929.css">
+        <link rel="stylesheet" href="../css/print-9e4910d8.css" media="print">
+
+        <!-- Fonts -->
+        <link rel="stylesheet" href="../fonts/fonts-9644e21d.css">
+
+        <!-- Highlight.js Stylesheets -->
+        <link rel="stylesheet" id="mdbook-highlight-css" href="../highlight-493f70e1.css">
+        <link rel="stylesheet" id="mdbook-tomorrow-night-css" href="../tomorrow-night-4c0ae647.css">
+        <link rel="stylesheet" id="mdbook-ayu-highlight-css" href="../ayu-highlight-3fdfc3ac.css">
+
+        <!-- Custom theme stylesheets -->
+
+
+        <!-- Provide site root and default themes to javascript -->
+        <script>
+            const path_to_root = "../";
+            const default_light_theme = "light";
+            const default_dark_theme = "navy";
+            window.path_to_searchindex_js = "../searchindex-76c5ea20.js";
+        </script>
+        <!-- Start loading toc.js asap -->
+        <script src="../toc-3f8cf947.js"></script>
+    <script defer data-domain="varta.sh" src="https://plausible.io/js/script.js"></script>
+<!-- Privacy-friendly analytics by Plausible -->
+<script async src="https://plausible.io/js/pa-YyA03_Ow6U040l0wzUwht.js"></script>
+<script>
+  window.plausible=window.plausible||function(){(plausible.q=plausible.q||[]).push(arguments)},plausible.init=plausible.init||function(i){plausible.o=i||{}};
+  plausible.init()
+</script>
+</head>
+    <body>
+    <div id="mdbook-help-container">
+        <div id="mdbook-help-popup">
+            <h2 class="mdbook-help-title">Keyboard shortcuts</h2>
+            <div>
+                <p>Press <kbd>←</kbd> or <kbd>→</kbd> to navigate between chapters</p>
+                <p>Press <kbd>S</kbd> or <kbd>/</kbd> to search in the book</p>
+                <p>Press <kbd>?</kbd> to show this help</p>
+                <p>Press <kbd>Esc</kbd> to hide this help</p>
+            </div>
+        </div>
+    </div>
+    <div id="mdbook-body-container">
+        <!-- Work around some values being stored in localStorage wrapped in quotes -->
+        <script>
+            try {
+                let theme = localStorage.getItem('mdbook-theme');
+                let sidebar = localStorage.getItem('mdbook-sidebar');
+
+                if (theme.startsWith('"') && theme.endsWith('"')) {
+                    localStorage.setItem('mdbook-theme', theme.slice(1, theme.length - 1));
+                }
+
+                if (sidebar.startsWith('"') && sidebar.endsWith('"')) {
+                    localStorage.setItem('mdbook-sidebar', sidebar.slice(1, sidebar.length - 1));
+                }
+            } catch (e) { }
+        </script>
+
+        <!-- Set the theme before any content is loaded, prevents flash -->
+        <script>
+            const default_theme = window.matchMedia("(prefers-color-scheme: dark)").matches ? default_dark_theme : default_light_theme;
+            let theme;
+            try { theme = localStorage.getItem('mdbook-theme'); } catch(e) { }
+            if (theme === null || theme === undefined) { theme = default_theme; }
+            const html = document.documentElement;
+            html.classList.remove('light')
+            html.classList.add(theme);
+            html.classList.add("js");
+        </script>
+
+        <input type="checkbox" id="mdbook-sidebar-toggle-anchor" class="hidden">
+
+        <!-- Hide / unhide sidebar before it is displayed -->
+        <script>
+            let sidebar = null;
+            const sidebar_toggle = document.getElementById("mdbook-sidebar-toggle-anchor");
+            if (document.body.clientWidth >= 1080) {
+                try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
+                sidebar = sidebar || 'visible';
+            } else {
+                sidebar = 'hidden';
+                sidebar_toggle.checked = false;
+            }
+            if (sidebar === 'visible') {
+                sidebar_toggle.checked = true;
+            } else {
+                html.classList.remove('sidebar-visible');
+            }
+        </script>
+
+        <nav id="mdbook-sidebar" class="sidebar" aria-label="Table of contents">
+            <!-- populated by js -->
+            <mdbook-sidebar-scrollbox class="sidebar-scrollbox"></mdbook-sidebar-scrollbox>
+            <noscript>
+                <iframe class="sidebar-iframe-outer" src="../toc.html"></iframe>
+            </noscript>
+            <div id="mdbook-sidebar-resize-handle" class="sidebar-resize-handle">
+                <div class="sidebar-resize-indicator"></div>
+            </div>
+        </nav>
+
+        <div id="mdbook-page-wrapper" class="page-wrapper">
+
+            <div class="page">
+                <div id="mdbook-menu-bar-hover-placeholder"></div>
+                <div id="mdbook-menu-bar" class="menu-bar sticky">
+                    <div class="left-buttons">
+                        <label id="mdbook-sidebar-toggle" class="icon-button" for="mdbook-sidebar-toggle-anchor" title="Toggle Table of Contents" aria-label="Toggle Table of Contents" aria-controls="mdbook-sidebar">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M0 96C0 78.3 14.3 64 32 64H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32C14.3 128 0 113.7 0 96zM0 256c0-17.7 14.3-32 32-32H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32c-17.7 0-32-14.3-32-32zM448 416c0 17.7-14.3 32-32 32H32c-17.7 0-32-14.3-32-32s14.3-32 32-32H416c17.7 0 32 14.3 32 32z"/></svg></span>
+                        </label>
+                        <button id="mdbook-theme-toggle" class="icon-button" type="button" title="Change theme" aria-label="Change theme" aria-haspopup="true" aria-expanded="false" aria-controls="mdbook-theme-list">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M371.3 367.1c27.3-3.9 51.9-19.4 67.2-42.9L600.2 74.1c12.6-19.5 9.4-45.3-7.6-61.2S549.7-4.4 531.1 9.6L294.4 187.2c-24 18-38.2 46.1-38.4 76.1L371.3 367.1zm-19.6 25.4l-116-104.4C175.9 290.3 128 339.6 128 400c0 3.9 .2 7.8 .6 11.6c1.8 17.5-10.2 36.4-27.8 36.4H96c-17.7 0-32 14.3-32 32s14.3 32 32 32H240c61.9 0 112-50.1 112-112c0-2.5-.1-5-.2-7.5z"/></svg></span>
+                        </button>
+                        <ul id="mdbook-theme-list" class="theme-popup" aria-label="Themes" role="menu">
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-default_theme">Auto</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-light">Light</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-rust">Rust</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-coal">Coal</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-navy">Navy</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-ayu">Ayu</button></li>
+                        </ul>
+                        <button id="mdbook-search-toggle" class="icon-button" type="button" title="Search (`/`)" aria-label="Toggle Searchbar" aria-expanded="false" aria-keyshortcuts="/ s" aria-controls="mdbook-searchbar">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M416 208c0 45.9-14.9 88.3-40 122.7L502.6 457.4c12.5 12.5 12.5 32.8 0 45.3s-32.8 12.5-45.3 0L330.7 376c-34.4 25.2-76.8 40-122.7 40C93.1 416 0 322.9 0 208S93.1 0 208 0S416 93.1 416 208zM208 352c79.5 0 144-64.5 144-144s-64.5-144-144-144S64 128.5 64 208s64.5 144 144 144z"/></svg></span>
+                        </button>
+                    </div>
+
+                    <h1 class="menu-title">The Varta Book</h1>
+
+                    <div class="right-buttons">
+                        <a href="../print.html" title="Print this book" aria-label="Print this book">
+                            <span class=fa-svg id="print-button"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M128 0C92.7 0 64 28.7 64 64v96h64V64H354.7L384 93.3V160h64V93.3c0-17-6.7-33.3-18.7-45.3L400 18.7C388 6.7 371.7 0 354.7 0H128zM384 352v32 64H128V384 368 352H384zm64 32h32c17.7 0 32-14.3 32-32V256c0-35.3-28.7-64-64-64H64c-35.3 0-64 28.7-64 64v96c0 17.7 14.3 32 32 32H64v64c0 35.3 28.7 64 64 64H384c35.3 0 64-28.7 64-64V384zm-16-88c-13.3 0-24-10.7-24-24s10.7-24 24-24s24 10.7 24 24s-10.7 24-24 24z"/></svg></span>
+                        </a>
+                        <a href="https://github.com/aramirez087/Varta" title="Git repository" aria-label="Git repository">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 496 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M165.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6zm-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3zm44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9zM244.8 8C106.1 8 0 113.3 0 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C428.2 457.8 496 362.9 496 252 496 113.3 383.5 8 244.8 8zM97.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1zm-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7zm32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1zm-11.4-14.7c-1.6 1-1.6 3.6 0 5.9 1.6 2.3 4.3 3.3 5.6 2.3 1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2z"/></svg></span>
+                        </a>
+                        <a href="https://github.com/aramirez087/Varta/edit/main/book/src/spec/vlp-secure.md" title="Suggest an edit" aria-label="Suggest an edit" rel="edit">
+                            <span class=fa-svg id="git-edit-button"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M421.7 220.3l-11.3 11.3-22.6 22.6-205 205c-6.6 6.6-14.8 11.5-23.8 14.1L30.8 511c-8.4 2.5-17.5 .2-23.7-6.1S-1.5 489.7 1 481.2L38.7 353.1c2.6-9 7.5-17.2 14.1-23.8l205-205 22.6-22.6 11.3-11.3 33.9 33.9 62.1 62.1 33.9 33.9zM96 353.9l-9.3 9.3c-.9 .9-1.6 2.1-2 3.4l-25.3 86 86-25.3c1.3-.4 2.5-1.1 3.4-2l9.3-9.3H112c-8.8 0-16-7.2-16-16V353.9zM453.3 19.3l39.4 39.4c25 25 25 65.5 0 90.5l-14.5 14.5-22.6 22.6-11.3 11.3-33.9-33.9-62.1-62.1L314.3 67.7l11.3-11.3 22.6-22.6 14.5-14.5c25-25 65.5-25 90.5 0z"/></svg></span>
+                        </a>
+
+                    </div>
+                </div>
+
+                <div id="mdbook-search-wrapper" class="hidden">
+                    <form id="mdbook-searchbar-outer" class="searchbar-outer">
+                        <div class="search-wrapper">
+                            <input type="search" id="mdbook-searchbar" name="searchbar" placeholder="Search this book ..." aria-controls="mdbook-searchresults-outer" aria-describedby="searchresults-header">
+                            <div class="spinner-wrapper">
+                                <span class=fa-svg id="fa-spin"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M304 48c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zm0 416c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zM48 304c26.5 0 48-21.5 48-48s-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48zm464-48c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zM142.9 437c18.7-18.7 18.7-49.1 0-67.9s-49.1-18.7-67.9 0s-18.7 49.1 0 67.9s49.1 18.7 67.9 0zm0-294.2c18.7-18.7 18.7-49.1 0-67.9S93.7 56.2 75 75s-18.7 49.1 0 67.9s49.1 18.7 67.9 0zM369.1 437c18.7 18.7 49.1 18.7 67.9 0s18.7-49.1 0-67.9s-49.1-18.7-67.9 0s-18.7 49.1 0 67.9z"/></svg></span>
+                            </div>
+                        </div>
+                    </form>
+                    <div id="mdbook-searchresults-outer" class="searchresults-outer hidden">
+                        <div id="mdbook-searchresults-header" class="searchresults-header"></div>
+                        <ul id="mdbook-searchresults">
+                        </ul>
+                    </div>
+                </div>
+
+                <!-- Apply ARIA attributes after the sidebar and the sidebar toggle button are added to the DOM -->
+                <script>
+                    document.getElementById('mdbook-sidebar-toggle').setAttribute('aria-expanded', sidebar === 'visible');
+                    document.getElementById('mdbook-sidebar').setAttribute('aria-hidden', sidebar !== 'visible');
+                    Array.from(document.querySelectorAll('#mdbook-sidebar a')).forEach(function(link) {
+                        link.setAttribute('tabIndex', sidebar === 'visible' ? 0 : -1);
+                    });
+                </script>
+
+                <div id="mdbook-content" class="content">
+                    <main>
+                        <h1 id="vlp-secure-transport-specification"><a class="header" href="#vlp-secure-transport-specification">VLP Secure Transport Specification</a></h1>
+<p><strong>Status:</strong> Normative. <strong>Frame versions:</strong> Shared-key 60-byte, Master-key
+64-byte. <strong>Document audience:</strong> anyone implementing a Varta-compatible client
+or observer that crosses an untrusted network.</p>
+<p>This document defines the encrypted wrapping of a VLP base frame (see
+<a href="./vlp.html">VLP — Base Frame</a>) for transmission over a network where the
+underlying transport offers no authentication or confidentiality (the
+typical example is UDP).</p>
+<p>The base 32-byte VLP frame remains the plaintext; the secure transport
+wraps it in a ChaCha20-Poly1305 AEAD construction (RFC 8439). Two wrapped
+forms are defined:</p>
+<ul>
+<li><strong>Shared-key</strong> (60 bytes) — a single pre-shared symmetric key is used by
+every agent.</li>
+<li><strong>Master-key</strong> (64 bytes) — every agent has a key derived from a single
+master via HKDF-SHA256; the agent’s PID is bound into the AEAD AAD.</li>
+</ul>
+<hr>
+<h2 id="1-conventions"><a class="header" href="#1-conventions">1. Conventions</a></h2>
+<p>The keywords <strong>MUST</strong>, <strong>MUST NOT</strong>, <strong>SHOULD</strong>, <strong>MAY</strong> follow RFC 2119 /
+RFC 8174. The base-frame conventions in <a href="./vlp.html#1-conventions">VLP — Base Frame §1</a>
+apply unchanged.</p>
+<p>In addition:</p>
+<ul>
+<li><code>Plaintext</code> always refers to the canonical 32-byte VLP frame defined in
+<a href="./vlp.html#2-frame-structure">VLP — Base Frame §2</a>.</li>
+<li><code>Ciphertext</code> is the AEAD-encrypted form of <code>Plaintext</code>, always 32 bytes.</li>
+<li><code>Tag</code> is the 16-byte Poly1305 authentication tag.</li>
+<li><code>Nonce</code> (in this document) refers to the 12-byte AEAD nonce, distinct
+from the 8-byte <code>nonce</code> <em>field</em> inside the plaintext base frame.</li>
+</ul>
+<hr>
+<h2 id="2-aead-primitive"><a class="header" href="#2-aead-primitive">2. AEAD Primitive</a></h2>
+<p>All secure transports use <strong>ChaCha20-Poly1305 AEAD</strong> as defined in
+<a href="https://datatracker.ietf.org/doc/html/rfc8439">RFC 8439</a>.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Parameter</th><th>Value</th></tr>
+</thead>
+<tbody>
+<tr><td>Symmetric key</td><td>32 bytes (256 bits)</td></tr>
+<tr><td>AEAD nonce</td><td>12 bytes (96 bits)</td></tr>
+<tr><td>AAD</td><td>variable (see §3, §4)</td></tr>
+<tr><td>Plaintext</td><td>32 bytes (one VLP base frame)</td></tr>
+<tr><td>Ciphertext</td><td>32 bytes</td></tr>
+<tr><td>Tag</td><td>16 bytes (128 bits)</td></tr>
+</tbody>
+</table>
+</div>
+<p>Implementations SHOULD use an externally-audited AEAD library
+(libsodium, BoringSSL, <code>golang.org/x/crypto/chacha20poly1305</code>, RustCrypto
+<code>chacha20poly1305</code>). Hand-rolled implementations of ChaCha20 or Poly1305
+are strongly discouraged for production use.</p>
+<p>The AEAD <code>seal</code> and <code>open</code> operations:</p>
+<pre><code class="language-text">seal(key[32], nonce[12], aad[], plaintext[32]) -&gt; (ciphertext[32], tag[16])
+open(key[32], nonce[12], aad[], ciphertext[32], tag[16])
+  -&gt; Some(plaintext[32]) if tag verifies, else None
+</code></pre>
+<p>Senders MUST never reuse a <code>(key, nonce)</code> pair. Nonce-reuse under a fixed
+key catastrophically breaks both confidentiality and integrity
+(Poly1305 key recovery, plaintext-XOR leak). The nonce-construction rules
+in §5 prevent reuse for conforming implementations.</p>
+<hr>
+<h2 id="3-shared-key-wire-format-60-bytes"><a class="header" href="#3-shared-key-wire-format-60-bytes">3. Shared-Key Wire Format (60 bytes)</a></h2>
+<p>A single 32-byte symmetric key <code>K</code> is provisioned out-of-band to every
+agent and observer. The wire frame is:</p>
+<pre><code class="language-text">offset │ size │ field        │ notes
+───────┼──────┼──────────────┼────────────────────────────────────────────
+ 0     │  8   │ iv_random    │ per-session OS entropy or HKDF derivation
+ 8     │  4   │ iv_counter   │ u32 LE — strictly increasing per emit
+12     │ 32   │ ciphertext   │ AEAD(K, nonce, "", plaintext)
+44     │ 16   │ tag          │ Poly1305 tag
+───────┴──────┴──────────────┴────────────────────────────────────────────
+                                                              total 60 bytes
+</code></pre>
+<ul>
+<li><strong>AEAD nonce</strong> = <code>iv_random || iv_counter</code> (12 bytes total).</li>
+<li><strong>AAD</strong> = empty byte string.</li>
+<li><strong>Plaintext</strong> = the 32-byte VLP base frame.</li>
+</ul>
+<h3 id="31-encoder"><a class="header" href="#31-encoder">3.1 Encoder</a></h3>
+<pre><code class="language-text">encode_shared(key[32], iv_random[8], iv_counter: u32,
+              plaintext[32]) -&gt; [60]byte:
+    nonce[0..8]  := iv_random
+    nonce[8..12] := u32_le(iv_counter)
+    (ct, tag) := seal(key, nonce, b"", plaintext)
+    out[0..8]   := iv_random
+    out[8..12]  := u32_le(iv_counter)
+    out[12..44] := ct
+    out[44..60] := tag
+    return out
+</code></pre>
+<h3 id="32-decoder"><a class="header" href="#32-decoder">3.2 Decoder</a></h3>
+<pre><code class="language-text">decode_shared(key[32], wire[60]) -&gt; Plaintext | AuthError:
+    iv_random  := wire[0..8]
+    iv_counter := u32_le(wire[8..12])
+    ct         := wire[12..44]
+    tag        := wire[44..60]
+    nonce[0..8]  := iv_random
+    nonce[8..12] := u32_le(iv_counter)
+    plaintext := open(key, nonce, b"", ct, tag)
+    if plaintext is None:
+        return AuthError
+    return plaintext  # caller MUST then run base-frame decode (§7 of VLP)
+</code></pre>
+<p>Observers MUST run the base-frame decoder (<a href="./vlp.html#7-decode-procedure">VLP — Base Frame §7</a>)
+on the recovered plaintext before trusting any field.</p>
+<hr>
+<h2 id="4-master-key-wire-format-64-bytes"><a class="header" href="#4-master-key-wire-format-64-bytes">4. Master-Key Wire Format (64 bytes)</a></h2>
+<p>A single 32-byte master key <code>M</code> is provisioned out-of-band. Every agent
+derives a per-agent key <code>K_agent = HKDF(M, agent_pid)</code> (see §6). The
+agent’s PID is bound into the AEAD AAD so an observer cannot accept a
+frame whose plaintext PID disagrees with the wire prefix.</p>
+<pre><code class="language-text">offset │ size │ field        │ notes
+───────┼──────┼──────────────┼────────────────────────────────────────────
+ 0     │  4   │ agent_pid    │ u32 LE — bound into AAD, NOT encrypted
+ 4     │  8   │ iv_random    │ per-session OS entropy or HKDF derivation
+12     │  4   │ iv_counter   │ u32 LE — strictly increasing per emit
+16     │ 32   │ ciphertext   │ AEAD(K_agent, nonce, agent_pid_bytes, pt)
+48     │ 16   │ tag          │ Poly1305 tag
+───────┴──────┴──────────────┴────────────────────────────────────────────
+                                                              total 64 bytes
+</code></pre>
+<ul>
+<li><strong>AEAD nonce</strong> = <code>iv_random || iv_counter</code> (12 bytes).</li>
+<li><strong>AAD</strong> = the 4-byte little-endian encoding of <code>agent_pid</code> (bytes 0..4
+of the wire frame, <strong>verbatim</strong>).</li>
+<li><strong>Plaintext</strong> = the 32-byte VLP base frame.</li>
+<li><strong>K_agent</strong> = <code>HKDF-SHA256(IKM=M, salt=empty, info="varta-agent-v1\0" || agent_pid_LE)</code>.</li>
+</ul>
+<p>The plaintext frame still carries its own <code>pid</code> field at base-frame
+offset 4..8. Observers MUST verify that <code>agent_pid</code> (wire offset 0..4)
+equals the recovered plaintext <code>pid</code> and reject mismatches.</p>
+<h3 id="41-encoder"><a class="header" href="#41-encoder">4.1 Encoder</a></h3>
+<pre><code class="language-text">encode_master(master[32], agent_pid: u32, iv_random[8], iv_counter: u32,
+              plaintext[32]) -&gt; [64]byte:
+    K_agent := derive_agent_key(master, agent_pid)
+    aad := u32_le(agent_pid)
+    nonce[0..8]  := iv_random
+    nonce[8..12] := u32_le(iv_counter)
+    (ct, tag) := seal(K_agent, nonce, aad, plaintext)
+    out[0..4]   := aad
+    out[4..12]  := iv_random
+    out[12..16] := u32_le(iv_counter)
+    out[16..48] := ct
+    out[48..64] := tag
+    return out
+</code></pre>
+<h3 id="42-decoder"><a class="header" href="#42-decoder">4.2 Decoder</a></h3>
+<pre><code class="language-text">decode_master(master[32], wire[64]) -&gt; Plaintext | AuthError:
+    aad        := wire[0..4]               # agent_pid LE
+    agent_pid  := u32_le(aad)
+    iv_random  := wire[4..12]
+    iv_counter := u32_le(wire[12..16])
+    ct         := wire[16..48]
+    tag        := wire[48..64]
+    K_agent    := derive_agent_key(master, agent_pid)
+    nonce[0..8]  := iv_random
+    nonce[8..12] := u32_le(iv_counter)
+    plaintext := open(K_agent, nonce, aad, ct, tag)
+    if plaintext is None:
+        return AuthError
+    # Observer MUST also confirm plaintext.pid == agent_pid.
+    return plaintext
+</code></pre>
+<hr>
+<h2 id="5-nonce-construction--uniqueness"><a class="header" href="#5-nonce-construction--uniqueness">5. Nonce Construction &amp; Uniqueness</a></h2>
+<p>The AEAD nonce is the 12-byte concatenation <code>iv_random || iv_counter</code>.</p>
+<ul>
+<li><code>iv_random</code> (8 bytes) MUST be drawn from cryptographic OS entropy at
+session start, <strong>or</strong> derived from a 16-byte session salt via the
+IV-prefix HKDF in §6.</li>
+<li><code>iv_counter</code> (4 bytes, little-endian) MUST start at <code>0</code> for a new
+session and strictly increase by 1 per emit.</li>
+<li>The pair <code>(iv_random, iv_counter)</code> MUST NEVER be reused under the
+same key.</li>
+</ul>
+<h3 id="51-counter-exhaustion"><a class="header" href="#51-counter-exhaustion">5.1 Counter exhaustion</a></h3>
+<p>A 32-bit <code>iv_counter</code> exhausts after 2^32 emits per session. Senders
+MUST rotate <code>iv_random</code> (and reset <code>iv_counter</code> to <code>0</code>) before the
+counter wraps. Implementations MAY rotate proactively at any threshold;
+the canonical Rust transport rotates well under 2^32.</p>
+<h3 id="52-fork2"><a class="header" href="#52-fork2">5.2 fork(2)</a></h3>
+<p>A child process inherits its parent’s <code>iv_random</code> and <code>iv_counter</code>
+after <code>fork(2)</code>. If the child emits without first refreshing the IV,
+both processes will use the same <code>(iv_random, iv_counter)</code> under the
+same key — catastrophic nonce reuse. Senders MUST detect fork (e.g. by
+comparing the cached PID at session establishment against the current
+PID at emit time) and either:</p>
+<ol>
+<li>Re-read <code>iv_random</code> from OS entropy and reset <code>iv_counter = 0</code>, <strong>or</strong></li>
+<li>Refuse to emit until the application explicitly re-establishes the
+session.</li>
+</ol>
+<p>The Rust reference implementation auto-detects fork and rotates IV
+state transparently; see
+<a href="../architecture/vlp-transports.html#fork-safety-on-secure-udp"><code>book/src/architecture/vlp-transports.md</code> — “Fork-safety on secure-UDP”</a>
+for the operational model.</p>
+<hr>
+<h2 id="6-hkdf-key-derivation"><a class="header" href="#6-hkdf-key-derivation">6. HKDF Key Derivation</a></h2>
+<p>The master-key mode (and the IV-prefix rotation mode for both wire
+formats) uses <strong>HKDF-SHA256</strong> as defined in
+<a href="https://datatracker.ietf.org/doc/html/rfc5869">RFC 5869</a>. Three info
+strings are reserved, all suffixed with <code>-v1</code> for future versioning:</p>
+<h3 id="61-per-agent-key-derivation"><a class="header" href="#61-per-agent-key-derivation">6.1 Per-agent key derivation</a></h3>
+<pre><code class="language-text">derive_agent_key(master_key[32], agent_id: u32) -&gt; [32]byte:
+    info := b"varta-agent-v1\0" || u32_le(agent_id)
+    # info length = 15 (the literal incl. NUL) + 4 = 19 bytes.
+    return HKDF-SHA256(IKM=master_key, salt=empty, info=info, L=32)
+</code></pre>
+<ul>
+<li><code>IKM</code> = master key (32 B).</li>
+<li><code>salt</code> = empty string (HKDF treats this as <code>0x00 * HashLen</code> per RFC 5869 §2.2).</li>
+<li><code>info</code> = the byte string <code>"varta-agent-v1"</code> (14 ASCII bytes) followed by
+one NUL byte (<code>0x00</code>), followed by <code>agent_id</code> in 4-byte little-endian
+encoding. Total info length: 19 bytes.</li>
+<li><code>L</code> = 32 output bytes.</li>
+</ul>
+<h3 id="62-per-session-iv-prefix-derivation"><a class="header" href="#62-per-session-iv-prefix-derivation">6.2 Per-session IV prefix derivation</a></h3>
+<pre><code class="language-text">derive_iv_prefix(session_salt[16], prefix_index: u32) -&gt; [8]byte:
+    info := b"varta-iv-prefix-v1\0" || u32_le(prefix_index)
+    # info length = 19 + 4 = 23 bytes.
+    return HKDF-SHA256(IKM=session_salt, salt=empty, info=info, L=8)
+</code></pre>
+<p>The session salt is the IKM; the HKDF-Extract <code>salt</code> argument is empty
+(RFC 5869 §2.2 treats empty salt as <code>0x00 * HashLen</code>).</p>
+<p>The Rust reference uses this to rotate <code>iv_random</code> over a session
+without re-reading OS entropy on the hot path.</p>
+<h3 id="63-per-epoch-key-derivation-reserved"><a class="header" href="#63-per-epoch-key-derivation-reserved">6.3 Per-epoch key derivation (reserved)</a></h3>
+<pre><code class="language-text">derive_epoch_key(agent_key[32], epoch: u64) -&gt; [32]byte:
+    info := b"varta-epoch-v1\0" || u64_le(epoch)
+    # info length = 15 + 8 = 23 bytes.
+    return HKDF-SHA256(IKM=agent_key, salt=empty, info=info, L=32)
+</code></pre>
+<p>Epoch keys are <strong>reserved for forward compatibility</strong> — they are not
+currently used on the wire. Conforming implementations MAY skip this
+derivation.</p>
+<h3 id="64-reference-vectors"><a class="header" href="#64-reference-vectors">6.4 Reference vectors</a></h3>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Derivation</th><th>Inputs</th><th>Output</th></tr>
+</thead>
+<tbody>
+<tr><td>Agent key</td><td>master = <code>0001…1f</code>, agent_id = <code>42</code></td><td><code>61f5951b2bf1905d5053df0abb027002cba62da1f16d93c6552ff61cb65f2599</code></td></tr>
+<tr><td>IV prefix</td><td>salt = <code>0102…10</code>, prefix_index = <code>7</code></td><td><code>9fee777f36be69ce</code></td></tr>
+<tr><td>Epoch key</td><td>agent = <code>0001…1f</code>, epoch = <code>100</code></td><td><code>cb9fe8cb3db0d8d667b7dd9e72adce07c669d3b27bc68ea69e3cc3c129d601ab</code></td></tr>
+</tbody>
+</table>
+</div>
+<p>Full <code>info</code> byte strings (so external implementers can confirm endianness
+and the literal NUL):</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Derivation</th><th>info (hex)</th></tr>
+</thead>
+<tbody>
+<tr><td>Agent (agent_id=42)</td><td><code>76617274612d6167656e742d7631002a000000</code></td></tr>
+<tr><td>IV prefix (prefix_index=7)</td><td><code>76617274612d69762d7072656669782d76310007000000</code></td></tr>
+<tr><td>Epoch (epoch=100)</td><td><code>76617274612d65706f63682d7631006400000000000000</code></td></tr>
+</tbody>
+</table>
+</div>
+<hr>
+<h2 id="7-replay-protection"><a class="header" href="#7-replay-protection">7. Replay Protection</a></h2>
+<p>Observers MUST maintain per-sender state to reject replayed frames.</p>
+<h3 id="71-shared-key-mode"><a class="header" href="#71-shared-key-mode">7.1 Shared-key mode</a></h3>
+<p>Per <code>(source_address, iv_random)</code> pair: track <code>last_seen_counter</code>.
+Accept a new frame only if <code>iv_counter &gt; last_seen_counter</code>; reject equal
+or lesser counters.</p>
+<h3 id="72-master-key-mode"><a class="header" href="#72-master-key-mode">7.2 Master-key mode</a></h3>
+<p>Per <code>(source_address, agent_pid, iv_random)</code> triple: same monotonicity
+rule.</p>
+<h3 id="73-bounded-state"><a class="header" href="#73-bounded-state">7.3 Bounded state</a></h3>
+<p>A real observer cannot retain unbounded per-sender state. The Rust
+reference implementation bounds per-sender records to 1024 simultaneous
+senders and refuses unknown senders at capacity after a stale-sender sweep; see
+<a href="../architecture/vlp-transports.html#secure-udp--replay-state-capacity-boundary-h4"><code>book/src/architecture/vlp-transports.md</code> — “Secure UDP — replay-state
+capacity boundary (H4)”</a>
+for the precise capacity rule and the threat-model implication
+(loopback-default binding when secure-UDP is configured).</p>
+<hr>
+<h2 id="8-worked-example--shared-key-seal"><a class="header" href="#8-worked-example--shared-key-seal">8. Worked Example — Shared-Key Seal</a></h2>
+<ul>
+<li>Key: <code>0001020304050607 0809 0a0b0c0d0e0f 1011 1213 1415 1617 1819 1a1b 1c1d 1e1f</code> (32 bytes)</li>
+<li><code>iv_random</code>: <code>1122334455667788</code></li>
+<li><code>iv_counter</code>: <code>0</code></li>
+<li>Plaintext (a base VLP frame, <code>Status::Ok</code> <code>pid=2</code> <code>ts=1000</code> <code>nonce=1</code>
+<code>payload=0</code>):
+<code>5641020002000000e80300000000000001000000000000000000000055d0861c</code></li>
+</ul>
+<p>Resulting 60-byte wire frame:</p>
+<pre><code class="language-text">1122334455667788 00000000
+bcba1b202190b688a08e0a7ac909da44a2023cb7a421fd6428453fd12141c257
+b6fd638c55fddf5c621020de1327975a
+</code></pre>
+<hr>
+<h2 id="9-worked-example--master-key-seal"><a class="header" href="#9-worked-example--master-key-seal">9. Worked Example — Master-Key Seal</a></h2>
+<ul>
+<li>Master key: <code>0001020304…1f</code> (same as above, 32 bytes)</li>
+<li><code>agent_pid</code>: <code>2</code> (<code>0x02000000</code> LE)</li>
+<li>Derived agent key: <code>db292f5843a0737aec785a9df270561b343d06e5fe8f89fce72f0869ba77afd5</code></li>
+<li><code>iv_random</code>: <code>1122334455667788</code></li>
+<li><code>iv_counter</code>: <code>0</code></li>
+<li>Plaintext: same as §8.</li>
+</ul>
+<p>Resulting 64-byte wire frame:</p>
+<pre><code class="language-text">02000000
+1122334455667788 00000000
+efe8fd8c226106641e01fc8fe649f79475e19b4f2093e063987f1c663a5d2f0b
+73ba429fadc4c494e2723baff86af9cc
+</code></pre>
+<hr>
+<h2 id="10-stability"><a class="header" href="#10-stability">10. Stability</a></h2>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Element</th><th>Stable?</th><th>Bump procedure</th></tr>
+</thead>
+<tbody>
+<tr><td>Shared-key wire layout (60 B)</td><td>Stable</td><td>Spec-version bump</td></tr>
+<tr><td>Master-key wire layout (64 B)</td><td>Stable</td><td>Spec-version bump</td></tr>
+<tr><td>HKDF info string <code>varta-agent-v1</code></td><td>Versioned</td><td>Replace <code>-v1</code> suffix; all agents must re-key</td></tr>
+<tr><td>HKDF info string <code>varta-iv-prefix-v1</code></td><td>Versioned</td><td>Same</td></tr>
+<tr><td>HKDF info string <code>varta-epoch-v1</code></td><td>Versioned</td><td>Same</td></tr>
+<tr><td>AEAD primitive (ChaCha20-Poly1305)</td><td>Stable</td><td>Spec-version bump</td></tr>
+</tbody>
+</table>
+</div>
+<p>Implementations MUST NOT silently accept an unknown info-string version;
+any change to a derivation requires explicit re-keying across the
+deployment.</p>
+<hr>
+<h2 id="11-reference-implementation"><a class="header" href="#11-reference-implementation">11. Reference Implementation</a></h2>
+<p>The Rust reference lives in
+<a href="https://github.com/aramirez087/Varta/tree/main/crates/varta-vlp/src/crypto"><code>crates/varta-vlp/src/crypto</code></a>.
+The <code>seal</code>/<code>open</code> operations delegate to the RustCrypto
+<code>chacha20poly1305</code> crate (NCC Group audit 2020); the HKDF derivations use
+the RustCrypto <code>hkdf</code> + <code>sha2</code> crates. No hand-rolled ChaCha20, Poly1305,
+or KDF logic exists in the workspace.</p>
+<p>Cross-language references (Python <code>cryptography</code>, C libsodium, Go
+<code>golang.org/x/crypto/chacha20poly1305</code>) live in
+<a href="https://github.com/aramirez087/Varta/tree/main/tools/reference-implementations"><code>tools/reference-implementations/</code></a>.</p>
+<hr>
+<h2 id="12-conformance"><a class="header" href="#12-conformance">12. Conformance</a></h2>
+<p>Run the test-vector suite against your implementation. The
+<code>secure_frame_vectors</code> array in
+<a href="https://github.com/aramirez087/Varta/blob/main/tools/vlp-test-vectors.json"><code>tools/vlp-test-vectors.json</code></a>
+contains:</p>
+<ul>
+<li><code>shared_key_seal</code> — encode a 60-byte wire frame; compare to <code>expected_wire_hex</code>.</li>
+<li><code>master_key_seal</code> — derive the agent key, encode a 64-byte wire frame;
+compare both the derived key and the wire bytes to the goldens.</li>
+<li><code>kdf_agent_key</code>, <code>kdf_iv_prefix</code>, <code>kdf_epoch_key</code> — drive each HKDF
+derivation and compare to the published OKM.</li>
+</ul>
+<p>See <a href="./conformance.html">Conformance &amp; Test Vectors</a> for the JSON schema
+and end-to-end recipe.</p>
+<hr>
+<h2 id="see-also"><a class="header" href="#see-also">See also</a></h2>
+<ul>
+<li><a href="./vlp.html">VLP — Base Frame</a> — the 32-byte plaintext layout this
+document wraps.</li>
+<li><a href="./conformance.html">Conformance &amp; Test Vectors</a> — JSON schema.</li>
+<li><a href="../architecture/vlp-transports.html">Rust transport rationale</a> — design
+trade-offs in the reference implementation (loopback default, bounded
+replay state, fork-safety auto-recovery). Not normative.</li>
+</ul>
+
+                    </main>
+
+                    <nav class="nav-wrapper" aria-label="Page navigation">
+                        <!-- Mobile navigation buttons -->
+                            <a rel="prev" href="../spec/vlp.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
+                            </a>
+
+                            <a rel="next prefetch" href="../spec/conformance.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                            </a>
+
+                        <div style="clear: both"></div>
+                    </nav>
+                </div>
+            </div>
+
+            <nav class="nav-wide-wrapper" aria-label="Page navigation">
+                    <a rel="prev" href="../spec/vlp.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
+                    </a>
+
+                    <a rel="next prefetch" href="../spec/conformance.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                    </a>
+            </nav>
+
+        </div>
+
+        <template id=fa-eye><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M288 32c-80.8 0-145.5 36.8-192.6 80.6C48.6 156 17.3 208 2.5 243.7c-3.3 7.9-3.3 16.7 0 24.6C17.3 304 48.6 356 95.4 399.4C142.5 443.2 207.2 480 288 480s145.5-36.8 192.6-80.6c46.8-43.5 78.1-95.4 93-131.1c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C433.5 68.8 368.8 32 288 32zM432 256c0 79.5-64.5 144-144 144s-144-64.5-144-144s64.5-144 144-144s144 64.5 144 144zM288 192c0 35.3-28.7 64-64 64c-11.5 0-22.3-3-31.6-8.4c-.2 2.8-.4 5.5-.4 8.4c0 53 43 96 96 96s96-43 96-96s-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6z"/></svg></span></template>
+        <template id=fa-eye-slash><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M38.8 5.1C28.4-3.1 13.3-1.2 5.1 9.2S-1.2 34.7 9.2 42.9l592 464c10.4 8.2 25.5 6.3 33.7-4.1s6.3-25.5-4.1-33.7L525.6 386.7c39.6-40.6 66.4-86.1 79.9-118.4c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C465.5 68.8 400.8 32 320 32c-68.2 0-125 26.3-169.3 60.8L38.8 5.1zM223.1 149.5C248.6 126.2 282.7 112 320 112c79.5 0 144 64.5 144 144c0 24.9-6.3 48.3-17.4 68.7L408 294.5c5.2-11.8 8-24.8 8-38.5c0-53-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6c0 10.2-2.4 19.8-6.6 28.3l-90.3-70.8zm223.1 298L373 389.9c-16.4 6.5-34.3 10.1-53 10.1c-79.5 0-144-64.5-144-144c0-6.9 .5-13.6 1.4-20.2L83.1 161.5C60.3 191.2 44 220.8 34.5 243.7c-3.3 7.9-3.3 16.7 0 24.6c14.9 35.7 46.2 87.7 93 131.1C174.5 443.2 239.2 480 320 480c47.8 0 89.9-12.9 126.2-32.5z"/></svg></span></template>
+        <template id=fa-copy><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M502.6 70.63l-61.25-61.25C435.4 3.371 427.2 0 418.7 0H255.1c-35.35 0-64 28.66-64 64l.0195 256C192 355.4 220.7 384 256 384h192c35.2 0 64-28.8 64-64V93.25C512 84.77 508.6 76.63 502.6 70.63zM464 320c0 8.836-7.164 16-16 16H255.1c-8.838 0-16-7.164-16-16L239.1 64.13c0-8.836 7.164-16 16-16h128L384 96c0 17.67 14.33 32 32 32h47.1V320zM272 448c0 8.836-7.164 16-16 16H63.1c-8.838 0-16-7.164-16-16L47.98 192.1c0-8.836 7.164-16 16-16H160V128H63.99c-35.35 0-64 28.65-64 64l.0098 256C.002 483.3 28.66 512 64 512h192c35.2 0 64-28.8 64-64v-32h-47.1L272 448z"/></svg></span></template>
+        <template id=fa-play><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 384 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M73 39c-14.8-9.1-33.4-9.4-48.5-.9S0 62.6 0 80V432c0 17.4 9.4 33.4 24.5 41.9s33.7 8.1 48.5-.9L361 297c14.3-8.7 23-24.2 23-41s-8.7-32.2-23-41L73 39z"/></svg></span></template>
+        <template id=fa-clock-rotate-left><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M75 75L41 41C25.9 25.9 0 36.6 0 57.9V168c0 13.3 10.7 24 24 24H134.1c21.4 0 32.1-25.9 17-41l-30.8-30.8C155 85.5 203 64 256 64c106 0 192 86 192 192s-86 192-192 192c-40.8 0-78.6-12.7-109.7-34.4c-14.5-10.1-34.4-6.6-44.6 7.9s-6.6 34.4 7.9 44.6C151.2 495 201.7 512 256 512c141.4 0 256-114.6 256-256S397.4 0 256 0C185.3 0 121.3 28.7 75 75zm181 53c-13.3 0-24 10.7-24 24V256c0 6.4 2.5 12.5 7 17l72 72c9.4 9.4 24.6 9.4 33.9 0s9.4-24.6 0-33.9l-65-65V152c0-13.3-10.7-24-24-24z"/></svg></span></template>
+
+
+
+        <script>
+            window.playground_copyable = true;
+        </script>
+
+
+        <script src="../elasticlunr-ef4e11c1.min.js"></script>
+        <script src="../mark-09e88c2c.min.js"></script>
+        <script src="../searcher-c2a407aa.js"></script>
+
+        <script src="../clipboard-1626706a.min.js"></script>
+        <script src="../highlight-abc7f01d.js"></script>
+        <script src="../book-a0b12cfe.js"></script>
+
+        <!-- Custom JS scripts -->
+        <script src="../mermaid-eefea253.min.js"></script>
+        <script src="../mermaid-init-ccf746f1.js"></script>
+
+
+
+    </div>
+    </body>
+</html>

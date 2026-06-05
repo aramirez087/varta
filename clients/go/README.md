@@ -3,7 +3,7 @@
 [![Go Reference](https://pkg.go.dev/badge/github.com/aramirez087/Varta/clients/go.svg)](https://pkg.go.dev/github.com/aramirez087/Varta/clients/go)
 [![License](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue.svg)](LICENSE)
 
-Production Go client for the [Varta](https://github.com/aramirez087/Varta) health protocol.
+Production Go client for [Varta](https://varta.sh) — docs at [varta.sh/book](https://varta.sh/book/).
 
 ```bash
 go get github.com/aramirez087/Varta/clients/go

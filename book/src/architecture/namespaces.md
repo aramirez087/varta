@@ -88,13 +88,24 @@ stuck at `None`. Out-of-order frames must not pin generation. Replay protection
 is untouched: a low nonce under the **same** generation is still dropped as
 out-of-order.
 
-**Cost.** Recycle detection requires re-reading the generation on *every*
-admitted `KernelAttested` beat — there is no way to observe PID reuse without
-re-stat-ing the peer. This adds one `/proc/<pid>/stat` `open`/`read`/`close`
-(three syscalls, allocation-free) per beat, on top of the existing
-`/proc/<pid>/ns/pid` namespace read. The read is deferred until after the
-global rate limiter admits the frame, so a flood cannot force a `/proc` read
-per packet. Non-Linux and non-attested transports skip the read entirely
+The same generation is revalidated when a kernel-attested slot first becomes a
+stall candidate. If `/proc/<pid>/stat` now returns a concrete **different**
+generation, the old slot is retired and no `Event::Stall` is emitted. This
+closes the silent-death case where no new beat arrives to trigger the beat-time
+recycle gate: a dead agent's stale `KernelAttested` origin must not drive
+recovery against a healthy process that inherited the PID. A missing generation
+read at stall time remains fail-open, because it may simply mean the original
+agent exited and recovery should still restart it.
+
+**Cost.** Beat-time recycle detection requires re-reading the generation on
+*every* admitted `KernelAttested` beat — there is no way to observe PID reuse
+without re-stat-ing the peer. This adds one `/proc/<pid>/stat`
+`open`/`read`/`close` (three syscalls, allocation-free) per beat, on top of the
+existing `/proc/<pid>/ns/pid` namespace read. The read is deferred until after
+the global rate limiter admits the frame, so a flood cannot force a `/proc`
+read per packet. Stall-time revalidation adds the same stack-buffered read only
+for kernel-attested slots that have already crossed the stall threshold.
+Non-Linux and non-attested transports skip the read entirely
 (`read_pid_start_time` returns `None`).
 
 ## Mitigation by deployment style
@@ -113,7 +124,7 @@ per packet. Non-Linux and non-attested transports skip the read entirely
 |---|---|
 | `varta_frame_namespace_mismatch_total` (counter) | Kernel-attested frames dropped at receive (peer ns ≠ observer ns). |
 | `varta_tracker_namespace_conflict_total` (counter) | Beats dropped because the slot's pinned ns inode disagreed with the beat's (first-namespace-wins). |
-| `varta_tracker_pid_recycle_total` (counter) | Slots reset because a kernel-attested process start-time mismatch proved the pid was recycled to a new process (recycle-safe identity). |
+| `varta_tracker_pid_recycle_total` (counter) | Stale slot identities reset or retired because a kernel-attested process start-time mismatch proved the pid was recycled to a new process (recycle-safe identity). |
 | `varta_recovery_refused_total{reason="cross_namespace_agent"}` (counter) | Stalls refused at recovery time because the slot's ns inode differed from the observer's. |
 | `varta_recovery_outcomes_total{outcome="refused_cross_namespace"}` (counter) | Same event, broken down on the outcome axis. |
 | Audit log record with `reason=cross_namespace_agent` | TSV record in `--recovery-audit-file`. |
@@ -131,7 +142,7 @@ rules stay green-on-green until the first event.
   `--allow-cross-namespace-agents`.
 - `Observer::drain_cross_namespace_drops() -> u64` — counter drain.
 - `Observer::drain_namespace_conflicts() -> u64` — counter drain.
-- `Observer::drain_pid_recycles() -> u64` — counter drain (PID-recycle slot resets).
+- `Observer::drain_pid_recycles() -> u64` — counter drain (PID-recycle slot resets/retirements).
 - `Tracker::record_with_generation(frame, now_ns, threshold_ns, origin, peer_pid_ns_inode, peer_generation)` — the generation-aware record path; `Tracker::record(..)` is a shim passing `peer_generation = None`.
 - `Tracker::pid_ns_inode_of(pid: u32) -> Option<Option<u64>>` — observer-side
   introspection.

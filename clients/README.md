@@ -1,5 +1,7 @@
 # Varta clients
 
+**Website:** [varta.sh](https://varta.sh) · **Book:** [varta.sh/book](https://varta.sh/book/)
+
 This directory holds official, production-grade client libraries for
 the Varta health protocol in languages other than Rust. Each language
 gets its own subdirectory with independent semver, packaging, and CI.

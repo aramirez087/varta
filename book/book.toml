@@ -12,6 +12,7 @@ command = "mdbook-mermaid"
 
 [output.html]
 theme = "theme"
+site-url = "https://varta.sh/book/"
 git-repository-url = "https://github.com/aramirez087/Varta"
 edit-url-template = "https://github.com/aramirez087/Varta/edit/main/book/{path}"
 preferred-dark-theme = "navy"
