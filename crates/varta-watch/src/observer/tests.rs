@@ -463,6 +463,72 @@ fn per_pid_limited_frame_does_not_spend_global_token() {
 }
 
 #[test]
+fn consumed_but_dropped_datagram_reports_io_so_loop_does_not_idle_sleep() {
+    // Regression: the main loop throttles with a 10 ms sleep only when the
+    // observer is "truly idle". A datagram that is dequeued and then dropped
+    // (here, by the per-pid rate limiter) yields no Event, so poll() returns
+    // None — but it IS I/O, and the socket may still hold queued beats.
+    // `last_poll_consumed()` must report it so the loop keeps draining; pre-
+    // fix the loop slept after every dropped datagram, capping drain at
+    // ~100 datagrams/s and head-of-line-blocking real beats -> false stalls.
+    let mut obs = Observer::new(
+        Duration::from_secs(60),
+        64,
+        EvictionPolicy::Strict,
+        DEFAULT_EVICTION_SCAN_WINDOW,
+        Some(1),
+        0,
+        0,
+        ClockSource::Monotonic,
+    )
+    .expect("Observer::new should succeed");
+
+    obs.add_listener(Box::new(ScriptedListener::with_frames(&[
+        (10, 1, 100),
+        (10, 2, 101),
+    ])));
+
+    // First beat is accepted and returned as an Event — clearly I/O.
+    let first = obs.poll();
+    assert!(
+        matches!(first, Some(Event::Beat { pid: 10, .. })),
+        "first beat should be accepted, got {first:?}"
+    );
+    assert!(obs.last_poll_consumed(), "an accepted beat is consumed I/O");
+
+    // Second beat is dequeued but dropped by the per-pid limiter: poll()
+    // returns None, yet a datagram WAS consumed off the socket.
+    let second = obs.poll();
+    assert!(
+        second.is_none(),
+        "too-fast same-pid beat should be dropped, got {second:?}"
+    );
+    assert_eq!(
+        obs.drain_per_pid_rate_limited(),
+        1,
+        "the second datagram was dequeued and dropped by the per-pid limiter"
+    );
+    assert!(
+        obs.last_poll_consumed(),
+        "THE FIX: a consumed-but-dropped datagram must still report I/O so \
+         the main loop keeps draining instead of sleeping 10 ms"
+    );
+
+    // Negative control: the socket is now empty (recv -> WouldBlock). poll()
+    // returns None AND reports no consumption, so the loop correctly sleeps.
+    let third = obs.poll();
+    assert!(
+        third.is_none(),
+        "empty socket yields no event, got {third:?}"
+    );
+    assert!(
+        !obs.last_poll_consumed(),
+        "a truly idle poll (WouldBlock) must report no I/O so the throttle \
+         sleep still fires when there is genuinely nothing to drain"
+    );
+}
+
+#[test]
 fn higher_trust_origin_repairs_untrusted_preemption_before_rate_limit() {
     let mut obs = Observer::new(
         Duration::from_secs(60),

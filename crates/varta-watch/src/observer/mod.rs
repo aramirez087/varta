@@ -252,6 +252,18 @@ pub struct Observer {
     stall_cursor: usize,
     /// Next index to start polling from for fair round-robin across listeners.
     next_listener_start: usize,
+    /// Whether the most recent [`Observer::poll`] dequeued at least one
+    /// datagram from any listener — including datagrams that were dropped
+    /// (rate-limited, short, cross-namespace, above `pid_max`) without
+    /// producing a returnable [`Event`]. The main loop reads this via
+    /// [`Observer::last_poll_consumed`] to decide whether the socket may
+    /// still hold queued beats. A consumed-but-dropped datagram must NOT be
+    /// mistaken for an idle tick: otherwise a burst of dropped traffic (e.g.
+    /// one agent beating above its per-pid limit) head-of-line-blocks
+    /// legitimate beats behind a 10 ms idle sleep per drained datagram,
+    /// capping drain at ~100 datagrams/s and triggering false stalls.
+    /// Overwritten at the end of every `poll()`.
+    last_poll_consumed: bool,
     /// Minimum inter-beat interval applied per pid, in nanoseconds.
     /// `None` means no rate limiting (the default).
     rate_limit_interval_ns: Option<u64>,
@@ -358,6 +370,7 @@ impl Observer {
             stall_queue: Vec::with_capacity(tracker_capacity),
             stall_cursor: 0,
             next_listener_start: 0,
+            last_poll_consumed: false,
             rate_limit_interval_ns,
             rate_limited_total: [0; RATE_LIMIT_N],
             global_rl: GlobalRateLimit::new(global_beat_rate, global_beat_burst),
@@ -482,11 +495,21 @@ impl Observer {
         let len = self.listeners.len();
         let start = self.next_listener_start;
         let mut first_event: Option<Event> = None;
+        let mut consumed = false;
         let mut round = 0;
         while round < len {
             let i = (start + round) % len;
             round += 1;
-            match self.listeners[i].recv() {
+            let result = self.listeners[i].recv();
+            // Any result other than `WouldBlock` means a datagram was pulled
+            // off the socket queue this pass — including the drop paths below
+            // that `continue` without yielding an `Event`. Record it so the
+            // main loop keeps draining instead of treating a dropped beat as
+            // an idle tick (see `last_poll_consumed`).
+            if !matches!(result, RecvResult::WouldBlock) {
+                consumed = true;
+            }
+            match result {
                 RecvResult::Authenticated {
                     peer_pid,
                     peer_uid: _,
@@ -696,6 +719,7 @@ impl Observer {
                 break;
             }
         }
+        self.last_poll_consumed = consumed;
         self.drain_stalls();
         first_event
     }
@@ -713,6 +737,17 @@ impl Observer {
     /// Whether the stall queue has unconsumed [`Event::Stall`] entries.
     pub fn has_pending_stalls(&self) -> bool {
         self.stall_cursor < self.stall_queue.len()
+    }
+
+    /// Whether the most recent [`Observer::poll`] dequeued at least one
+    /// datagram (see the `last_poll_consumed` field). Returns `true` even
+    /// when every dequeued datagram was dropped without yielding an `Event`
+    /// (rate-limited, short, cross-namespace, above `pid_max`). The main loop
+    /// uses this to skip the idle throttle sleep while the socket may still
+    /// hold queued beats, so a flood of dropped traffic cannot starve real
+    /// beats one 10 ms sleep at a time.
+    pub fn last_poll_consumed(&self) -> bool {
+        self.last_poll_consumed
     }
 
     /// Observer-local nanosecond timestamp (ns since [`Observer`] start).

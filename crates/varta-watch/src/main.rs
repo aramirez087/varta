@@ -1110,7 +1110,12 @@ fn run(cfg: Config) -> std::io::Result<()> {
         // ----- 2. One non-blocking I/O poll for new beats / decode / auth ------
         // poll() never returns stalls — those are surfaced exclusively via
         // poll_pending() above.
-        let had_io = if let Some(ev) = observer.poll() {
+        // poll() pulls at most one datagram per listener and returns the
+        // first returnable Event (if any). Whether the socket still holds
+        // queued beats is reported separately via `last_poll_consumed()` —
+        // a dropped datagram yields no Event but is still I/O, and must not
+        // be mistaken for an idle tick by the throttle below.
+        if let Some(ev) = observer.poll() {
             if let Some(fe) = file_export.as_mut() {
                 if let Err(e) = fe.record(&ev) {
                     varta_error_rl!(LogKind::FileExportIo, "file export error: {e}");
@@ -1145,10 +1150,7 @@ fn run(cfg: Config) -> std::io::Result<()> {
                     ));
                 }
             }
-            true
-        } else {
-            false
-        };
+        }
 
         // Record poll stage, then reset timer for the maintenance phase.
         // Publication unconditional under the feature (see DrainPending above).
@@ -1617,11 +1619,15 @@ fn run(cfg: Config) -> std::io::Result<()> {
         CURRENT_STAGE.store(u8::MAX, Ordering::Release);
 
         // ----- 6. Throttle: sleep only when truly idle ------
-        // Avoid busy-waiting when there are no I/O events and no queued
-        // stalls.  If poll() populated new stalls via drain_stalls() the
-        // check below catches them and the next iteration drains them
-        // without a sleep penalty.
-        if !had_io && !observer.has_pending_stalls() {
+        // Avoid busy-waiting when there is no I/O and no queued stalls.
+        // "Truly idle" means poll() pulled nothing off any socket this
+        // iteration — `last_poll_consumed()` is false. A consumed-but-dropped
+        // datagram (rate-limited / short / cross-namespace) yields no Event
+        // but IS I/O: sleeping after it would cap drain at ~100 datagrams/s
+        // and head-of-line-block real beats behind dropped traffic, causing
+        // false stalls and spurious recovery. If poll() populated new stalls
+        // via drain_stalls() the next iteration drains them without a sleep.
+        if !observer.last_poll_consumed() && !observer.has_pending_stalls() {
             std::thread::sleep(Duration::from_millis(10));
         }
 
