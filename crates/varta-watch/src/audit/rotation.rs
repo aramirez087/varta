@@ -166,16 +166,7 @@ impl RecoveryAuditLog {
                         };
                     } else {
                         let first = format!("{path_str}.1");
-                        let rename_result = match std::fs::rename(&self.path, &first) {
-                            Ok(()) => Ok(()),
-                            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
-                            Err(e) if is_cross_device_error(&e) => {
-                                std::fs::copy(&self.path, &first)
-                                    .and_then(|_| std::fs::remove_file(&self.path))
-                            }
-                            Err(e) => Err(e),
-                        };
-                        if let Err(e) = rename_result {
+                        if let Err(e) = self.rotate_live_to_first(&first) {
                             self.pending_err = Some(e);
                             self.rotation_progress = RotationProgress::Idle;
                             self.needs_rotation = false;
@@ -303,6 +294,53 @@ impl RecoveryAuditLog {
                 }
             }
         }
+    }
+
+    /// Move the live file to `.1` to open the post-rotation generation.
+    ///
+    /// Fast path is `rename(2)`: `self.sink`'s open fd follows the inode into
+    /// `.1`, so the subsequent `Finalizing` drain + fsync append to — and make
+    /// durable — the rotated generation. On `EXDEV` (the audit directory and
+    /// its `.N` siblings resolve to different devices — overlayfs upper/lower
+    /// splits, certain bind-mount layouts) rename is impossible and we fall
+    /// back to copy+unlink, which needs the inode re-point in
+    /// [`Self::copy_live_to_first`].
+    fn rotate_live_to_first(&mut self, first: &str) -> io::Result<()> {
+        match std::fs::rename(&self.path, first) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(e) if is_cross_device_error(&e) => self.copy_live_to_first(first),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// `EXDEV` fallback for [`Self::rotate_live_to_first`].
+    ///
+    /// `copy`+`remove_file` makes `.1` a SEPARATE inode from the one
+    /// `self.sink`'s fd holds — unlike the rename fast path, the fd does NOT
+    /// follow into `.1`. Left as-is, the `Finalizing` drain and its `fsync`
+    /// would write into the now-unlinked original inode: the records silently
+    /// vanish, and the post-rotation `boot` anchor's `final_chain` (snapshotted
+    /// from `prev_chain`) never matches `.1`'s true tail — a hash-chain break
+    /// across the generation boundary that an offline tamper-evidence verifier
+    /// cannot distinguish from forgery. So flush first (the copy captures every
+    /// durable byte, never a half-written buffer) then re-point `self.sink` at
+    /// `.1` so `Finalizing` appends and fsyncs there exactly as the rename path
+    /// does.
+    fn copy_live_to_first(&mut self, first: &str) -> io::Result<()> {
+        self.flush_and_sync()?;
+        std::fs::copy(&self.path, first)?;
+        std::fs::remove_file(&self.path)?;
+        use super::writer::{DurableSink, FileSink};
+        use std::os::unix::fs::OpenOptionsExt;
+        let file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .mode(0o600)
+            .open(first)?;
+        let sink_box: Box<dyn DurableSink> = Box::new(FileSink(file));
+        self.sink = std::io::BufWriter::new(sink_box);
+        Ok(())
     }
 
     /// Read up to the last [`TAIL_SCAN_BYTES`] of `path` and parse the
@@ -940,6 +978,72 @@ mod tests {
             .expect("v2 record");
         assert!(first_record.contains("\tboot\t"));
         assert!(first_record.contains("\tschema_drift"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// On the `EXDEV` rotation fallback, `copy`+`unlink` makes `.1` a fresh
+    /// inode distinct from the one `self.sink`'s fd holds. The fallback must
+    /// re-point the sink at `.1`; otherwise every record drained during
+    /// `Finalizing` lands in the now-unlinked original inode and silently
+    /// vanishes (and the post-rotation boot anchor's chain never matches
+    /// `.1`'s tail — a hash-chain break across the generation boundary). This
+    /// drives `copy_live_to_first` directly because forcing a real `EXDEV` is
+    /// not portable across CI filesystems.
+    #[test]
+    fn cross_device_fallback_repoints_sink_so_drained_records_reach_first() {
+        let dir = tmpdir("exdev");
+        let path = dir.join("audit.log");
+
+        let (mut log, _) = RecoveryAuditLog::create(&path, cfg(None, 1)).expect("create");
+        log.record_spawn(&crate::audit::SpawnRecord {
+            wallclock_ms: 1,
+            observer_ns: 1,
+            agent_pid: 1,
+            child_pid: 100,
+            mode: "exec",
+            program: "/bin/before-rotation",
+            source: "inline",
+            template_len: 1,
+        });
+        log.flush_pending(Duration::from_secs(5));
+
+        let first = format!("{}.1", path.to_string_lossy());
+        log.copy_live_to_first(&first)
+            .expect("cross-device fallback");
+
+        // The live file was unlinked; the snapshot copy now lives at `.1`.
+        assert!(!path.exists(), "original live file must be unlinked");
+        assert!(
+            std::path::Path::new(&first).exists(),
+            "rotated `.1` generation must exist"
+        );
+        let first_body = std::fs::read_to_string(&first).expect("read .1");
+        assert!(
+            first_body.contains("/bin/before-rotation"),
+            "pre-rotation records must be carried into `.1`"
+        );
+
+        // A record emitted AFTER the fallback must reach `.1` via the
+        // re-pointed sink — not the orphaned, now-unlinked original inode.
+        log.record_spawn(&crate::audit::SpawnRecord {
+            wallclock_ms: 2,
+            observer_ns: 2,
+            agent_pid: 2,
+            child_pid: 200,
+            mode: "exec",
+            program: "/bin/after-rotation",
+            source: "inline",
+            template_len: 2,
+        });
+        log.flush_pending(Duration::from_secs(5));
+
+        let first_body = std::fs::read_to_string(&first).expect("read .1 again");
+        assert!(
+            first_body.contains("/bin/after-rotation"),
+            "records drained after the cross-device fallback must be durable in \
+             `.1`, not lost to the unlinked original inode"
+        );
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 
