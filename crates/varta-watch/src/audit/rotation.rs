@@ -210,6 +210,28 @@ impl RecoveryAuditLog {
                     }
                     self.refresh_falling_edge_watermarks();
 
+                    // The tail below — `.1` fsync, sink swap, v2 header, boot
+                    // record, new-generation fsync — is atomic (chain linearity
+                    // forbids a `Deferred` between the header and its boot anchor;
+                    // see the block comment at the OpenOptions call) and runs TWO
+                    // ordered fsyncs UNBUDGETED. If the drain above already spent
+                    // the rotation budget, running the tail now stacks those
+                    // fsyncs on top of a full-budget call: the per-call wall time
+                    // becomes drain(≤budget) + 2·fsync, which defeats the
+                    // `MAX_AUDIT_ROTATION_BUDGET_MS ≤ MAINTENANCE_STAGE_ABORT_MS/2`
+                    // clamp (bug-363) and can overrun the Maintenance self-watchdog
+                    // stage → `process::abort()` of a HEALTHY observer on a slow
+                    // disk. The drain is now empty, so defer: the next tick
+                    // re-enters `Finalizing`, re-drains (a no-op when empty),
+                    // re-snapshots `final_chain` from the current `prev_chain`, and
+                    // runs the atomic tail with a fresh `call_start` — restoring
+                    // the one-call-≤-budget invariant the clamp relies on.
+                    if call_start.elapsed() >= budget {
+                        self.audit_rotation_budget_exceeded_total =
+                            self.audit_rotation_budget_exceeded_total.saturating_add(1);
+                        return RotationOutcome::Deferred;
+                    }
+
                     // Snapshot at the swap boundary: `self.prev_chain` now equals
                     // the chain of the last record physically written to `.1`.
                     // This is the value the post-rotation `boot` records in its
@@ -635,6 +657,57 @@ mod tests {
         );
         assert!(log.needs_rotation);
         assert!(log.rotation_progress.is_idle());
+        assert_eq!(log.audit_rotation_budget_exceeded_total, 1);
+    }
+
+    /// A `Finalizing` drain that empties the queue but consumes the whole
+    /// rotation budget must NOT then run the unbudgeted sink-swap + 2-fsync tail
+    /// in the same call. Doing so makes one `drive_audit_rotation` cost
+    /// drain(≤budget) + 2·fsync, defeating the
+    /// `MAX_AUDIT_ROTATION_BUDGET_MS ≤ MAINTENANCE_STAGE_ABORT_MS/2` clamp
+    /// (bug-363) and able to overrun the Maintenance self-watchdog stage →
+    /// `process::abort()` of a healthy observer on a slow disk. The tail must
+    /// defer to a fresh call where the drain is empty and `call_start` is reset.
+    #[test]
+    fn rotation_finalizing_defers_tail_when_drain_exhausts_budget() {
+        let writes = Arc::new(AtomicUsize::new(0));
+        let mut log = synthetic_rotation_log(writes.clone(), Duration::from_millis(10));
+        // Enter the FSM directly at the post-rename stage with the sink still on
+        // the soon-to-be `.1` inode — the only state the tail hazard lives in.
+        log.rotation_progress = RotationProgress::Finalizing;
+
+        log.record_spawn(&crate::audit::SpawnRecord {
+            wallclock_ms: 1,
+            observer_ns: 1,
+            agent_pid: 7,
+            child_pid: 107,
+            mode: "exec",
+            program: "/bin/true",
+            source: "inline",
+            template_len: 9,
+        });
+        assert_eq!(log.pending_lines.len(), 1);
+
+        // budget == the single drain write's cost: the drain COMPLETES (queue
+        // empties) yet `call_start.elapsed()` reaches the budget, so the atomic
+        // tail must defer rather than run on top of an already-spent budget.
+        let outcome = log.drive_audit_rotation(Duration::from_millis(10));
+
+        assert_eq!(outcome, RotationOutcome::Deferred);
+        assert!(
+            log.pending_lines.is_empty(),
+            "the drain itself must have completed — the deferral is the tail's, not the drain's"
+        );
+        assert!(
+            matches!(log.rotation_progress, RotationProgress::Finalizing),
+            "rotation must stay armed in Finalizing so the next tick runs the tail with a fresh call_start"
+        );
+        assert!(log.needs_rotation);
+        assert_eq!(
+            writes.load(Ordering::Relaxed),
+            1,
+            "only the drain write ran; the swap + header + boot tail must not have executed"
+        );
         assert_eq!(log.audit_rotation_budget_exceeded_total, 1);
     }
 
