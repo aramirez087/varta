@@ -15,7 +15,7 @@ use std::io;
 use std::path::Path;
 use std::time::Duration;
 
-use varta_vlp::{DecodeError, Frame, Status};
+use varta_vlp::{DecodeError, Frame, Status, NONCE_TERMINAL};
 
 use crate::clock::{Clock, ClockSource};
 use crate::listener::{BeatListener, PreThreadAttestation, UdsListener};
@@ -562,6 +562,26 @@ impl Observer {
                                 None => false,
                             };
 
+                            // A panic hook's terminal frame
+                            // (`NONCE_TERMINAL`, decode-enforced ⇒ `Critical`)
+                            // is the agent's single dying gasp. It almost
+                            // always arrives within the per-pid interval of the
+                            // last regular beat (the process was beating
+                            // normally, then panicked), so the per-pid limiter
+                            // below would shed exactly the one beat the tracker
+                            // is built never to drop (see
+                            // `tracker::record_with_generation`, which records a
+                            // terminal frame even when its namespace inode has
+                            // already read back `None`). Exempt it from the
+                            // per-pid limiter, mirroring `origin_upgrade`. The
+                            // global limiter still applies — the pre-readlink
+                            // DoS guard stays intact — and kernel attestation
+                            // (`frame.pid == peer_pid`) still bounds a forged
+                            // terminal flood to the sender's own pid, while the
+                            // tracker's timestamp gate (`refresh_terminal`)
+                            // rejects replays. So no flood / victim-targeting
+                            // vector opens.
+                            let is_terminal = frame.nonce == NONCE_TERMINAL;
                             // Per-pid rate limiting is an O(1) tracker lookup
                             // and must run before the global bucket. A
                             // same-pid burst that is already being dropped
@@ -570,7 +590,7 @@ impl Observer {
                             // the global limiter below, preserving the
                             // rotation-attack guard before namespace reads or
                             // tracker insertion.
-                            if !origin_upgrade {
+                            if !origin_upgrade && !is_terminal {
                                 if let Some(interval_ns) = self.rate_limit_interval_ns {
                                     if let Some(last_ns) = self.tracker.last_ns_of(frame.pid) {
                                         if now_ns.saturating_sub(last_ns) < interval_ns {

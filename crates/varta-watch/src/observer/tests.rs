@@ -325,6 +325,31 @@ impl ScriptedListener {
         Self { results }
     }
 
+    /// A regular beat (`nonce 1`, `Ok`) immediately followed by the pid's
+    /// terminal dying-gasp (`NONCE_TERMINAL`, decode-enforced `Critical`),
+    /// both kernel-attested. The two frames are microseconds apart, so the
+    /// terminal beat falls inside any realistic per-pid interval.
+    fn with_terminal_after_regular(pid: u32) -> Self {
+        let mut results = VecDeque::new();
+        for (status, nonce, payload) in [
+            (Status::Ok, 1u64, 100u32),
+            (Status::Critical, NONCE_TERMINAL, 0xDEAD),
+        ] {
+            let frame = Frame::new(status, pid, 1, nonce, payload);
+            let mut data = [0u8; 32];
+            frame.encode(&mut data);
+            results.push_back(RecvResult::Authenticated {
+                peer_pid: pid,
+                peer_uid: 0,
+                peer_pid_ns_inode: None,
+                peer_pidfd: None,
+                origin: BeatOrigin::KernelAttested,
+                data,
+            });
+        }
+        Self { results }
+    }
+
     fn with_origin_frames(frames: &[(u32, u64, u32, BeatOrigin)]) -> Self {
         let mut results = VecDeque::new();
         for &(pid, nonce, payload, origin) in frames {
@@ -459,6 +484,61 @@ fn per_pid_limited_frame_does_not_spend_global_token() {
         obs.drain_global_rate_limited(),
         0,
         "no frame should have exhausted the global bucket"
+    );
+}
+
+#[test]
+fn terminal_gasp_bypasses_per_pid_rate_limiter() {
+    // Regression: a panic hook's terminal beat (`NONCE_TERMINAL` => `Critical`)
+    // is the agent's single dying gasp and almost always arrives within the
+    // per-pid interval of the last regular beat. The tracker is built to never
+    // drop a terminal frame (it records it even when the namespace inode has
+    // read back `None`), but the per-pid rate limiter runs FIRST. Pre-fix it
+    // shed exactly that beat, so the observer lost the Critical status + panic
+    // payload and fell back to slow silence-based stall detection.
+    //
+    // max_beat_rate = 1/s (interval 1 s); the two frames are microseconds
+    // apart, so a regular second beat WOULD be dropped here.
+    let mut obs = Observer::new(
+        Duration::from_secs(60),
+        64,
+        EvictionPolicy::Strict,
+        DEFAULT_EVICTION_SCAN_WINDOW,
+        Some(1),
+        0,
+        0,
+        ClockSource::Monotonic,
+    )
+    .expect("Observer::new should succeed");
+
+    obs.add_listener(Box::new(ScriptedListener::with_terminal_after_regular(10)));
+
+    let first = obs.poll();
+    assert!(
+        matches!(first, Some(Event::Beat { pid: 10, .. })),
+        "first regular beat should be accepted, got {first:?}"
+    );
+
+    // THE FIX: the terminal gasp must be admitted despite arriving inside the
+    // per-pid interval, surfacing its Critical status to the tracker/recovery.
+    let second = obs.poll();
+    assert!(
+        matches!(
+            second,
+            Some(Event::Beat {
+                pid: 10,
+                status: Status::Critical,
+                payload: 0xDEAD,
+                nonce: NONCE_TERMINAL,
+                ..
+            })
+        ),
+        "terminal gasp must bypass the per-pid limiter and surface Critical, got {second:?}"
+    );
+    assert_eq!(
+        obs.drain_per_pid_rate_limited(),
+        0,
+        "the terminal beat must NOT be counted as a per-pid drop"
     );
 }
 
