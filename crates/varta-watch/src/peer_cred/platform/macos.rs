@@ -80,7 +80,117 @@ extern "C" {
 
 // --- ancillary buffer sizing ----------------------------------------------
 
-pub(crate) const ANCILLARY_BUFFER_SIZE: usize = 16;
+// macOS derives peer identity from `getsockopt(LOCAL_PEERTOKEN)`, not from
+// ancillary data, so no *legitimate* cmsg is ever expected here. But a peer
+// can still attach `SCM_RIGHTS` to a datagram, and XNU installs those file
+// descriptors into the observer on `recvmsg(2)` regardless of buffer size —
+// empirically even with a NULL control buffer the fd is still installed
+// (install-on-overflow). The only way to reclaim them is to give `recvmsg` a
+// control buffer large enough to *enumerate* them, then walk and close every
+// `SCM_RIGHTS` fd (see `reclaim_scm_rights`).
+//
+// XNU caps `SCM_RIGHTS` at 253 fds per message (a 254-fd `sendmsg` is rejected
+// with EMSGSIZE on the sender). 253 fds is exactly `CMSG_ALIGN(sizeof(cmsghdr))
+// + 253 * sizeof(int)` = `12 + 1012` = 1024 bytes on XNU (cmsg alignment is to
+// `sizeof(u32)` = 4). Sizing the buffer to that kernel maximum means a single
+// datagram's unsolicited fds are always fully enumerable and reclaimable — no
+// truncation, no leaked overflow.
+pub(crate) const ANCILLARY_BUFFER_SIZE: usize = 1024;
+
+/// `SOL_SOCKET` on macOS / XNU (`<sys/socket.h>`) — the cmsg level the kernel
+/// stamps on `SCM_RIGHTS` ancillary data.
+const SOL_SOCKET: i32 = 0xffff;
+/// `SCM_RIGHTS` — the cmsg type for passed file descriptors (`<sys/socket.h>`,
+/// `0x01` on XNU). Varta never sends fds, so any `SCM_RIGHTS` a peer attaches
+/// is unsolicited and must be reclaimed.
+const SCM_RIGHTS: i32 = 0x01;
+
+/// macOS `struct cmsghdr` — `cmsg_len: u32`, `cmsg_level: i32`, `cmsg_type:
+/// i32` (`<sys/socket.h>`). 12 bytes; `CMSG_ALIGN` rounds to `sizeof(u32)`.
+#[repr(C)]
+struct Cmsghdr {
+    cmsg_len: u32,
+    cmsg_level: i32,
+    cmsg_type: i32,
+}
+
+extern "C" {
+    fn close(fd: i32) -> i32;
+}
+
+/// `CMSG_ALIGN` on XNU rounds up to `sizeof(u32)` (4 bytes), unlike the
+/// `sizeof(usize)` (8-byte) alignment the shared `cmsg` walker assumes for the
+/// other platforms — which is why macOS keeps its own small walker here.
+#[inline]
+fn cmsg_align(len: usize) -> usize {
+    let a = core::mem::size_of::<u32>();
+    (len + a - 1) & !(a - 1)
+}
+
+/// Reclaim every peer-injected `SCM_RIGHTS` file descriptor XNU installed from
+/// this datagram's ancillary data.
+///
+/// `recv_authenticated` calls this once per datagram, ahead of every return
+/// path, on every credential-passing platform. On macOS the kernel installs
+/// passed fds even though the observer never solicits ancillary data (it uses
+/// `getsockopt` for credentials); left open they exhaust the long-lived
+/// single-threaded observer's fd table and silently disable recovery
+/// (fd-exhaustion DoS — the macOS twin of the Linux/BSD/illumos leak). The walk
+/// is bounded by the kernel-reported `msg_controllen` and clamps each cmsg's
+/// payload to the bytes actually present, so a truncated or malformed control
+/// buffer can never drive an out-of-bounds read.
+pub(crate) fn reclaim_scm_rights(mhdr: &Msghdr) {
+    let base = mhdr.msg_control as *const u8;
+    if base.is_null() {
+        return;
+    }
+    let controllen = mhdr.msg_controllen as usize;
+    let hdr_size = core::mem::size_of::<Cmsghdr>();
+    let mut off = 0usize;
+    while off + hdr_size <= controllen {
+        // SAFETY: `base + off` is in-bounds (`off + hdr_size <= controllen`)
+        // and points at kernel-initialised cmsg bytes from `recvmsg(2)`. The
+        // ancillary buffer is `#[repr(align(8))]` in `recv.rs`, satisfying the
+        // 4-byte alignment of `Cmsghdr`.
+        let hdr = unsafe { &*(base.add(off) as *const Cmsghdr) };
+        let cmsg_len = hdr.cmsg_len as usize;
+        if cmsg_len < hdr_size {
+            break;
+        }
+        if hdr.cmsg_level == SOL_SOCKET && hdr.cmsg_type == SCM_RIGHTS {
+            // Clamp the payload to the bytes actually inside the buffer: a
+            // peer (or a truncating kernel) can report a `cmsg_len` larger
+            // than what was delivered.
+            let declared_payload = cmsg_len - hdr_size;
+            let avail_payload = controllen.saturating_sub(off + hdr_size);
+            let payload = declared_payload.min(avail_payload);
+            let fd_count = payload / core::mem::size_of::<i32>();
+            for i in 0..fd_count {
+                // SAFETY: `off + hdr_size + i*4 + 4 <= off + hdr_size + payload
+                // <= controllen`, so the i32 is in bounds. `read_unaligned`
+                // because the cmsg payload ABI only promises byte validity.
+                let fd = unsafe {
+                    base.add(off + hdr_size + i * core::mem::size_of::<i32>())
+                        .cast::<i32>()
+                        .read_unaligned()
+                };
+                if fd >= 0 {
+                    // SAFETY: `recvmsg` installed this descriptor into our fd
+                    // table; close it to reclaim. Close errors cannot be
+                    // usefully recovered on the receive path.
+                    let _ = unsafe { close(fd) };
+                }
+            }
+        }
+        // Advance by the aligned cmsg size; clamp to at least one header so a
+        // malicious `cmsg_len` cannot stall the walk.
+        let adv = cmsg_align(cmsg_len).max(hdr_size);
+        off = match off.checked_add(adv) {
+            Some(v) => v,
+            None => break,
+        };
+    }
+}
 
 /// Extract peer PID and UID after a successful `recvmsg` on macOS.
 ///
@@ -213,19 +323,6 @@ pub(crate) fn msghdr_for_recv(
 pub(crate) fn ctrl_truncated(_mhdr: &Msghdr) -> bool {
     false
 }
-
-/// SCM_RIGHTS reclamation is a no-op on macOS.
-///
-/// `recv_authenticated` calls this on every cred-passing platform, but macOS
-/// derives peer identity from `getsockopt(LOCAL_PEERTOKEN)` rather than the
-/// cmsg walk, and `ANCILLARY_BUFFER_SIZE` is only 16 bytes — too small to even
-/// hold one `SCM_RIGHTS` cmsg header + fd (20 bytes). XNU installs passed fds
-/// on overflow without surfacing an enumerable cmsg, so they cannot be walked
-/// and closed from this buffer. Closing peer-injected fds on macOS requires
-/// sizing the ancillary buffer to `SO_RCVBUF` — a separate transport change
-/// tracked outside this fd-leak reclamation path. The no-op keeps the
-/// `recv_authenticated` call site cfg-free across platforms.
-pub(crate) fn reclaim_scm_rights(_mhdr: &Msghdr) {}
 
 // Compile-time invariant: macOS msghdr is 48 bytes on x86_64 + aarch64.
 const _: () = assert!(mem::size_of::<Msghdr>() == 48);

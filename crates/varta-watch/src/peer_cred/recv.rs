@@ -606,4 +606,118 @@ mod tests {
             _ => panic!("expected authenticated datagram"),
         }
     }
+
+    /// Regression (fd-exhaustion DoS, macOS): a peer datagram carrying an
+    /// `SCM_RIGHTS` ancillary message must not leak the passed fds into the
+    /// observer. XNU installs passed fds on `recvmsg(2)` even though the macOS
+    /// observer derives credentials from `getsockopt` and never solicits
+    /// ancillary data — and it installs them even on control-buffer overflow.
+    /// Before the fix `reclaim_scm_rights` was a no-op on macOS and the buffer
+    /// was 16 bytes, so any same-UID process could exhaust the observer's fd
+    /// table by attaching fds to well-formed beats. This sends *multiple* fds
+    /// in one message to also exercise the multi-fd enumeration the 1024-byte
+    /// buffer enables (XNU caps `SCM_RIGHTS` at 253 fds).
+    ///
+    /// Real-syscall test (bind/sendmsg/recvmsg + `/dev/fd`); not available
+    /// under Miri isolation.
+    #[cfg(all(target_os = "macos", not(miri)))]
+    #[test]
+    fn scm_rights_fds_are_reclaimed_not_leaked_macos() {
+        use super::plat;
+        use super::{enable_credential_passing, recv_authenticated, RecvResult};
+        use std::os::unix::io::AsRawFd;
+        use std::os::unix::net::UnixDatagram;
+
+        extern "C" {
+            fn sendmsg(fd: i32, msg: *const plat::Msghdr, flags: i32) -> isize;
+            fn dup(fd: i32) -> i32;
+            fn close(fd: i32) -> i32;
+        }
+
+        const SOL_SOCKET: i32 = 0xffff;
+        const SCM_RIGHTS: i32 = 0x01;
+        const NFDS: usize = 8;
+
+        fn open_fd_count() -> usize {
+            std::fs::read_dir("/dev/fd").expect("read /dev/fd").count()
+        }
+
+        let path =
+            std::env::temp_dir().join(format!("varta-scmrights-macos-{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+
+        let observer = UnixDatagram::bind(&path).expect("bind observer");
+        enable_credential_passing(observer.as_raw_fd()).expect("enable credential passing");
+        let sender = UnixDatagram::unbound().expect("sender socket");
+        sender.connect(&path).expect("connect sender");
+
+        // NFDS duplicate handles of /dev/null; the sender's copies are closed
+        // after send so only the observer's recvmsg-installed duplicates are
+        // leak candidates.
+        let base = std::fs::File::open("/dev/null").expect("open /dev/null");
+        let dups: Vec<i32> = (0..NFDS)
+            .map(|_| unsafe { dup(base.as_raw_fd()) })
+            .collect();
+
+        // One SCM_RIGHTS cmsg carrying NFDS fds. macOS CMSG_ALIGN is 4 bytes;
+        // cmsg_len = 12 (cmsghdr) + NFDS*4.
+        let cmsg_len = 12 + NFDS * 4;
+        let total = (cmsg_len + 3) & !3;
+        let mut ctrl = vec![0u8; total];
+        ctrl[0..4].copy_from_slice(&(cmsg_len as u32).to_le_bytes());
+        ctrl[4..8].copy_from_slice(&SOL_SOCKET.to_le_bytes());
+        ctrl[8..12].copy_from_slice(&SCM_RIGHTS.to_le_bytes());
+        for (i, fd) in dups.iter().enumerate() {
+            ctrl[12 + i * 4..16 + i * 4].copy_from_slice(&fd.to_le_bytes());
+        }
+
+        let mut beat = [0u8; super::VLP_FRAME_LEN];
+        let mut iov = plat::Iovec {
+            iov_base: beat.as_mut_ptr() as *mut core::ffi::c_void,
+            iov_len: beat.len(),
+        };
+        let mhdr = plat::Msghdr {
+            msg_name: core::ptr::null_mut(),
+            msg_namelen: 0,
+            _pad1: 0,
+            msg_iov: &mut iov,
+            msg_iovlen: 1,
+            _pad2: 0,
+            msg_control: ctrl.as_mut_ptr() as *mut core::ffi::c_void,
+            msg_controllen: total as u32,
+            msg_flags: 0,
+        };
+        // SAFETY: `mhdr` describes the 32-byte beat iovec and an in-bounds
+        // SCM_RIGHTS control buffer carrying NFDS live fds; all buffers outlive
+        // the call. `sendmsg(2)` only reads them.
+        let sent = unsafe { sendmsg(sender.as_raw_fd(), &mhdr, 0) };
+        assert_eq!(
+            sent,
+            super::VLP_FRAME_LEN as isize,
+            "sendmsg should send the beat"
+        );
+        // Sender drops its own copies; only the observer's installed duplicates
+        // remain as leak candidates.
+        for d in &dups {
+            unsafe { close(*d) };
+        }
+
+        let before = open_fd_count();
+        let result = recv_authenticated(observer.as_raw_fd());
+        let after = open_fd_count();
+
+        match result {
+            RecvResult::Authenticated { data, origin, .. } => {
+                assert_eq!(data, beat, "beat payload should survive intact");
+                assert_eq!(origin, BeatOrigin::SocketModeOnly);
+            }
+            _ => panic!("expected an authenticated beat"),
+        }
+        assert_eq!(
+            after, before,
+            "observer leaked peer-injected SCM_RIGHTS fds (before={before}, after={after})"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
 }
