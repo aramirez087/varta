@@ -150,7 +150,12 @@ fn stall_freshness_detects_pid_recycle_in_deferral_window() {
         t.record_with_generation(&frame(1, 1), 0, threshold_ns, ORIGIN, None, Some(42)),
         Update::Inserted
     );
-    t.drain_stalled_slots(threshold_ns * 2, threshold_ns, |_, _, _, _, _, _| {});
+    t.drain_stalled_slots_with_generation_check(
+        threshold_ns * 2,
+        threshold_ns,
+        |_, _| false,
+        |_, _, _, _, _, _| {},
+    );
 
     // Still silence-latched and the PID still names the same process → fire.
     assert_eq!(
