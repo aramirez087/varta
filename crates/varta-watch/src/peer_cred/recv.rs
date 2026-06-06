@@ -418,7 +418,15 @@ mod tests {
     /// the kernel attests a nonzero peer PID and the beat is accepted normally;
     /// the discriminating assertion is that the observer's open-fd count does
     /// not grow across the `recv`.
-    #[cfg(all(target_os = "linux", not(feature = "force-socketmode-fallback")))]
+    // Real-syscall test (bind/sendmsg/recvmsg + `/proc/self/fd` + `unlink`):
+    // none of these are available under Miri's isolation, so gate it out of the
+    // Miri run. The cmsg pointer-walk soundness Miri actually checks is covered
+    // by the fabricated-buffer tests in `cmsg::miri_cmsg_tests`.
+    #[cfg(all(
+        target_os = "linux",
+        not(feature = "force-socketmode-fallback"),
+        not(miri)
+    ))]
     #[test]
     fn scm_rights_fds_are_reclaimed_not_leaked() {
         use super::plat;
@@ -502,10 +510,23 @@ mod tests {
 
         // Consume `result` by value before measuring: on Linux 6.5+ the kernel
         // also attaches an `SCM_PIDFD`, which `recv_authenticated` legitimately
-        // returns (still open) inside the result. Dropping it here closes that
-        // pidfd so the count isolates the peer-injected `SCM_RIGHTS` leak.
+        // returns (still open) inside the result. Bind `peer_pidfd` explicitly
+        // and drop it here — a partial move out of the named `result` binding
+        // leaves the unbound fields owned by `result` until end-of-scope, so
+        // letting `..` swallow the pidfd would defer its close past the `after`
+        // sample and the count would spuriously show a +1 "leak" that is really
+        // the still-open kernel pidfd. Dropping it now isolates the
+        // peer-injected `SCM_RIGHTS` leak the test actually targets.
         let (data, peer_pid) = match result {
-            RecvResult::Authenticated { data, peer_pid, .. } => (data, peer_pid),
+            RecvResult::Authenticated {
+                data,
+                peer_pid,
+                peer_pidfd,
+                ..
+            } => {
+                drop(peer_pidfd);
+                (data, peer_pid)
+            }
             _ => panic!("expected an authenticated beat"),
         };
         let after = open_fd_count();
