@@ -32,9 +32,9 @@ use varta_watch::log_ratelimit::LogKind;
 #[cfg(feature = "prometheus-exporter")]
 use varta_watch::PromExporter;
 use varta_watch::{
-    varta_error, varta_error_err, varta_error_pid, varta_error_rl, varta_info_pid_child,
-    varta_warn, varta_warn_child, varta_warn_rl, Config, ConfigError, Event, Exporter,
-    FileExporter, Observer, Recovery, RecoveryOutcome,
+    varta_error, varta_error_err, varta_error_pid, varta_error_rl, varta_info_pid,
+    varta_info_pid_child, varta_warn, varta_warn_child, varta_warn_rl, Config, ConfigError, Event,
+    Exporter, FileExporter, Observer, Recovery, RecoveryOutcome,
 };
 
 /// Shutdown latch flipped by [`handle_shutdown`] on SIGINT/SIGTERM
@@ -945,6 +945,30 @@ fn run(cfg: Config) -> std::io::Result<()> {
             } = &ev
             {
                 if let Some(rec) = recovery.as_mut() {
+                    // Freshness re-check before firing. This stall may have
+                    // sat queued across ticks: a mass simultaneous stall
+                    // queues more events than RECOVERY_SPAWN_MAX_PER_TICK can
+                    // fire in one DrainPending stage, deferring the remainder.
+                    // If the agent resumed beating in that window its tracker
+                    // slot cleared `stall_emitted`; firing the stale stall now
+                    // would kill/restart a healthy process. Skip — O(1), and
+                    // it consumes no spawn budget (no fork). See
+                    // observer::stall_recovery_warranted.
+                    if !observer.stall_recovery_warranted(*pid) {
+                        #[cfg(feature = "prometheus-exporter")]
+                        if let Some(pe) = prom_export.as_mut() {
+                            pe.record_recovery_outcome(
+                                &RecoveryOutcome::SkippedAgentResumed { pid: *pid },
+                                None,
+                            );
+                        }
+                        varta_info_pid!(
+                            *pid,
+                            "recovery for pid {pid} SKIPPED: agent resumed \
+                             beating before its deferred stall fired"
+                        );
+                        continue;
+                    }
                     // Cross-namespace agent: the slot's pinned PID-namespace
                     // inode differs from the observer's. Linux-only signal;
                     // on non-Linux both inodes are None and this is always
@@ -1066,6 +1090,12 @@ fn run(cfg: Config) -> std::io::Result<()> {
                         | RecoveryOutcome::Killed { .. }
                         | RecoveryOutcome::ReapFailed(_) => {
                             unreachable!("on_stall returned a reap-only recovery outcome")
+                        }
+                        RecoveryOutcome::SkippedAgentResumed { .. } => {
+                            // Synthesized only by the freshness re-check above,
+                            // which `continue`s before reaching this match;
+                            // on_stall never returns it.
+                            unreachable!("on_stall returned SkippedAgentResumed")
                         }
                     }
 

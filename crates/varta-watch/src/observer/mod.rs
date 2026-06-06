@@ -739,6 +739,16 @@ impl Observer {
         self.stall_cursor < self.stall_queue.len()
     }
 
+    /// True iff the queued stall for `pid` is still warranted — its tracker
+    /// slot remains silence-latched and no fresh beat has cleared it since the
+    /// stall was enqueued. The main loop calls this immediately before firing
+    /// recovery so a stall deferred across ticks by the per-tick spawn budget
+    /// (a mass simultaneous stall exceeding `RECOVERY_SPAWN_MAX_PER_TICK`)
+    /// cannot kill an agent that resumed beating inside the deferral window.
+    pub fn stall_recovery_warranted(&self, pid: u32) -> bool {
+        self.tracker.stall_recovery_warranted(pid)
+    }
+
     /// Whether the most recent [`Observer::poll`] dequeued at least one
     /// datagram (see the `last_poll_consumed` field). Returns `true` even
     /// when every dequeued datagram was dropped without yielding an `Event`

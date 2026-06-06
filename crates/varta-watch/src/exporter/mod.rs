@@ -272,7 +272,7 @@ const DROP_REASON_LABELS: [&str; 3] = ["drain", "rate_limit", "ip_table_full"];
 /// [`recovery_outcome_index`]; emitted unconditionally (every value, even
 /// at zero) so `absent()` alert rules stay green.
 #[cfg(feature = "prometheus-exporter")]
-const RECOVERY_OUTCOME_LABELS: [&str; 11] = [
+const RECOVERY_OUTCOME_LABELS: [&str; 12] = [
     "spawned",
     "debounced",
     "reaped_zero",
@@ -284,6 +284,7 @@ const RECOVERY_OUTCOME_LABELS: [&str; 11] = [
     "refused_debounce_capacity",
     "refused_outstanding_capacity",
     "refused_socket_mode_only",
+    "skipped_agent_resumed",
 ];
 
 /// Reason label values for `varta_recovery_refused_total`. Indexed by
@@ -320,6 +321,7 @@ fn recovery_outcome_index(outcome: &crate::recovery::RecoveryOutcome) -> usize {
         RecoveryOutcome::RefusedDebounceCapacity { .. } => 8,
         RecoveryOutcome::RefusedOutstandingCapacity { .. } => 9,
         RecoveryOutcome::RefusedSocketModeOnly { .. } => 10,
+        RecoveryOutcome::SkippedAgentResumed { .. } => 11,
         // ReapFailed is not user-facing here — treat as a reap-nonzero
         // (it implies the child terminated abnormally from our POV).
         RecoveryOutcome::ReapFailed(_) => 3,

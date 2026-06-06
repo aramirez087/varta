@@ -178,6 +178,20 @@ pub enum RecoveryOutcome {
         /// Agent pid whose stall was refused.
         pid: u32,
     },
+    /// Recovery was skipped because the agent resumed beating before its
+    /// stall fired. A mass simultaneous stall queues more events than the
+    /// per-tick spawn budget ([`RECOVERY_SPAWN_MAX_PER_TICK`]) can fire, so
+    /// the remainder is deferred across ticks. If the agent emits an accepted
+    /// beat in that window its tracker slot clears `stall_emitted`; firing the
+    /// stale, deferred stall now would `kill(2)`/restart a healthy process.
+    /// This is a benign self-heal, not a safety refusal — it is synthesized by
+    /// the observer's freshness re-check (never returned by
+    /// [`Recovery::on_stall`]) and counted in Prometheus as
+    /// `varta_recovery_outcomes_total{outcome="skipped_agent_resumed"}`.
+    SkippedAgentResumed {
+        /// Agent pid whose deferred stall was skipped after it resumed beating.
+        pid: u32,
+    },
 }
 
 impl RecoveryOutcome {

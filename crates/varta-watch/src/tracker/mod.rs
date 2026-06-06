@@ -891,6 +891,29 @@ impl Tracker {
         self.len == 0
     }
 
+    /// True iff a stall already emitted for `pid` is still warranted — the
+    /// slot is present, used, and remains silence-latched (`stall_emitted`).
+    ///
+    /// Returns `false` when the agent resumed beating (any accepted beat
+    /// clears `stall_emitted`) or the slot was evicted/retired since the
+    /// stall was queued. The observer calls this immediately before firing
+    /// recovery so a stall deferred across ticks by the per-tick spawn budget
+    /// cannot kill an agent that recovered inside the deferral window.
+    ///
+    /// Within one deferral batch a slot can only transition
+    /// `stall_emitted` true → false (a heal): `drain_stalled_slots` re-emits
+    /// only once the whole queue is consumed, which cannot happen while the
+    /// batch is still draining. So this single flag is an unambiguous
+    /// freshness signal.
+    pub fn stall_recovery_warranted(&self, pid: u32) -> bool {
+        self.pid_to_index
+            .get(pid)
+            .and_then(|idx| self.entries.get(idx))
+            .filter(|s| s.used)
+            .map(|s| s.stall_emitted)
+            .unwrap_or(false)
+    }
+
     /// Find newly-stalled slots and mark them emitted in one atomic pass.
     ///
     /// A slot is "newly stalled" when its silence duration exceeds

@@ -89,6 +89,45 @@ fn stall_counter_decrements_on_refresh() {
     assert_eq!(t.stall_emitted_count, 0);
 }
 
+/// Freshness predicate behind the deferred-stall recovery guard: a stall is
+/// "still warranted" only while its slot stays silence-latched. A fresh beat
+/// (the agent resumed beating inside the per-tick-spawn-budget deferral
+/// window) must flip the predicate to false so recovery is NOT fired against
+/// a now-healthy process. Absent pids are never warranted.
+#[test]
+fn stall_recovery_warranted_tracks_resumed_beat() {
+    let mut t = Tracker::new(4, EvictionPolicy::Strict, DEFAULT_EVICTION_SCAN_WINDOW);
+    let threshold_ns = 100;
+
+    // Untracked pid: nothing to recover.
+    assert!(!t.stall_recovery_warranted(1));
+
+    // Tracked but not yet stalled: no stall has been emitted.
+    assert_eq!(
+        t.record(&frame(1, 1), 0, threshold_ns, ORIGIN, None),
+        Update::Inserted
+    );
+    assert!(!t.stall_recovery_warranted(1));
+
+    // Silence crosses the threshold and the stall is emitted (queued).
+    t.drain_stalled_slots(threshold_ns * 2, threshold_ns, |_, _, _, _, _, _| {});
+    assert!(
+        t.stall_recovery_warranted(1),
+        "a freshly-emitted, still-silent stall must remain warranted"
+    );
+
+    // The agent resumes beating before the deferred stall fired — the slot's
+    // stall latch clears, so firing recovery now would kill a healthy process.
+    assert_eq!(
+        t.record(&frame(1, 2), threshold_ns * 3, threshold_ns, ORIGIN, None),
+        Update::Refreshed
+    );
+    assert!(
+        !t.stall_recovery_warranted(1),
+        "a resumed beat must withdraw the recovery warrant"
+    );
+}
+
 /// The bounded scan window must cap per-call work. Fill 4096 slots
 /// at t=0, stall them all, then verify each find_evictable_slot call
 /// advances the cursor by at most the configured window.

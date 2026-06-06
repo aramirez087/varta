@@ -759,6 +759,31 @@ fn recovery_refused_debounce_capacity_outcome_drives_counters() {
     );
 }
 
+/// The deferred-stall freshness guard surfaces its skips as a distinct,
+/// benign outcome label (NOT a `refused_*` safety reason). Confirms the new
+/// `SkippedAgentResumed` variant drives only the outcome array and leaves
+/// every refused-reason counter at zero.
+#[test]
+fn recovery_skipped_agent_resumed_outcome_drives_only_outcome_counter() {
+    let mut prom = PromExporter::bind("127.0.0.1:0".parse().unwrap(), make_token()).expect("bind");
+    let outcome = crate::recovery::RecoveryOutcome::SkippedAgentResumed { pid: 7 };
+    prom.record_recovery_outcome(&outcome, None);
+    prom.render_body();
+    let body = &prom.body_buf;
+    assert!(
+        body.contains("varta_recovery_outcomes_total{outcome=\"skipped_agent_resumed\"} 1"),
+        "outcome counter must increment under skipped_agent_resumed; body:\n{body}"
+    );
+    // A self-heal is not a structural refusal — no reason counter moves.
+    for reason in RECOVERY_REFUSED_REASON_LABELS.iter() {
+        let needle = format!("varta_recovery_refused_total{{reason=\"{reason}\"}} 0");
+        assert!(
+            body.contains(&needle),
+            "skipped_agent_resumed must not bump refused reason {reason:?}; body:\n{body}"
+        );
+    }
+}
+
 #[test]
 fn recovery_reaped_outcome_records_duration_metrics() {
     use std::os::unix::process::ExitStatusExt;
