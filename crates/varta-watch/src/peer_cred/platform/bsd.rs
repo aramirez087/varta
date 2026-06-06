@@ -109,6 +109,34 @@ extern "C" {
     ) -> i32;
 
     pub(crate) fn recvmsg(fd: i32, msg: *mut Msghdr, flags: i32) -> isize;
+
+    pub(crate) fn close(fd: i32) -> i32;
+}
+
+/// `SCM_RIGHTS` — the CMSG type for passed file descriptors (`<sys/socket.h>`;
+/// `0x01` on the BSD family). Varta never sends fds, so any `SCM_RIGHTS` a peer
+/// attaches is unsolicited and must be reclaimed — see [`reclaim_scm_rights`].
+#[cfg(any(target_os = "freebsd", target_os = "dragonfly", target_os = "netbsd"))]
+pub(crate) const SCM_RIGHTS: i32 = 0x01;
+
+/// Reclaim every peer-injected `SCM_RIGHTS` file descriptor the kernel
+/// installed from this datagram's ancillary data.
+///
+/// `LOCAL_CREDS` makes the kernel prepend an `SCM_CREDS` cmsg, but a peer can
+/// still append an `SCM_RIGHTS` cmsg in the same datagram; `recvmsg(2)`
+/// installs those fds into the observer regardless. The 256-byte ancillary
+/// buffer holds both, so [`peer_pid_after_recv`] would walk past the
+/// credentials and leave the passed fds open — an fd-exhaustion DoS. This is
+/// the single SCM_RIGHTS reclamation point on the BSD family, invoked once per
+/// datagram by `recv_authenticated` ahead of every return path.
+#[cfg(any(target_os = "freebsd", target_os = "dragonfly", target_os = "netbsd"))]
+pub(crate) fn reclaim_scm_rights(mhdr: &Msghdr) {
+    super::super::cmsg::reclaim_scm_rights::<BsdCmsg>(mhdr, SCM_RIGHTS, |fd| {
+        // SAFETY: recvmsg installed this descriptor into our fd table; close it
+        // to reclaim. Close errors cannot be usefully recovered on the receive
+        // path.
+        let _ = unsafe { close(fd) };
+    });
 }
 
 // --- ancillary buffer sizing ----------------------------------------------

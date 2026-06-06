@@ -214,6 +214,19 @@ pub(crate) fn ctrl_truncated(_mhdr: &Msghdr) -> bool {
     false
 }
 
+/// SCM_RIGHTS reclamation is a no-op on macOS.
+///
+/// `recv_authenticated` calls this on every cred-passing platform, but macOS
+/// derives peer identity from `getsockopt(LOCAL_PEERTOKEN)` rather than the
+/// cmsg walk, and `ANCILLARY_BUFFER_SIZE` is only 16 bytes — too small to even
+/// hold one `SCM_RIGHTS` cmsg header + fd (20 bytes). XNU installs passed fds
+/// on overflow without surfacing an enumerable cmsg, so they cannot be walked
+/// and closed from this buffer. Closing peer-injected fds on macOS requires
+/// sizing the ancillary buffer to `SO_RCVBUF` — a separate transport change
+/// tracked outside this fd-leak reclamation path. The no-op keeps the
+/// `recv_authenticated` call site cfg-free across platforms.
+pub(crate) fn reclaim_scm_rights(_mhdr: &Msghdr) {}
+
 // Compile-time invariant: macOS msghdr is 48 bytes on x86_64 + aarch64.
 const _: () = assert!(mem::size_of::<Msghdr>() == 48);
 

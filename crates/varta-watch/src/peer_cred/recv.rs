@@ -250,6 +250,16 @@ pub(crate) fn recv_authenticated(fd: i32) -> RecvResult {
             break ret;
         };
 
+        // Reclaim any peer-injected `SCM_RIGHTS` file descriptors the kernel
+        // installed from this datagram's ancillary data, before any return
+        // path. Varta never sends fds, so SCM_RIGHTS is always unsolicited;
+        // left open they exhaust the long-lived single-threaded observer's fd
+        // table and silently disable recovery (fd-exhaustion DoS). This is the
+        // single cross-platform reclamation point — the success, truncated, and
+        // short-read paths below all run after it. (SCM_PIDFD is handled
+        // separately: consumed on success, closed on early-drop.)
+        plat::reclaim_scm_rights(&mhdr);
+
         if plat::ctrl_truncated(&mhdr) {
             #[cfg(target_os = "linux")]
             plat::close_received_fds(&mhdr);

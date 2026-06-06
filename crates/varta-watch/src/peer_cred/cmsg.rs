@@ -270,6 +270,65 @@ pub(super) fn find_credential<P: CmsgPlatform>(mhdr: &P::Msghdr) -> Option<(u32,
     None
 }
 
+/// Close every file descriptor carried by an `SCM_RIGHTS` ancillary message.
+///
+/// Varta never sends ancillary file descriptors, so any `SCM_RIGHTS` a peer
+/// attaches to a datagram is unsolicited. File-descriptor passing is
+/// sender-driven: `recvmsg(2)` installs the passed fds into the observer
+/// regardless of socket options, and `MSG_CMSG_CLOEXEC` (where the platform
+/// even supports it) only sets `FD_CLOEXEC` — it does not close them. Left
+/// open, they accumulate in the long-lived single-threaded observer until
+/// `RLIMIT_NOFILE` is reached, after which `recvmsg`, `/metrics` accepts,
+/// `/proc` reads, and audit-log rotation begin failing — silently disabling
+/// recovery supervision while the process still appears live (fd-exhaustion
+/// DoS). This walks the kernel-supplied ancillary buffer and hands each
+/// `SCM_RIGHTS` fd to `close_fd` for immediate reclamation.
+///
+/// `scm_rights_type` is the platform's `SCM_RIGHTS` cmsg `type`; the `level`
+/// filter reuses [`CmsgPlatform::TARGET_LEVEL`] (`SOL_SOCKET`), which is the
+/// level the kernel sets on `SCM_RIGHTS` on every supported platform — the
+/// same level as its credential cmsg.
+///
+/// This is the single cross-platform reclamation point invoked once per
+/// datagram by `recv::recv_authenticated`, ahead of every success / truncated
+/// / short-read return path.
+///
+/// # Notes
+///
+/// Soundness relies on `mhdr` having been populated by `recvmsg(2)` (or an
+/// equivalent fabricator) — the same contract as [`find_credential`].
+pub(super) fn reclaim_scm_rights<P: CmsgPlatform>(
+    mhdr: &P::Msghdr,
+    scm_rights_type: i32,
+    mut close_fd: impl FnMut(i32),
+) {
+    // SAFETY: documented by this function's contract — callers commit that
+    // `mhdr` was populated by `recvmsg(2)` (or an equivalent fabricator).
+    let iter = unsafe { CmsgIter::<P>::new(mhdr) };
+    for (hdr, data_ptr) in iter {
+        if P::cmsg_level(hdr) != P::TARGET_LEVEL || P::cmsg_type(hdr) != scm_rights_type {
+            continue;
+        }
+        let payload_len = P::cmsg_len(hdr).saturating_sub(P::cmsg_hdr_size());
+        let fd_count = payload_len / core::mem::size_of::<i32>();
+        for i in 0..fd_count {
+            // SAFETY: the iterator proved the whole cmsg (header + `payload_len`
+            // bytes) lies inside the kernel-supplied ancillary buffer, so the
+            // i32 at byte offset `i * 4` is in bounds. `read_unaligned` because
+            // the cmsg payload ABI only promises byte validity.
+            let fd = unsafe {
+                data_ptr
+                    .add(i * core::mem::size_of::<i32>())
+                    .cast::<i32>()
+                    .read_unaligned()
+            };
+            if fd >= 0 {
+                close_fd(fd);
+            }
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Miri-compatible tests
 // ---------------------------------------------------------------------------
@@ -801,5 +860,166 @@ mod miri_cmsg_tests {
         // hang otherwise).
         let result = plat::peer_pid_after_recv(0, &mhdr);
         assert!(result.is_none());
+    }
+
+    /// Write one `SCM_RIGHTS` cmsg (Linux shape: usize `cmsg_len`) carrying
+    /// `fds`. Returns CMSG_SPACE for the message.
+    fn write_scm_rights_linux(buf: &mut [u8], offset: usize, fds: &[i32]) -> usize {
+        let hdr_size = cmsg_hdr_size();
+        let payload = mem::size_of_val(fds);
+        let cmsg_len = hdr_size + payload;
+        let total = cmsg_align(cmsg_len);
+        let slice = &mut buf[offset..offset + total];
+        slice.fill(0);
+        slice[..mem::size_of::<usize>()].copy_from_slice(&cmsg_len.to_ne_bytes());
+        slice[mem::size_of::<usize>()..mem::size_of::<usize>() + 4]
+            .copy_from_slice(&plat::SOL_SOCKET.to_ne_bytes());
+        slice[mem::size_of::<usize>() + 4..mem::size_of::<usize>() + 8]
+            .copy_from_slice(&plat::SCM_RIGHTS.to_ne_bytes());
+        for (i, fd) in fds.iter().enumerate() {
+            let off = hdr_size + i * mem::size_of::<i32>();
+            slice[off..off + 4].copy_from_slice(&fd.to_ne_bytes());
+        }
+        total
+    }
+
+    /// `reclaim_scm_rights` hands every fd in an `SCM_RIGHTS` cmsg to the
+    /// closure — including multiple fds in one cmsg — and ignores a
+    /// co-resident credential cmsg (the fd-exhaustion DoS regression).
+    #[test]
+    fn reclaim_scm_rights_collects_every_passed_fd() {
+        let mut abuf = AlignedBuf([0u8; 512]);
+        // First: a credential cmsg the reclaimer must skip.
+        write_scm_credentials(&mut abuf.0, 0, 1234, 1000, 100);
+        let cred_space = cmsg_space_ucred();
+        // Then: an SCM_RIGHTS cmsg with three fds.
+        let rights_space = write_scm_rights_linux(&mut abuf.0, cred_space, &[7, 8, 9]);
+        let controllen = cred_space + rights_space;
+        let mhdr = make_mhdr(&abuf.0, controllen);
+
+        let mut closed = Vec::new();
+        reclaim_scm_rights::<plat::LinuxCmsg>(&mhdr, plat::SCM_RIGHTS, |fd| closed.push(fd));
+        assert_eq!(closed, vec![7, 8, 9], "every passed fd must be reclaimed");
+    }
+
+    /// A datagram with only a credential cmsg (no `SCM_RIGHTS`) closes nothing.
+    #[test]
+    fn reclaim_scm_rights_ignores_credential_only() {
+        let mut abuf = AlignedBuf([0u8; 512]);
+        write_scm_credentials(&mut abuf.0, 0, 1234, 1000, 100);
+        let mhdr = make_mhdr(&abuf.0, cmsg_space_ucred());
+
+        let mut closed = Vec::new();
+        reclaim_scm_rights::<plat::LinuxCmsg>(&mhdr, plat::SCM_RIGHTS, |fd| closed.push(fd));
+        assert!(
+            closed.is_empty(),
+            "no SCM_RIGHTS present — nothing to close"
+        );
+    }
+
+    /// Negative fd sentinels in an `SCM_RIGHTS` payload must be skipped, never
+    /// passed to `close(2)`.
+    #[test]
+    fn reclaim_scm_rights_skips_negative_fds() {
+        let mut abuf = AlignedBuf([0u8; 512]);
+        let space = write_scm_rights_linux(&mut abuf.0, 0, &[-1, 5, -1, 6]);
+        let mhdr = make_mhdr(&abuf.0, space);
+
+        let mut closed = Vec::new();
+        reclaim_scm_rights::<plat::LinuxCmsg>(&mhdr, plat::SCM_RIGHTS, |fd| closed.push(fd));
+        assert_eq!(closed, vec![5, 6], "negative fd sentinels must be skipped");
+    }
+
+    /// Drives `reclaim_scm_rights` through the BSD-family arm (u32 `cmsg_len`,
+    /// `SOL_SOCKET = 0xffff`) on the Linux test host, proving the pointer
+    /// arithmetic is provenance-clean for the BSD-shaped layout. The BSD
+    /// `recv_authenticated` path has no CI host; this is its only coverage.
+    #[test]
+    fn reclaim_scm_rights_bsd_shape() {
+        use super::super::platform::bsd::{BsdCmsg, Msghdr};
+
+        let hdr_size = <BsdCmsg as CmsgPlatform>::cmsg_hdr_size();
+        let fds: [i32; 2] = [11, 12];
+        let payload = mem::size_of_val(&fds);
+        // CMSG_LEN: aligned header + payload (data starts at the aligned
+        // offset `hdr_size`), matching the walker's payload-length arithmetic.
+        let cmsg_len = hdr_size + payload;
+        let total = cmsg_align(cmsg_len);
+
+        #[repr(align(8))]
+        struct AlignedBuf([u8; 128]);
+        let mut buf_wrapper = AlignedBuf([0u8; 128]);
+        let buf = &mut buf_wrapper.0[..total];
+
+        buf[0..4].copy_from_slice(&(cmsg_len as u32).to_ne_bytes());
+        let sol_socket: i32 = 0xffff;
+        let scm_rights: i32 = 0x01;
+        buf[4..8].copy_from_slice(&sol_socket.to_ne_bytes());
+        buf[8..12].copy_from_slice(&scm_rights.to_ne_bytes());
+        for (i, fd) in fds.iter().enumerate() {
+            let off = hdr_size + i * mem::size_of::<i32>();
+            buf[off..off + 4].copy_from_slice(&fd.to_ne_bytes());
+        }
+
+        let mhdr = Msghdr {
+            msg_name: core::ptr::null_mut(),
+            msg_namelen: 0,
+            _pad1: 0,
+            msg_iov: core::ptr::null_mut(),
+            msg_iovlen: 0,
+            _pad2: 0,
+            msg_control: buf.as_mut_ptr() as *mut _,
+            msg_controllen: total as u32,
+            msg_flags: 0,
+        };
+
+        let mut closed = Vec::new();
+        reclaim_scm_rights::<BsdCmsg>(&mhdr, scm_rights, |fd| closed.push(fd));
+        assert_eq!(closed, vec![11, 12]);
+    }
+
+    /// Drives `reclaim_scm_rights` through the illumos/Solaris arm
+    /// (`SCM_RIGHTS = 0x1010`, distinct from `SCM_UCRED = 0x1012`) on the Linux
+    /// test host — the illumos `recv_authenticated` path has no CI host.
+    #[test]
+    fn reclaim_scm_rights_illumos_shape() {
+        use super::super::platform::illumos::{IllumosCmsg, Msghdr};
+
+        let hdr_size = <IllumosCmsg as CmsgPlatform>::cmsg_hdr_size();
+        let fds: [i32; 1] = [21];
+        let payload = mem::size_of_val(&fds);
+        // CMSG_LEN: aligned header + payload (data starts at the aligned
+        // offset `hdr_size`), matching the walker's payload-length arithmetic.
+        let cmsg_len = hdr_size + payload;
+        let total = cmsg_align(cmsg_len);
+
+        #[repr(align(8))]
+        struct AlignedBuf([u8; 128]);
+        let mut buf_wrapper = AlignedBuf([0u8; 128]);
+        let buf = &mut buf_wrapper.0[..total];
+
+        buf[0..4].copy_from_slice(&(cmsg_len as u32).to_ne_bytes());
+        let sol_socket: i32 = 0xffff;
+        let scm_rights: i32 = 0x1010;
+        buf[4..8].copy_from_slice(&sol_socket.to_ne_bytes());
+        buf[8..12].copy_from_slice(&scm_rights.to_ne_bytes());
+        let off = hdr_size;
+        buf[off..off + 4].copy_from_slice(&fds[0].to_ne_bytes());
+
+        let mhdr = Msghdr {
+            msg_name: core::ptr::null_mut(),
+            msg_namelen: 0,
+            _pad1: 0,
+            msg_iov: core::ptr::null_mut(),
+            msg_iovlen: 0,
+            _pad2: 0,
+            msg_control: buf.as_mut_ptr() as *mut _,
+            msg_controllen: total as u32,
+            msg_flags: 0,
+        };
+
+        let mut closed = Vec::new();
+        reclaim_scm_rights::<IllumosCmsg>(&mhdr, scm_rights, |fd| closed.push(fd));
+        assert_eq!(closed, vec![21]);
     }
 }
