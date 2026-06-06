@@ -187,8 +187,28 @@ impl<K: Copy + Eq + Hash32> BoundedIndex<K> {
             i = (i + 1) & self.mask;
         }
         // Probe budget exhausted without finding an EMPTY slot or the key.
-        // If we passed a tombstone we could reuse it, but that would
-        // exceed the WCET budget callers signed up for — fall through.
+        // If the window held a tombstone, reclaim it: the slot was already
+        // visited inside the `MAX_PROBE` budget, so reusing it adds no probing
+        // work and the WCET bound is unchanged — exactly the reuse the EMPTY
+        // arm above performs via `first_tombstone.unwrap_or(i)`. Without this,
+        // a window that fills with live + tombstone entries (no EMPTY) refuses
+        // the insert *forever*, even though `occupied` is far below capacity:
+        // under ordinary key churn the EMPTY pool drains monotonically until
+        // some chain saturates, after which every key hashing into it is
+        // silently and permanently denied admission — and, for the tracker
+        // index, denied stall detection and recovery — while `len()` still
+        // reports free space.
+        if let Some(t) = first_tombstone {
+            if let Some(slot) = self.table.get_mut(t) {
+                slot.key.write(key);
+                slot.slot_idx = slot_idx as u32;
+                // `remove()` decremented `occupied` when it created the
+                // tombstone; re-incrementing restores the live count.
+                self.occupied = self.occupied.saturating_add(1);
+                return Ok(());
+            }
+        }
+        // No reusable tombstone in the window: genuine capacity exhaustion.
         self.probe_exhausted = self.probe_exhausted.saturating_add(1);
         Err(ProbeExhausted)
     }
@@ -537,5 +557,86 @@ mod tests {
         let h3 = SocketAddr::V6(SocketAddrV6::new(ip6, 1, 0, 0)).hash32();
         let h4 = SocketAddr::V6(SocketAddrV6::new(ip6, 2, 0, 0)).hash32();
         assert_ne!(h3, h4);
+    }
+
+    #[test]
+    fn insert_reuses_tombstone_when_window_has_no_empty_slot() {
+        // Regression (silent recovery-denial): a probe window with no EMPTY
+        // slot but a reusable TOMBSTONE must admit a new key by reclaiming the
+        // tombstone, not return `ProbeExhausted`. A size-2 table makes the
+        // window exhaustive — after one removal it holds exactly
+        // {live, tombstone} and zero EMPTY, so every probe of a new key cycles
+        // those two slots for the full `MAX_PROBE` budget without ever seeing
+        // EMPTY. Before the fix this returned `ProbeExhausted` forever even
+        // though one slot was a reclaimable tombstone and `len()` reported free
+        // capacity.
+        let mut t: BoundedIndex<u32> = BoundedIndex::new(1); // table size 2
+        t.insert(10, 0).unwrap();
+        t.insert(20, 1).unwrap();
+        assert_eq!(t.len(), 2, "both physical slots live");
+
+        // Remove one -> one tombstone, one live, ZERO empty slots.
+        assert_eq!(t.remove(10), Some(0));
+        assert_eq!(t.len(), 1);
+        let _ = t.take_probe_exhausted();
+
+        // A new key now probes a full {live, tombstone} window. It must reuse
+        // the tombstone (Ok), be findable, restore occupancy, and NOT be
+        // counted as a probe exhaustion.
+        assert_eq!(t.insert(30, 7), Ok(()));
+        assert_eq!(
+            t.get(30),
+            Some(7),
+            "reclaimed-tombstone key must be findable"
+        );
+        assert_eq!(t.len(), 2, "occupancy restored to two live entries");
+        assert_eq!(t.get(20), Some(1), "the untouched live entry survives");
+        assert_eq!(t.get(10), None, "the removed key stays absent");
+        assert_eq!(
+            t.take_probe_exhausted(),
+            0,
+            "tombstone reuse is not a capacity exhaustion"
+        );
+    }
+
+    #[test]
+    fn insert_still_refuses_when_window_is_all_live() {
+        // Negative control: the tombstone-reuse fix must NOT mask genuine
+        // capacity exhaustion. When every probed slot is LIVE (no tombstone to
+        // reclaim), insert must still return `ProbeExhausted` and count it.
+        let mut t: BoundedIndex<u32> = BoundedIndex::new(1); // table size 2
+        t.insert(10, 0).unwrap();
+        t.insert(20, 1).unwrap();
+        assert_eq!(t.len(), 2, "both slots live: no tombstone, no empty");
+        let _ = t.take_probe_exhausted();
+
+        assert_eq!(t.insert(30, 7), Err(ProbeExhausted));
+        assert_eq!(t.take_probe_exhausted(), 1, "real exhaustion is observable");
+        assert_eq!(t.get(30), None);
+        assert_eq!(t.len(), 2, "table state unchanged on a genuine refusal");
+    }
+
+    #[test]
+    fn sustained_churn_never_permanently_wedges_admission() {
+        // The real-world trigger: a long-running observer under ordinary agent
+        // churn. Distinct keys enter and leave; each removal leaves a
+        // tombstone. Without tombstone reclamation on the probe-budget path,
+        // the EMPTY pool drains monotonically until some probe window is
+        // entirely live+tombstone, after which every new key hashing there is
+        // refused forever while `len()` still reports the table almost empty —
+        // silently denying tracking (and, for the tracker index, stall
+        // detection and recovery) to a genuinely-new agent. Cycling far more
+        // distinct keys than the table holds must never wedge admission.
+        let mut t: BoundedIndex<u32> = BoundedIndex::new(8); // table size 16
+        for k in 0..50_000u32 {
+            t.insert(k, k as usize)
+                .expect("admission must never permanently wedge under churn");
+            assert_eq!(t.get(k), Some(k as usize));
+            t.remove(k);
+        }
+        assert!(t.len() <= 1, "at most the in-flight key is live");
+        // A fresh key is still admittable after heavy churn.
+        t.insert(123_456, 1).expect("fresh insert after churn");
+        assert_eq!(t.get(123_456), Some(1));
     }
 }
