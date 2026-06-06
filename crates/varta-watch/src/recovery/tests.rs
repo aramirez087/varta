@@ -1165,3 +1165,54 @@ fn try_reap_truncation_counter_increments_and_resets() {
     assert_eq!(rec.take_reap_truncated(), 1, "one truncated tick");
     assert_eq!(rec.take_reap_truncated(), 0, "counter reset after drain");
 }
+
+/// Per-tick boundedness regression for the orphan reaper (sibling of
+/// `try_reap_caps_and_cursor_advances` for the outstanding table). The orphan
+/// drain was the one remaining unbounded per-tick loop after bug-350/353: a
+/// recycle-churn storm pushes reclaimed children onto `reaping_orphans` faster
+/// than killed stale children become reapable, and a full-vector walk per tick
+/// could overrun `STAGE_ABORT_NS[RecoveryReap]` → `process::abort()` of a
+/// healthy observer (host reboot under `--hw-watchdog`). The fix caps the drain
+/// at `reap_max` `try_wait(2)` calls per tick with a rotating cursor.
+///
+/// Discriminator: 5 already-exited orphans with `reap_max == 2`. The bounded
+/// drain removes at most 2 on the first tick (≥3 remain); the pre-fix unbounded
+/// loop clears all 5 in a single tick (negative control: reverting the bound
+/// fails the `>= 3` assertion). The rotating cursor still drains every orphan
+/// within `ceil(5/2) == 3` ticks (no reap starvation).
+#[test]
+#[cfg_attr(miri, ignore)]
+fn drain_orphan_reaps_is_bounded_per_tick() {
+    let mut rec = Recovery::new_exec("true".to_string(), vec![], Duration::ZERO);
+    for pid in 1u32..=5 {
+        rec.push_orphan_for_test(pid, "true", &[]);
+    }
+    rec.shrink_reap_max_for_test(2);
+    // Let the `true` children exit so every `try_wait` returns Ok(Some(_)) — the
+    // worst case for an unbounded loop, which would reap all 5 at once.
+    std::thread::sleep(Duration::from_millis(100));
+
+    let _ = rec.try_reap(0);
+    assert!(
+        rec.reaping_orphans.len() >= 3,
+        "bounded orphan drain must remove at most reap_max (2) per tick; an \
+         unbounded drain clears all 5 in one tick — {} left",
+        rec.reaping_orphans.len()
+    );
+
+    // Subsequent ticks drain the remainder; the rotating cursor prevents
+    // starvation, so all 5 are reaped within ceil(5/2) == 3 ticks total.
+    let mut ticks = 1;
+    while !rec.reaping_orphans.is_empty() && ticks < 10 {
+        let _ = rec.try_reap(0);
+        ticks += 1;
+    }
+    assert!(
+        rec.reaping_orphans.is_empty(),
+        "every orphan must eventually be reaped (no leak)"
+    );
+    assert!(
+        ticks <= 3,
+        "5 orphans with reap_max=2 drain within 3 ticks; took {ticks}"
+    );
+}

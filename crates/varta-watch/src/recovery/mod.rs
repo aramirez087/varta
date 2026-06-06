@@ -230,6 +230,12 @@ pub struct Recovery {
     /// occupant can be recovered immediately; they are reaped non-blockingly
     /// here across later ticks (mirrors the timeout-kill → later-reap split).
     pub(in crate::recovery) reaping_orphans: Vec<(u32, Outstanding)>,
+    /// Rotating index into `reaping_orphans`, the orphan-side analogue of
+    /// `reap_cursor`. Caps the per-tick `try_wait(2)` budget for the orphan
+    /// reaper at [`REAP_MAX_PER_TICK`] so a large reclaimed-orphan fan cannot
+    /// blow the `RecoveryReap` stage budget; the cursor guarantees every orphan
+    /// is eventually examined (no reap starvation under churn).
+    pub(in crate::recovery) orphan_reap_cursor: usize,
     /// Count of outstanding slots reclaimed because a slot's pinned generation
     /// proved its PID had been recycled to a new process while the previous
     /// lineage's recovery child was still in flight. Surfaced as
@@ -287,6 +293,7 @@ impl Recovery {
             reap_truncated_total: 0,
             reap_max: REAP_MAX_PER_TICK,
             reaping_orphans: Vec::new(),
+            orphan_reap_cursor: 0,
             outstanding_recycle_resets: 0,
         }
     }
@@ -409,6 +416,35 @@ impl Recovery {
     #[cfg(test)]
     pub(crate) fn shrink_reap_max_for_test(&mut self, max: usize) {
         self.reap_max = max.max(1);
+    }
+
+    /// Test-only: push a real reclaimed orphan onto [`Self::reaping_orphans`]
+    /// without the full recycle dance, so the per-tick orphan-drain bound can be
+    /// exercised cheaply. `program`/`args` choose whether the child exits
+    /// immediately (`true`) or stays running (`sleep 30`).
+    #[cfg(test)]
+    pub(crate) fn push_orphan_for_test(&mut self, pid: u32, program: &str, args: &[&str]) {
+        let child = std::process::Command::new(program)
+            .args(args)
+            .spawn()
+            .expect("spawn test orphan child");
+        self.reaping_orphans.push((
+            pid,
+            runner::Outstanding {
+                child,
+                spawned_at: Instant::now(),
+                killed: true,
+                generation: None,
+                wallclock_at_spawn_ms: 0,
+                stdout_handle: None,
+                stderr_handle: None,
+                stdout_len: 0,
+                stderr_len: 0,
+                truncated: false,
+                completed_status: None,
+                completed_at: None,
+            },
+        ));
     }
 
     /// Attach a recovery audit sink.
@@ -731,18 +767,42 @@ impl Recovery {
     /// recycled PID slots. Emits each one's terminal `complete` audit row on
     /// exit (mirroring [`Self::reap_finished_child`]) and drops it; still-running
     /// orphans are retained for a later tick. Runs every [`Self::try_reap`].
+    ///
+    /// Bounded to [`Self::reap_max`] `try_wait(2)` calls per tick (the orphan-side
+    /// analogue of the outstanding-table reap budget): `reclaim_recycled_outstanding`
+    /// can push orphans onto this list faster than killed children become reapable
+    /// (a stale child wedged in uninterruptible sleep ignores `SIGKILL` until its
+    /// syscall returns), so an unbounded full-vector walk here is the one remaining
+    /// per-tick loop that could overrun `STAGE_ABORT_NS[RecoveryReap]` and
+    /// `process::abort()` a healthy observer (a host reboot under `--hw-watchdog`)
+    /// at the exact moment a PID-recycle churn storm is in progress. The rotating
+    /// [`Self::orphan_reap_cursor`] guarantees every orphan is eventually examined,
+    /// so the bound staggers rather than starves reaping.
     fn drain_orphan_reaps(&mut self, observer_ns: u64) {
-        let mut i = 0;
-        while i < self.reaping_orphans.len() {
-            // Non-blocking: Ok(None) means still running — keep for a later tick.
+        let mut visited = 0;
+        while visited < self.reap_max {
+            let len = self.reaping_orphans.len();
+            if len == 0 {
+                break;
+            }
+            if self.orphan_reap_cursor >= len {
+                self.orphan_reap_cursor = 0;
+            }
+            let i = self.orphan_reap_cursor;
+            visited += 1;
+            // Non-blocking: Ok(None) means still running — advance past it and
+            // keep it for a later tick.
             let exit_status = match self.reaping_orphans[i].1.child.try_wait() {
                 Ok(None) => {
-                    i += 1;
+                    self.orphan_reap_cursor += 1;
                     continue;
                 }
                 Ok(Some(status)) => Some(status),
                 Err(_) => None,
             };
+            // `swap_remove` moves the tail entry into slot `i`; leave the cursor
+            // on `i` so that swapped-in entry is examined next (it wraps to 0 via
+            // the `>= len` guard when `i` was the final slot).
             let (orphan_pid, entry) = self.reaping_orphans.swap_remove(i);
             let child_pid = entry.child.id();
             self.emit_complete_audit(
