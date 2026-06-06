@@ -34,7 +34,7 @@ use varta_watch::PromExporter;
 use varta_watch::{
     varta_error, varta_error_err, varta_error_pid, varta_error_rl, varta_info_pid,
     varta_info_pid_child, varta_warn, varta_warn_child, varta_warn_rl, Config, ConfigError, Event,
-    Exporter, FileExporter, Observer, Recovery, RecoveryOutcome,
+    Exporter, FileExporter, Observer, Recovery, RecoveryOutcome, StallFreshness,
 };
 
 /// Shutdown latch flipped by [`handle_shutdown`] on SIGINT/SIGTERM
@@ -949,25 +949,48 @@ fn run(cfg: Config) -> std::io::Result<()> {
                     // sat queued across ticks: a mass simultaneous stall
                     // queues more events than RECOVERY_SPAWN_MAX_PER_TICK can
                     // fire in one DrainPending stage, deferring the remainder.
-                    // If the agent resumed beating in that window its tracker
-                    // slot cleared `stall_emitted`; firing the stale stall now
-                    // would kill/restart a healthy process. Skip — O(1), and
-                    // it consumes no spawn budget (no fork). See
-                    // observer::stall_recovery_warranted.
-                    if !observer.stall_recovery_warranted(*pid) {
-                        #[cfg(feature = "prometheus-exporter")]
-                        if let Some(pe) = prom_export.as_mut() {
-                            pe.record_recovery_outcome(
-                                &RecoveryOutcome::SkippedAgentResumed { pid: *pid },
-                                None,
+                    // Two things can invalidate a queued stall inside that
+                    // window — the agent resuming beating (slot clears
+                    // `stall_emitted`), or the OS recycling the stalled PID to
+                    // a different process (slot stays latched but its pinned
+                    // start-time generation no longer matches the live process,
+                    // mirroring drain_stalled_slots' enqueue-time check). Firing
+                    // in either case would kill/restart an innocent process.
+                    // Skip — O(1) plus at most one /proc start-time read on the
+                    // cold fire path, and it consumes no spawn budget (no fork).
+                    // See observer::stall_freshness.
+                    match observer.stall_freshness(*pid, *generation) {
+                        StallFreshness::Warranted => {}
+                        StallFreshness::AgentResumed => {
+                            #[cfg(feature = "prometheus-exporter")]
+                            if let Some(pe) = prom_export.as_mut() {
+                                pe.record_recovery_outcome(
+                                    &RecoveryOutcome::SkippedAgentResumed { pid: *pid },
+                                    None,
+                                );
+                            }
+                            varta_info_pid!(
+                                *pid,
+                                "recovery for pid {pid} SKIPPED: agent resumed \
+                                 beating before its deferred stall fired"
                             );
+                            continue;
                         }
-                        varta_info_pid!(
-                            *pid,
-                            "recovery for pid {pid} SKIPPED: agent resumed \
-                             beating before its deferred stall fired"
-                        );
-                        continue;
+                        StallFreshness::PidRecycled => {
+                            #[cfg(feature = "prometheus-exporter")]
+                            if let Some(pe) = prom_export.as_mut() {
+                                pe.record_recovery_outcome(
+                                    &RecoveryOutcome::SkippedPidRecycled { pid: *pid },
+                                    None,
+                                );
+                            }
+                            varta_info_pid!(
+                                *pid,
+                                "recovery for pid {pid} SKIPPED: PID recycled to a \
+                                 different process before its deferred stall fired"
+                            );
+                            continue;
+                        }
                     }
                     // Cross-namespace agent: the slot's pinned PID-namespace
                     // inode differs from the observer's. Linux-only signal;
@@ -1091,11 +1114,12 @@ fn run(cfg: Config) -> std::io::Result<()> {
                         | RecoveryOutcome::ReapFailed(_) => {
                             unreachable!("on_stall returned a reap-only recovery outcome")
                         }
-                        RecoveryOutcome::SkippedAgentResumed { .. } => {
+                        RecoveryOutcome::SkippedAgentResumed { .. }
+                        | RecoveryOutcome::SkippedPidRecycled { .. } => {
                             // Synthesized only by the freshness re-check above,
                             // which `continue`s before reaching this match;
-                            // on_stall never returns it.
-                            unreachable!("on_stall returned SkippedAgentResumed")
+                            // on_stall never returns them.
+                            unreachable!("on_stall returned a deferred-skip outcome")
                         }
                     }
 

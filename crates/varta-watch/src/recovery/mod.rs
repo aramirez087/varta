@@ -192,6 +192,21 @@ pub enum RecoveryOutcome {
         /// Agent pid whose deferred stall was skipped after it resumed beating.
         pid: u32,
     },
+    /// Recovery was skipped because the stalled PID was recycled to a
+    /// *different* process before its deferred stall fired. As with
+    /// [`Self::SkippedAgentResumed`], a mass simultaneous stall defers events
+    /// across ticks; if the OS recycles a stalled agent's PID inside that
+    /// window and the new occupant has not beaten, the tracker slot stays
+    /// silence-latched but its pinned start-time generation no longer matches
+    /// the live process. Firing the `{pid}`-substituted `kill(2)`/restart now
+    /// would target an innocent bystander. This is a safety skip — synthesized
+    /// by the observer's freshness re-check (never returned by
+    /// [`Recovery::on_stall`]) and counted in Prometheus as
+    /// `varta_recovery_outcomes_total{outcome="skipped_pid_recycled"}`.
+    SkippedPidRecycled {
+        /// Agent pid whose deferred stall was skipped after PID recycle.
+        pid: u32,
+    },
 }
 
 impl RecoveryOutcome {

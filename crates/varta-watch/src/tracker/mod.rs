@@ -287,6 +287,33 @@ pub enum Update {
     NamespaceConflict,
 }
 
+/// Verdict from the deferred-stall fire-time freshness re-check.
+///
+/// A stall queued by `drain_stalled_slots` may sit on the recovery queue
+/// across several ticks: a mass simultaneous stall enqueues more events than
+/// `RECOVERY_SPAWN_MAX_PER_TICK` can fire in one `DrainPending` stage, so the
+/// remainder is deferred. The observer re-checks each stall at fire time —
+/// *both* failure modes below mean "do not fire", but they are operationally
+/// distinct and counted under separate metrics.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StallFreshness {
+    /// The slot is present, used, still silence-latched, and the PID still
+    /// names the same process. Fire recovery.
+    Warranted,
+    /// The agent resumed beating (any accepted beat clears `stall_emitted`) or
+    /// the slot was evicted/retired since the stall was queued. A benign
+    /// self-heal — firing now would kill/restart a process that recovered
+    /// inside the deferral window.
+    AgentResumed,
+    /// The PID was recycled to a *different* process inside the deferral
+    /// window. The new occupant never beat (else `stall_emitted` would have
+    /// cleared), so the slot is still silence-latched yet its pinned start-time
+    /// generation no longer matches the live process — the numeric PID now
+    /// names an innocent bystander. Firing recovery's `{pid}`-substituted
+    /// `kill(2)`/`systemctl restart` would target it.
+    PidRecycled,
+}
+
 /// Bounded per-pid liveness ledger.
 ///
 /// The slot table is a `Vec<Slot>` pre-allocated at construction to the
@@ -891,27 +918,52 @@ impl Tracker {
         self.len == 0
     }
 
-    /// True iff a stall already emitted for `pid` is still warranted — the
-    /// slot is present, used, and remains silence-latched (`stall_emitted`).
+    /// Re-validate a deferred stall immediately before recovery fires.
     ///
-    /// Returns `false` when the agent resumed beating (any accepted beat
-    /// clears `stall_emitted`) or the slot was evicted/retired since the
-    /// stall was queued. The observer calls this immediately before firing
-    /// recovery so a stall deferred across ticks by the per-tick spawn budget
-    /// cannot kill an agent that recovered inside the deferral window.
+    /// Returns [`StallFreshness::Warranted`] only while the slot stays present,
+    /// used, and silence-latched (`stall_emitted`) AND — for a kernel-attested
+    /// slot with a pinned start-time `generation` — the live process still
+    /// matches that generation. This is the fire-time mirror of the recycle
+    /// check `drain_stalled_slots` already runs at *enqueue* time: a PID
+    /// recycle that lands inside the spawn-budget deferral window leaves the
+    /// stall-latched slot untouched (the new occupant never beat), so without
+    /// this re-check `on_stall` would fire `{pid}` recovery against the
+    /// innocent recycled process.
     ///
-    /// Within one deferral batch a slot can only transition
-    /// `stall_emitted` true → false (a heal): `drain_stalled_slots` re-emits
-    /// only once the whole queue is consumed, which cannot happen while the
-    /// batch is still draining. So this single flag is an unambiguous
-    /// freshness signal.
-    pub fn stall_recovery_warranted(&self, pid: u32) -> bool {
-        self.pid_to_index
+    /// `generation` is the token carried on the queued `Event::Stall`; pass
+    /// `None` for non-kernel-attested / non-Linux slots, which skips the
+    /// recycle check and degrades to the silence-latch test alone.
+    pub fn stall_freshness(&self, pid: u32, generation: Option<u64>) -> StallFreshness {
+        self.stall_freshness_with_recycle_check(pid, generation, |pid, pinned_generation| {
+            matches!(
+                crate::peer_cred::read_pid_start_time(pid),
+                Some(current_generation) if current_generation != pinned_generation
+            )
+        })
+    }
+
+    fn stall_freshness_with_recycle_check(
+        &self,
+        pid: u32,
+        generation: Option<u64>,
+        mut generation_recycled: impl FnMut(u32, u64) -> bool,
+    ) -> StallFreshness {
+        let still_latched = self
+            .pid_to_index
             .get(pid)
             .and_then(|idx| self.entries.get(idx))
             .filter(|s| s.used)
             .map(|s| s.stall_emitted)
-            .unwrap_or(false)
+            .unwrap_or(false);
+        if !still_latched {
+            return StallFreshness::AgentResumed;
+        }
+        if let Some(pinned_generation) = generation {
+            if generation_recycled(pid, pinned_generation) {
+                return StallFreshness::PidRecycled;
+            }
+        }
+        StallFreshness::Warranted
     }
 
     /// Find newly-stalled slots and mark them emitted in one atomic pass.

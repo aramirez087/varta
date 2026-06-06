@@ -20,7 +20,7 @@ use varta_vlp::{DecodeError, Frame, Status, NONCE_TERMINAL};
 use crate::clock::{Clock, ClockSource};
 use crate::listener::{BeatListener, PreThreadAttestation, UdsListener};
 use crate::peer_cred::{BeatOrigin, RecvResult};
-use crate::tracker::{EvictionPolicy, Tracker, Update};
+use crate::tracker::{EvictionPolicy, StallFreshness, Tracker, Update};
 
 /// Reason a beat was dropped by the rate limiter.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -759,14 +759,16 @@ impl Observer {
         self.stall_cursor < self.stall_queue.len()
     }
 
-    /// True iff the queued stall for `pid` is still warranted — its tracker
-    /// slot remains silence-latched and no fresh beat has cleared it since the
-    /// stall was enqueued. The main loop calls this immediately before firing
-    /// recovery so a stall deferred across ticks by the per-tick spawn budget
-    /// (a mass simultaneous stall exceeding `RECOVERY_SPAWN_MAX_PER_TICK`)
-    /// cannot kill an agent that resumed beating inside the deferral window.
-    pub fn stall_recovery_warranted(&self, pid: u32) -> bool {
-        self.tracker.stall_recovery_warranted(pid)
+    /// Re-validate the queued stall for `pid` immediately before recovery
+    /// fires. A stall deferred across ticks by the per-tick spawn budget (a
+    /// mass simultaneous stall exceeding `RECOVERY_SPAWN_MAX_PER_TICK`) must
+    /// not fire if, inside the deferral window, the agent resumed beating
+    /// ([`StallFreshness::AgentResumed`]) or its PID was recycled to a
+    /// different process ([`StallFreshness::PidRecycled`]) — either would
+    /// kill/restart an innocent process. `generation` is the start-time token
+    /// carried on the queued `Event::Stall`.
+    pub fn stall_freshness(&self, pid: u32, generation: Option<u64>) -> StallFreshness {
+        self.tracker.stall_freshness(pid, generation)
     }
 
     /// Whether the most recent [`Observer::poll`] dequeued at least one

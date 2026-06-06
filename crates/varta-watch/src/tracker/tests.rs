@@ -1,5 +1,7 @@
 use super::pid_index::{PidIndex, ProbeExhausted};
-use super::{EvictionPolicy, Tracker, Update, DEFAULT_EVICTION_SCAN_WINDOW, MAX_CAPACITY};
+use super::{
+    EvictionPolicy, StallFreshness, Tracker, Update, DEFAULT_EVICTION_SCAN_WINDOW, MAX_CAPACITY,
+};
 use crate::peer_cred::BeatOrigin;
 use varta_vlp::{Frame, Status, NONCE_TERMINAL};
 
@@ -100,19 +102,20 @@ fn stall_recovery_warranted_tracks_resumed_beat() {
     let threshold_ns = 100;
 
     // Untracked pid: nothing to recover.
-    assert!(!t.stall_recovery_warranted(1));
+    assert_eq!(t.stall_freshness(1, None), StallFreshness::AgentResumed);
 
     // Tracked but not yet stalled: no stall has been emitted.
     assert_eq!(
         t.record(&frame(1, 1), 0, threshold_ns, ORIGIN, None),
         Update::Inserted
     );
-    assert!(!t.stall_recovery_warranted(1));
+    assert_eq!(t.stall_freshness(1, None), StallFreshness::AgentResumed);
 
     // Silence crosses the threshold and the stall is emitted (queued).
     t.drain_stalled_slots(threshold_ns * 2, threshold_ns, |_, _, _, _, _, _| {});
-    assert!(
-        t.stall_recovery_warranted(1),
+    assert_eq!(
+        t.stall_freshness(1, None),
+        StallFreshness::Warranted,
         "a freshly-emitted, still-silent stall must remain warranted"
     );
 
@@ -122,9 +125,54 @@ fn stall_recovery_warranted_tracks_resumed_beat() {
         t.record(&frame(1, 2), threshold_ns * 3, threshold_ns, ORIGIN, None),
         Update::Refreshed
     );
-    assert!(
-        !t.stall_recovery_warranted(1),
+    assert_eq!(
+        t.stall_freshness(1, None),
+        StallFreshness::AgentResumed,
         "a resumed beat must withdraw the recovery warrant"
+    );
+}
+
+/// The fire-time freshness re-check must also catch a PID *recycle* inside the
+/// deferral window: the stalled agent died, the OS reissued its PID to an
+/// unrelated process that never beat, so the slot stays silence-latched
+/// (`stall_emitted == true`) yet the live start-time generation no longer
+/// matches the slot's pinned token. Without this, the deferred stall would fire
+/// `kill(2)`/restart against the innocent recycled process. The recycle check
+/// is exercised through the injectable seam (mirroring `drain_stalled_slots`)
+/// so the verdict is deterministic without depending on real `/proc` state.
+#[test]
+fn stall_freshness_detects_pid_recycle_in_deferral_window() {
+    let mut t = Tracker::new(4, EvictionPolicy::Strict, DEFAULT_EVICTION_SCAN_WINDOW);
+    let threshold_ns = 100;
+
+    // Track pid 1 with a pinned start-time generation, then let it stall.
+    assert_eq!(
+        t.record_with_generation(&frame(1, 1), 0, threshold_ns, ORIGIN, None, Some(42)),
+        Update::Inserted
+    );
+    t.drain_stalled_slots(threshold_ns * 2, threshold_ns, |_, _, _, _, _, _| {});
+
+    // Still silence-latched and the PID still names the same process → fire.
+    assert_eq!(
+        t.stall_freshness_with_recycle_check(1, Some(42), |_, _| false),
+        StallFreshness::Warranted,
+        "a matching generation must keep the warrant"
+    );
+
+    // PID recycled to a different process (the injected check reports a
+    // generation mismatch) → recovery must NOT fire against the bystander.
+    assert_eq!(
+        t.stall_freshness_with_recycle_check(1, Some(42), |_, _| true),
+        StallFreshness::PidRecycled,
+        "a recycled PID must withdraw the recovery warrant"
+    );
+
+    // A slot with no pinned generation (non-Linux / non-kernel-attested) skips
+    // the recycle check entirely and degrades to the silence-latch test.
+    assert_eq!(
+        t.stall_freshness_with_recycle_check(1, None, |_, _| true),
+        StallFreshness::Warranted,
+        "no pinned generation means the recycle check is a no-op"
     );
 }
 

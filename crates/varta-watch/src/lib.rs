@@ -137,7 +137,7 @@ pub use listener::{BeatListener, PreThreadAttestation, TransportTrust, UdsListen
 pub use observer::{Event, Observer};
 pub use peer_cred::BeatOrigin;
 pub use recovery::{Recovery, RecoveryOutcome};
-pub use tracker::{EvictionPolicy, Slot, Tracker, Update};
+pub use tracker::{EvictionPolicy, Slot, StallFreshness, Tracker, Update};
 
 #[cfg(feature = "unsafe-plaintext-udp")]
 pub use listener::UdpListener;
