@@ -305,31 +305,63 @@ impl RecoveryAuditLog {
             &head[..n]
         };
         let head_str = core::str::from_utf8(head_read).unwrap_or("");
-        let has_v2_header = head_str.starts_with(AUDIT_HEADER_V2.trim_end_matches('\n'));
-        let is_v1 = head_str.starts_with(AUDIT_HEADER_V1_PREFIX);
+        let head_is_v2 = head_str.starts_with(AUDIT_HEADER_V2.trim_end_matches('\n'));
+        let head_is_v1 = head_str.starts_with(AUDIT_HEADER_V1_PREFIX);
 
-        if !has_v2_header && is_v1 {
-            return Ok(TailProbe {
-                last_seq: 0,
-                last_chain: [0u8; 32],
-                reason: BootReason::LegacyV1,
-                truncate_to: None,
-                has_v2_header: false,
+        if !head_is_v2 {
+            // The head is a v1 header, a drifted header, or arbitrary bytes —
+            // but "v2-ness" is a property of the *whole* file, not just the
+            // head. `create` MIGRATES a v1/drift file by appending a v2 header
+            // (and its `boot` record) BELOW the original leading bytes, which it
+            // deliberately preserves as provenance. So a once-migrated file
+            // still *starts* with its v1/drift header while carrying a complete
+            // v2 region lower down. Concluding "unmigrated" from the head alone
+            // re-migrates on every restart: another header is appended, `seq`
+            // rolls back to 1, and the hash chain restarts from zero — the exact
+            // monotonic-seq + linear-chain break the v2 format exists to prevent
+            // (the head-window twin of the tail-window hazard `classify_tail`
+            // guards against). Read the file once and locate the last v2 header
+            // before drawing that conclusion. This whole-file read runs only for
+            // a non-v2 head (a legacy / drifted file, never the common native-v2
+            // restart), once at startup, and is bounded by the same `max_bytes`
+            // rotation cap the native-v2 widen path already relies on.
+            file.seek(SeekFrom::Start(0))?;
+            let mut whole = vec![0u8; total as usize];
+            file.read_exact(&mut whole)?;
+            return Ok(match last_v2_header_end(&whole) {
+                None => {
+                    // No v2 header anywhere: this file was never migrated.
+                    // Classify the head and let `create` migrate it once.
+                    let reason = if head_is_v1 {
+                        BootReason::LegacyV1
+                    } else {
+                        BootReason::SchemaDrift
+                    };
+                    TailProbe {
+                        last_seq: 0,
+                        last_chain: [0u8; 32],
+                        reason,
+                        truncate_to: None,
+                        has_v2_header: false,
+                    }
+                }
+                Some(data_start) => {
+                    // Already migrated: the authoritative v2 region begins right
+                    // after the last header. Resume from its tail exactly as a
+                    // native v2 file would — no new header, `seq`/chain continue.
+                    // `last_v2_header_end` guarantees `data_start <= whole.len()`;
+                    // the `get` is a static guard so a future arithmetic slip
+                    // degrades to the empty-region path instead of panicking.
+                    let region = whole.get(data_start as usize..).unwrap_or(&[]);
+                    classify_tail(region, data_start, data_start).0
+                }
             });
         }
-        if !has_v2_header && !is_v1 {
-            return Ok(TailProbe {
-                last_seq: 0,
-                last_chain: [0u8; 32],
-                reason: BootReason::SchemaDrift,
-                truncate_to: None,
-                has_v2_header: false,
-            });
-        }
 
-        // Fast path: scan only the last `TAIL_SCAN_BYTES`. For a file at or
-        // below the window this already covers the whole body; for the common
-        // small-record case it keeps the restart read cheap.
+        // Native v2 file (header at offset 0). Fast path: scan only the last
+        // `TAIL_SCAN_BYTES`. For a file at or below the window this already
+        // covers the whole body; for the common small-record case it keeps the
+        // restart read cheap.
         let scan_len = TAIL_SCAN_BYTES.min(total);
         let scan_start = total - scan_len;
         file.seek(SeekFrom::Start(scan_start))?;
@@ -337,7 +369,7 @@ impl RecoveryAuditLog {
         file.read_exact(&mut buf)?;
 
         let data_start = AUDIT_HEADER_V2.len() as u64;
-        let (probe, recovered) = classify_tail(&buf, scan_start);
+        let (probe, recovered) = classify_tail(&buf, scan_start, data_start);
         if recovered || scan_start <= data_start {
             return Ok(probe);
         }
@@ -358,9 +390,27 @@ impl RecoveryAuditLog {
         file.seek(SeekFrom::Start(scan_start))?;
         let mut buf = vec![0u8; scan_len as usize];
         file.read_exact(&mut buf)?;
-        let (probe, _) = classify_tail(&buf, scan_start);
+        let (probe, _) = classify_tail(&buf, scan_start, data_start);
         Ok(probe)
     }
+}
+
+/// Return the absolute offset just past the last v2 header line in `buf`, or
+/// `None` when no v2 header is present. The offset is the start of the
+/// authoritative v2 data region (the bytes a migrated file resumes from).
+///
+/// The needle includes the trailing newline, so it can only match a real
+/// header line: record fields are `sanitize`d (tab/newline stripped) and every
+/// record begins with a `seq` digit, never `#`, so the header text can never
+/// occur inside a record body.
+fn last_v2_header_end(buf: &[u8]) -> Option<u64> {
+    let needle = AUDIT_HEADER_V2.as_bytes();
+    if buf.len() < needle.len() {
+        return None;
+    }
+    buf.windows(needle.len())
+        .rposition(|w| w == needle)
+        .map(|pos| (pos + needle.len()) as u64)
 }
 
 /// Derive a [`TailProbe`] from `buf`, the trailing bytes of an audit file that
@@ -372,7 +422,13 @@ impl RecoveryAuditLog {
 /// authoritative only once the window covers the whole data region; otherwise
 /// a record larger than the window may have hidden the true tail and the scan
 /// must be widened before the reset is trusted.
-fn classify_tail(buf: &[u8], scan_start: u64) -> (TailProbe, bool) {
+///
+/// `data_start` is the absolute offset of the v2 data region (just past the v2
+/// header). When a torn tail leaves no newline in the buffer, truncation falls
+/// back to this floor rather than the file head, so a file MIGRATED from v1 —
+/// whose v2 header sits below a preserved v1 section — never truncates into its
+/// provenance bytes.
+fn classify_tail(buf: &[u8], scan_start: u64, data_start: u64) -> (TailProbe, bool) {
     if buf.last() == Some(&b'\n') {
         let view = &buf[..buf.len() - 1];
         let last_line_start = view
@@ -408,7 +464,7 @@ fn classify_tail(buf: &[u8], scan_start: u64) -> (TailProbe, bool) {
     let last_nl = buf.iter().rposition(|&b| b == b'\n');
     let truncate_to = match last_nl {
         Some(rel) => Some(scan_start + (rel as u64) + 1),
-        None => Some(AUDIT_HEADER_V2.len() as u64),
+        None => Some(data_start),
     };
 
     if let Some(rel) = last_nl {
@@ -608,6 +664,186 @@ mod tests {
             .expect("v2 record");
         assert!(first_record.contains("\tboot\t"));
         assert!(first_record.contains("\tlegacy_v1"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A v1 file migrates exactly once. `create` preserves the v1 header as
+    /// provenance and appends the v2 region below it, so on the NEXT restart the
+    /// file still *starts* with the v1 header. The probe must recognise the
+    /// embedded v2 region and RESUME — not re-migrate. The unfixed head-only
+    /// classifier re-migrated on every restart: a fresh v2 header stacked each
+    /// boot, `seq` rolled back to 1, and the SHA-256 chain restarted from zero —
+    /// silent destruction of the monotonic-seq + linear-chain Class-C guarantee.
+    #[test]
+    fn migrated_v1_file_resumes_on_restart_instead_of_remigrating() {
+        let dir = tmpdir("v1-resume");
+        let path = dir.join("audit.log");
+        std::fs::write(
+            &path,
+            "# varta-watch recovery audit v1\n\
+             1700000000000\t42\tspawn\t7\t9001\texec\t/bin/true\tinline\t9\n",
+        )
+        .expect("write v1");
+
+        // Restart #1: migrates (legacy_v1 boot + v2 header appended).
+        let (mut log1, w1) = RecoveryAuditLog::create(&path, cfg(None, 1)).expect("create 1");
+        assert!(w1.legacy_v1, "first open of a v1 file must migrate");
+        log1.record_spawn(&crate::audit::SpawnRecord {
+            wallclock_ms: 1,
+            observer_ns: 1,
+            agent_pid: 1,
+            child_pid: 100,
+            mode: "exec",
+            program: "/bin/a",
+            source: "inline",
+            template_len: 1,
+        });
+        log1.flush_pending(Duration::from_secs(5));
+        drop(log1);
+
+        // Restart #2: file still starts with the v1 header but carries a
+        // complete v2 region — must resume, not re-migrate.
+        let (mut log2, w2) = RecoveryAuditLog::create(&path, cfg(None, 1)).expect("create 2");
+        assert!(
+            !w2.legacy_v1,
+            "a migrated file must not re-migrate on restart"
+        );
+        log2.record_spawn(&crate::audit::SpawnRecord {
+            wallclock_ms: 2,
+            observer_ns: 2,
+            agent_pid: 2,
+            child_pid: 200,
+            mode: "exec",
+            program: "/bin/b",
+            source: "inline",
+            template_len: 1,
+        });
+        log2.flush_pending(Duration::from_secs(5));
+        drop(log2);
+
+        let body = std::fs::read_to_string(&path).expect("read");
+
+        // (a) Exactly one v2 header — restart #2 must not stack another.
+        assert_eq!(
+            body.matches(AUDIT_HEADER_V2).count(),
+            1,
+            "restart must not append a second v2 header:\n{body}"
+        );
+
+        // (b) Migration boot then resume boot — not two legacy_v1 boots.
+        let boots: Vec<&str> = body.lines().filter(|l| l.contains("\tboot\t")).collect();
+        assert_eq!(
+            boots.len(),
+            2,
+            "one migration boot + one resume boot:\n{body}"
+        );
+        assert!(
+            boots[0].contains("\tlegacy_v1"),
+            "first boot is the migration"
+        );
+        assert!(
+            boots[1].contains("\tresume"),
+            "second boot must resume, got: {}",
+            boots[1]
+        );
+
+        // (c) seq strictly monotonic across every v2 record — no rollback to 1.
+        let v2_start = body.find(AUDIT_HEADER_V2).unwrap() + AUDIT_HEADER_V2.len();
+        let mut last_seq = 0u64;
+        for line in body[v2_start..].lines().filter(|l| !l.starts_with('#')) {
+            let seq = parse_record(line.as_bytes()).expect("v2 record parses").0;
+            assert!(
+                seq > last_seq,
+                "seq must be monotonic: {seq} after {last_seq}\n{body}"
+            );
+            last_seq = seq;
+        }
+        assert!(
+            last_seq >= 4,
+            "boot+spawn+boot+spawn => last seq >= 4, got {last_seq}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Probe-level pin: a hand-built migrated file (v1 header + v1 record, then
+    /// a v2 header + two v2 records) must resume from the embedded v2 region's
+    /// tail, scanning only the bytes after the last v2 header — never the v1
+    /// provenance lines.
+    #[test]
+    fn probe_tail_treats_embedded_v2_header_as_resume_not_legacy() {
+        let dir = tmpdir("embedded-v2");
+        let path = dir.join("audit.log");
+        let chain: String = if crate::audit::chain_enabled() {
+            "a".repeat(64)
+        } else {
+            "-".to_string()
+        };
+        let body = format!(
+            "# varta-watch recovery audit v1\n\
+             1700000000000\t1\tspawn\t7\t9001\texec\t/bin/true\tinline\t9\n\
+             # varta-watch recovery audit v2\n\
+             1\t1\t1\tboot\t1234\t-\tlegacy_v1\t{chain}\n\
+             2\t2\t2\tspawn\t7\t9001\texec\t/bin/x\tinline\t1\t{chain}\n",
+        );
+        std::fs::write(&path, &body).expect("write migrated");
+
+        let probe = RecoveryAuditLog::probe_tail(&path).expect("probe");
+        assert!(
+            matches!(probe.reason, BootReason::Resume),
+            "embedded v2 header must resume, got {:?}",
+            probe.reason
+        );
+        assert_eq!(probe.last_seq, 2, "must resume from the last v2 record seq");
+        assert!(probe.has_v2_header, "must report the v2 header present");
+        assert_eq!(
+            probe.truncate_to, None,
+            "a clean migrated file must not truncate"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The same head-window blind spot afflicts drift-headed files: an
+    /// unrecognised header is preserved on migration, so the head stays
+    /// non-v2 forever. A migrated drift file must also resume, not re-migrate.
+    #[test]
+    fn migrated_drift_file_resumes_on_restart() {
+        let dir = tmpdir("drift-resume");
+        let path = dir.join("audit.log");
+        std::fs::write(&path, "garbage not an audit header\n").expect("write drift");
+
+        let (log1, w1) = RecoveryAuditLog::create(&path, cfg(None, 1)).expect("create 1");
+        assert!(w1.schema_drift, "first open of a drift file must migrate");
+        drop(log1);
+
+        let (log2, w2) = RecoveryAuditLog::create(&path, cfg(None, 1)).expect("create 2");
+        assert!(
+            !w2.schema_drift,
+            "a migrated drift file must not re-migrate"
+        );
+        drop(log2);
+
+        let body = std::fs::read_to_string(&path).expect("read");
+        assert_eq!(
+            body.matches(AUDIT_HEADER_V2).count(),
+            1,
+            "restart must not append a second v2 header:\n{body}"
+        );
+        let boots: Vec<&str> = body.lines().filter(|l| l.contains("\tboot\t")).collect();
+        assert_eq!(
+            boots.len(),
+            2,
+            "one migration boot + one resume boot:\n{body}"
+        );
+        assert!(
+            boots[0].contains("\tschema_drift"),
+            "first boot is migration"
+        );
+        assert!(
+            boots[1].contains("\tresume"),
+            "second boot must resume, got: {}",
+            boots[1]
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
