@@ -282,6 +282,21 @@ impl RecoveryAuditLog {
                     }
                     self.bytes_written = AUDIT_HEADER_V2.len() as u64;
 
+                    // Suppress the boot record's own cadence fsync so the tail
+                    // runs exactly the TWO ordered fsyncs its budget model is
+                    // sized for (the `.1` sync above + the new-generation sync
+                    // below). At default `sync_every == 1` the single boot write
+                    // makes `writes_since_sync` reach the cadence and
+                    // `direct_write_line` would otherwise fire a THIRD,
+                    // unbudgeted `fdatasync` — the explicit `flush_and_sync`
+                    // immediately after already makes the boot anchor durable,
+                    // so that extra syscall is pure overrun that defeats the
+                    // `MAX_AUDIT_ROTATION_BUDGET_MS ≤ MAINTENANCE_STAGE_ABORT_MS/2`
+                    // clamp (bug-363/373) and can `process::abort()` a healthy
+                    // observer on a slow disk (bug-379). `flush_pending` resets
+                    // this flag at the start of the next tick's drain, so the
+                    // suppression cannot leak into normal cadence syncing.
+                    self.deferred_fsync_in_drain = true;
                     self.emit_boot(BootReason::Rotation, Some(final_chain));
                     if let Err(e) = self.flush_and_sync() {
                         self.pending_err = Some(e);
@@ -747,6 +762,48 @@ mod tests {
             "only the drain write ran; the swap + header + boot tail must not have executed"
         );
         assert_eq!(log.audit_rotation_budget_exceeded_total, 1);
+    }
+
+    /// The `Finalizing` atomic tail must run EXACTLY two fsyncs — the `.1`
+    /// durability sync before the swap and the new-generation sync after the
+    /// boot anchor — never three. At default `sync_every == 1` the single boot
+    /// write reaches the fsync cadence, so without the in-tail suppression
+    /// `emit_boot`'s `direct_write_line` fires a third, unbudgeted `fdatasync`
+    /// on top of the explicit one that follows it. That extra syscall defeats
+    /// the `MAX_AUDIT_ROTATION_BUDGET_MS ≤ MAINTENANCE_STAGE_ABORT_MS/2` clamp
+    /// (bug-363/373) and can `process::abort()` a healthy observer on a slow
+    /// disk (bug-379). `fsync_durations` records one entry per `flush_and_sync`,
+    /// so its length after a rotation from an empty queue is the exact tail
+    /// fsync count.
+    #[test]
+    fn rotation_finalizing_tail_runs_exactly_two_fsyncs() {
+        let writes = Arc::new(AtomicUsize::new(0));
+        // Zero write delay so the generous budget is never the limiting factor —
+        // this isolates fsync COUNT, not timing.
+        let mut log = synthetic_rotation_log(writes, Duration::from_millis(0));
+        // The tail re-opens `self.path` and swaps the sink to a real `FileSink`
+        // before the post-swap fsyncs; point it at a writable temp file so those
+        // `sync_data` calls succeed and are recorded (a character device like
+        // /dev/null errors `sync_data` on macOS, hiding them).
+        let dir = tmpdir("tail-fsync");
+        log.path = dir.join("audit.log");
+        // Enter directly at the post-rename tail with an empty queue so the
+        // drain is a no-op and every recorded fsync belongs to the atomic tail.
+        log.rotation_progress = RotationProgress::Finalizing;
+        assert_eq!(log.sync_every, 1, "default cadence is the hazard case");
+        assert!(log.pending_lines.is_empty());
+        assert!(log.fsync_durations.is_empty());
+
+        let outcome = log.drive_audit_rotation(Duration::from_secs(5));
+
+        assert_eq!(outcome, RotationOutcome::Complete);
+        assert_eq!(
+            log.fsync_durations.len(),
+            2,
+            "tail must fsync exactly twice (.1 durability + new-generation); a \
+             third means emit_boot's cadence fsync was not suppressed (bug-379)"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
