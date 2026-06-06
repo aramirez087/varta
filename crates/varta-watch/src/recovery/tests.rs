@@ -6,7 +6,26 @@ use crate::probe_table::{mix32, BoundedIndex};
 
 use super::debounce::{InsertOutcome, LastFiredTable, MAX_LAST_FIRED_CAPACITY};
 use super::reaper::{CAPTURE_DRAIN_BYTES_PER_TICK, POST_EXIT_CAPTURE_DRAIN_GRACE};
-use super::{Recovery, RecoveryMode, RecoveryOutcome};
+use super::{
+    Recovery, RecoveryMode, RecoveryOutcome, RECOVERY_SPAWN_MAX_PER_TICK,
+    RECOVERY_STALL_EVAL_MAX_PER_TICK,
+};
+
+/// The per-tick stall *evaluation* budget must stay at or above the per-tick
+/// *spawn* budget. If it dropped below, the DrainPending loop's evaluation cap
+/// would trip before the spawn cap in a stall batch that genuinely spawns —
+/// silently throttling real recovery throughput, which the eval cap exists to
+/// protect, not to limit. The eval cap is meant to bite only the non-spawning
+/// flood (Debounced/Refused). Regression guard for that ordering.
+#[test]
+fn stall_eval_budget_does_not_throttle_spawn_budget() {
+    assert!(
+        RECOVERY_STALL_EVAL_MAX_PER_TICK >= RECOVERY_SPAWN_MAX_PER_TICK,
+        "eval budget {} must not trip before spawn budget {}",
+        RECOVERY_STALL_EVAL_MAX_PER_TICK,
+        RECOVERY_SPAWN_MAX_PER_TICK,
+    );
+}
 
 #[test]
 fn capacity_builders_cap_untrusted_values() {

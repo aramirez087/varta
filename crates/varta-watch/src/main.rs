@@ -922,10 +922,24 @@ fn run(cfg: Config) -> std::io::Result<()> {
         // Per-tick recovery spawn budget: a mass simultaneous stall must not
         // fork+exec the whole fleet in one DrainPending stage (head-of-line
         // block + 2 s self-watchdog abort). Count only actual spawn attempts;
-        // cheap Debounced/Refused outcomes never consume the budget. The
+        // cheap Debounced/Refused outcomes never consume this budget. The
         // remainder stays queued (the stall_queue cursor resumes next tick).
         let mut spawns_this_tick = 0usize;
-        while let Some(ev) = observer.poll_pending() {
+        // Per-tick stall *evaluation* budget: even a non-spawning outcome costs
+        // an O(tracker_capacity) debounce-ledger scan in on_stall plus a
+        // /proc/<pid>/stat freshness read, so a mass non-spawning batch (a
+        // flapping fleet whose stalls all Debounce) could otherwise drain the
+        // whole tracker_capacity-deep queue in one stage — the last unbounded
+        // per-tick poll-loop walk. The loop condition itself bounds the walk so
+        // the cheap `continue` (AgentResumed/PidRecycled) paths are capped too;
+        // the cursor defers the remainder to the next tick, exactly like the
+        // spawn budget. See recovery::RECOVERY_STALL_EVAL_MAX_PER_TICK.
+        let mut evals_this_tick = 0usize;
+        while evals_this_tick < varta_watch::recovery::RECOVERY_STALL_EVAL_MAX_PER_TICK {
+            let Some(ev) = observer.poll_pending() else {
+                break;
+            };
+            evals_this_tick += 1;
             if let Some(fe) = file_export.as_mut() {
                 if let Err(e) = fe.record(&ev) {
                     varta_error_rl!(LogKind::FileExportIo, "file export error: {e}");

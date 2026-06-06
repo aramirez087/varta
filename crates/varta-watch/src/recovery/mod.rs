@@ -65,6 +65,32 @@ const REAP_MAX_PER_TICK: usize = 64;
 /// than the non-blocking `waitpid(WNOHANG)` the reap side performs.
 pub const RECOVERY_SPAWN_MAX_PER_TICK: usize = 16;
 
+/// Maximum queued stalls *evaluated* in one observer poll tick, regardless of
+/// outcome.
+///
+/// [`RECOVERY_SPAWN_MAX_PER_TICK`] bounds only the stalls that `fork`+`exec` a
+/// recovery child; it leaves the *non-spawning* outcomes — `Debounced` and
+/// every `Refused*` — uncapped. But evaluating a stall is not free even when it
+/// never spawns: [`Recovery::on_stall`] runs an O(`tracker_capacity`) scan of
+/// the debounce ledger (`prune_expired` + `get`) on every call, and the
+/// `DrainPending` freshness re-check adds a `/proc/<pid>/stat` start-time read
+/// per stall. A mass simultaneous stall queues up to `tracker_capacity` events
+/// (the same trigger that motivates the spawn cap), and a flapping fleet whose
+/// stalls all land inside their debounce window resolves every one of them to
+/// `Debounced`. Without this cap the loop would drain the whole queue in a
+/// single `DrainPending` stage — `O(N·tracker_capacity)` slot touches plus up
+/// to `N` `/proc` reads — head-of-line-blocking the single-threaded poll loop
+/// and, under `--prometheus-exporter`, overrunning `STAGE_ABORT_NS[DrainPending]`
+/// into a spurious `process::abort()` (host reboot under `--hw-watchdog`). This
+/// is the *evaluation*-side sibling of the spawn and reap per-tick budgets — the
+/// last unbounded per-tick walk on the poll loop. The remainder stays queued
+/// (the `stall_queue`/`stall_cursor` cursor resumes next tick), exactly as the
+/// spawn budget defers its overflow. Kept comfortably above
+/// [`RECOVERY_SPAWN_MAX_PER_TICK`] so it never throttles genuine spawn
+/// throughput: in a stall batch that *does* spawn, the spawn cap trips first;
+/// this cap bites only the non-spawning flood it exists to bound.
+pub const RECOVERY_STALL_EVAL_MAX_PER_TICK: usize = 256;
+
 /// How the recovery command is executed when an agent stalls.
 ///
 /// One mode is available:
