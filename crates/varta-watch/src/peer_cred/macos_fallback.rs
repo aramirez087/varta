@@ -80,12 +80,28 @@ pub(super) fn pid_uid_from_results(
     } else {
         0
     };
-    let resolved_uid = if cred.ret == 0 && cred.optlen >= XUCRED_MIN_RETURN {
-        cred.cr_uid
+    // A real UID requires `LOCAL_PEERCRED` to have actually succeeded. A failed
+    // read must NOT silently default to 0: on a root observer (`my_uid == 0`)
+    // the recv UID gate (`peer_uid != my_uid`) would then pass, and a nonzero
+    // `resolved_pid` would mislabel the beat `KernelAttested` — granting
+    // recovery eligibility to a peer whose UID was never attested, defeating
+    // the kernel cross-check that stops a same-host process from forging
+    // `frame.pid` (CLAUDE.md hard-constraint #8).
+    let attested_uid = if cred.ret == 0 && cred.optlen >= XUCRED_MIN_RETURN {
+        Some(cred.cr_uid)
     } else {
-        0
+        None
     };
-    (resolved_pid, resolved_uid)
+    match attested_uid {
+        // The PID is only trustworthy when paired with a genuinely attested
+        // UID; emit the resolved pair.
+        Some(uid) => (resolved_pid, uid),
+        // UID unverifiable → collapse to the `(0, 0)` no-peer sentinel so the
+        // recv path downgrades to `SocketModeOnly` (recovery refused) and falls
+        // back to Layer-1 socket-file permissions, rather than admitting an
+        // unattested peer as kernel-attested.
+        None => (0, 0),
+    }
 }
 
 #[cfg(test)]
@@ -180,9 +196,15 @@ mod tests {
     }
 
     #[test]
-    fn token_fails_pid_succeeds_cred_fails_returns_zero_uid() {
+    fn token_fails_pid_succeeds_cred_fails_collapses_to_no_peer_sentinel() {
+        // LOCAL_PEERCRED failed, so the UID was never attested. A defaulted
+        // uid=0 must NOT be paired with the real pid: on a root observer that
+        // would pass the recv UID gate and mislabel the beat KernelAttested,
+        // granting recovery eligibility to an unverified peer (CLAUDE.md #8).
+        // The pair collapses to the (0, 0) sentinel → SocketModeOnly → recovery
+        // refused.
         let result = pid_uid_from_results(fail_token(), ok_pid(4321), fail_cred());
-        assert_eq!(result, (4321, 0));
+        assert_eq!(result, (0, 0));
     }
 
     #[test]
