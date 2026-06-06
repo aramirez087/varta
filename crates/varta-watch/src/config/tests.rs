@@ -110,6 +110,43 @@ fn read_timeout_above_ceiling_is_rejected() {
     );
 }
 
+/// The static read-timeout ceiling is not enough when the operator configures
+/// the minimum 1 s self-watchdog. A 1000 ms idle `recv(2)` can consume the
+/// whole full-iteration watchdog deadline before the loop gets to tick again,
+/// so the active ceiling must fall to half the watchdog window.
+#[test]
+fn read_timeout_respects_configured_self_watchdog_deadline() {
+    match Config::from_args(args(&[
+        "--socket",
+        "/tmp/x.sock",
+        "--threshold-ms",
+        "100",
+        "--self-watchdog-secs",
+        "1",
+        "--read-timeout-ms",
+        "501",
+    ])) {
+        Err(ConfigError::ReadTimeoutTooLarge { value, max }) => {
+            assert_eq!(value, 501);
+            assert_eq!(max, 500);
+        }
+        other => panic!("expected ReadTimeoutTooLarge, got {other:?}"),
+    }
+
+    let cfg = Config::from_args(args(&[
+        "--socket",
+        "/tmp/x.sock",
+        "--threshold-ms",
+        "100",
+        "--self-watchdog-secs",
+        "1",
+        "--read-timeout-ms",
+        "500",
+    ]))
+    .expect("half the watchdog deadline leaves poll-loop headroom");
+    assert_eq!(cfg.read_timeout, Duration::from_millis(500));
+}
+
 /// `--self-watchdog-secs 0` must be rejected. A zero deadline makes the
 /// watchdog `process::abort()` a healthy observer on the first tick after
 /// startup (host reboot under `--hw-watchdog`); help text documents

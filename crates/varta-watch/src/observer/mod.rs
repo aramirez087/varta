@@ -573,15 +573,15 @@ impl Observer {
                             // `tracker::record_with_generation`, which records a
                             // terminal frame even when its namespace inode has
                             // already read back `None`). Exempt it from the
-                            // per-pid limiter, mirroring `origin_upgrade`. The
-                            // global limiter still applies — the pre-readlink
-                            // DoS guard stays intact — and kernel attestation
-                            // (`frame.pid == peer_pid`) still bounds a forged
-                            // terminal flood to the sender's own pid, while the
-                            // tracker's timestamp gate (`refresh_terminal`)
-                            // rejects replays. So no flood / victim-targeting
-                            // vector opens.
+                            // per-pid limiter, mirroring `origin_upgrade`.
                             let is_terminal = frame.nonce == NONCE_TERMINAL;
+                            let terminal_global_bypass = is_terminal
+                                && peer_pid != 0
+                                && frame.pid == peer_pid
+                                && matches!(
+                                    self.tracker.last_observed_nonce_of(frame.pid),
+                                    Some(nonce) if nonce != NONCE_TERMINAL
+                                );
                             // Per-pid rate limiting is an O(1) tracker lookup
                             // and must run before the global bucket. A
                             // same-pid burst that is already being dropped
@@ -607,10 +607,13 @@ impl Observer {
                             // Global token bucket: drop BEFORE namespace /
                             // tracker classification so a rotation attack
                             // cannot exhaust namespace reads or insertion
-                            // work. Per-pid drops have already been shed
-                            // above, so the global budget is reserved for
-                            // frames that could otherwise advance state.
-                            if !self.global_rl.try_consume(now_ns) {
+                            // work. One narrow exception is the first
+                            // kernel-attested terminal frame after a tracked
+                            // non-terminal beat: an unrelated burst must not
+                            // erase a dying agent's only Critical signal, but
+                            // untracked / UDP terminal traffic and repeated
+                            // terminal frames still pay the global bucket.
+                            if !terminal_global_bypass && !self.global_rl.try_consume(now_ns) {
                                 self.rate_limited_total[RateLimitReason::Global as usize] =
                                     self.rate_limited_total[RateLimitReason::Global as usize]
                                         .saturating_add(1);

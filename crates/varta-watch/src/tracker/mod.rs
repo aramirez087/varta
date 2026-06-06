@@ -888,6 +888,18 @@ impl Tracker {
             .and_then(|idx| self.entries.get(idx).map(|s| s.last_ns))
     }
 
+    /// Return the most recent accepted wire nonce for a tracked pid, if
+    /// present. Used by the observer to admit one authenticated terminal
+    /// panic frame after a regular beat without creating an unlimited
+    /// terminal-frame bypass around the global rate limiter.
+    pub fn last_observed_nonce_of(&self, pid: u32) -> Option<u64> {
+        self.pid_to_index
+            .get(pid)
+            .and_then(|idx| self.entries.get(idx))
+            .filter(|s| s.used)
+            .map(|s| s.last_observed_nonce)
+    }
+
     /// Return the pinned transport origin of a tracked pid, if present.
     /// Used by the observer to populate `Event::OriginConflict::slot_origin`
     /// before calling `record` (which may produce the conflict).

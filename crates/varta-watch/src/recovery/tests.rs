@@ -17,15 +17,7 @@ use super::{
 /// silently throttling real recovery throughput, which the eval cap exists to
 /// protect, not to limit. The eval cap is meant to bite only the non-spawning
 /// flood (Debounced/Refused). Regression guard for that ordering.
-#[test]
-fn stall_eval_budget_does_not_throttle_spawn_budget() {
-    assert!(
-        RECOVERY_STALL_EVAL_MAX_PER_TICK >= RECOVERY_SPAWN_MAX_PER_TICK,
-        "eval budget {} must not trip before spawn budget {}",
-        RECOVERY_STALL_EVAL_MAX_PER_TICK,
-        RECOVERY_SPAWN_MAX_PER_TICK,
-    );
-}
+const _: () = assert!(RECOVERY_STALL_EVAL_MAX_PER_TICK >= RECOVERY_SPAWN_MAX_PER_TICK);
 
 #[test]
 fn capacity_builders_cap_untrusted_values() {

@@ -26,17 +26,33 @@ pub const POLL_STAGE_ABORT_MS: u64 = 2_000;
 
 /// Upper bound for `--read-timeout-ms`. The idle `Poll` stage spends ≈ one
 /// blocking UDS `recv(2)` of `--read-timeout-ms` (see
-/// `observer-liveness.md`), so the read timeout MUST stay safely below
-/// [`POLL_STAGE_ABORT_MS`]; otherwise a perfectly healthy, idle observer
-/// trips the self-watchdog and `process::abort()`s — a host reboot under
-/// `--hw-watchdog`. Half the abort threshold leaves headroom for the rest of
-/// the poll cycle plus the watchdog's tick granularity.
+/// `observer-liveness.md`), so the static ceiling stays safely below
+/// [`POLL_STAGE_ABORT_MS`]. When `--self-watchdog-secs` is configured with a
+/// smaller full-iteration deadline, [`max_read_timeout_ms`] lowers this
+/// ceiling again so one idle receive cannot consume the whole watchdog window.
 pub const MAX_READ_TIMEOUT_MS: u64 = POLL_STAGE_ABORT_MS / 2;
 
 const _: () = assert!(
     MAX_READ_TIMEOUT_MS < POLL_STAGE_ABORT_MS,
     "read-timeout ceiling must stay below the Poll-stage self-watchdog abort",
 );
+
+/// Maximum accepted UDS read timeout for the active watchdog configuration.
+///
+/// The static Poll-stage ceiling protects prometheus-enabled builds that have
+/// per-stage aborts. Default/Class-A builds rely on the full-iteration
+/// `--self-watchdog-secs` deadline instead, so a configured 1 s watchdog must
+/// lower the read-timeout ceiling to 500 ms. `None` means no in-process
+/// watchdog, leaving the static ceiling in force.
+pub fn max_read_timeout_ms(self_watchdog: Option<Duration>) -> u64 {
+    match self_watchdog {
+        Some(deadline) => {
+            let half_deadline_ms = deadline.as_millis() / 2;
+            half_deadline_ms.min(u128::from(MAX_READ_TIMEOUT_MS)) as u64
+        }
+        None => MAX_READ_TIMEOUT_MS,
+    }
+}
 
 /// Hard self-watchdog abort threshold for the `Maintenance` iteration stage,
 /// in milliseconds. `STAGE_ABORT_NS[IterStage::Maintenance]` in `main.rs`
@@ -636,9 +652,10 @@ pub enum ConfigError {
         /// The maximum allowed value.
         max: usize,
     },
-    /// `--read-timeout-ms` exceeded [`MAX_READ_TIMEOUT_MS`]. A read timeout at
-    /// or above the `Poll`-stage self-watchdog abort would let a healthy, idle
-    /// observer trip the watchdog and `process::abort()`.
+    /// `--read-timeout-ms` exceeded the active ceiling from
+    /// [`max_read_timeout_ms`]. A read timeout that can consume the active
+    /// watchdog window would let a healthy, idle observer trip the watchdog
+    /// and `process::abort()`.
     ReadTimeoutTooLarge {
         /// The value provided, in milliseconds.
         value: u64,
@@ -800,7 +817,7 @@ impl core::fmt::Display for ConfigError {
             ConfigError::ReadTimeoutTooLarge { value, max } => write!(
                 f,
                 "--read-timeout-ms: {value} ms exceeds the maximum {max} ms \
-                 (must stay below the {POLL_STAGE_ABORT_MS} ms Poll-stage self-watchdog abort)"
+                 (must stay below the active self-watchdog budget)"
             ),
             ConfigError::AuditRotationBudgetTooLarge { value, max } => write!(
                 f,

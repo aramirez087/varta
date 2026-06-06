@@ -27,12 +27,12 @@ use crate::tracker::{
 use super::parse_helpers::{parse_octal, parse_u16, parse_u64};
 #[cfg(not(feature = "compile-time-config"))]
 use super::types::{
-    Config, ConfigError, DEFAULT_PROM_RATE_LIMIT_BURST, DEFAULT_PROM_RATE_LIMIT_PER_SEC,
-    DEFAULT_READ_TIMEOUT_MS, DEFAULT_RECOVERY_CAPTURE_BYTES, DEFAULT_RECOVERY_DEBOUNCE_MS,
-    DEFAULT_SHUTDOWN_GRACE_MS, DEFAULT_SOCKET_MODE, MAX_AUDIT_ROTATION_BUDGET_MS,
-    MAX_ITERATION_BUDGET_MS, MAX_READ_TIMEOUT_MS, MAX_RECOVERY_CAPTURE_BYTES, MAX_SCRAPE_BUDGET_MS,
-    MIN_ITERATION_BUDGET_MS, MIN_SCRAPE_BUDGET_MS, MIN_SELF_WATCHDOG_SECS, MIN_SHUTDOWN_GRACE_MS,
-    MIN_THRESHOLD_MS,
+    max_read_timeout_ms, Config, ConfigError, DEFAULT_PROM_RATE_LIMIT_BURST,
+    DEFAULT_PROM_RATE_LIMIT_PER_SEC, DEFAULT_READ_TIMEOUT_MS, DEFAULT_RECOVERY_CAPTURE_BYTES,
+    DEFAULT_RECOVERY_DEBOUNCE_MS, DEFAULT_SHUTDOWN_GRACE_MS, DEFAULT_SOCKET_MODE,
+    MAX_AUDIT_ROTATION_BUDGET_MS, MAX_ITERATION_BUDGET_MS, MAX_RECOVERY_CAPTURE_BYTES,
+    MAX_SCRAPE_BUDGET_MS, MIN_ITERATION_BUDGET_MS, MIN_SCRAPE_BUDGET_MS, MIN_SELF_WATCHDOG_SECS,
+    MIN_SHUTDOWN_GRACE_MS, MIN_THRESHOLD_MS,
 };
 
 #[cfg(not(feature = "compile-time-config"))]
@@ -747,16 +747,16 @@ impl Config {
         }
 
         // --read-timeout-ms ceiling. The idle Poll stage spends ≈ one blocking
-        // UDS recv(2) of this duration; a value at/above the Poll-stage
-        // self-watchdog abort (MAX_READ_TIMEOUT_MS = half of it) would let a
-        // perfectly healthy, idle observer trip the watchdog and
-        // process::abort() — a host reboot under --hw-watchdog. See
-        // book/src/architecture/observer-liveness.md.
+        // UDS recv(2) of this duration. The static cap protects the
+        // prometheus-enabled per-stage Poll abort; a configured
+        // --self-watchdog-secs can be smaller, so lower the cap again to half
+        // of that full-iteration deadline.
         let read_timeout_ms_resolved = read_timeout_ms.unwrap_or(DEFAULT_READ_TIMEOUT_MS);
-        if read_timeout_ms_resolved > MAX_READ_TIMEOUT_MS {
+        let read_timeout_ceiling_ms = max_read_timeout_ms(self_watchdog);
+        if read_timeout_ms_resolved > read_timeout_ceiling_ms {
             return Err(ConfigError::ReadTimeoutTooLarge {
                 value: read_timeout_ms_resolved,
-                max: MAX_READ_TIMEOUT_MS,
+                max: read_timeout_ceiling_ms,
             });
         }
 

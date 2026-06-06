@@ -37,8 +37,8 @@ impl super::types::Config {
         self,
     ) -> Result<super::types::Config, super::types::ConfigError> {
         use super::types::{
-            ConfigError, MAX_AUDIT_ROTATION_BUDGET_MS, MAX_ITERATION_BUDGET_MS,
-            MAX_READ_TIMEOUT_MS, MAX_RECOVERY_CAPTURE_BYTES, MAX_SCRAPE_BUDGET_MS,
+            max_read_timeout_ms, ConfigError, MAX_AUDIT_ROTATION_BUDGET_MS,
+            MAX_ITERATION_BUDGET_MS, MAX_RECOVERY_CAPTURE_BYTES, MAX_SCRAPE_BUDGET_MS,
             MIN_ITERATION_BUDGET_MS, MIN_SCRAPE_BUDGET_MS, MIN_SELF_WATCHDOG_SECS,
             MIN_SHUTDOWN_GRACE_MS, MIN_THRESHOLD_MS,
         };
@@ -89,16 +89,6 @@ impl super::types::Config {
                 max: MAX_SCRAPE_BUDGET_MS,
             });
         }
-        // The idle Poll stage blocks ≈ one UDS recv(2) of `read_timeout`; a
-        // value above the Poll-stage self-watchdog abort would self-abort a
-        // healthy idle observer. Mirror the argv parser's ceiling here so the
-        // compile-time-config path enforces the same invariant.
-        if duration_ms_saturating(self.read_timeout) > MAX_READ_TIMEOUT_MS {
-            return Err(ConfigError::ReadTimeoutTooLarge {
-                value: duration_ms_saturating(self.read_timeout),
-                max: MAX_READ_TIMEOUT_MS,
-            });
-        }
         // A `--self-watchdog-secs` of 0 bakes a zero-nanosecond deadline that
         // self-aborts a healthy observer on the first watchdog tick. Mirror the
         // argv parser's floor so the compile-time-config path enforces the same
@@ -110,6 +100,18 @@ impl super::types::Config {
                     min: MIN_SELF_WATCHDOG_SECS,
                 });
             }
+        }
+        // The idle Poll stage blocks ≈ one UDS recv(2) of `read_timeout`.
+        // Mirror the argv parser's active ceiling: static Poll-stage cap when
+        // no self-watchdog is configured, or half the full-iteration watchdog
+        // deadline when that deadline is tighter.
+        let read_timeout_ms = duration_ms_saturating(self.read_timeout);
+        let read_timeout_ceiling_ms = max_read_timeout_ms(self.self_watchdog);
+        if read_timeout_ms > read_timeout_ceiling_ms {
+            return Err(ConfigError::ReadTimeoutTooLarge {
+                value: read_timeout_ms,
+                max: read_timeout_ceiling_ms,
+            });
         }
 
         // H7 — platform-restricted clock sources must fail loudly rather
@@ -291,6 +293,21 @@ mod tests {
         assert!(matches!(
             cfg.validate_runtime(),
             Err(ConfigError::SelfWatchdogTooLow { value: 0, min: 1 })
+        ));
+    }
+
+    #[test]
+    fn validate_runtime_rejects_read_timeout_that_consumes_watchdog_window() {
+        let mut cfg = valid_config();
+        cfg.self_watchdog = Some(Duration::from_secs(1));
+        cfg.read_timeout = Duration::from_millis(501);
+
+        assert!(matches!(
+            cfg.validate_runtime(),
+            Err(ConfigError::ReadTimeoutTooLarge {
+                value: 501,
+                max: 500
+            })
         ));
     }
 

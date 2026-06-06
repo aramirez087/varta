@@ -98,7 +98,8 @@ OPTIONAL:
                                      child runs until completion).
     --read-timeout-ms <MS>         UDS read timeout per poll call
                                      (default 100).  Bounded so a stalled peer
-                                     cannot hold the observer loop indefinitely.
+                                     cannot hold the observer loop indefinitely;
+                                     lower when --self-watchdog-secs is tight.
     --tracker-capacity <N>          Maximum number of distinct agent pids
                                       tracked concurrently (default 256).
                                       Range [1, 4096].

@@ -325,6 +325,24 @@ impl ScriptedListener {
         Self { results }
     }
 
+    fn with_status_frames(frames: &[(u32, Status, u64, u64, u32)]) -> Self {
+        let mut results = VecDeque::new();
+        for &(pid, status, timestamp, nonce, payload) in frames {
+            let frame = Frame::new(status, pid, timestamp, nonce, payload);
+            let mut data = [0u8; 32];
+            frame.encode(&mut data);
+            results.push_back(RecvResult::Authenticated {
+                peer_pid: pid,
+                peer_uid: 0,
+                peer_pid_ns_inode: None,
+                peer_pidfd: None,
+                origin: BeatOrigin::KernelAttested,
+                data,
+            });
+        }
+        Self { results }
+    }
+
     /// A regular beat (`nonce 1`, `Ok`) immediately followed by the pid's
     /// terminal dying-gasp (`NONCE_TERMINAL`, decode-enforced `Critical`),
     /// both kernel-attested. The two frames are microseconds apart, so the
@@ -539,6 +557,87 @@ fn terminal_gasp_bypasses_per_pid_rate_limiter() {
         obs.drain_per_pid_rate_limited(),
         0,
         "the terminal beat must NOT be counted as a per-pid drop"
+    );
+}
+
+#[test]
+fn terminal_gasp_bypasses_global_limiter_once_for_tracked_kernel_agent() {
+    // Regression: the terminal panic frame was protected from the per-pid
+    // limiter but still paid the global bucket. A single unrelated burst could
+    // exhaust that bucket first, dropping the dying agent's only Critical beat
+    // and leaving operators to infer the panic later from silence.
+    let mut obs = Observer::new(
+        Duration::from_secs(60),
+        64,
+        EvictionPolicy::Strict,
+        DEFAULT_EVICTION_SCAN_WINDOW,
+        None,
+        1,
+        1,
+        ClockSource::Monotonic,
+    )
+    .expect("Observer::new should succeed");
+
+    obs.add_listener(Box::new(ScriptedListener::with_status_frames(&[
+        (10, Status::Ok, 1, 1, 100),
+        (20, Status::Ok, 1, 1, 200),
+        (10, Status::Critical, 2, NONCE_TERMINAL, 0xDEAD),
+        (10, Status::Critical, 3, NONCE_TERMINAL, 0xBEEF),
+    ])));
+
+    let first = obs.poll();
+    assert!(
+        matches!(
+            first,
+            Some(Event::Beat {
+                pid: 10,
+                payload: 100,
+                ..
+            })
+        ),
+        "first tracked beat should consume the only global token, got {first:?}"
+    );
+
+    let second = obs.poll();
+    assert!(
+        second.is_none(),
+        "unrelated beat should be dropped after the global bucket is empty, got {second:?}"
+    );
+    assert_eq!(
+        obs.drain_global_rate_limited(),
+        1,
+        "the unrelated beat should account as the global drop"
+    );
+
+    let third = obs.poll();
+    assert!(
+        matches!(
+            third,
+            Some(Event::Beat {
+                pid: 10,
+                status: Status::Critical,
+                payload: 0xDEAD,
+                nonce: NONCE_TERMINAL,
+                ..
+            })
+        ),
+        "tracked kernel-attested terminal gasp must bypass the exhausted global bucket once, got {third:?}"
+    );
+    assert_eq!(
+        obs.drain_global_rate_limited(),
+        0,
+        "the terminal gasp must not be counted as a global drop"
+    );
+
+    let fourth = obs.poll();
+    assert!(
+        fourth.is_none(),
+        "repeated terminal frames must not get an unlimited global-limiter bypass, got {fourth:?}"
+    );
+    assert_eq!(
+        obs.drain_global_rate_limited(),
+        1,
+        "the repeated terminal frame should pay the exhausted global bucket"
     );
 }
 
