@@ -248,8 +248,6 @@ public final class Varta implements AutoCloseable {
             try {
                 transport.reconnect();
                 connectPid = currentPid();
-                nonce = NONCE_MIN;
-                lastTimestamp = 0L;
                 consecutiveDropped = 0;
             } catch (IOException e) {
                 throw new IllegalStateException("Varta.reconnect: " + e.getMessage(), e);

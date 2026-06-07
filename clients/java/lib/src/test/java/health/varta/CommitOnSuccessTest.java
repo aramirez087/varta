@@ -104,4 +104,18 @@ class CommitOnSuccessTest {
         assertThat(agent.beat(Status.OK)).isInstanceOf(BeatOutcome.Sent.class);
         assertThat(Frame.decode(t.last).nonce()).isEqualTo(1L);
     }
+
+    @Test
+    void explicitReconnectPreservesCommittedNonce() {
+        DropThenCapture t = new DropThenCapture(0);
+        Varta agent = Varta.__forTest(t);
+
+        assertThat(agent.beat(Status.OK)).isInstanceOf(BeatOutcome.Sent.class);
+        assertThat(Frame.decode(t.last).nonce()).isEqualTo(1L);
+
+        agent.reconnect();
+
+        assertThat(agent.beat(Status.OK)).isInstanceOf(BeatOutcome.Sent.class);
+        assertThat(Frame.decode(t.last).nonce()).isEqualTo(2L);
+    }
 }
