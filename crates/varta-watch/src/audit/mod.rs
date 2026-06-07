@@ -332,7 +332,31 @@ impl RecoveryAuditLog {
     /// Called once per tick from the maintenance phase.
     pub fn flush_pending(&mut self, budget: Duration) {
         let start = Instant::now();
-        self.deferred_fsync_in_drain = false;
+        let retry_deferred_sync = self.deferred_fsync_in_drain && self.writes_since_sync > 0;
+        if retry_deferred_sync || self.accepted_writes_need_sync() {
+            // A prior drain may have accepted records into the BufWriter after
+            // one slow fsync caused the rest of that drain's syncs to defer.
+            // Retry that durability debt at the start of the next maintenance
+            // tick even if no new audit records arrived.
+            self.deferred_fsync_in_drain = false;
+            if start.elapsed() >= budget {
+                self.audit_flush_budget_exceeded_total =
+                    self.audit_flush_budget_exceeded_total.saturating_add(1);
+                return;
+            }
+            if !self.flush_due_accepted_writes() {
+                return;
+            }
+            if start.elapsed() >= budget {
+                if !self.pending_lines.is_empty() {
+                    self.audit_flush_budget_exceeded_total =
+                        self.audit_flush_budget_exceeded_total.saturating_add(1);
+                }
+                return;
+            }
+        } else {
+            self.deferred_fsync_in_drain = false;
+        }
         while !self.pending_lines.is_empty() {
             if start.elapsed() >= budget {
                 self.audit_flush_budget_exceeded_total =

@@ -185,24 +185,8 @@ impl RecoveryAuditLog {
             Ok(()) => {
                 self.bytes_written = self.bytes_written.saturating_add(line.len() as u64);
                 self.writes_since_sync = self.writes_since_sync.saturating_add(1);
-                let by_record = self.writes_since_sync >= self.sync_every;
-                let by_time = match (self.sync_interval, self.last_sync_at) {
-                    (Some(interval), Some(last)) => last.elapsed() >= interval,
-                    (Some(_), None) => true,
-                    (None, _) => false,
-                };
-                if (by_record || by_time) && !self.deferred_fsync_in_drain {
-                    match self.flush_and_sync() {
-                        Ok(d) => {
-                            self.writes_since_sync = 0;
-                            if d > self.fsync_budget {
-                                self.deferred_fsync_in_drain = true;
-                            }
-                        }
-                        Err(e) => {
-                            self.pending_err = Some(e);
-                        }
-                    }
+                if self.accepted_writes_need_sync() && !self.deferred_fsync_in_drain {
+                    let _ = self.flush_due_accepted_writes();
                 }
                 if let Some(max) = self.max_bytes {
                     if self.rotation_progress.is_idle()
@@ -211,6 +195,43 @@ impl RecoveryAuditLog {
                     {
                         self.needs_rotation = true;
                     }
+                }
+                true
+            }
+            Err(e) => {
+                self.pending_err = Some(e);
+                false
+            }
+        }
+    }
+
+    /// Returns true when accepted BufWriter bytes have reached the configured
+    /// record or time cadence and therefore need a `flush + fdatasync`.
+    pub(super) fn accepted_writes_need_sync(&self) -> bool {
+        if self.writes_since_sync == 0 {
+            return false;
+        }
+        if self.writes_since_sync >= self.sync_every {
+            return true;
+        }
+        match (self.sync_interval, self.last_sync_at) {
+            (Some(interval), Some(last)) => last.elapsed() >= interval,
+            (Some(_), None) => true,
+            (None, _) => false,
+        }
+    }
+
+    /// Flush and sync already-accepted BufWriter bytes, updating cadence state.
+    ///
+    /// Returns `false` when the sink rejected the flush/sync. The accepted bytes
+    /// remain counted in `writes_since_sync` so the next maintenance tick can
+    /// retry without needing a new audit record to arrive.
+    pub(super) fn flush_due_accepted_writes(&mut self) -> bool {
+        match self.flush_and_sync() {
+            Ok(d) => {
+                self.writes_since_sync = 0;
+                if d > self.fsync_budget {
+                    self.deferred_fsync_in_drain = true;
                 }
                 true
             }
@@ -587,6 +608,40 @@ mod tests {
     }
 
     #[test]
+    fn flush_pending_retries_deferred_fsync_without_new_lines() {
+        let ctr = Arc::new(SyncCounter::default());
+        let sink = Box::new(SlowSink {
+            ctr: ctr.clone(),
+            delay: Duration::from_millis(5),
+        });
+        let mut log = synthetic_log_with(sink, 1, Duration::from_millis(1), None, None);
+        for i in 0..2u32 {
+            log.record_spawn(&dummy_spawn(i));
+        }
+
+        log.flush_pending(Duration::from_secs(1));
+        assert_eq!(
+            *ctr.syncs.lock().unwrap(),
+            1,
+            "the first slow fsync defers the second record's sync"
+        );
+        assert_eq!(log.pending_lines.len(), 0);
+        assert_eq!(
+            log.writes_since_sync, 1,
+            "accepted BufWriter bytes must remain marked as unsynced"
+        );
+
+        log.flush_pending(Duration::from_secs(1));
+
+        assert_eq!(
+            *ctr.syncs.lock().unwrap(),
+            2,
+            "next maintenance tick must retry the deferred fsync even with an empty ring"
+        );
+        assert_eq!(log.writes_since_sync, 0);
+    }
+
+    #[test]
     fn flush_pending_keeps_line_queued_when_write_is_not_accepted() {
         let ctr = Arc::new(SyncCounter::default());
         let sink = Box::new(FailFirstWriteSink {
@@ -752,6 +807,39 @@ mod tests {
         log.flush_pending(Duration::from_secs(1));
         let syncs_after_interval = *ctr.syncs.lock().unwrap();
         assert!(syncs_after_interval > syncs_quick);
+    }
+
+    #[test]
+    fn sync_interval_flushes_without_new_record() {
+        let ctr = Arc::new(SyncCounter::default());
+        let sink = Box::new(CountingSink(ctr.clone()));
+        let mut log = synthetic_log_with(
+            sink,
+            64,
+            Duration::from_secs(10),
+            Some(Duration::from_millis(25)),
+            None,
+        );
+        log.record_spawn(&dummy_spawn(1));
+        log.flush_pending(Duration::from_secs(1));
+        let syncs_after_first = *ctr.syncs.lock().unwrap();
+        assert_eq!(syncs_after_first, 1);
+
+        log.record_spawn(&dummy_spawn(2));
+        log.flush_pending(Duration::from_secs(1));
+        let syncs_quick = *ctr.syncs.lock().unwrap();
+        assert_eq!(syncs_quick, syncs_after_first);
+        assert_eq!(log.writes_since_sync, 1);
+
+        std::thread::sleep(Duration::from_millis(30));
+        log.flush_pending(Duration::from_secs(1));
+
+        let syncs_after_interval = *ctr.syncs.lock().unwrap();
+        assert!(
+            syncs_after_interval > syncs_quick,
+            "elapsed sync interval must flush already-accepted bytes without waiting for another audit record"
+        );
+        assert_eq!(log.writes_since_sync, 0);
     }
 
     #[test]
