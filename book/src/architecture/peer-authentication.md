@@ -94,7 +94,7 @@ refusal.  See `book/src/architecture/namespaces.md` for the planned gate.
 
 | Platform | Mechanism | Per-datagram? | Recovery-eligible? |
 |---|---|---|---|
-| Linux | `SO_PASSCRED` + `SCM_CREDENTIALS` (`struct ucred`) | Yes | Yes |
+| Linux | `SO_PASSCRED` + `SCM_CREDENTIALS` (`struct ucred`) | Yes | Yes, after `/proc/<pid>/stat` start-time generation is pinned |
 | macOS pathname UDS | socket file permissions only (`LOCAL_PEERTOKEN` requires a connected local socket) | **No** | **No** |
 | FreeBSD / DragonFly / NetBSD | `LOCAL_CREDS` + `SCM_CREDS` (`struct cmsgcred`) | Yes | Yes |
 | illumos / Solaris | `SO_RECVUCRED` + `SCM_UCRED` + `ucred_t` (opaque) | Yes | Yes |

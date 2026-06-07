@@ -936,6 +936,22 @@ impl Tracker {
             .map(|s| s.pid_ns_inode)
     }
 
+    /// Return the pinned process start-time generation of a tracked pid, if
+    /// present.
+    ///
+    /// The outer `Option` is `Some` when the pid is tracked at all; the inner
+    /// `Option` is the Linux `/proc/<pid>/stat` start-time token. The observer
+    /// uses this before recording a beat to avoid promoting first-contact
+    /// Linux UDS frames to recovery-eligible status when generation pinning
+    /// failed.
+    pub fn generation_of(&self, pid: u32) -> Option<Option<u64>> {
+        self.pid_to_index
+            .get(pid)
+            .and_then(|idx| self.entries.get(idx))
+            .filter(|s| s.used)
+            .map(|s| s.generation)
+    }
+
     /// True iff no pids are tracked.
     pub fn is_empty(&self) -> bool {
         self.len == 0

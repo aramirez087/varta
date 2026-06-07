@@ -79,14 +79,24 @@ namespace inode, and silence timer all re-pinned) and the event is counted as
 `varta_tracker_pid_recycle_total`. The generation check runs **before** the
 origin / namespace / nonce checks — a recycled process legitimately differs on
 all of them. A `None` on either side ("generation unknown": non-Linux, UDP, or
-unreadable `/proc`) is treated leniently and never triggers a reset, so prior
-PID-only behaviour is preserved exactly. When the slot's pinned generation is
-`None` and a later beat carries `Some(_)` with an **accepted** nonce, the token
-is pinned in place (same rule as the namespace-inode `None → Some` upgrade) so
-a subsequent recycle can compare `(Some(G1), Some(G2))` instead of staying
-stuck at `None`. Out-of-order frames must not pin generation. Replay protection
-is untouched: a low nonce under the **same** generation is still dropped as
-out-of-order.
+unreadable `/proc`) is treated leniently by the tracker and never triggers a
+reset, so prior PID-only behaviour is preserved exactly for non-recovery
+transports and for already-pinned slots whose peer vanished. When the slot's
+pinned generation is `None` and a later beat carries `Some(_)` with an
+**accepted** nonce, the token is pinned in place (same rule as the
+namespace-inode `None → Some` upgrade) so a subsequent recycle can compare
+`(Some(G1), Some(G2))` instead of staying stuck at `None`. Out-of-order frames
+must not pin generation. Replay protection is untouched: a low nonce under the
+**same** generation is still dropped as out-of-order.
+
+For Linux UDS first contact, the observer requires that `Some(generation)`
+before the slot may pin recovery-eligible `KernelAttested` origin. If the
+sender exits after `recvmsg(2)` but before the `/proc/<pid>/stat` start-time
+read, the beat is still observable, but it is recorded as `SocketModeOnly`.
+A later accepted beat that can read a concrete generation may upgrade the slot
+to `KernelAttested`. This keeps transient dying-gasp frames from breaking
+monitoring while preventing an unpinned numeric PID from driving `{pid}`
+recovery after PID recycle.
 
 The same generation is revalidated when a kernel-attested slot first becomes a
 stall candidate. If `/proc/<pid>/stat` now returns a concrete **different**
@@ -174,6 +184,10 @@ rules stay green-on-green until the first event.
   returns `None`. The tracker's `None → Some` upgrade allows one-shot
   recovery so a transient `/proc` unavailability does not pin a slot as
   permanently unknown.
+- **`/proc/<peer_pid>/stat` unreadable on first contact**: the helper returns
+  `None`, so the beat is tracked as `SocketModeOnly` until a later accepted
+  Linux UDS beat can pin `Some(generation)`. Missing generation remains
+  fail-open only after a slot already has recovery-eligible identity pinned.
 - **Existing `frame.pid != peer_pid` check fires first** for most real
   cross-namespace traffic (the two namespaces almost always produce different
   numeric pids for the same process). The namespace gate is belt-and-suspenders

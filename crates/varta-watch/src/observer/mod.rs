@@ -176,9 +176,10 @@ pub enum Event {
         /// `Some(_)` value that differs from the observer's namespace inode
         /// indicates a cross-namespace agent and gates recovery refusal.
         pid_ns_inode: Option<u64>,
-        /// Kernel-attested process *generation* (start-time) token pinned by
-        /// the slot's first beat. `Some` only for `KernelAttested` Linux
-        /// agents; `None` otherwise. Threaded into `Recovery::on_stall` so the
+        /// Process *generation* (start-time) token pinned by the slot's first
+        /// beat. `Some` only for Linux slots whose `/proc/<pid>/stat`
+        /// start-time was pinned; `None` for non-Linux, non-attested, and
+        /// generation-unpinned slots. Threaded into `Recovery::on_stall` so the
         /// debounce ledger can tell a recycled PID from the original process.
         generation: Option<u64>,
         /// Observer-local timestamp (ns since [`Observer`] start) when this
@@ -557,6 +558,8 @@ impl Observer {
                             // lower-trust preemption before the per-pid limiter
                             // can drop the corrective beat.
                             let slot_origin_before = self.tracker.origin_of(frame.pid);
+                            #[cfg(target_os = "linux")]
+                            let slot_generation_before = self.tracker.generation_of(frame.pid);
                             let origin_upgrade = match slot_origin_before {
                                 Some(pinned) => origin.can_replace(pinned),
                                 None => false,
@@ -634,6 +637,28 @@ impl Observer {
                                 crate::peer_cred::read_peer_identity(peer_pid, peer_pidfd.as_ref())
                             } else {
                                 (peer_pid_ns_inode, None)
+                            };
+                            // Linux recovery safety needs a process-generation
+                            // token before a first-contact UDS beat may pin a
+                            // recovery-eligible origin. If the sender exits
+                            // between recvmsg(2) and the /proc start-time
+                            // read, the kernel still attested the numeric PID,
+                            // but the tracker cannot distinguish the original
+                            // process from a later PID recycle. Keep the beat
+                            // observable by tracking it as SocketModeOnly until
+                            // a later accepted beat can pin Some(generation)
+                            // and upgrade to KernelAttested. Existing pinned
+                            // slots are left alone so terminal dying-gasp frames
+                            // do not lose their Critical signal when /proc has
+                            // already vanished.
+                            #[cfg(target_os = "linux")]
+                            let origin = if origin == BeatOrigin::KernelAttested
+                                && peer_generation.is_none()
+                                && slot_generation_before.flatten().is_none()
+                            {
+                                BeatOrigin::SocketModeOnly
+                            } else {
+                                origin
                             };
                             // Resolve the peer's process identity
                             // (PID-namespace inode + start-time generation)

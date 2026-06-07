@@ -21,6 +21,17 @@ fn unique_sock_path() -> PathBuf {
     p
 }
 
+#[cfg(target_os = "linux")]
+fn nonexistent_pid_below_pid_max(obs: &Observer) -> u32 {
+    let upper = obs.pid_max().min(1_000_000);
+    for pid in (2..=upper).rev() {
+        if crate::peer_cred::read_pid_start_time(pid).is_none() {
+            return pid;
+        }
+    }
+    panic!("could not find an unused pid <= pid_max for observer regression test");
+}
+
 #[test]
 fn new_caps_untrusted_tracker_capacity_before_auxiliary_allocations() {
     let obs = Observer::new(
@@ -641,6 +652,56 @@ fn terminal_gasp_bypasses_global_limiter_once_for_tracked_kernel_agent() {
     );
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn first_contact_without_generation_is_recovery_ineligible() {
+    let mut obs = Observer::new(
+        Duration::ZERO,
+        64,
+        EvictionPolicy::Strict,
+        DEFAULT_EVICTION_SCAN_WINDOW,
+        None,
+        0,
+        0,
+        ClockSource::Monotonic,
+    )
+    .expect("Observer::new should succeed");
+    let pid = nonexistent_pid_below_pid_max(&obs);
+
+    obs.add_listener(Box::new(ScriptedListener::with_frame(pid, 1, 0xCAFE)));
+
+    let beat = obs.poll();
+    assert!(
+        matches!(
+            beat,
+            Some(Event::Beat {
+                pid: got_pid,
+                payload: 0xCAFE,
+                origin: BeatOrigin::SocketModeOnly,
+                ..
+            }) if got_pid == pid
+        ),
+        "first-contact Linux UDS beat with no start-time generation must stay \
+         observable but recovery-ineligible, got {beat:?}"
+    );
+
+    let stall = obs.poll_pending();
+    assert!(
+        matches!(
+            stall,
+            Some(Event::Stall {
+                pid: got_pid,
+                origin: BeatOrigin::SocketModeOnly,
+                generation: None,
+                ..
+            }) if got_pid == pid
+        ),
+        "stall from an unpinned first-contact beat must carry SocketModeOnly \
+         so Recovery::on_stall refuses it, got {stall:?}"
+    );
+    assert_eq!(obs.drain_origin_conflicts(), 0);
+}
+
 #[test]
 fn consumed_but_dropped_datagram_reports_io_so_loop_does_not_idle_sleep() {
     // Regression: the main loop throttles with a 10 ms sleep only when the
@@ -721,9 +782,10 @@ fn higher_trust_origin_repairs_untrusted_preemption_before_rate_limit() {
     )
     .expect("Observer::new should succeed");
 
+    let pid = std::process::id();
     obs.add_listener(Box::new(ScriptedListener::with_origin_frames(&[
-        (42, 99, 100, BeatOrigin::NetworkUnverified),
-        (42, 1, 200, BeatOrigin::KernelAttested),
+        (pid, 99, 100, BeatOrigin::NetworkUnverified),
+        (pid, 1, 200, BeatOrigin::KernelAttested),
     ])));
 
     let first = obs.poll();
@@ -731,11 +793,11 @@ fn higher_trust_origin_repairs_untrusted_preemption_before_rate_limit() {
         matches!(
             first,
             Some(Event::Beat {
-                pid: 42,
+                pid: got_pid,
                 payload: 100,
                 origin: BeatOrigin::NetworkUnverified,
                 ..
-            })
+            }) if got_pid == pid
         ),
         "untrusted preemption frame should be recorded first, got {first:?}"
     );
@@ -745,12 +807,12 @@ fn higher_trust_origin_repairs_untrusted_preemption_before_rate_limit() {
         matches!(
             second,
             Some(Event::Beat {
-                pid: 42,
+                pid: got_pid,
                 payload: 200,
                 nonce: 1,
                 origin: BeatOrigin::KernelAttested,
                 ..
-            })
+            }) if got_pid == pid
         ),
         "kernel-attested beat should replace the weaker slot immediately, got {second:?}"
     );

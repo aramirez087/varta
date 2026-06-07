@@ -142,7 +142,10 @@ varta-watch --socket /tmp/varta.sock --threshold-ms 500 \
 
 - **UDS**: On Linux, the kernel attests the sender's PID and UID via
   `SCM_CREDENTIALS`. The observer rejects frames where `frame.pid != peer_pid`
-  or `peer_uid != observer_uid`. On macOS pathname datagram sockets,
+  or `peer_uid != observer_uid`. Linux recovery eligibility also requires the
+  observer to pin the sender's `/proc/<pid>/stat` start-time generation before
+  first contact can become `KernelAttested`; an unpinned first-contact beat is
+  tracked as `SocketModeOnly`. On macOS pathname datagram sockets,
   `LOCAL_PEERTOKEN` requires a connected local socket and the observer falls
   back to `--socket-mode 0600`. On other platforms without per-datagram
   credentials, the only defence is `--socket-mode`.
