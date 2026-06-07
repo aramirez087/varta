@@ -39,14 +39,17 @@ impl super::PromExporter {
                 .saturating_add(prom_ip_probes);
         }
 
-        let mut pids: Vec<u32> = self.rows.keys().copied().collect();
-        pids.sort_unstable();
+        self.pid_scratch.clear();
+        self.rows.push_pids(&mut self.pid_scratch);
+        self.pid_scratch.sort_unstable();
 
         self.body_buf
             .push_str("# HELP varta_beats_total Total accepted beats per agent pid.\n");
         self.body_buf.push_str("# TYPE varta_beats_total counter\n");
-        for pid in &pids {
-            let row = &self.rows[pid];
+        for pid in &self.pid_scratch {
+            let Some(row) = self.rows.get(*pid) else {
+                continue;
+            };
             let _ = writeln!(
                 self.body_buf,
                 "varta_beats_total{{pid=\"{pid}\"}} {}",
@@ -57,8 +60,10 @@ impl super::PromExporter {
             .push_str("# HELP varta_stalls_total Total observer-detected stalls per agent pid.\n");
         self.body_buf
             .push_str("# TYPE varta_stalls_total counter\n");
-        for pid in &pids {
-            let row = &self.rows[pid];
+        for pid in &self.pid_scratch {
+            let Some(row) = self.rows.get(*pid) else {
+                continue;
+            };
             let _ = writeln!(
                 self.body_buf,
                 "varta_stalls_total{{pid=\"{pid}\"}} {}",
@@ -67,8 +72,10 @@ impl super::PromExporter {
         }
         self.body_buf.push_str("# HELP varta_status Last reported status code per agent pid (0=ok,1=degraded,2=critical,3=stall).\n");
         self.body_buf.push_str("# TYPE varta_status gauge\n");
-        for pid in &pids {
-            let row = &self.rows[pid];
+        for pid in &self.pid_scratch {
+            let Some(row) = self.rows.get(*pid) else {
+                continue;
+            };
             if let Some(code) = row.last_status {
                 let _ = writeln!(self.body_buf, "varta_status{{pid=\"{pid}\"}} {code}");
             }
@@ -555,6 +562,16 @@ impl super::PromExporter {
             self.body_buf,
             "varta_prom_ip_state_probe_exhausted_total {}",
             self.prom_ip_state_probe_exhausted_total
+        );
+        self.body_buf.push_str(
+            "# HELP varta_prom_pid_row_refused_total Per-pid Prometheus metric rows refused by the bounded row table. Should stay at 0.\n",
+        );
+        self.body_buf
+            .push_str("# TYPE varta_prom_pid_row_refused_total counter\n");
+        let _ = writeln!(
+            self.body_buf,
+            "varta_prom_pid_row_refused_total {}",
+            self.prom_pid_row_refused_total
         );
         self.body_buf.push_str(
             "# HELP varta_frame_decrypt_failures_total Total AEAD decryption/tag-verification failures.\n",

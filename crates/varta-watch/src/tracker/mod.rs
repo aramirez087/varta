@@ -430,7 +430,7 @@ impl Tracker {
 
     /// Record a frame against the tracker.
     ///
-    /// Uses O(1) HashMap pid lookup to find the slot for `frame.pid`.
+    /// Uses bounded `PidIndex` lookup to find the slot for `frame.pid`.
     /// Returns [`Update::Inserted`] for a brand-new pid, [`Update::Refreshed`]
     /// for an existing pid whose nonce moved forward, [`Update::OutOfOrder`]
     /// if the nonce did not strictly increase, [`Update::CapacityExceeded`]

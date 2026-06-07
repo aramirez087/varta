@@ -11,7 +11,7 @@ use crate::probe_table::{BoundedIndex, Hash32};
 use super::bearer_token::parse_authorization_bearer;
 use super::http::{drain_read_to_would_block, PROM_DRAIN_READ_CAP};
 use super::{
-    drop_reason_index, DropReason, Exporter, IterStage, PromExporter,
+    drop_reason_index, DropReason, Exporter, IterStage, PidRowTable, PromExporter,
     RECOVERY_REFUSED_REASON_LABELS, STAGE_LABELS,
 };
 // MAX_PROM_IP_STATES and DROP_REASON_LABELS are used in the table-full and
@@ -77,6 +77,29 @@ fn decode_and_io_events_do_not_create_rows() {
         .unwrap();
     prom.record(&Event::Io(io::Error::other("x"), 0)).unwrap();
     assert!(prom.rows.is_empty());
+}
+
+#[test]
+fn pid_row_table_is_bounded_and_preserves_existing_rows() {
+    let mut rows = PidRowTable::with_capacity(2);
+
+    rows.get_mut_or_insert(10).expect("pid 10 row").beats_total = 1;
+    rows.get_mut_or_insert(20).expect("pid 20 row").stalls_total = 1;
+
+    assert!(
+        rows.get_mut_or_insert(30).is_none(),
+        "third pid must be refused when the fixed row table is full"
+    );
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows.get(10).map(|row| row.beats_total), Some(1));
+    assert_eq!(rows.get(20).map(|row| row.stalls_total), Some(1));
+
+    rows.remove(10);
+    assert!(
+        rows.get_mut_or_insert(30).is_some(),
+        "removing an evicted pid must free a row slot"
+    );
+    assert!(rows.contains_key(&30));
 }
 
 #[test]
@@ -445,6 +468,48 @@ fn record_evicted_pid_ignores_unknown_pid() {
     prom.record_evicted_pid(99);
     // Verify rows is still empty.
     assert!(prom.rows.is_empty());
+}
+
+#[test]
+fn record_refuses_new_pid_when_bounded_row_table_is_full() {
+    let mut prom = PromExporter::bind("127.0.0.1:0".parse().unwrap(), make_token()).expect("bind");
+    prom.rows = PidRowTable::with_capacity(1);
+    prom.pid_scratch = Vec::with_capacity(1);
+
+    prom.record(&Event::Beat {
+        pid: 1,
+        status: Status::Ok,
+        nonce: 1,
+        payload: 0,
+        observer_ns: 0,
+        origin: crate::peer_cred::BeatOrigin::KernelAttested,
+        pid_ns_inode: None,
+    })
+    .unwrap();
+    prom.record(&Event::Beat {
+        pid: 2,
+        status: Status::Critical,
+        nonce: 1,
+        payload: 0,
+        observer_ns: 0,
+        origin: crate::peer_cred::BeatOrigin::KernelAttested,
+        pid_ns_inode: None,
+    })
+    .unwrap();
+
+    assert!(prom.rows.contains_key(&1));
+    assert!(
+        !prom.rows.contains_key(&2),
+        "failed row admission must not evict an existing pid row"
+    );
+    assert_eq!(prom.prom_pid_row_refused_total, 1);
+
+    prom.render_body();
+    assert!(
+        prom.body_buf.contains("varta_prom_pid_row_refused_total 1"),
+        "row-table pressure must be observable:\n{}",
+        prom.body_buf
+    );
 }
 
 #[test]

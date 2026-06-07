@@ -15,8 +15,6 @@ use std::time::Duration;
 pub use file::{Exporter, FileExporter};
 
 #[cfg(feature = "prometheus-exporter")]
-use std::collections::HashMap;
-#[cfg(feature = "prometheus-exporter")]
 use std::io;
 #[cfg(feature = "prometheus-exporter")]
 use std::net::{SocketAddr, TcpListener};
@@ -37,6 +35,8 @@ use crate::log_ratelimit::LogKind;
 
 #[cfg(feature = "prometheus-exporter")]
 use crate::observer::Event;
+#[cfg(feature = "prometheus-exporter")]
+use crate::probe_table::BoundedIndex;
 
 /// Prometheus `kind` label values for `varta_log_suppressed_total`. Indexed
 /// by [`LogKind::index`]; the array doubles as the canonical ordering for
@@ -100,6 +100,98 @@ impl GaugeRow {
     }
 }
 
+#[cfg(feature = "prometheus-exporter")]
+#[derive(Clone, Copy)]
+struct PidRowSlot {
+    pid: u32,
+    row: GaugeRow,
+}
+
+#[cfg(feature = "prometheus-exporter")]
+struct PidRowTable {
+    slab: Vec<Option<PidRowSlot>>,
+    free_list: Vec<u32>,
+    pid_to_slot: BoundedIndex<u32>,
+}
+
+#[cfg(feature = "prometheus-exporter")]
+impl PidRowTable {
+    fn with_capacity(capacity: usize) -> Self {
+        debug_assert!(capacity > 0, "PidRowTable capacity must be > 0");
+        let mut slab = Vec::with_capacity(capacity);
+        for _ in 0..capacity {
+            slab.push(None);
+        }
+        let mut free_list = Vec::with_capacity(capacity);
+        for i in (0..capacity as u32).rev() {
+            free_list.push(i);
+        }
+        Self {
+            slab,
+            free_list,
+            pid_to_slot: BoundedIndex::new(capacity),
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.pid_to_slot.len()
+    }
+
+    #[cfg(test)]
+    fn is_empty(&self) -> bool {
+        self.pid_to_slot.len() == 0
+    }
+
+    #[cfg(test)]
+    fn contains_key(&self, pid: &u32) -> bool {
+        self.pid_to_slot.get(*pid).is_some()
+    }
+
+    fn get(&self, pid: u32) -> Option<&GaugeRow> {
+        let idx = self.pid_to_slot.get(pid)?;
+        self.slab.get(idx)?.as_ref().map(|slot| &slot.row)
+    }
+
+    fn get_mut_or_insert(&mut self, pid: u32) -> Option<&mut GaugeRow> {
+        if let Some(idx) = self.pid_to_slot.get(pid) {
+            return self.slab.get_mut(idx)?.as_mut().map(|slot| &mut slot.row);
+        }
+
+        let slot_idx = self.free_list.pop()?;
+        if self.pid_to_slot.insert(pid, slot_idx as usize).is_err() {
+            self.free_list.push(slot_idx);
+            return None;
+        }
+        let Some(cell) = self.slab.get_mut(slot_idx as usize) else {
+            self.pid_to_slot.remove(pid);
+            self.free_list.push(slot_idx);
+            return None;
+        };
+        *cell = Some(PidRowSlot {
+            pid,
+            row: GaugeRow::new(),
+        });
+        cell.as_mut().map(|slot| &mut slot.row)
+    }
+
+    fn remove(&mut self, pid: u32) -> Option<GaugeRow> {
+        let slot_idx = self.pid_to_slot.remove(pid)?;
+        let taken = self.slab.get_mut(slot_idx)?.take();
+        if let Some(slot) = taken {
+            self.free_list.push(slot_idx as u32);
+            Some(slot.row)
+        } else {
+            None
+        }
+    }
+
+    fn push_pids(&self, out: &mut Vec<u32>) {
+        for slot in self.slab.iter().flatten() {
+            out.push(slot.pid);
+        }
+    }
+}
+
 /// Per-connection read timeout on the [`PromExporter`]'s accepted streams.
 /// Capped so a slow or hostile client cannot stall the observer's poll loop.
 #[cfg(feature = "prometheus-exporter")]
@@ -114,6 +206,13 @@ const PROM_WRITE_TIMEOUT: Duration = Duration::from_millis(50);
 /// as an additional guard.
 #[cfg(feature = "prometheus-exporter")]
 const PROM_MAX_CONNECTIONS_PER_SERVE: usize = 8;
+/// Slack above tracker capacity for per-pid metric rows.
+///
+/// The observer records an accepted beat before the maintenance phase drains
+/// tracker removals into [`PromExporter::record_evicted_pid`], so the exporter
+/// must be able to hold the just-inserted pid plus rows awaiting cleanup.
+#[cfg(feature = "prometheus-exporter")]
+const PROM_PID_ROW_SLACK: usize = 64;
 /// After the serve budget is exhausted, the exporter enters drain mode:
 /// remaining connections are accepted and immediately closed (without
 /// serving) to prevent the kernel's accept queue from building up under a
@@ -381,7 +480,8 @@ fn drop_reason_index(r: DropReason) -> usize {
 #[cfg(feature = "prometheus-exporter")]
 pub struct PromExporter {
     listener: TcpListener,
-    rows: HashMap<u32, GaugeRow>,
+    rows: PidRowTable,
+    pid_scratch: Vec<u32>,
     /// Reused across `/metrics` scrapes to avoid per-scrape allocation.
     body_buf: String,
     /// Timestamp of the most recent scrape served. Enforces
@@ -550,6 +650,10 @@ pub struct PromExporter {
     /// `IpStateTable` ip-index probe-exhaustion events. Surfaced as
     /// `varta_prom_ip_state_probe_exhausted_total`.
     prom_ip_state_probe_exhausted_total: u64,
+    /// Per-pid metric rows that could not be allocated. Should stay at zero;
+    /// non-zero means the bounded row table's slack was exhausted before
+    /// tracker eviction cleanup reached the exporter.
+    prom_pid_row_refused_total: u64,
     /// Sum of recovery child wall-clock durations in ns. Used together with
     /// `recovery_duration_count_total` to compute an average runtime.
     recovery_duration_ns_sum: u64,
@@ -722,7 +826,8 @@ impl PromExporter {
         let now = Instant::now();
         Ok(PromExporter {
             listener,
-            rows: HashMap::new(),
+            rows: PidRowTable::with_capacity(crate::tracker::MAX_CAPACITY + PROM_PID_ROW_SLACK),
+            pid_scratch: Vec::with_capacity(crate::tracker::MAX_CAPACITY + PROM_PID_ROW_SLACK),
             body_buf: String::new(),
             last_scrape: None,
             evicted_total: 0,
@@ -763,6 +868,7 @@ impl PromExporter {
             recovery_outstanding_probe_exhausted_total: 0,
             recovery_reap_truncated_total: 0,
             prom_ip_state_probe_exhausted_total: 0,
+            prom_pid_row_refused_total: 0,
             recovery_duration_ns_sum: 0,
             recovery_duration_count_total: 0,
             scrape_skipped_total: 0,
@@ -812,10 +918,11 @@ impl PromExporter {
     }
 
     /// Remove the GaugeRow for a pid that was evicted from the tracker.
-    /// Prevents unbounded memory growth in the rows HashMap over long-running
-    /// deployments with ephemeral processes (CI runners, cron jobs, containers).
+    /// Keeps the bounded row table aligned with tracker membership in
+    /// long-running deployments with ephemeral processes (CI runners, cron
+    /// jobs, containers).
     pub fn record_evicted_pid(&mut self, pid: u32) {
-        self.rows.remove(&pid);
+        self.rows.remove(pid);
     }
 
     /// Record one or more beats dropped due to tracker capacity exceeded.
@@ -1314,18 +1421,26 @@ impl Exporter for PromExporter {
                 observer_ns: _,
                 ..
             } => {
-                let row = self.rows.entry(*pid).or_insert_with(GaugeRow::new);
-                row.beats_total = row.beats_total.saturating_add(1);
-                row.last_status = Some(*status as u8);
+                if let Some(row) = self.rows.get_mut_or_insert(*pid) {
+                    row.beats_total = row.beats_total.saturating_add(1);
+                    row.last_status = Some(*status as u8);
+                } else {
+                    self.prom_pid_row_refused_total =
+                        self.prom_pid_row_refused_total.saturating_add(1);
+                }
             }
             Event::Stall {
                 pid,
                 observer_ns: _,
                 ..
             } => {
-                let row = self.rows.entry(*pid).or_insert_with(GaugeRow::new);
-                row.stalls_total = row.stalls_total.saturating_add(1);
-                row.last_status = Some(Status::Stall as u8);
+                if let Some(row) = self.rows.get_mut_or_insert(*pid) {
+                    row.stalls_total = row.stalls_total.saturating_add(1);
+                    row.last_status = Some(Status::Stall as u8);
+                } else {
+                    self.prom_pid_row_refused_total =
+                        self.prom_pid_row_refused_total.saturating_add(1);
+                }
             }
             Event::AuthFailure { observer_ns: _, .. } => {
                 self.frame_auth_failures_total = self.frame_auth_failures_total.saturating_add(1);
