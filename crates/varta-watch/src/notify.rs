@@ -110,8 +110,20 @@ impl SdNotify {
     /// watchdog-thread-death gap that existed when emission lived on the
     /// main loop.
     pub fn take_watchdog_notifier(&mut self) -> Option<WatchdogNotifier> {
-        let interval = self.watchdog_interval.take()?;
-        let sock = self.sock.as_ref()?.try_clone().ok()?;
+        self.take_watchdog_notifier_with_clone(|sock| sock.try_clone().ok())
+    }
+
+    fn take_watchdog_notifier_with_clone<F>(&mut self, clone_sock: F) -> Option<WatchdogNotifier>
+    where
+        F: FnOnce(&UnixDatagram) -> Option<UnixDatagram>,
+    {
+        let interval = self.watchdog_interval?;
+        let Some(sock) = self.sock.as_ref() else {
+            self.watchdog_interval = None;
+            return None;
+        };
+        let sock = clone_sock(sock)?;
+        self.watchdog_interval = None;
         Some(WatchdogNotifier {
             sock,
             interval,
@@ -295,6 +307,28 @@ mod tests {
         );
         // Subsequent watchdog_tick must be a no-op.
         n.watchdog_tick();
+    }
+
+    /// A failed `dup(2)` must not consume the interval. `main.rs` uses the
+    /// still-present interval to emit the startup warning that systemd
+    /// watchdog integration could not be started.
+    #[test]
+    fn take_watchdog_notifier_preserves_interval_when_socket_clone_fails() {
+        use std::os::unix::net::UnixDatagram;
+
+        let (_listener, sender) =
+            UnixDatagram::pair().expect("socketpair for hermetic notify test");
+        let interval = Duration::from_micros(100);
+        let mut n = SdNotify {
+            sock: Some(sender),
+            watchdog_interval: Some(interval),
+            last_notify: Instant::now(),
+        };
+
+        let taken = n.take_watchdog_notifier_with_clone(|_| None);
+
+        assert!(taken.is_none());
+        assert_eq!(n.watchdog_half_interval(), Some(interval));
     }
 
     /// With a live socket the notifier comes back populated and ticks fire
