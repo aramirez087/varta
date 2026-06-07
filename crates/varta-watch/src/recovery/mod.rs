@@ -845,16 +845,37 @@ impl Recovery {
             }
             let i = self.orphan_reap_cursor;
             visited += 1;
-            // Non-blocking: Ok(None) means still running — advance past it and
-            // keep it for a later tick.
-            let exit_status = match self.reaping_orphans[i].1.child.try_wait() {
-                Ok(None) => {
-                    self.orphan_reap_cursor += 1;
-                    continue;
+
+            // Orphans are still recovery children with audit-visible capture
+            // state. Preserve the normal reap path's bounded drain semantics
+            // before emitting their terminal complete record.
+            let remove_now = {
+                let entry = &mut self.reaping_orphans[i].1;
+                Self::drain_outstanding_capture(entry, self.capture_cap);
+
+                if entry.completed_status.is_none() {
+                    match entry.child.try_wait() {
+                        Ok(Some(status)) => {
+                            entry.completed_status = Some(status);
+                            entry.completed_at = Some(Instant::now());
+                            Self::capture_drained(entry)
+                        }
+                        Ok(None) => {
+                            self.orphan_reap_cursor += 1;
+                            continue;
+                        }
+                        Err(_) => true,
+                    }
+                } else {
+                    Self::capture_drained(entry)
                 }
-                Ok(Some(status)) => Some(status),
-                Err(_) => None,
             };
+
+            if !remove_now {
+                self.orphan_reap_cursor += 1;
+                continue;
+            }
+
             // `swap_remove` moves the tail entry into slot `i`; leave the cursor
             // on `i` so that swapped-in entry is examined next (it wraps to 0 via
             // the `>= len` guard when `i` was the final slot).
@@ -864,7 +885,7 @@ impl Recovery {
                 orphan_pid,
                 child_pid,
                 crate::audit::CompleteOutcome::Killed,
-                exit_status.as_ref(),
+                entry.completed_status.as_ref(),
                 entry.spawned_at,
                 entry.wallclock_at_spawn_ms,
                 entry.stdout_len,

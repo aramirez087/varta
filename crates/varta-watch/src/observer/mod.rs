@@ -878,7 +878,10 @@ impl Observer {
         self.tracker.take_evictions()
     }
 
-    /// Drain the pid of the most recently evicted slot, if any.
+    /// Drain one pid whose tracker slot was removed, if any.
+    ///
+    /// Covers capacity evictions and generation-mismatch retirements. The
+    /// main loop drains this to remove stale per-pid exporter rows.
     pub fn drain_evicted_pid(&mut self) -> Option<u32> {
         self.tracker.take_evicted_pid()
     }

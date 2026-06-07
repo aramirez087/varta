@@ -71,6 +71,34 @@ fn stall_counter_enables_eviction_after_drain() {
     assert_eq!(t.stall_emitted_count, cap - 1);
 }
 
+#[test]
+fn capacity_eviction_queues_removed_pid_for_exporter_cleanup() {
+    let mut t = Tracker::new(2, EvictionPolicy::Strict, DEFAULT_EVICTION_SCAN_WINDOW);
+    let threshold_ns = 100;
+
+    assert_eq!(
+        t.record(&frame(10, 1), 0, threshold_ns, ORIGIN, None),
+        Update::Inserted
+    );
+    assert_eq!(
+        t.record(&frame(20, 1), 0, threshold_ns, ORIGIN, None),
+        Update::Inserted
+    );
+    let now_ns = threshold_ns * 20;
+    t.drain_stalled_slots(now_ns, threshold_ns, |_, _, _, _, _, _| {});
+
+    assert_eq!(
+        t.record(&frame(30, 1), now_ns, threshold_ns, ORIGIN, None),
+        Update::Inserted
+    );
+    assert_eq!(
+        t.take_evicted_pid(),
+        Some(10),
+        "the evicted slot pid must be surfaced for exporter cleanup"
+    );
+    assert_eq!(t.take_evicted_pid(), None);
+}
+
 /// A fresh beat on a previously-stalled slot must decrement the counter.
 #[test]
 fn stall_counter_decrements_on_refresh() {
@@ -1116,6 +1144,47 @@ fn stall_generation_mismatch_retires_slot_without_emitting_recovery_event() {
     );
     assert_eq!(t.entries[0].generation, Some(222));
     assert_eq!(t.entries[0].last_nonce, 1);
+}
+
+#[test]
+fn stall_generation_mismatch_queues_every_retired_pid_for_exporter_cleanup() {
+    let mut t = Tracker::new(4, EvictionPolicy::Strict, DEFAULT_EVICTION_SCAN_WINDOW);
+    let threshold_ns = 100;
+    for (pid, generation) in [(10, 110), (20, 120), (30, 130)] {
+        assert_eq!(
+            t.record_with_generation(
+                &frame(pid, 5_000),
+                0,
+                threshold_ns,
+                BeatOrigin::KernelAttested,
+                Some(10),
+                Some(generation),
+            ),
+            Update::Inserted
+        );
+    }
+
+    let mut emitted = 0u32;
+    t.drain_stalled_slots_with_generation_check(
+        threshold_ns * 2,
+        threshold_ns,
+        |_, _| true,
+        |_, _, _, _, _, _| emitted += 1,
+    );
+
+    assert_eq!(emitted, 0);
+    assert_eq!(t.len(), 0);
+    assert_eq!(t.take_pid_recycles(), 3);
+    let mut removed = Vec::new();
+    while let Some(pid) = t.take_evicted_pid() {
+        removed.push(pid);
+    }
+    removed.sort_unstable();
+    assert_eq!(
+        removed,
+        vec![10, 20, 30],
+        "every retired slot must be surfaced, not only the last one"
+    );
 }
 
 /// A missing generation read at stall time is fail-open. `/proc` can vanish

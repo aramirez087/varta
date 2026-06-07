@@ -642,6 +642,18 @@ mod tests {
             std::fs::read_dir("/dev/fd").expect("read /dev/fd").count()
         }
 
+        fn eventually_open_fd_count_at_most(expected: usize) -> usize {
+            let mut last = open_fd_count();
+            for _ in 0..50 {
+                if last <= expected {
+                    return last;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1));
+                last = open_fd_count();
+            }
+            last
+        }
+
         let path =
             std::env::temp_dir().join(format!("varta-scmrights-macos-{}.sock", std::process::id()));
         let _ = std::fs::remove_file(&path);
@@ -704,7 +716,7 @@ mod tests {
 
         let before = open_fd_count();
         let result = recv_authenticated(observer.as_raw_fd());
-        let after = open_fd_count();
+        let after = eventually_open_fd_count_at_most(before);
 
         match result {
             RecvResult::Authenticated { data, origin, .. } => {
@@ -713,8 +725,8 @@ mod tests {
             }
             _ => panic!("expected an authenticated beat"),
         }
-        assert_eq!(
-            after, before,
+        assert!(
+            after <= before,
             "observer leaked peer-injected SCM_RIGHTS fds (before={before}, after={after})"
         );
 

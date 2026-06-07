@@ -687,6 +687,73 @@ fn completed_child_capture_drain_is_bounded_per_tick() {
 }
 
 #[test]
+#[cfg_attr(miri, ignore)]
+fn orphan_reaper_drains_capture_before_complete_audit() {
+    const PID: u32 = 701;
+    const CAPTURED_BYTES: u32 = 6_000;
+
+    let dir = audit_tmpdir("orphan-capture");
+    let path = dir.join("audit.log");
+    let (sink, _) = audit::RecoveryAuditLog::create(&path, audit::AuditConfig::default())
+        .expect("create audit");
+
+    let mut rec = Recovery::with_mode(
+        RecoveryMode::Exec {
+            program: "sh".to_string(),
+            args: vec![
+                "-c".to_string(),
+                "printf '%6000s' '' | tr ' ' X; exec sleep 30".to_string(),
+            ],
+        },
+        Duration::from_secs(60),
+    )
+    .with_capture(CAPTURED_BYTES + 1024)
+    .with_audit_sink(Some(sink));
+
+    match rec.on_stall(PID, BeatOrigin::KernelAttested, false, Some(1), 0) {
+        RecoveryOutcome::Spawned { .. } => {}
+        other => panic!("expected first lineage to spawn, got {other:?}"),
+    }
+
+    std::thread::sleep(Duration::from_millis(100));
+    match rec.on_stall(PID, BeatOrigin::KernelAttested, false, Some(2), 0) {
+        RecoveryOutcome::Spawned { .. } => {}
+        other => panic!("expected recycled lineage to spawn, got {other:?}"),
+    }
+    assert_eq!(
+        rec.reaping_orphans.len(),
+        1,
+        "first lineage must move to the orphan reaper"
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while !rec.reaping_orphans.is_empty() && Instant::now() < deadline {
+        let _ = rec.try_reap(123_456);
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        rec.reaping_orphans.is_empty(),
+        "orphaned child must be reaped"
+    );
+    drop(rec);
+
+    let body = std::fs::read_to_string(&path).expect("read audit");
+    let complete = body
+        .lines()
+        .find(|l| l.contains(&format!("\tcomplete\t{PID}\t")))
+        .expect("complete line for orphan");
+    let cols: Vec<&str> = complete.split('\t').collect();
+    assert_eq!(cols[3], "complete", "column-layout sanity: {complete}");
+    assert_eq!(cols[6], "killed", "orphan completion outcome: {complete}");
+    let stdout_len: u32 = cols[10].parse().expect("stdout_len");
+    assert!(
+        stdout_len >= CAPTURED_BYTES,
+        "orphan reaper must preserve captured stdout before audit complete; got {stdout_len}: {complete}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn audit_disabled_does_not_create_audit_file() {
     let mut rec = Recovery::with_mode(
         RecoveryMode::Exec {

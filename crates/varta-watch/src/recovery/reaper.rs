@@ -140,7 +140,7 @@ impl Recovery {
     /// Takes the entry by `&mut Outstanding` so it can be called while an
     /// `OccupiedEntry` is held in [`Self::reap_finished_child`] without
     /// re-borrowing the map.
-    fn drain_outstanding_capture(entry: &mut Outstanding, cap_cfg: u32) {
+    pub(super) fn drain_outstanding_capture(entry: &mut Outstanding, cap_cfg: u32) {
         let cap = cap_cfg as usize;
         if cap == 0 {
             return;
@@ -216,7 +216,7 @@ impl Recovery {
         }
     }
 
-    fn capture_drained(entry: &Outstanding) -> bool {
+    pub(super) fn capture_drained(entry: &Outstanding) -> bool {
         entry.truncated
             || (entry.stdout_handle.is_none() && entry.stderr_handle.is_none())
             || matches!(entry.completed_at, Some(t) if t.elapsed() >= POST_EXIT_CAPTURE_DRAIN_GRACE)

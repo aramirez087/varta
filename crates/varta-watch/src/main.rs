@@ -118,6 +118,13 @@ const STAGE_ABORT_NS: [u64; 6] = [
     1_000 * 1_000_000, // Housekeeping: 1 s (100× 10 ms)
 ];
 
+/// Maximum tracker-removal cleanup records drained per maintenance tick.
+///
+/// A generation-recycle sweep can retire many stale slots in one poll call.
+/// Draining cleanup through a fixed cap keeps file-export I/O bounded while
+/// still clearing Prometheus/file rows over subsequent ticks.
+const REMOVED_PID_DRAIN_MAX_PER_TICK: usize = 64;
+
 /// The self-watchdog's clock is **hardwired** to the suspend-paused
 /// monotonic clock (`CLOCK_MONOTONIC`), never the operator-selected
 /// `--clock-source`.  The watchdog measures on-CPU wedge time of the main
@@ -1243,7 +1250,10 @@ fn run(cfg: Config) -> std::io::Result<()> {
             }
         }
 
-        if let Some(evicted_pid) = observer.drain_evicted_pid() {
+        for _ in 0..REMOVED_PID_DRAIN_MAX_PER_TICK {
+            let Some(evicted_pid) = observer.drain_evicted_pid() else {
+                break;
+            };
             if let Some(fe) = file_export.as_mut() {
                 if let Err(e) = fe.record_eviction_pid(evicted_pid, observer.now_ns()) {
                     varta_error_rl!(LogKind::FileExportIo, "file export error: {e}");

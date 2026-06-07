@@ -329,7 +329,7 @@ pub struct Tracker {
     evictions: u64,
     capacity_exceeded: u64,
     nonce_wraps: u64,
-    last_evicted_pid: Option<u32>,
+    removed_pids: Vec<u32>,
     eviction_policy: EvictionPolicy,
     /// Cached count of slots whose `stall_emitted` flag is currently set.
     ///
@@ -415,7 +415,7 @@ impl Tracker {
             evictions: 0,
             capacity_exceeded: 0,
             nonce_wraps: 0,
-            last_evicted_pid: None,
+            removed_pids: Vec::with_capacity(cap),
             eviction_policy,
             stall_emitted_count: 0,
             eviction_scan_window: window,
@@ -679,7 +679,7 @@ impl Tracker {
                     self.stall_emitted_count = self.stall_emitted_count.saturating_sub(1);
                 }
                 self.evictions = self.evictions.saturating_add(1);
-                self.last_evicted_pid = Some(evicted_slot.pid);
+                self.remember_removed_pid(evicted_slot.pid);
                 return Update::Inserted;
             }
             self.capacity_exceeded = self.capacity_exceeded.saturating_add(1);
@@ -816,6 +816,7 @@ impl Tracker {
         }
 
         let removed = self.entries[idx];
+        let removed_pid = removed.pid;
         let _ = self.pid_to_index.remove(removed.pid);
         if removed.stall_emitted {
             self.stall_emitted_count = self.stall_emitted_count.saturating_sub(1);
@@ -842,6 +843,13 @@ impl Tracker {
         } else {
             self.eviction_scan_cursor %= self.len;
         }
+        self.remember_removed_pid(removed_pid);
+    }
+
+    fn remember_removed_pid(&mut self, pid: u32) {
+        if self.removed_pids.len() < self.removed_pids.capacity() {
+            self.removed_pids.push(pid);
+        }
     }
 
     /// Take and reset the eviction counter. Returns the number of slots
@@ -852,10 +860,13 @@ impl Tracker {
         count
     }
 
-    /// Return the pid of the most recently evicted slot, if any slots
-    /// have been evicted since the last call.
+    /// Return one pending pid removed from the tracker, if any.
+    ///
+    /// Covers both capacity evictions and generation-mismatch retirements.
+    /// Consumers use this to drop per-pid exporter rows after the slot is no
+    /// longer tracked. Repeated calls drain all pending removals.
     pub fn take_evicted_pid(&mut self) -> Option<u32> {
-        self.last_evicted_pid.take()
+        self.removed_pids.pop()
     }
 
     /// Take and reset the nonce-wrap counter. Returns the number of
