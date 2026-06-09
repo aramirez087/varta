@@ -296,18 +296,39 @@ fn run(cfg: Config) -> std::io::Result<()> {
     // Linux, FreeBSD, DragonFly, NetBSD, illumos, and Solaris have
     // per-datagram credential mechanisms for this socket shape — the observer
     // enforces them automatically.
-    #[cfg(not(any(
-        target_os = "linux",
-        target_os = "freebsd",
-        target_os = "dragonfly",
-        target_os = "netbsd",
-        target_os = "illumos",
-        target_os = "solaris",
-    )))]
+    #[cfg(all(
+        not(feature = "compile-time-config"),
+        not(any(
+            target_os = "linux",
+            target_os = "freebsd",
+            target_os = "dragonfly",
+            target_os = "netbsd",
+            target_os = "illumos",
+            target_os = "solaris",
+        ))
+    ))]
     varta_warn!(
         "running on {} — per-datagram PID verification is unavailable. \
          Beats are tagged socket-mode-only; recovery commands will be refused. \
          The only trust boundary is --socket-mode (default 0600): any process \
+         under the same UID can forge frame.pid.",
+        std::env::consts::OS,
+    );
+    #[cfg(all(
+        feature = "compile-time-config",
+        not(any(
+            target_os = "linux",
+            target_os = "freebsd",
+            target_os = "dragonfly",
+            target_os = "netbsd",
+            target_os = "illumos",
+            target_os = "solaris",
+        ))
+    ))]
+    varta_warn!(
+        "running on {} — per-datagram PID verification is unavailable. \
+         Beats are tagged socket-mode-only; recovery commands will be refused. \
+         The only trust boundary is the configured socket file mode: any process \
          under the same UID can forge frame.pid.",
         std::env::consts::OS,
     );

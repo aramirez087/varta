@@ -67,6 +67,24 @@ fn linux_effective_origin_for_identity(
     }
 }
 
+fn origin_repair_bypasses_per_pid(incoming: BeatOrigin, pinned: BeatOrigin) -> bool {
+    if !incoming.can_replace(pinned) {
+        return false;
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        // Raw UDS credentials are not enough to repair a Linux slot that was
+        // already downgraded for incomplete identity; otherwise that stream
+        // can bypass the per-pid limiter forever before the later downgrade.
+        if incoming == BeatOrigin::KernelAttested && pinned == BeatOrigin::SocketModeOnly {
+            return false;
+        }
+    }
+
+    true
+}
+
 /// Global per-observer token bucket — one shared across all senders.
 ///
 /// Guards against per-pid rotation attacks where an attacker cycles through
@@ -585,7 +603,7 @@ impl Observer {
                             #[cfg(target_os = "linux")]
                             let slot_pid_ns_inode_before = self.tracker.pid_ns_inode_of(frame.pid);
                             let origin_upgrade = match slot_origin_before {
-                                Some(pinned) => origin.can_replace(pinned),
+                                Some(pinned) => origin_repair_bypasses_per_pid(origin, pinned),
                                 None => false,
                             };
 
