@@ -410,6 +410,65 @@ impl BeatListener for ScriptedListener {
 }
 
 #[test]
+fn linux_effective_origin_requires_namespace_for_unpinned_kernel_authority() {
+    assert_eq!(
+        linux_effective_origin_for_identity(
+            BeatOrigin::KernelAttested,
+            None,
+            Some(123),
+            None,
+            None,
+        ),
+        BeatOrigin::SocketModeOnly,
+        "first-contact Linux UDS recovery authority needs both generation and namespace proof"
+    );
+}
+
+#[test]
+fn linux_effective_origin_accepts_complete_first_contact_identity() {
+    assert_eq!(
+        linux_effective_origin_for_identity(
+            BeatOrigin::KernelAttested,
+            Some(4026531836),
+            Some(123),
+            None,
+            None,
+        ),
+        BeatOrigin::KernelAttested
+    );
+}
+
+#[test]
+fn linux_effective_origin_preserves_already_pinned_kernel_slot() {
+    assert_eq!(
+        linux_effective_origin_for_identity(
+            BeatOrigin::KernelAttested,
+            None,
+            None,
+            Some(Some(4026531836)),
+            Some(Some(123)),
+        ),
+        BeatOrigin::KernelAttested,
+        "already-pinned agents may lose /proc metadata while emitting a terminal frame"
+    );
+}
+
+#[test]
+fn linux_effective_origin_does_not_upgrade_slot_with_generation_but_no_namespace() {
+    assert_eq!(
+        linux_effective_origin_for_identity(
+            BeatOrigin::KernelAttested,
+            None,
+            Some(123),
+            Some(None),
+            Some(Some(123)),
+        ),
+        BeatOrigin::SocketModeOnly,
+        "generation-only identity is not enough to mint recovery authority"
+    );
+}
+
+#[test]
 fn poll_returns_multi_listener_events_one_at_a_time() {
     let mut obs = Observer::new(
         Duration::from_secs(1),

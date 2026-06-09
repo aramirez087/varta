@@ -45,6 +45,28 @@ const CLOCK_JUMP_FORWARD_THRESHOLD_NS: u64 = 5_000_000_000;
 /// cadence convention.
 const PID_MAX_REFRESH_INTERVAL_NS: u64 = 60_000_000_000;
 
+#[cfg(any(target_os = "linux", test))]
+fn linux_effective_origin_for_identity(
+    origin: BeatOrigin,
+    peer_pid_ns_inode: Option<u64>,
+    peer_generation: Option<u64>,
+    slot_pid_ns_inode_before: Option<Option<u64>>,
+    slot_generation_before: Option<Option<u64>>,
+) -> BeatOrigin {
+    let incoming_identity_complete = peer_pid_ns_inode.is_some() && peer_generation.is_some();
+    let pinned_identity_complete =
+        slot_pid_ns_inode_before.flatten().is_some() && slot_generation_before.flatten().is_some();
+
+    if origin == BeatOrigin::KernelAttested
+        && !incoming_identity_complete
+        && !pinned_identity_complete
+    {
+        BeatOrigin::SocketModeOnly
+    } else {
+        origin
+    }
+}
+
 /// Global per-observer token bucket — one shared across all senders.
 ///
 /// Guards against per-pid rotation attacks where an attacker cycles through
@@ -560,6 +582,8 @@ impl Observer {
                             let slot_origin_before = self.tracker.origin_of(frame.pid);
                             #[cfg(target_os = "linux")]
                             let slot_generation_before = self.tracker.generation_of(frame.pid);
+                            #[cfg(target_os = "linux")]
+                            let slot_pid_ns_inode_before = self.tracker.pid_ns_inode_of(frame.pid);
                             let origin_upgrade = match slot_origin_before {
                                 Some(pinned) => origin.can_replace(pinned),
                                 None => false,
@@ -640,28 +664,27 @@ impl Observer {
                             } else {
                                 (peer_pid_ns_inode, None)
                             };
-                            // Linux recovery safety needs a process-generation
-                            // token before a first-contact UDS beat may pin a
-                            // recovery-eligible origin. If the sender exits
-                            // between recvmsg(2) and the /proc start-time
-                            // read, the kernel still attested the numeric PID,
-                            // but the tracker cannot distinguish the original
-                            // process from a later PID recycle. Keep the beat
-                            // observable by tracking it as SocketModeOnly until
-                            // a later accepted beat can pin Some(generation)
-                            // and upgrade to KernelAttested. Existing pinned
-                            // slots are left alone so terminal dying-gasp frames
-                            // do not lose their Critical signal when /proc has
-                            // already vanished.
+                            // Linux recovery safety needs both namespace and
+                            // process-generation proof before a first-contact
+                            // UDS beat may pin a recovery-eligible origin. If
+                            // either `/proc/<pid>/ns/pid` or `/proc/<pid>/stat`
+                            // failed, the kernel still attested the numeric PID
+                            // but recovery cannot prove same-namespace targeting
+                            // and PID-recycle identity. Keep the beat observable
+                            // as SocketModeOnly until a later accepted beat can
+                            // pin complete identity and upgrade to
+                            // KernelAttested. Existing pinned slots are left
+                            // alone so terminal dying-gasp frames do not lose
+                            // their Critical signal when /proc has already
+                            // vanished.
                             #[cfg(target_os = "linux")]
-                            let origin = if origin == BeatOrigin::KernelAttested
-                                && peer_generation.is_none()
-                                && slot_generation_before.flatten().is_none()
-                            {
-                                BeatOrigin::SocketModeOnly
-                            } else {
-                                origin
-                            };
+                            let origin = linux_effective_origin_for_identity(
+                                origin,
+                                peer_pid_ns_inode,
+                                peer_generation,
+                                slot_pid_ns_inode_before,
+                                slot_generation_before,
+                            );
                             // Resolve the peer's process identity
                             // (PID-namespace inode + start-time generation)
                             // alongside the same kernel-attested `peer_pid`.
