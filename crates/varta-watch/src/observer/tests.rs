@@ -652,6 +652,76 @@ fn terminal_gasp_bypasses_global_limiter_once_for_tracked_kernel_agent() {
     );
 }
 
+#[test]
+fn repeated_terminal_gasp_pays_per_pid_rate_limiter() {
+    // The terminal-frame carve-out exists for exactly one case: a process
+    // beats normally, panics, and emits one Critical dying gasp inside the
+    // ordinary per-pid interval. Once that terminal frame is recorded,
+    // repeated terminal frames are no longer a dying-gasp edge; they are a
+    // same-pid hot loop and must pay --max-beat-rate.
+    let mut obs = Observer::new(
+        Duration::from_secs(60),
+        64,
+        EvictionPolicy::Strict,
+        DEFAULT_EVICTION_SCAN_WINDOW,
+        Some(1),
+        0,
+        0,
+        ClockSource::Monotonic,
+    )
+    .expect("Observer::new should succeed");
+
+    obs.add_listener(Box::new(ScriptedListener::with_status_frames(&[
+        (10, Status::Ok, 1, 1, 100),
+        (10, Status::Critical, 2, NONCE_TERMINAL, 0xDEAD),
+        (10, Status::Critical, 3, NONCE_TERMINAL, 0xBEEF),
+    ])));
+
+    let first = obs.poll();
+    assert!(
+        matches!(
+            first,
+            Some(Event::Beat {
+                pid: 10,
+                payload: 100,
+                ..
+            })
+        ),
+        "regular beat should be accepted, got {first:?}"
+    );
+
+    let second = obs.poll();
+    assert!(
+        matches!(
+            second,
+            Some(Event::Beat {
+                pid: 10,
+                status: Status::Critical,
+                payload: 0xDEAD,
+                nonce: NONCE_TERMINAL,
+                ..
+            })
+        ),
+        "first terminal beat after a regular beat must still bypass the per-pid limiter, got {second:?}"
+    );
+    assert_eq!(
+        obs.drain_per_pid_rate_limited(),
+        0,
+        "the first terminal edge must not count as a per-pid drop"
+    );
+
+    let third = obs.poll();
+    assert!(
+        third.is_none(),
+        "repeated terminal frame inside the interval must be per-pid limited, got {third:?}"
+    );
+    assert_eq!(
+        obs.drain_per_pid_rate_limited(),
+        1,
+        "repeated terminal frames should pay the per-pid limiter"
+    );
+}
+
 #[cfg(target_os = "linux")]
 #[test]
 fn first_contact_without_generation_is_recovery_ineligible() {

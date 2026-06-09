@@ -575,16 +575,18 @@ impl Observer {
                             // is built never to drop (see
                             // `tracker::record_with_generation`, which records a
                             // terminal frame even when its namespace inode has
-                            // already read back `None`). Exempt it from the
-                            // per-pid limiter, mirroring `origin_upgrade`.
+                            // already read back `None`). Exempt exactly the
+                            // regular→terminal edge from the per-pid limiter,
+                            // mirroring `origin_upgrade`; repeated terminal
+                            // frames are ordinary same-pid pressure.
                             let is_terminal = frame.nonce == NONCE_TERMINAL;
-                            let terminal_global_bypass = is_terminal
-                                && peer_pid != 0
-                                && frame.pid == peer_pid
+                            let terminal_after_regular = is_terminal
                                 && matches!(
                                     self.tracker.last_observed_nonce_of(frame.pid),
                                     Some(nonce) if nonce != NONCE_TERMINAL
                                 );
+                            let terminal_global_bypass =
+                                terminal_after_regular && peer_pid != 0 && frame.pid == peer_pid;
                             // Per-pid rate limiting is an O(1) tracker lookup
                             // and must run before the global bucket. A
                             // same-pid burst that is already being dropped
@@ -593,7 +595,7 @@ impl Observer {
                             // the global limiter below, preserving the
                             // rotation-attack guard before namespace reads or
                             // tracker insertion.
-                            if !origin_upgrade && !is_terminal {
+                            if !origin_upgrade && !terminal_after_regular {
                                 if let Some(interval_ns) = self.rate_limit_interval_ns {
                                     if let Some(last_ns) = self.tracker.last_ns_of(frame.pid) {
                                         if now_ns.saturating_sub(last_ns) < interval_ns {
