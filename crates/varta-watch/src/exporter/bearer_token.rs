@@ -6,11 +6,17 @@ pub(super) fn find_crlf(buf: &[u8]) -> Option<usize> {
     buf.windows(2).position(|w| w == b"\r\n")
 }
 
+#[cfg(feature = "prometheus-exporter")]
+#[inline]
+fn is_ows(b: u8) -> bool {
+    matches!(b, b' ' | b'\t')
+}
+
 /// Parse `Authorization: Bearer <64hex>` out of a buffered HTTP/1.x
 /// request without allocating.  Returns the decoded 32-byte token when
-/// the header is present, well-formed, and carries exactly 64 hex
-/// characters of token material; returns `None` otherwise.  The header
-/// field name is matched case-insensitively per RFC 7230 §3.2.
+/// the header is present, well-formed, and carries a 64-hex token with
+/// only optional whitespace around it; returns `None` otherwise.  The
+/// header field name is matched case-insensitively per RFC 7230 §3.2.
 #[cfg(feature = "prometheus-exporter")]
 pub(super) fn parse_authorization_bearer(buf: &[u8]) -> Option<[u8; 32]> {
     // Skip the request line. find_crlf returns the index of '\r'; bump
@@ -31,7 +37,7 @@ pub(super) fn parse_authorization_bearer(buf: &[u8]) -> Option<[u8; 32]> {
         if line.len() >= HDR.len() && line[..HDR.len()].eq_ignore_ascii_case(HDR) {
             let mut value = &line[HDR.len()..];
             while let Some(b) = value.first().copied() {
-                if b == b' ' || b == b'\t' {
+                if is_ows(b) {
                     value = &value[1..];
                 } else {
                     break;
@@ -46,7 +52,7 @@ pub(super) fn parse_authorization_bearer(buf: &[u8]) -> Option<[u8; 32]> {
             }
             let mut token_part = &value[BEARER.len()..];
             while let Some(b) = token_part.first().copied() {
-                if b == b' ' || b == b'\t' {
+                if is_ows(b) {
                     token_part = &token_part[1..];
                 } else {
                     break;
@@ -55,7 +61,11 @@ pub(super) fn parse_authorization_bearer(buf: &[u8]) -> Option<[u8; 32]> {
             if token_part.len() < 64 {
                 return None;
             }
-            return varta_vlp::decode_hex_32(&token_part[..64]).ok();
+            let (token_hex, trailing) = token_part.split_at(64);
+            if trailing.iter().any(|b| !is_ows(*b)) {
+                return None;
+            }
+            return varta_vlp::decode_hex_32(token_hex).ok();
         }
     }
     None

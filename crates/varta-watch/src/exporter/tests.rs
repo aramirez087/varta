@@ -255,6 +255,22 @@ fn metrics_rejects_wrong_token() {
 }
 
 #[test]
+fn metrics_rejects_token_with_trailing_garbage() {
+    let mut prom = PromExporter::bind("127.0.0.1:0".parse().unwrap(), make_token()).expect("bind");
+    let addr = prom.local_addr().expect("local_addr");
+    let bad = format!("Bearer {TEST_TOKEN_HEX}extra");
+    let response = one_get(&mut prom, addr, Some(&bad));
+    assert!(
+        response.starts_with("HTTP/1.0 401 Unauthorized"),
+        "expected 401 on token with trailing garbage, got: {response}"
+    );
+    assert_eq!(
+        prom.prom_auth_failures_total, 1,
+        "prom_auth_failures_total must bump on malformed token"
+    );
+}
+
+#[test]
 fn metrics_accepts_valid_token() {
     let mut prom = PromExporter::bind("127.0.0.1:0".parse().unwrap(), make_token()).expect("bind");
     let addr = prom.local_addr().expect("local_addr");
@@ -438,6 +454,19 @@ fn parse_authorization_bearer_rejects_non_bearer_scheme() {
 fn parse_authorization_bearer_rejects_short_token() {
     let req = "GET /metrics HTTP/1.0\r\nAuthorization: Bearer abc\r\n\r\n";
     assert!(parse_authorization_bearer(req.as_bytes()).is_none());
+}
+
+#[test]
+fn parse_authorization_bearer_rejects_trailing_garbage_after_token() {
+    let req =
+        format!("GET /metrics HTTP/1.0\r\nAuthorization: Bearer {TEST_TOKEN_HEX}extra\r\n\r\n");
+    assert!(parse_authorization_bearer(req.as_bytes()).is_none());
+}
+
+#[test]
+fn parse_authorization_bearer_accepts_trailing_ows_after_token() {
+    let req = format!("GET /metrics HTTP/1.0\r\nAuthorization: Bearer {TEST_TOKEN_HEX}\t \r\n\r\n");
+    assert_eq!(parse_authorization_bearer(req.as_bytes()), Some(TEST_TOKEN));
 }
 
 #[test]
