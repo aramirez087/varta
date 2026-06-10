@@ -91,7 +91,7 @@ def test_beat_emits_decodable_frame(
         assert frame.payload == 42
 
 
-class _CountingTransport(BeatTransport):
+class _SimpleSendTransport(BeatTransport):
     def __init__(self) -> None:
         self.send_calls = 0
         self.reconnect_calls = 0
@@ -106,7 +106,7 @@ class _CountingTransport(BeatTransport):
 
 @pytest.mark.parametrize("status", [Status.STALL, "stall", 3])
 def test_beat_rejects_observer_only_stall_without_side_effects(status: object) -> None:
-    transport = _CountingTransport()
+    transport = _SimpleSendTransport()
     agent = Varta(transport)
     agent._consecutive_dropped = 7
 
