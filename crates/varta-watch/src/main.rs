@@ -254,6 +254,53 @@ fn main() -> ExitCode {
     }
 }
 
+/// Record one ingress [`Event`] into the configured exporters and enforce
+/// strict-namespace fatality. Shared by the Poll step and the DrainPending
+/// ingress pre-drain so a beat consumed early in the tick is exported
+/// identically to one consumed by the regular poll step.
+fn record_ingress_event(
+    ev: &Event,
+    file_export: &mut Option<FileExporter>,
+    #[cfg(feature = "prometheus-exporter")] prom_export: &mut Option<PromExporter>,
+    cfg: &Config,
+) -> std::io::Result<()> {
+    if let Some(fe) = file_export.as_mut() {
+        if let Err(e) = fe.record(ev) {
+            varta_error_rl!(LogKind::FileExportIo, "file export error: {e}");
+        }
+    }
+    #[cfg(feature = "prometheus-exporter")]
+    if let Some(pe) = prom_export.as_mut() {
+        let _ = pe.record(ev);
+    }
+    // Strict namespace mode: a cross-namespace agent is a fatal
+    // startup error. The default behaviour is to drop the beat and
+    // refuse recovery (already enforced inside `Observer`); strict
+    // mode escalates to daemon exit so the operator notices.
+    if cfg.strict_namespace_check && !cfg.allow_cross_namespace_agents {
+        if let Event::NamespaceConflict { claimed_pid, .. } = ev {
+            #[cfg(not(feature = "compile-time-config"))]
+            varta_error!(
+                "FATAL --strict-namespace-check: cross-namespace agent \
+                 detected for claimed pid {claimed_pid}; refusing to \
+                 continue. Re-run with --allow-cross-namespace-agents \
+                 only if PID translation is correctly configured."
+            );
+            #[cfg(feature = "compile-time-config")]
+            varta_error!(
+                "FATAL strict namespace check: cross-namespace agent \
+                 detected for claimed pid {claimed_pid}; refusing to \
+                 continue."
+            );
+            return Err(io::Error::new(
+                io::ErrorKind::Other,
+                "cross-namespace agent detected under strict namespace check",
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn run(cfg: Config) -> std::io::Result<()> {
     // Attest single-threadedness before the first umask(2) call in
     // UdsListener::bind.  The token is constructed here — the first
@@ -943,6 +990,44 @@ fn run(cfg: Config) -> std::io::Result<()> {
             CURRENT_STAGE.store(IterStage::DrainPending as u8, Ordering::Release);
         }
 
+        // ------ 1a. Ingress pre-drain before deferred stalls may fire ------
+        // A queued stall is only as fresh as the tracker state behind it, and
+        // the tracker only learns that an agent resumed when poll() consumes
+        // the agent's beat. Step 2 consumes at most one returnable beat per
+        // tick, while the loop below fires up to RECOVERY_SPAWN_MAX_PER_TICK
+        // recoveries per tick — under a mass stall whose agents have since
+        // resumed (a transient system-wide pause: cgroup freeze, hypervisor
+        // pause, suspend/resume on a suspend-advancing --clock-source),
+        // deferred kills would outrun the resume-beats that prove them wrong
+        // ~16:1 and the stall_freshness gate would read stale `stall_emitted`
+        // state, killing most of a healthy, already-recovered fleet. Drain
+        // ingress until the sockets are empty so the gate judges every queued
+        // stall against all evidence already received. Genuinely stalled
+        // agents are silent and contribute nothing here; a hostile flood is
+        // bounded by RECOVERY_PREDRAIN_INGRESS_MAX_PER_TICK (each item is one
+        // recv+decode+record, microseconds — far inside the 2 s DrainPending
+        // stage ceiling).
+        if recovery.is_some() && observer.has_pending_stalls() {
+            let mut predrained = 0usize;
+            while predrained < varta_watch::recovery::RECOVERY_PREDRAIN_INGRESS_MAX_PER_TICK {
+                predrained += 1;
+                let ev = observer.poll();
+                let consumed = observer.last_poll_consumed();
+                if let Some(ev) = ev {
+                    record_ingress_event(
+                        &ev,
+                        &mut file_export,
+                        #[cfg(feature = "prometheus-exporter")]
+                        &mut prom_export,
+                        &cfg,
+                    )?;
+                }
+                if !consumed {
+                    break;
+                }
+            }
+        }
+
         // ------ 1. Drain queued stall events before I/O or maintenance ------
         // Surface every pending stall immediately; this prevents a batch of
         // N simultaneous stalls from taking N full poll cycles (each of which
@@ -1212,40 +1297,13 @@ fn run(cfg: Config) -> std::io::Result<()> {
         // a dropped datagram yields no Event but is still I/O, and must not
         // be mistaken for an idle tick by the throttle below.
         if let Some(ev) = observer.poll() {
-            if let Some(fe) = file_export.as_mut() {
-                if let Err(e) = fe.record(&ev) {
-                    varta_error_rl!(LogKind::FileExportIo, "file export error: {e}");
-                }
-            }
-            #[cfg(feature = "prometheus-exporter")]
-            if let Some(pe) = prom_export.as_mut() {
-                let _ = pe.record(&ev);
-            }
-            // Strict namespace mode: a cross-namespace agent is a fatal
-            // startup error. The default behaviour is to drop the beat and
-            // refuse recovery (already enforced inside `Observer`); strict
-            // mode escalates to daemon exit so the operator notices.
-            if cfg.strict_namespace_check && !cfg.allow_cross_namespace_agents {
-                if let Event::NamespaceConflict { claimed_pid, .. } = &ev {
-                    #[cfg(not(feature = "compile-time-config"))]
-                    varta_error!(
-                        "FATAL --strict-namespace-check: cross-namespace agent \
-                         detected for claimed pid {claimed_pid}; refusing to \
-                         continue. Re-run with --allow-cross-namespace-agents \
-                         only if PID translation is correctly configured."
-                    );
-                    #[cfg(feature = "compile-time-config")]
-                    varta_error!(
-                        "FATAL strict namespace check: cross-namespace agent \
-                         detected for claimed pid {claimed_pid}; refusing to \
-                         continue."
-                    );
-                    return Err(io::Error::new(
-                        io::ErrorKind::Other,
-                        "cross-namespace agent detected under strict namespace check",
-                    ));
-                }
-            }
+            record_ingress_event(
+                &ev,
+                &mut file_export,
+                #[cfg(feature = "prometheus-exporter")]
+                &mut prom_export,
+                &cfg,
+            )?;
         }
 
         // Record poll stage, then reset timer for the maintenance phase.

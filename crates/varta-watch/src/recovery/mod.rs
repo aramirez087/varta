@@ -91,6 +91,31 @@ pub const RECOVERY_SPAWN_MAX_PER_TICK: usize = 16;
 /// this cap bites only the non-spawning flood it exists to bound.
 pub const RECOVERY_STALL_EVAL_MAX_PER_TICK: usize = 256;
 
+/// Maximum ingress datagrams consumed by the `DrainPending` pre-drain in one
+/// observer poll tick, before any deferred stall is allowed to fire.
+///
+/// The fire-time freshness gate (`Observer::stall_freshness`) can only see
+/// resumptions the tracker has *recorded*, and the tracker only learns of a
+/// resumption when `Observer::poll()` consumes the agent's beat. But `poll()`
+/// returns on the first exported `Event` — at most one returnable beat per
+/// listener per tick — while the `DrainPending` stage fires up to
+/// [`RECOVERY_SPAWN_MAX_PER_TICK`] deferred recoveries per tick. Under a mass
+/// simultaneous stall whose agents have since resumed (a transient
+/// system-wide pause: cgroup freeze, hypervisor pause, suspend/resume on a
+/// suspend-advancing `--clock-source`), deferred kills would outrun the
+/// resume-beats that prove them wrong ~16:1 and the freshness gate would read
+/// stale `stall_emitted` state — spuriously killing most of a healthy,
+/// already-recovered fleet. The pre-drain consumes queued ingress until the
+/// sockets report `WouldBlock` (genuinely stalled agents are silent and
+/// contribute nothing), so every queued stall is judged against all evidence
+/// already received. This budget is the runaway guard for the one case the
+/// sockets never empty — a hostile datagram flood: set to
+/// [`crate::tracker::MAX_CAPACITY`] so a single tick can observe a resume
+/// beat from every trackable agent, while bounding the stage to
+/// `MAX_CAPACITY` recv+decode+record steps (microseconds each — two orders
+/// of magnitude inside the 2 s `STAGE_ABORT_NS[DrainPending]` ceiling).
+pub const RECOVERY_PREDRAIN_INGRESS_MAX_PER_TICK: usize = crate::tracker::MAX_CAPACITY;
+
 /// How the recovery command is executed when an agent stalls.
 ///
 /// One mode is available:

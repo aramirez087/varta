@@ -956,3 +956,93 @@ fn higher_trust_origin_repairs_untrusted_preemption_before_rate_limit() {
         "a higher-trust replacement is not an origin conflict"
     );
 }
+
+#[test]
+fn predrain_loop_observes_all_buffered_resumes_before_deferred_stalls_fire() {
+    // Regression for the DrainPending ingress pre-drain (main.rs step 1a).
+    // The fire-time freshness gate can only see resumptions the tracker has
+    // recorded, and poll() returns on the first exported Event — one
+    // returnable beat per call. A mass stall whose agents have since resumed
+    // leaves their resume-beats buffered on the socket while up to
+    // RECOVERY_SPAWN_MAX_PER_TICK deferred recoveries fire per tick; without
+    // draining ingress first, stall_freshness reads stale `stall_emitted`
+    // state and recovery kills a healthy, already-recovered fleet ~16:1.
+    // This locks the contract the pre-drain relies on: looping poll() until
+    // `last_poll_consumed()` is false consumes EVERY buffered resume and
+    // flips each queued stall to AgentResumed, while the stall queue itself
+    // stays intact for the eval loop to skip.
+    let mut obs = Observer::new(
+        Duration::from_secs(1),
+        64,
+        EvictionPolicy::Strict,
+        DEFAULT_EVICTION_SCAN_WINDOW,
+        None,
+        0,
+        0,
+        ClockSource::Monotonic,
+    )
+    .expect("Observer::new should succeed");
+
+    const PIDS: [u32; 3] = [40, 41, 42];
+    obs.add_listener(Box::new(ScriptedListener::with_origin_frames(&[
+        (PIDS[0], 1, 100, BeatOrigin::SocketModeOnly),
+        (PIDS[1], 1, 101, BeatOrigin::SocketModeOnly),
+        (PIDS[2], 1, 102, BeatOrigin::SocketModeOnly),
+    ])));
+
+    // Consume the three initial beats (one returnable Event per poll()).
+    let _ = obs.apply_raw_clock_test(1_000_000);
+    for _ in 0..PIDS.len() {
+        let ev = obs.poll();
+        assert!(
+            matches!(ev, Some(Event::Beat { .. })),
+            "initial beat should be observed, got {ev:?}"
+        );
+    }
+
+    // Cross the silence threshold; the empty poll's drain_stalls pass queues
+    // a stall for every pid and latches `stall_emitted`.
+    let _ = obs.apply_raw_clock_test(5_000_000_000);
+    assert!(obs.poll().is_none());
+    assert!(obs.has_pending_stalls(), "mass stall should queue events");
+    for pid in PIDS {
+        assert_eq!(
+            obs.stall_freshness(pid, None),
+            StallFreshness::Warranted,
+            "queued stall for pid {pid} starts warranted"
+        );
+    }
+
+    // The whole fleet resumes; its beats sit buffered (a second listener
+    // stands in for the socket queue).
+    obs.add_listener(Box::new(ScriptedListener::with_origin_frames(&[
+        (PIDS[0], 2, 100, BeatOrigin::SocketModeOnly),
+        (PIDS[1], 2, 101, BeatOrigin::SocketModeOnly),
+        (PIDS[2], 2, 102, BeatOrigin::SocketModeOnly),
+    ])));
+
+    // The main loop's pre-drain shape: poll until the sockets are empty.
+    let mut drained = 0usize;
+    loop {
+        drained += 1;
+        assert!(drained <= 16, "pre-drain loop did not terminate");
+        let _ = obs.poll();
+        if !obs.last_poll_consumed() {
+            break;
+        }
+    }
+
+    // Every buffered resume was observed: each queued stall must now be
+    // judged stale, and the queue itself remains for the eval loop to skip.
+    assert!(
+        obs.has_pending_stalls(),
+        "pre-drain must not consume the stall queue"
+    );
+    for pid in PIDS {
+        assert_eq!(
+            obs.stall_freshness(pid, None),
+            StallFreshness::AgentResumed,
+            "buffered resume for pid {pid} must flip its deferred stall stale"
+        );
+    }
+}
