@@ -218,12 +218,13 @@ impl super::PromExporter {
         // set_write_timeout: those silently re-enable blocking mode.
         stream.set_nonblocking(true)?;
         let deadline = Instant::now() + PROM_READ_DEADLINE;
-        // 512 bytes is enough for a request line + Authorization header +
-        // typical scrape headers (Prometheus' default request is ~110 bytes
-        // including the 64-hex-char token).  We accumulate across reads so
-        // that headers split across multiple TCP segments are still
-        // contiguous when we scan for `Authorization:`.
-        let mut buf = [0u8; 512];
+        // PROM_REQUEST_CAP bytes covers the widest real-world request: a
+        // Prometheus request line + Authorization header + verbose user-agent /
+        // Accept / Accept-Encoding headers can exceed 512 bytes on some
+        // scrapers.  We accumulate across reads so headers split across
+        // multiple TCP segments are still contiguous when we scan for
+        // `Authorization:`.
+        let mut buf = [0u8; PROM_REQUEST_CAP];
         let mut total = 0;
         loop {
             if Instant::now() >= deadline {

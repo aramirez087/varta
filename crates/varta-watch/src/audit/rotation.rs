@@ -1476,10 +1476,12 @@ mod tests {
             "budget-exceeded counter must be incremented exactly once"
         );
         assert!(
-            matches!(log.rotation_progress, RotationProgress::Renaming { next_gen: 1 }),
+            matches!(
+                log.rotation_progress,
+                RotationProgress::Renaming { next_gen: 1 }
+            ),
             "must stay in Renaming{{next_gen:1}} so the next tick retries with a fresh budget"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
-
 }

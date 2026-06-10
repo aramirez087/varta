@@ -286,6 +286,53 @@ fn metrics_accepts_valid_token() {
     );
 }
 
+/// Regression: a verbose scraper (large User-Agent / Accept-Encoding /
+/// Accept headers) can push the Authorization header past byte 512.  The
+/// request buffer must be sized to PROM_REQUEST_CAP (4096), not a fixed 512,
+/// so the token is always within the scanned window.
+#[test]
+fn metrics_accepts_token_after_verbose_headers() {
+    use super::PROM_REQUEST_CAP;
+    let mut prom = PromExporter::bind("127.0.0.1:0".parse().unwrap(), make_token()).expect("bind");
+    let addr = prom.local_addr().expect("local_addr");
+
+    // Build a request whose Authorization header starts after byte 512 by
+    // padding with a long (but legal) X-Verbose header.
+    let padding = "X".repeat(600);
+    let req = format!(
+        "GET /metrics HTTP/1.0\r\nHost: localhost\r\nX-Verbose: {padding}\r\nAuthorization: Bearer {TEST_TOKEN_HEX}\r\nConnection: close\r\n\r\n"
+    );
+    assert!(
+        req.find("Authorization:").unwrap() > 512,
+        "padding must push Authorization past byte 512 (sanity check)"
+    );
+    assert!(
+        req.len() <= PROM_REQUEST_CAP,
+        "request must fit within PROM_REQUEST_CAP"
+    );
+
+    let mut stream = TcpStream::connect(addr).expect("connect");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .expect("read timeout");
+    stream.write_all(req.as_bytes()).expect("write");
+    for _ in 0..20 {
+        std::thread::sleep(Duration::from_millis(5));
+        prom.serve_pending().expect("serve_pending");
+    }
+    let mut response = String::new();
+    stream.read_to_string(&mut response).expect("read response");
+
+    assert!(
+        response.starts_with("HTTP/1.0 200 OK"),
+        "expected 200 with Authorization past byte 512, got: {response}"
+    );
+    assert_eq!(
+        prom.prom_auth_failures_total, 0,
+        "prom_auth_failures_total must not bump when Authorization is past byte 512"
+    );
+}
+
 /// Regression: `varta_frame_auth_failures_total` (frame PID-spoofing,
 /// `Event::AuthFailure`) and `varta_prom_auth_failures_total` (/metrics
 /// bearer-token rejection) are two INDEPENDENT counters. They were once a
