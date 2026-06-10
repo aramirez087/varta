@@ -118,6 +118,11 @@ public sealed class Varta : IDisposable
         lock (_lock)
         {
             ObjectDisposedException.ThrowIf(_disposed, this);
+            if (!IsAgentStatus(status))
+            {
+                _consecutiveDropped = 0;
+                return BeatOutcome.Failed(new BeatError(0, "InvalidInput"));
+            }
 
             // Per-emission PID read — never cache.
             int currentPid = Environment.ProcessId;
@@ -291,4 +296,6 @@ public sealed class Varta : IDisposable
 
     private static ulong SaturatingIncrement(ulong v) => v == ulong.MaxValue ? v : v + 1;
     private static uint SaturatingIncrementU32(uint v) => v == uint.MaxValue ? v : v + 1;
+    private static bool IsAgentStatus(Status status) =>
+        status == Status.Ok || status == Status.Degraded || status == Status.Critical;
 }

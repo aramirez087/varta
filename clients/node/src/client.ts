@@ -67,6 +67,32 @@ export function __setMonotonicForTest(fn: (() => bigint) | null): void {
   monotonicNs = fn ?? (() => process.hrtime.bigint());
 }
 
+function coerceBeatStatus(status: StatusLike): Status | null {
+  if (typeof status === "string") {
+    switch (status.toLowerCase()) {
+      case "ok":
+        return Status.Ok;
+      case "degraded":
+        return Status.Degraded;
+      case "critical":
+        return Status.Critical;
+      case "stall":
+        return Status.Stall;
+      default:
+        return null;
+    }
+  }
+  if (
+    status === Status.Ok ||
+    status === Status.Degraded ||
+    status === Status.Critical ||
+    status === Status.Stall
+  ) {
+    return status as Status;
+  }
+  return null;
+}
+
 export class Varta {
   private transport: BeatTransport;
   private readonly buf: Buffer;
@@ -128,6 +154,12 @@ export class Varta {
   // ─── public API ───────────────────────────────────────────────
 
   beat(status: StatusLike, payload: number = 0): BeatOutcome {
+    const statusValue = coerceBeatStatus(status);
+    if (statusValue === null || statusValue === Status.Stall) {
+      this.consecutiveDropped = 0;
+      return BeatOutcomes.failed(new BeatError(0, "InvalidInput"));
+    }
+
     const pid = process.pid;
     if (pid !== this.connectPid) {
       try {
@@ -167,7 +199,7 @@ export class Varta {
     const candidateTimestamp =
       rawElapsed > this.lastTimestamp ? rawElapsed : this.lastTimestamp;
 
-    encodeInto(this.buf, status, pid, candidateTimestamp, candidateNonce, payload);
+    encodeInto(this.buf, statusValue, pid, candidateTimestamp, candidateNonce, payload);
 
     const outcome = this.sendFrame();
     if (outcome.kind === "sent") {

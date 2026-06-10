@@ -36,6 +36,18 @@ class DropAndFailReconnect implements BeatTransport {
   close(): void {}
 }
 
+class CountingTransport implements BeatTransport {
+  sends = 0;
+  reconnects = 0;
+  send(_buf: Buffer): void {
+    this.sends += 1;
+  }
+  reconnect(): void {
+    this.reconnects += 1;
+  }
+  close(): void {}
+}
+
 function errnoErr(code: string, errno: number): NodeJS.ErrnoException {
   const e = new Error(`mock ${code}`) as NodeJS.ErrnoException;
   e.code = code;
@@ -121,6 +133,24 @@ test("beat sends a valid VLP frame to the bound listener", async () => {
     agent.close();
   } finally {
     await listener.close();
+  }
+});
+
+test("beat rejects observer-only Stall without side effects", () => {
+  for (const status of [Status.Stall, "stall", 3] as const) {
+    const transport = new CountingTransport();
+    const agent = Varta.fromTransport(transport);
+
+    const outcome = agent.beat(status);
+
+    assert.equal(outcome.kind, "failed");
+    if (outcome.kind === "failed") {
+      assert.equal(outcome.error.errno, 0);
+      assert.equal(outcome.error.kind, "InvalidInput");
+    }
+    assert.equal(transport.sends, 0);
+    assert.equal(transport.reconnects, 0);
+    agent.close();
   }
 });
 

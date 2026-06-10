@@ -8,6 +8,11 @@ here. Versioning is independent of the Rust workspace and follows
 
 ### Fixed
 
+- `Varta.Beat()` now rejects observer-only status byte `0x03` (for example
+  `(Status)0x03`) with `BeatOutcome.Failed(InvalidInput)` before
+  reconnecting or sending. `Stall` is synthesized by `varta-watch` and is
+  forbidden on the wire.
+
 - Auto-reconnect (`SetReconnectAfter`) now resets the consecutive-dropped
   counter only after a *successful* `Reconnect()`, matching the frozen
   cross-client contract (Rust `varta-client`). Previously the counter was

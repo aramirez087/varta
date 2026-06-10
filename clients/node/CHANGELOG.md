@@ -8,6 +8,11 @@ governed independently — see `book/src/spec/vlp.md` in the workspace.
 
 ### Fixed
 
+- `Varta.beat()` now rejects observer-only `Status.Stall` inputs
+  (`Status.Stall`, `"stall"`, or `3`) with `{ kind: "failed",
+  error.kind: "InvalidInput" }` before reconnecting or sending. `Stall`
+  is synthesized by `varta-watch` and is forbidden on the wire.
+
 - Auto-reconnect (`setReconnectAfter`) now resets the consecutive-dropped
   counter only after a *successful* `reconnect()`, matching the frozen
   cross-client contract (Rust `varta-client`). Previously the counter was

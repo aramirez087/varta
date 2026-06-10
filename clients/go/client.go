@@ -91,6 +91,11 @@ func (v *Varta) Beat(status Status, payload uint32) BeatOutcome {
 	v.mu.Lock()
 	defer v.mu.Unlock()
 
+	if !isAgentStatus(status) {
+		v.consecutiveDropped = 0
+		return BeatOutcomeFailed(BeatError{Errno: 0, Kind: "InvalidInput"})
+	}
+
 	pid := os.Getpid()
 	if pid != v.connectPID {
 		if err := v.transport.Reconnect(); err != nil {
@@ -164,6 +169,10 @@ func (v *Varta) Beat(status Status, payload uint32) BeatOutcome {
 	// (matches the Rust BeatOutcome::Failed arm).
 	v.consecutiveDropped = 0
 	return outcome
+}
+
+func isAgentStatus(status Status) bool {
+	return status == vlp.StatusOk || status == vlp.StatusDegraded || status == vlp.StatusCritical
 }
 
 // commitSentFrame advances the committed nonce/timestamp after the kernel

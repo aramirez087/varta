@@ -91,6 +91,37 @@ def test_beat_emits_decodable_frame(
         assert frame.payload == 42
 
 
+class _CountingTransport(BeatTransport):
+    def __init__(self) -> None:
+        self.send_calls = 0
+        self.reconnect_calls = 0
+
+    def send(self, buf: bytes) -> int:
+        self.send_calls += 1
+        return len(buf)
+
+    def reconnect(self) -> None:
+        self.reconnect_calls += 1
+
+
+@pytest.mark.parametrize("status", [Status.STALL, "stall", 3])
+def test_beat_rejects_observer_only_stall_without_side_effects(status: object) -> None:
+    transport = _CountingTransport()
+    agent = Varta(transport)
+    agent._consecutive_dropped = 7
+
+    outcome = agent.beat(status)  # type: ignore[arg-type]
+
+    assert outcome.is_failed
+    assert outcome.error is not None
+    assert outcome.error.errno == BeatError.UNKNOWN_ERRNO
+    assert outcome.error.kind == "InvalidInput"
+    assert transport.send_calls == 0
+    assert transport.reconnect_calls == 0
+    assert agent._nonce == 0
+    assert agent._consecutive_dropped == 0
+
+
 def test_consecutive_beats_increment_nonce(
     bound_uds_listener: Tuple[socket.socket, Path],
 ) -> None:

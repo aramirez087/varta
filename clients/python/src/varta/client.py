@@ -40,7 +40,9 @@ from ._transport import (
 from ._vlp import (
     FRAME_BYTES,
     NONCE_TERMINAL,
+    Status,
     StatusLike,
+    _coerce_status,
     encode_into,
 )
 
@@ -147,6 +149,10 @@ class BeatOutcome:
             return f"dropped: {self.reason.value}"
         assert self.error is not None
         return f"failed: errno={self.error.errno} kind={self.error.kind}"
+
+
+def _invalid_input_outcome() -> BeatOutcome:
+    return BeatOutcome.failed(BeatError(BeatError.UNKNOWN_ERRNO, "InvalidInput"))
 
 
 def _errno_name(code: Optional[int]) -> str:
@@ -278,6 +284,15 @@ class Varta:
         See ``crates/varta-client/src/client.rs:514-593`` for the
         canonical reference.
         """
+        try:
+            status_value = _coerce_status(status)
+        except (TypeError, ValueError):
+            self._consecutive_dropped = 0
+            return _invalid_input_outcome()
+        if status_value is Status.STALL:
+            self._consecutive_dropped = 0
+            return _invalid_input_outcome()
+
         pid = os.getpid()
         if pid != self._connect_pid:
             try:
@@ -314,7 +329,7 @@ class Varta:
 
         encode_into(
             self._buf,
-            status,
+            status_value,
             pid & 0xFFFFFFFF,
             candidate_timestamp,
             candidate_nonce,

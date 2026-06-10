@@ -118,6 +118,13 @@ impl BeatError {
     /// Sentinel value used when no OS error number is available.
     pub const UNKNOWN_ERRNO: i32 = 0;
 
+    fn invalid_status() -> Self {
+        Self {
+            errno: Self::UNKNOWN_ERRNO,
+            kind: io::ErrorKind::InvalidInput,
+        }
+    }
+
     /// Capture the failure shape from an `io::Error` without cloning or allocating.
     pub fn from_io(e: &io::Error) -> Self {
         Self {
@@ -208,9 +215,10 @@ const _: () = {
 
 /// Result of a single [`Varta::beat`] call.
 ///
-/// `beat()` never blocks and never panics; the kernel's view of the send is
-/// translated into one of three steady-state outcomes. `Failed` carries the
-/// underlying error for higher layers that wish to log or escalate.
+/// `beat()` never blocks and never panics; the kernel's view of the send
+/// and any rejected agent-side input are translated into one of three
+/// steady-state outcomes. `Failed` carries the failure shape for higher
+/// layers that wish to log or escalate.
 #[must_use]
 pub enum BeatOutcome {
     /// The 32-byte datagram was accepted by the kernel.
@@ -220,7 +228,8 @@ pub enum BeatOutcome {
     /// cause and lets operators distinguish "observer absent" from "peer gone"
     /// from "kernel pressure" from "disk full".
     Dropped(DropReason),
-    /// An unexpected I/O error surfaced from the underlying `send(2)`.
+    /// Invalid agent-side input or an unexpected I/O error surfaced from
+    /// the underlying `send(2)`.
     /// Callers wanting an `io::Error` can call [`BeatError::to_io_error`].
     Failed(BeatError),
 }
@@ -542,12 +551,22 @@ impl<T: BeatTransport> Varta<T> {
     /// (`Sent` / `Dropped`) neither blocks nor allocates; the rare `Failed`
     /// path preserves the allocation-free [`BeatError`] shape.
     ///
+    /// [`Status::Stall`] is observer-synthesized and forbidden on the wire.
+    /// Passing it to `beat()` returns [`BeatOutcome::Failed`] with
+    /// [`io::ErrorKind::InvalidInput`] and does not reconnect, encode, or
+    /// send a frame.
+    ///
     /// When [`set_reconnect_after`](Self::set_reconnect_after) is enabled and
     /// the consecutive-dropped threshold is crossed, `beat` will internally
     /// reconnect the socket and retry the send before returning. The retry
     /// path allocates a fresh socket; this is acceptable because observer
     /// restarts are rare and the steady-state path remains allocation-free.
     pub fn beat(&mut self, status: Status, payload: u32) -> BeatOutcome {
+        if status == Status::Stall {
+            self.consecutive_dropped = 0;
+            return BeatOutcome::Failed(BeatError::invalid_status());
+        }
+
         let pid = std::process::id();
         if pid != self.connect_pid {
             // Fork detected. Refresh the underlying transport so any
@@ -889,6 +908,23 @@ mod tests {
         }
     }
 
+    struct CountingTransport {
+        sends: u32,
+        reconnects: u32,
+    }
+
+    impl BeatTransport for CountingTransport {
+        fn send(&mut self, _buf: &[u8; 32]) -> io::Result<usize> {
+            self.sends = self.sends.saturating_add(1);
+            Ok(32)
+        }
+
+        fn reconnect(&mut self) -> io::Result<()> {
+            self.reconnects = self.reconnects.saturating_add(1);
+            Ok(())
+        }
+    }
+
     fn varta_with_transport<T: BeatTransport>(transport: T) -> Varta<T> {
         Varta {
             transport,
@@ -1018,6 +1054,37 @@ mod tests {
         assert_eq!(agent.nonce, 1);
         assert_eq!(&agent.transport.attempted_nonces[..2], &[1, 1]);
         assert_eq!(&agent.transport.accepted_nonces[..1], &[1]);
+    }
+
+    #[test]
+    fn beat_rejects_observer_only_stall_without_side_effects() {
+        let mut agent = varta_with_transport(CountingTransport {
+            sends: 0,
+            reconnects: 0,
+        });
+        agent.consecutive_dropped = 7;
+
+        let outcome = agent.beat(Status::Stall, 0);
+        match outcome {
+            BeatOutcome::Failed(e) => {
+                assert_eq!(e.errno, BeatError::UNKNOWN_ERRNO);
+                assert_eq!(e.kind, io::ErrorKind::InvalidInput);
+            }
+            other => panic!("expected InvalidInput failure for Status::Stall, got {other:?}"),
+        }
+        assert_eq!(agent.transport.sends, 0, "Stall must never reach send(2)");
+        assert_eq!(
+            agent.transport.reconnects, 0,
+            "invalid input must not trigger reconnect side effects"
+        );
+        assert_eq!(
+            agent.nonce, 0,
+            "invalid input must not advance the committed nonce"
+        );
+        assert_eq!(
+            agent.consecutive_dropped, 0,
+            "invalid input follows Failed outcome counter semantics"
+        );
     }
 
     #[test]

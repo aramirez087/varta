@@ -30,6 +30,40 @@ public class VartaAgentTests
         public void Dispose() { }
     }
 
+    private sealed class CountingTransport : IBeatTransport
+    {
+        public int Sends;
+        public int Reconnects;
+
+        public int Send(ReadOnlySpan<byte> frame32)
+        {
+            Sends++;
+            return frame32.Length;
+        }
+
+        public void Reconnect()
+        {
+            Reconnects++;
+        }
+
+        public void Dispose() { }
+    }
+
+    [Fact]
+    public void Beat_RejectsObserverOnlyStallWithoutSideEffects()
+    {
+        var transport = new CountingTransport();
+        using var agent = global::Varta.Varta.FromTransportForTest(transport);
+
+        var outcome = agent.Beat((Status)0x03);
+
+        Assert.True(outcome.IsFailed);
+        Assert.Equal(0, outcome.Error.Errno);
+        Assert.Equal("InvalidInput", outcome.Error.Kind);
+        Assert.Equal(0, transport.Sends);
+        Assert.Equal(0, transport.Reconnects);
+    }
+
     [Fact]
     public void FailedReconnect_PreservesConsecutiveDropped_ForImmediateRetry()
     {

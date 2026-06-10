@@ -28,6 +28,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   release-notes file per tag; the workflow refuses to publish without
   one (no auto-generated release notes).
 
+### Fixed
+
+- **Agent clients reject observer-only `Stall` status before sending.**
+  `Status::Stall` / wire byte `0x03` is synthesized by `varta-watch` and
+  `Frame::decode` rejects it on the wire. Rust, Python, Node.js, Go, and
+  .NET clients now return a structured `Failed(InvalidInput)` result for
+  `beat(Stall)` / equivalent cast or string forms without reconnecting,
+  advancing nonce state, or writing a datagram.
+
 ### Changed
 
 - **Breaking: `BeatOutcome::Dropped` now carries a `DropReason` payload.**
