@@ -138,6 +138,22 @@ impl RecoveryAuditLog {
                 }
                 RotationProgress::Renaming { next_gen } => {
                     let path_str = self.path.to_string_lossy().into_owned();
+                    // Recheck budget before the last Renaming step (live→`.1`).
+                    // The fast path is a single `rename(2)`, but on EXDEV
+                    // (overlayfs / cross-device bind mounts) `rotate_live_to_first`
+                    // falls back to `copy_live_to_first`, an unbounded whole-file
+                    // I/O that can overrun the Maintenance self-watchdog stage when
+                    // stacked on top of an already-spent rotation budget →
+                    // `process::abort()` of a healthy observer (same abort-class
+                    // hazard as bug-363/373/379). The check is placed BEFORE the
+                    // `.1→.2` generation sub-step to avoid a livelock: if placed
+                    // after, a tight budget fires every tick after the (idempotent,
+                    // ENOENT-fast) sub-step and the FSM never advances.
+                    if next_gen == 1 && call_start.elapsed() >= budget {
+                        self.audit_rotation_budget_exceeded_total =
+                            self.audit_rotation_budget_exceeded_total.saturating_add(1);
+                        return RotationOutcome::Deferred;
+                    }
                     let sub_result = if next_gen == AUDIT_ROTATION_GENERATIONS {
                         let oldest = format!("{path_str}.{AUDIT_ROTATION_GENERATIONS}");
                         match std::fs::remove_file(&oldest) {
@@ -344,7 +360,14 @@ impl RecoveryAuditLog {
     /// does.
     fn copy_live_to_first(&mut self, first: &str) -> io::Result<()> {
         self.flush_and_sync()?;
-        std::fs::copy(&self.path, first)?;
+        if let Err(e) = std::fs::copy(&self.path, first) {
+            // A failed copy may have left a partial `.1` file. Remove it so the
+            // next rotation attempt starts from a clean destination rather than
+            // promoting a truncated generation that an offline verifier cannot
+            // distinguish from a torn write.
+            let _ = std::fs::remove_file(first);
+            return Err(e);
+        }
         std::fs::remove_file(&self.path)?;
         use super::writer::{DurableSink, FileSink};
         use std::os::unix::fs::OpenOptionsExt;
@@ -1414,4 +1437,49 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    /// The live-to-`.1` rename/copy (the last sub-step in the `Renaming` stage)
+    /// must not run when the rotation budget is already exhausted. On an EXDEV
+    /// mount the rename falls back to `copy_live_to_first`, an unbounded
+    /// whole-file I/O operation. Running it on top of an already-spent budget
+    /// stacks the copy on the Maintenance-stage wall clock and risks overrunning
+    /// the 500 ms self-watchdog ceiling → `process::abort()` of a healthy
+    /// observer (same abort-class hazard as bug-363/373/379). The rotation must
+    /// defer and retry with a fresh `call_start` the next tick.
+    #[test]
+    fn renaming_live_to_first_defers_before_copy_when_budget_exhausted() {
+        let dir = tmpdir("exdev-budget");
+        let path = dir.join("audit.log");
+
+        let (mut log, _) = RecoveryAuditLog::create(&path, cfg(None, 1)).expect("create");
+        // Jump directly to the last Renaming sub-step so only the live→.1 move
+        // remains; the prior generation renames are irrelevant to this hazard.
+        log.rotation_progress = RotationProgress::Renaming { next_gen: 1 };
+        log.needs_rotation = true;
+
+        // Zero budget: exhausted before the very first check, ensuring the
+        // function returns Deferred without touching the live file or creating
+        // a partial `.1` generation.
+        let outcome = log.drive_audit_rotation(Duration::ZERO);
+
+        assert_eq!(outcome, RotationOutcome::Deferred);
+        assert!(
+            path.exists(),
+            "live file must not be renamed/copied when budget is exhausted"
+        );
+        assert!(
+            !dir.join("audit.log.1").exists(),
+            "no `.1` generation must exist — rename/copy must not have started"
+        );
+        assert_eq!(
+            log.audit_rotation_budget_exceeded_total, 1,
+            "budget-exceeded counter must be incremented exactly once"
+        );
+        assert!(
+            matches!(log.rotation_progress, RotationProgress::Renaming { next_gen: 1 }),
+            "must stay in Renaming{{next_gen:1}} so the next tick retries with a fresh budget"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
 }
