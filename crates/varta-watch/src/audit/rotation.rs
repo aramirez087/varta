@@ -256,12 +256,9 @@ impl RecoveryAuditLog {
                     // each tick) can never wedge a record, nor displace the v2
                     // header, into the new generation ahead of its boot anchor.
                     use std::os::unix::fs::OpenOptionsExt;
-                    let file = match OpenOptions::new()
-                        .create(true)
-                        .append(true)
-                        .mode(0o600)
-                        .open(&self.path)
-                    {
+                    let mut options = OpenOptions::new();
+                    options.read(true).create_new(true).append(true).mode(0o600);
+                    let file = match crate::file_security::open_nofollow(&self.path, &mut options) {
                         Ok(f) => f,
                         Err(e) => {
                             // The live file was already renamed to `.1` and the
@@ -360,31 +357,55 @@ impl RecoveryAuditLog {
     /// does.
     fn copy_live_to_first(&mut self, first: &str) -> io::Result<()> {
         self.flush_and_sync()?;
-        if let Err(e) = std::fs::copy(&self.path, first) {
-            // A failed copy may have left a partial `.1` file. Remove it so the
-            // next rotation attempt starts from a clean destination rather than
-            // promoting a truncated generation that an offline verifier cannot
-            // distinguish from a torn write.
-            let _ = std::fs::remove_file(first);
+        let first_path = Path::new(first);
+        // Read from the writer's exact inode, not from a fresh pathname open:
+        // an attacker cannot replace `self.path` between flush and copy and
+        // redirect the fallback into an unrelated same-UID file.
+        let mut source = self.sink.get_ref().try_clone_file()?;
+        source.seek(SeekFrom::Start(0))?;
+
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut destination_options = OpenOptions::new();
+        destination_options
+            .create_new(true)
+            .append(true)
+            .mode(0o600);
+        let mut destination =
+            crate::file_security::open_nofollow(first_path, &mut destination_options)?;
+        if let Err(e) = std::io::copy(&mut source, &mut destination) {
+            let _ = std::fs::remove_file(first_path);
             return Err(e);
         }
-        std::fs::remove_file(&self.path)?;
+        if let Err(e) = destination.sync_all() {
+            let _ = std::fs::remove_file(first_path);
+            return Err(e);
+        }
+        if let Err(e) = std::fs::remove_file(&self.path) {
+            let _ = std::fs::remove_file(first_path);
+            return Err(e);
+        }
         use super::writer::{DurableSink, FileSink};
-        use std::os::unix::fs::OpenOptionsExt;
-        let file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .mode(0o600)
-            .open(first)?;
-        let sink_box: Box<dyn DurableSink> = Box::new(FileSink(file));
+        let sink_box: Box<dyn DurableSink> = Box::new(FileSink(destination));
         self.sink = std::io::BufWriter::new(sink_box);
         Ok(())
     }
 
     /// Read up to the last [`TAIL_SCAN_BYTES`] of `path` and parse the
     /// most recent record line to derive seq + chain + boot reason.
+    #[cfg(test)]
     pub(super) fn probe_tail(path: &Path) -> io::Result<TailProbe> {
-        let mut file = OpenOptions::new().read(true).open(path)?;
+        let mut options = OpenOptions::new();
+        options.read(true);
+        let mut file = crate::file_security::open_nofollow(path, &mut options)?;
+        crate::file_security::validate_regular_file(&file, path)?;
+        Self::probe_tail_file(&mut file)
+    }
+
+    /// Descriptor-based tail probe used by [`RecoveryAuditLog::create`].
+    ///
+    /// Keeping the probe on the same descriptor that will be truncated and
+    /// appended prevents a pathname replacement from redirecting recovery.
+    pub(super) fn probe_tail_file(file: &mut std::fs::File) -> io::Result<TailProbe> {
         let total = file.metadata()?.len();
 
         if total == 0 {
@@ -1157,6 +1178,81 @@ mod tests {
              `.1`, not lost to the unlinked original inode"
         );
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cross_device_fallback_refuses_symlink_destination_without_modifying_target() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        let dir = tmpdir("copy-symlink");
+        let path = dir.join("audit.log");
+        let first = dir.join("audit.log.1");
+        let target = dir.join("victim");
+        let original = b"must remain unchanged\n";
+        std::fs::write(&target, original).expect("write target");
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600))
+            .expect("chmod target");
+
+        let (mut log, _) = RecoveryAuditLog::create(&path, cfg(None, 1)).expect("create audit");
+        log.flush_pending(Duration::MAX);
+        symlink(&target, &first).expect("create destination symlink");
+
+        let err = log
+            .copy_live_to_first(first.to_str().expect("utf8 path"))
+            .expect_err("copy fallback must refuse an existing symlink");
+
+        assert!(matches!(
+            err.kind(),
+            io::ErrorKind::AlreadyExists | io::ErrorKind::InvalidInput
+        ));
+        assert!(
+            std::fs::symlink_metadata(&first)
+                .expect("destination symlink remains")
+                .file_type()
+                .is_symlink(),
+            "fallback must not delete a destination it did not create"
+        );
+        assert_eq!(
+            std::fs::read(&target).expect("read target"),
+            original,
+            "copy fallback must not overwrite the symlink target"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cross_device_fallback_reads_owned_descriptor_after_live_path_swap() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        let dir = tmpdir("copy-source-swap");
+        let path = dir.join("audit.log");
+        let displaced = dir.join("displaced-audit.log");
+        let first = dir.join("audit.log.1");
+        let target = dir.join("victim");
+        let original = b"must remain unchanged\n";
+        std::fs::write(&target, original).expect("write target");
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600))
+            .expect("chmod target");
+
+        let (mut log, _) = RecoveryAuditLog::create(&path, cfg(None, 1)).expect("create audit");
+        log.flush_pending(Duration::MAX);
+        std::fs::rename(&path, &displaced).expect("displace live audit path");
+        symlink(&target, &path).expect("replace live path with symlink");
+
+        log.copy_live_to_first(first.to_str().expect("utf8 path"))
+            .expect("copy fallback");
+
+        assert_eq!(
+            std::fs::read(&target).expect("read target"),
+            original,
+            "copy fallback must not read from or write to the replacement target"
+        );
+        assert_eq!(
+            std::fs::read(&first).expect("read rotated audit"),
+            std::fs::read(&displaced).expect("read original audit inode"),
+            "rotated generation must come from the descriptor owned by the writer"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

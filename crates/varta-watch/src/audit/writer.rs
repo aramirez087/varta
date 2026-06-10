@@ -14,6 +14,14 @@ use super::RecoveryAuditLog;
 pub(super) trait DurableSink: Write + Send {
     /// `File::sync_data()` on the real impl; counted by the test fake.
     fn sync_data(&self) -> io::Result<()>;
+
+    /// Clone the real backing file for descriptor-stable rotation reads.
+    fn try_clone_file(&self) -> io::Result<File> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "audit sink does not expose a backing file",
+        ))
+    }
 }
 
 /// Real backing — wraps a `File` and delegates `sync_data` to the OS.
@@ -31,6 +39,10 @@ impl Write for FileSink {
 impl DurableSink for FileSink {
     fn sync_data(&self) -> io::Result<()> {
         self.0.sync_data()
+    }
+
+    fn try_clone_file(&self) -> io::Result<File> {
+        self.0.try_clone()
     }
 }
 

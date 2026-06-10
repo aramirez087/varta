@@ -32,7 +32,7 @@ mod writer;
 pub use rotation::RotationOutcome;
 pub use schema::{chain_enabled, CompleteOutcome, CompleteRecord, RefusedRecord, SpawnRecord};
 
-use rotation::{RotationProgress, TailProbe};
+use rotation::RotationProgress;
 use schema::{sanitize, AuditKind, BootReason, AUDIT_HEADER_V2};
 use writer::{DurableSink, FileSink, AUDIT_RING_CAP, FSYNC_HISTORY_CAP};
 
@@ -134,10 +134,9 @@ impl RecoveryAuditLog {
     /// Open `path` in append mode, creating it (and writing the header)
     /// if necessary. The file is opened with mode 0600 on create.
     pub fn create(path: impl AsRef<Path>, cfg: AuditConfig) -> io::Result<(Self, CreateWarnings)> {
-        use std::os::unix::fs::OpenOptionsExt;
+        use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 
         let path_buf = path.as_ref().to_path_buf();
-        let existed = path_buf.exists();
 
         let mut warnings = CreateWarnings::default();
         if !chain_enabled() {
@@ -165,26 +164,24 @@ impl RecoveryAuditLog {
             ));
         }
 
-        let probe = if existed {
-            match Self::probe_tail(&path_buf) {
-                Ok(p) => p,
-                Err(_) => TailProbe {
-                    last_seq: 0,
-                    last_chain: [0u8; 32],
-                    reason: BootReason::SchemaDrift,
-                    truncate_to: None,
-                    has_v2_header: false,
-                },
-            }
-        } else {
-            TailProbe {
-                last_seq: 0,
-                last_chain: [0u8; 32],
-                reason: BootReason::Fresh,
-                truncate_to: None,
-                has_v2_header: false,
-            }
-        };
+        // Open once and retain this exact descriptor through tail probing,
+        // optional torn-tail truncation, and all later appends. O_NOFOLLOW
+        // atomically rejects a leaf symlink; using one fd also removes the
+        // probe-by-path -> truncate-by-path TOCTOU window.
+        let mut options = OpenOptions::new();
+        options.read(true).append(true).create(true).mode(0o600);
+        let mut file = crate::file_security::open_nofollow(&path_buf, &mut options)?;
+        let meta = crate::file_security::validate_regular_file(&file, &path_buf)?;
+        if meta.nlink() != 1 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "{}: audit file must have exactly one hard link",
+                    path_buf.display()
+                ),
+            ));
+        }
+        let probe = Self::probe_tail_file(&mut file)?;
 
         match probe.reason {
             BootReason::LegacyV1 => warnings.legacy_v1 = true,
@@ -194,16 +191,10 @@ impl RecoveryAuditLog {
         }
 
         if let Some(len) = probe.truncate_to {
-            let file = OpenOptions::new().write(true).open(&path_buf)?;
             file.set_len(len)?;
             file.sync_all()?;
         }
 
-        let file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .mode(0o600)
-            .open(&path_buf)?;
         let mut bytes_written = file.metadata().map(|m| m.len()).unwrap_or(0);
 
         let sink_box: Box<dyn DurableSink> = Box::new(FileSink(file));
@@ -485,6 +476,60 @@ mod tests {
         assert!(lines[1].contains("\tboot\t"));
         assert!(lines[1].contains("\tfresh\t") || lines[1].ends_with("\tfresh\t-"));
         assert!(!w.legacy_v1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn create_rejects_symlink_without_modifying_target() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        let dir = tmpdir("symlink");
+        let target = dir.join("victim");
+        let path = dir.join("audit.log");
+        let original = b"must remain unchanged\n";
+        std::fs::write(&target, original).expect("write target");
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600))
+            .expect("chmod target");
+        symlink(&target, &path).expect("create symlink");
+
+        let err = match RecoveryAuditLog::create(&path, cfg(None, 1)) {
+            Ok(_) => panic!("audit creation must reject a symlink"),
+            Err(e) => e,
+        };
+
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(
+            std::fs::read(&target).expect("read target"),
+            original,
+            "audit startup must not append to or truncate the symlink target"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn create_rejects_hard_link_without_modifying_target() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tmpdir("hard-link");
+        let target = dir.join("victim");
+        let path = dir.join("audit.log");
+        let original = b"must remain unchanged\n";
+        std::fs::write(&target, original).expect("write target");
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600))
+            .expect("chmod target");
+        std::fs::hard_link(&target, &path).expect("create hard link");
+
+        let err = match RecoveryAuditLog::create(&path, cfg(None, 1)) {
+            Ok(_) => panic!("audit creation must reject a multiply-linked inode"),
+            Err(e) => e,
+        };
+
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(
+            std::fs::read(&target).expect("read target"),
+            original,
+            "audit startup must not append to or truncate a hard-linked target"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

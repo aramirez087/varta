@@ -107,6 +107,19 @@ In addition, the daemon **unconditionally** syncs:
 - After writing the post-rotation `boot` record.
 - In `Drop` (best-effort; not load-bearing for correctness).
 
+## File identity hardening
+
+Audit startup opens the live path once with `O_NOFOLLOW`, verifies the opened
+inode is a regular file owned by the observer UID with exactly one hard link,
+then uses that same descriptor for tail recovery, optional truncation, and all
+later appends. Leaf symlinks and multiply-linked files are rejected before any
+audit bytes are changed.
+
+Rotation creates every new live generation and EXDEV copy destination
+exclusively with mode 0600. The EXDEV fallback copies from a clone of the
+writer's already-validated descriptor, not from a second pathname open, and
+keeps the exclusive destination descriptor as the new sink.
+
 ## Tamper-evidence: the hash chain
 
 When the daemon is built with `--features audit-chain`, every record's
@@ -205,7 +218,7 @@ cat audit.log.5 audit.log.4 audit.log.3 audit.log.2 audit.log.1 audit.log \
 
 | Flag                                | Required | Default | Meaning |
 | ----------------------------------- | -------- | ------- | ------- |
-| `--recovery-audit-file <PATH>`      | no       | unset   | Append audit records to PATH. Created mode 0600. |
+| `--recovery-audit-file <PATH>`      | no       | unset   | Append audit records to PATH. Created mode 0600; leaf symlinks and multiply-linked files are rejected. |
 | `--recovery-audit-max-bytes <N>`    | no       | unbounded | Rotate after a write that pushes the file past N bytes. |
 | `--recovery-audit-sync-every <N>`   | no       | 1       | fdatasync cadence. `1` is the only Class C-conforming value. |
 | `--audit-fsync-budget-ms <MS>`      | no       | 50      | Soft per-call budget for one `fdatasync(2)`. Overruns defer further fsyncs in the *current* drain to next tick; the poll loop never blocks on more than one slow fsync per tick. |

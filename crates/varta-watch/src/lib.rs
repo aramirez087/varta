@@ -71,6 +71,7 @@ pub mod audit;
 pub mod clock;
 pub mod config;
 pub mod exporter;
+mod file_security;
 pub mod hw_watchdog;
 pub mod listener;
 pub mod log;
