@@ -547,6 +547,39 @@ fn classify_tail(buf: &[u8], scan_start: u64, data_start: u64) -> (TailProbe, bo
                 true,
             );
         }
+        // The last line is complete (newline-terminated) yet unparseable: a
+        // bit-rot-corrupted record, or a forward-incompatible newer-schema
+        // record. Unlike a torn fragment it is NOT truncated — it may be
+        // durable data a newer verifier can still read — but `seq` and the
+        // hash chain MUST resume from the last record we *can* parse. Falling
+        // straight through to a seq-0 / zero-chain reset (as this branch used
+        // to) rolls `seq` back to 1 and re-anchors the chain at genesis in the
+        // middle of an otherwise-clean file, which an offline tamper-evidence
+        // verifier cannot distinguish from forgery across every prior record —
+        // the exact silent integrity break the v2 format guarantees against,
+        // and the clean-tail sibling of the torn-tail look-back below.
+        let prior = if last_line_start == 0 {
+            &view[..0]
+        } else {
+            &view[..last_line_start - 1]
+        };
+        let prev_start = prior
+            .iter()
+            .rposition(|&b| b == b'\n')
+            .map(|p| p + 1)
+            .unwrap_or(0);
+        if let Some((seq, chain)) = parse_record(&prior[prev_start..]) {
+            return (
+                TailProbe {
+                    last_seq: seq,
+                    last_chain: chain,
+                    reason: BootReason::SchemaDrift,
+                    truncate_to: None,
+                    has_v2_header: true,
+                },
+                true,
+            );
+        }
         return (
             TailProbe {
                 last_seq: 0,
@@ -1236,6 +1269,78 @@ mod tests {
         assert_eq!(probe.last_chain, chain_b, "chain must continue from B");
         let _ = chain_b;
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A cleanly-flushed file whose final, fully-durable record is complete
+    /// (newline-terminated) but unparseable — bit-rot, or a forward-
+    /// incompatible newer-schema record — must resume `seq` and the hash chain
+    /// from the last record that *does* parse, not reset them. The unfixed
+    /// clean branch returned a seq-0 / zero-chain reset here (no look-back,
+    /// unlike the torn branch), rolling `seq` back to 1 and re-anchoring the
+    /// chain at genesis mid-file on the next restart — a silent Class-C
+    /// integrity break across every prior record, with no crash or truncation
+    /// to signal it. The complete unparseable record is preserved (not
+    /// truncated): it may be data a newer verifier can read.
+    #[test]
+    fn clean_unparseable_tail_resumes_not_resets() {
+        let dir = tmpdir("clean-drift");
+        let path = dir.join("audit.log");
+
+        let (mut log, _) = RecoveryAuditLog::create(&path, cfg(None, 1)).expect("create");
+        log.record_spawn(&crate::audit::SpawnRecord {
+            wallclock_ms: 1,
+            observer_ns: 1,
+            agent_pid: 1,
+            child_pid: 100,
+            mode: "exec",
+            program: "/bin/small",
+            source: "inline",
+            template_len: 1,
+        });
+        log.flush_pending(Duration::from_secs(5));
+        drop(log);
+
+        // Snapshot the last fully-parseable record (the spawn, seq > 1).
+        let body = std::fs::read_to_string(&path).expect("read");
+        let last_line = body
+            .lines()
+            .rfind(|l| !l.starts_with('#'))
+            .expect("a v2 record");
+        let (seq_good, chain_good) = parse_record(last_line.as_bytes()).expect("last parses");
+        assert!(seq_good > 1, "precondition: a real record past the boot");
+
+        // Append a COMPLETE (newline-terminated) but unparseable record: a
+        // valid leading seq column with a malformed trailing chain column.
+        {
+            let mut f = OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .expect("open append");
+            f.write_all(format!("{}\tbogus\tnot-a-valid-chain\n", seq_good + 1).as_bytes())
+                .expect("clean unparseable write");
+        }
+
+        let probe = RecoveryAuditLog::probe_tail(&path).expect("probe");
+        assert!(
+            matches!(probe.reason, BootReason::SchemaDrift),
+            "a complete unparseable tail is drift, got {:?}",
+            probe.reason
+        );
+        assert_eq!(
+            probe.last_seq, seq_good,
+            "seq must resume from the last good record, not reset to 0"
+        );
+        assert_eq!(
+            probe.truncate_to, None,
+            "a complete record must not be truncated"
+        );
+        #[cfg(feature = "audit-chain")]
+        assert_eq!(
+            probe.last_chain, chain_good,
+            "chain must continue from the last good record, not genesis"
+        );
+        let _ = chain_good;
         let _ = std::fs::remove_dir_all(&dir);
     }
 

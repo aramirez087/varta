@@ -1270,7 +1270,14 @@ jobs:
       - name: dump observer logs on failure
         if: failure()
         run: |
-          kubectl -n varta describe pods
+          # Guard: if the kind cluster never started, kubectl has no endpoint and
+          # will exit 1 trying to reach localhost:8080 — fail-fast the dump
+          # instead of cascading into a misleading second failure.
+          if ! kubectl cluster-info --request-timeout=5s 2>/dev/null; then
+            echo "No reachable cluster — kind creation likely failed before this step."
+            exit 0
+          fi
+          kubectl -n varta describe pods || true
           # --tail=-1 (no cap) so config-parse errors at the top of stdout
           # aren't truncated by Config::HELP output below them.
           # --previous covers the first crash in a CrashLoopBackOff cycle —
