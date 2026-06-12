@@ -163,7 +163,10 @@ done
 ```
 
 The first field in the heartbeat file is a monotonically increasing loop
-counter.  If it stops advancing, the observer is wedged or dead.
+counter.  If it stops advancing, the observer is wedged or dead. Each update
+uses an exclusively-created mode-`0600` tempfile plus an atomic same-directory
+rename, so stale files and symlinks are never opened or truncated. The parent
+directory should still be writable only by the observer account.
 
 ### Prometheus uptime scraper
 

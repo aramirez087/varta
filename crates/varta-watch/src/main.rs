@@ -125,6 +125,19 @@ const STAGE_ABORT_NS: [u64; 6] = [
 /// still clearing Prometheus/file rows over subsequent ticks.
 const REMOVED_PID_DRAIN_MAX_PER_TICK: usize = 64;
 
+/// Unique suffix source for heartbeat tempfiles.
+///
+/// The sequence prevents a stale tempfile left by a crashed process or a
+/// recycled PID from permanently blocking future atomic heartbeat writes.
+static HEARTBEAT_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+/// Maximum exclusive-create attempts for one heartbeat publication.
+///
+/// The loop is bounded because this code runs on the observer's single poll
+/// thread. Normal operation succeeds on the first attempt; retries only cover
+/// stale tempfiles or deliberate name collisions.
+const HEARTBEAT_TEMP_CREATE_ATTEMPTS: usize = 16;
+
 /// The self-watchdog's clock is **hardwired** to the suspend-paused
 /// monotonic clock (`CLOCK_MONOTONIC`), never the operator-selected
 /// `--clock-source`.  The watchdog measures on-CPU wedge time of the main
@@ -182,34 +195,70 @@ fn watchdog_expired(now_ns: u64, last_ns: u64, deadline_ns: u64) -> bool {
     last_ns != 0 && now_ns.saturating_sub(last_ns) > deadline_ns
 }
 
+struct HeartbeatTempPath {
+    path: PathBuf,
+    armed: bool,
+}
+
+impl HeartbeatTempPath {
+    fn new(path: PathBuf) -> Self {
+        Self { path, armed: true }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for HeartbeatTempPath {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
+
+fn create_heartbeat_temp(path: &Path) -> io::Result<(std::fs::File, HeartbeatTempPath)> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let pid = std::process::id();
+    for _ in 0..HEARTBEAT_TEMP_CREATE_ATTEMPTS {
+        let sequence = HEARTBEAT_TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let mut tmp_os = path.as_os_str().to_owned();
+        tmp_os.push(format!(".{pid}.{sequence}.tmp"));
+        let tmp_path = PathBuf::from(tmp_os);
+
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true).mode(0o600);
+        match options.open(&tmp_path) {
+            Ok(file) => return Ok((file, HeartbeatTempPath::new(tmp_path))),
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+    }
+
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        "heartbeat tempfile create attempts exhausted",
+    ))
+}
+
 /// Write `contents` to `path` atomically via a same-directory tempfile + rename.
 ///
 /// `rename(2)` is atomic on POSIX-compliant filesystems; a reader of `path`
 /// will observe either the previous complete file or the new complete file,
-/// never a partial write.  A `.<pid>.tmp` suffix keeps concurrent observers
-/// (misconfigured onto the same path) from clobbering each other's tempfile.
-/// If the rename fails the tempfile is removed before returning the error.
+/// never a partial write. Each tempfile is created exclusively with mode
+/// `0600`; pre-existing files and symlinks are never opened or truncated.
+/// A per-process sequence prevents stale PID-reuse tempfiles from wedging the
+/// writer. If writing or renaming fails, the owned tempfile is removed by its
+/// RAII guard before the error returns.
 fn write_heartbeat_atomic(path: &Path, contents: &[u8]) -> io::Result<()> {
-    let pid = std::process::id();
-    let mut tmp_os = path.as_os_str().to_owned();
-    tmp_os.push(format!(".{pid}.tmp"));
-    let tmp_path = PathBuf::from(tmp_os);
-
-    let result = (|| -> io::Result<()> {
-        let mut f = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&tmp_path)?;
-        f.write_all(contents)?;
-        drop(f);
-        std::fs::rename(&tmp_path, path)
-    })();
-
-    if result.is_err() {
-        let _ = std::fs::remove_file(&tmp_path);
-    }
-    result
+    let (mut file, mut temp) = create_heartbeat_temp(path)?;
+    file.write_all(contents)?;
+    drop(file);
+    std::fs::rename(&temp.path, path)?;
+    temp.disarm();
+    Ok(())
 }
 
 fn main() -> ExitCode {
@@ -1997,6 +2046,35 @@ mod tests {
         );
     }
 
+    #[test]
+    fn heartbeat_write_does_not_follow_preplanted_temp_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let dir = mk_tmpdir("temp-symlink");
+        let path = dir.join("hb.txt");
+        let victim = dir.join("victim.txt");
+        fs::write(&victim, b"do not touch\n").expect("seed victim");
+
+        let pid = std::process::id();
+        let legacy_tmp = PathBuf::from(format!("{}.{pid}.tmp", path.display()));
+        symlink(&victim, &legacy_tmp).expect("plant legacy tempfile symlink");
+
+        write_heartbeat_atomic(&path, b"1 100\n").expect("write hardened heartbeat");
+
+        assert_eq!(
+            fs::read(&victim).expect("read victim"),
+            b"do not touch\n",
+            "heartbeat tempfile handling must never follow a pre-planted symlink"
+        );
+        assert!(
+            fs::symlink_metadata(&path)
+                .expect("heartbeat metadata")
+                .file_type()
+                .is_file(),
+            "published heartbeat must be a regular file"
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn signal_handler_returns_ok_under_normal_conditions() {
@@ -2066,18 +2144,27 @@ mod tests {
     #[test]
     fn heartbeat_tempfile_cleaned_on_rename_failure() {
         let dir = mk_tmpdir("cleanup");
-        // Point the target path at a directory that doesn't exist so the
-        // rename will fail (the parent dir is missing).
-        let target = dir.join("nonexistent_subdir").join("hb.txt");
+        // Renaming a regular tempfile over a non-empty directory fails after
+        // the tempfile has been created, exercising the RAII cleanup path.
+        let target = dir.join("hb.txt");
+        fs::create_dir(&target).expect("create conflicting target directory");
+        fs::write(target.join("keep"), b"x").expect("make target non-empty");
+
         let result = write_heartbeat_atomic(&target, b"1 100\n");
         assert!(result.is_err());
-        // The tempfile should have been removed.
-        let pid = std::process::id();
-        let tmp = PathBuf::from(format!("{}.{pid}.tmp", target.display()));
+
+        let prefix = format!("hb.txt.{}.", std::process::id());
+        let stale_temp = fs::read_dir(&dir)
+            .expect("read temp directory")
+            .filter_map(Result::ok)
+            .map(|entry| entry.file_name())
+            .any(|name| {
+                let name = name.to_string_lossy();
+                name.starts_with(&prefix) && name.ends_with(".tmp")
+            });
         assert!(
-            !tmp.exists(),
-            "stale tempfile left behind: {}",
-            tmp.display()
+            !stale_temp,
+            "stale heartbeat tempfile left behind after rename failure"
         );
     }
 }
