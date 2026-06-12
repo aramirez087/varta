@@ -1,7 +1,7 @@
 //! File-backed exporter. See [`FileExporter`].
 
 use std::fs::{File, OpenOptions};
-use std::io::{self, BufWriter, Write};
+use std::io::{self, BufWriter, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use varta_vlp::Status;
@@ -62,6 +62,10 @@ pub trait Exporter {
 /// that pushes the size over the limit. Rotation shifts `PATH` → `PATH.1`,
 /// `PATH.1` → `PATH.2`, …, up to 5 generations, then re-opens `PATH` in
 /// append mode. Without `max_bytes` the file grows unbounded.
+///
+/// The live path must resolve to a readable and writable regular file owned by
+/// the observer with exactly one hard link. Leaf symlinks and multiply-linked
+/// files are rejected before any event data is written.
 pub struct FileExporter {
     sink: BufWriter<File>,
     pending_err: Option<io::Error>,
@@ -108,11 +112,8 @@ impl FileExporter {
         max_bytes: Option<u64>,
         sync_every: u32,
     ) -> io::Result<Self> {
-        let file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path.as_ref())?;
-        let bytes_written = file.metadata().map(|m| m.len()).unwrap_or(0);
+        let file = open_or_create_export_file(path.as_ref())?;
+        let bytes_written = file.metadata()?.len();
         Ok(FileExporter {
             sink: BufWriter::new(file),
             pending_err: None,
@@ -203,15 +204,11 @@ impl FileExporter {
             self.remember_error(&e);
             return Err(first_err.unwrap_or(e));
         }
-        if let Err(e) = Self::rotate(&self.path) {
+        if let Err(e) = self.rotate() {
             self.remember_error(&e);
             return Err(first_err.unwrap_or(e));
         }
-        match OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.path)
-        {
+        match create_new_export_file(&self.path) {
             Ok(file) => {
                 self.sink = BufWriter::new(file);
                 self.bytes_written = 0;
@@ -230,39 +227,152 @@ impl FileExporter {
 
     /// Rotate `path`: shift `path` → `path.1`, `path.1` → `path.2`, …
     /// up to [`MAX_ROTATION_GENERATIONS`]. The oldest generation is deleted.
-    fn rotate(path: &Path) -> io::Result<()> {
-        let path_str = path.to_string_lossy();
-        let oldest = format!("{path_str}.{MAX_ROTATION_GENERATIONS}");
+    fn rotate(&mut self) -> io::Result<()> {
+        let oldest = generation_path(&self.path, MAX_ROTATION_GENERATIONS);
         match std::fs::remove_file(&oldest) {
             Ok(()) => {}
             Err(e) if e.kind() == io::ErrorKind::NotFound => {}
             Err(e) => return Err(e),
         }
         for gen in (1..MAX_ROTATION_GENERATIONS).rev() {
-            let src = format!("{path_str}.{gen}");
-            let dst = format!("{path_str}.{}", gen + 1);
+            let src = generation_path(&self.path, gen);
+            let dst = generation_path(&self.path, gen + 1);
             match std::fs::rename(&src, &dst) {
                 Ok(()) => {}
                 Err(e) if e.kind() == io::ErrorKind::NotFound => {}
                 Err(e) => return Err(e),
             }
         }
-        let first = format!("{path_str}.1");
-        match std::fs::rename(path, &first) {
+        let first = generation_path(&self.path, 1);
+        match std::fs::rename(&self.path, &first) {
             Ok(()) => {}
             Err(e) if e.kind() == io::ErrorKind::NotFound => {}
             Err(e) if is_cross_device_error(&e) => {
-                std::fs::copy(path, &first)?;
-                std::fs::remove_file(path)?;
+                self.copy_live_to_first(&first)?;
             }
             Err(e) => return Err(e),
         }
+        Ok(())
+    }
+
+    /// Copy the live generation through the writer's owned descriptor.
+    ///
+    /// This is the `EXDEV` fallback for unusual mount layouts where the live
+    /// leaf and its `.1` sibling cannot be renamed atomically. The destination
+    /// is exclusively created and synced before the live pathname is removed.
+    fn copy_live_to_first(&mut self, first: &Path) -> io::Result<()> {
+        let mut source = self.sink.get_ref().try_clone()?;
+        source.seek(SeekFrom::Start(0))?;
+
+        let mut destination = create_new_export_file(first)?;
+        let mut destination_guard = CreatedPathGuard::new(first, &destination)?;
+        io::copy(&mut source, &mut destination)?;
+        destination.sync_data()?;
+        std::fs::remove_file(&self.path)?;
+        destination_guard.disarm();
         Ok(())
     }
 }
 
 fn is_cross_device_error(e: &io::Error) -> bool {
     e.raw_os_error() == Some(EXDEV)
+}
+
+fn generation_path(path: &Path, generation: u32) -> PathBuf {
+    let mut value = path.as_os_str().to_os_string();
+    value.push(format!(".{generation}"));
+    PathBuf::from(value)
+}
+
+fn open_or_create_export_file(path: &Path) -> io::Result<File> {
+    match create_new_export_file(path) {
+        Ok(file) => Ok(file),
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => open_existing_export_file(path),
+        Err(e) => Err(e),
+    }
+}
+
+fn create_new_export_file(path: &Path) -> io::Result<File> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let mut options = OpenOptions::new();
+    options.read(true).append(true).create_new(true).mode(0o600);
+    let file = crate::file_security::open_nofollow(path, &mut options)?;
+    let mut created_guard = CreatedPathGuard::new(path, &file)?;
+    validate_export_file(&file, path)?;
+    created_guard.disarm();
+    Ok(file)
+}
+
+fn open_existing_export_file(path: &Path) -> io::Result<File> {
+    let mut options = OpenOptions::new();
+    options.read(true).append(true);
+    let file = crate::file_security::open_nofollow(path, &mut options)?;
+    validate_export_file(&file, path)?;
+    Ok(file)
+}
+
+fn validate_export_file(file: &File, path: &Path) -> io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+
+    let meta = crate::file_security::validate_regular_file(file, path)?;
+    if meta.nlink() != 1 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "{}: export file must have exactly one hard link",
+                path.display()
+            ),
+        ));
+    }
+    Ok(())
+}
+
+struct CreatedPathGuard {
+    path: PathBuf,
+    dev: u64,
+    ino: u64,
+    armed: bool,
+}
+
+impl CreatedPathGuard {
+    fn new(path: &Path, file: &File) -> io::Result<Self> {
+        use std::os::unix::fs::MetadataExt;
+
+        let meta = file.metadata()?;
+        Ok(Self {
+            path: path.to_path_buf(),
+            dev: meta.dev(),
+            ino: meta.ino(),
+            armed: true,
+        })
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for CreatedPathGuard {
+    fn drop(&mut self) {
+        use std::os::unix::fs::MetadataExt;
+
+        if !self.armed {
+            return;
+        }
+        match std::fs::symlink_metadata(&self.path) {
+            Ok(meta) if meta.dev() == self.dev && meta.ino() == self.ino => {
+                let _ = std::fs::remove_file(&self.path);
+            }
+            Ok(_) => {}
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    io::ErrorKind::NotFound | io::ErrorKind::PermissionDenied
+                ) => {}
+            Err(_) => {}
+        }
+    }
 }
 
 impl Exporter for FileExporter {
@@ -506,6 +616,146 @@ mod tests {
             pid_ns_inode: None,
             observer_ns,
         }
+    }
+
+    #[test]
+    fn create_rejects_symlink_without_modifying_target() {
+        use std::os::unix::fs::symlink;
+
+        let (dir, path) = rotation_reopen_fixture("create-symlink");
+        let victim = dir.join("victim");
+        let original = b"must remain unchanged\n";
+        std::fs::write(&victim, original).expect("seed victim");
+        symlink(&victim, &path).expect("plant export symlink");
+
+        let err = match FileExporter::create(&path, None, 0) {
+            Ok(_) => panic!("file exporter must reject a symlink"),
+            Err(e) => e,
+        };
+
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(
+            std::fs::read(&victim).expect("read victim"),
+            original,
+            "export startup must not append to the symlink target"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn create_rejects_hard_link_without_modifying_target() {
+        let (dir, path) = rotation_reopen_fixture("create-hard-link");
+        let victim = dir.join("victim");
+        let original = b"must remain unchanged\n";
+        std::fs::write(&victim, original).expect("seed victim");
+        std::fs::hard_link(&victim, &path).expect("plant export hard link");
+
+        let err = match FileExporter::create(&path, None, 0) {
+            Ok(_) => panic!("file exporter must reject a multiply-linked inode"),
+            Err(e) => e,
+        };
+
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(
+            std::fs::read(&victim).expect("read victim"),
+            original,
+            "export startup must not append to the hard-linked target"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cross_device_fallback_refuses_symlink_destination_without_modifying_target() {
+        use std::os::unix::fs::symlink;
+
+        let (dir, path) = rotation_reopen_fixture("copy-symlink");
+        let first = generation_path(&path, 1);
+        let victim = dir.join("victim");
+        let original = b"must remain unchanged\n";
+        std::fs::write(&victim, original).expect("seed victim");
+
+        let mut fe = FileExporter::create(&path, None, 0).expect("create exporter");
+        fe.record(&sample_beat(123)).expect("record beat");
+        fe.flush().expect("flush beat");
+        symlink(&victim, &first).expect("plant destination symlink");
+
+        let err = fe
+            .copy_live_to_first(&first)
+            .expect_err("copy fallback must reject an existing symlink");
+
+        assert!(matches!(
+            err.kind(),
+            io::ErrorKind::AlreadyExists | io::ErrorKind::InvalidInput
+        ));
+        assert!(
+            std::fs::symlink_metadata(&first)
+                .expect("destination symlink remains")
+                .file_type()
+                .is_symlink(),
+            "fallback must not unlink a destination it did not create"
+        );
+        assert_eq!(
+            std::fs::read(&victim).expect("read victim"),
+            original,
+            "fallback must not overwrite the destination symlink target"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cross_device_fallback_reads_owned_descriptor_after_live_path_swap() {
+        use std::os::unix::fs::symlink;
+
+        let (dir, path) = rotation_reopen_fixture("copy-source-swap");
+        let displaced = dir.join("displaced-export.tsv");
+        let first = generation_path(&path, 1);
+        let victim = dir.join("victim");
+        let original = b"must remain unchanged\n";
+        std::fs::write(&victim, original).expect("seed victim");
+
+        let mut fe = FileExporter::create(&path, None, 0).expect("create exporter");
+        fe.record(&sample_beat(123)).expect("record beat");
+        fe.flush().expect("flush beat");
+        std::fs::rename(&path, &displaced).expect("displace live export path");
+        symlink(&victim, &path).expect("replace live path with symlink");
+
+        fe.copy_live_to_first(&first).expect("copy fallback");
+
+        assert_eq!(
+            std::fs::read(&victim).expect("read victim"),
+            original,
+            "fallback must not read from or write to the replacement target"
+        );
+        assert_eq!(
+            std::fs::read(&first).expect("read rotated export"),
+            std::fs::read(&displaced).expect("read original export inode"),
+            "rotated generation must come from the descriptor owned by the exporter"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn created_path_guard_preserves_replacement_inode() {
+        let (dir, path) = rotation_reopen_fixture("guard-replacement");
+        let displaced = dir.join("displaced-export.tsv");
+        let replacement = b"replacement must survive\n";
+        let file = create_new_export_file(&path).expect("create guarded file");
+        let guard = CreatedPathGuard::new(&path, &file).expect("capture created inode");
+
+        std::fs::rename(&path, &displaced).expect("displace guarded inode");
+        std::fs::write(&path, replacement).expect("install replacement");
+        drop(guard);
+
+        assert_eq!(
+            std::fs::read(&path).expect("read replacement"),
+            replacement,
+            "cleanup must not unlink a leaf that no longer names the created inode"
+        );
+        assert!(
+            displaced.exists(),
+            "the created inode must remain displaced"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

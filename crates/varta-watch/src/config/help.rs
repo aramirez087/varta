@@ -56,7 +56,10 @@ OPTIONAL:
     --socket-mode <OCTAL>           File mode for the observer socket
                                      (default 0600 — owner-only r/w).
     --export-file <PATH>            Append one tab-separated event line per
-                                     observer event to this file.
+                                     observer event to this file. Existing
+                                     files must be observer-owned, readable
+                                     and writable regular files with one hard
+                                     link; leaf symlinks are rejected.
     --export-file-max-bytes <N>     Rotate export file when its size exceeds
                                      N bytes (keeps up to 5 generations:
                                      PATH.1 .. PATH.5).  Without this flag
