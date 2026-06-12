@@ -21,7 +21,12 @@ from varta import (
     Varta,
     classify_send_error,
 )
-from varta._transport import BeatTransport
+from varta._transport import (
+    BeatTransport,
+    SecureUdpTransport,
+    UdpTransport,
+    UdsTransport,
+)
 from varta._vlp import decode
 
 
@@ -145,6 +150,73 @@ def test_connect_to_nonexistent_path_raises(tmp_uds_path: Path) -> None:
     # tmp_uds_path is a clean path with no listener — connect must fail.
     with pytest.raises(OSError):
         Varta.connect(tmp_uds_path)
+
+
+def test_uds_failed_reconnect_preserves_socket(
+    bound_uds_listener: Tuple[socket.socket, Path],
+) -> None:
+    listener, path = bound_uds_listener
+    transport = UdsTransport(path)
+    old_sock = transport._sock
+    listener.close()
+    path.unlink()
+
+    try:
+        with pytest.raises(OSError):
+            transport.reconnect()
+        assert transport._sock is old_sock
+        assert old_sock is not None
+        assert old_sock.fileno() >= 0
+    finally:
+        transport.close()
+
+
+def test_udp_failed_reconnect_preserves_socket() -> None:
+    transport = UdpTransport(("127.0.0.1", 9))
+    old_sock = transport._sock
+    transport._addr = ("[", 9)
+
+    try:
+        with pytest.raises(OSError):
+            transport.reconnect()
+        assert transport._sock is old_sock
+        assert old_sock is not None
+        assert old_sock.fileno() >= 0
+    finally:
+        transport.close()
+
+
+def test_secure_udp_failed_reconnect_preserves_session(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    transport = SecureUdpTransport(("127.0.0.1", 9), key=bytes(32))
+    transport._set_iv_counter_for_test(17)
+    old_sock = transport._sock
+    old_session = (
+        transport._session_salt,
+        transport._iv_prefix,
+        transport._iv_prefix_index,
+        transport._iv_counter,
+    )
+
+    def fail_entropy(_: int) -> bytes:
+        raise OSError(errno.EIO, "simulated entropy failure")
+
+    monkeypatch.setattr("varta._transport.os.urandom", fail_entropy)
+    try:
+        with pytest.raises(OSError):
+            transport.reconnect()
+        assert transport._sock is old_sock
+        assert old_sock is not None
+        assert old_sock.fileno() >= 0
+        assert (
+            transport._session_salt,
+            transport._iv_prefix,
+            transport._iv_prefix_index,
+            transport._iv_counter,
+        ) == old_session
+    finally:
+        transport.close()
 
 
 # ---------------------------------------------------------------------------

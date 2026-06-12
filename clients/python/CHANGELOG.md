@@ -8,6 +8,12 @@ governed independently — see `book/src/spec/vlp.md` in the workspace.
 
 ### Fixed
 
+- UDS, UDP, and secure-UDP reconnects are now transactional: replacement
+  sockets and secure-session material are prepared before the active
+  transport is retired. A failed reconnect no longer leaves the agent with
+  `_sock = None`, which previously made the next `beat()` raise an internal
+  `AssertionError`.
+
 - `Varta.beat()` now rejects observer-only `Status.STALL` inputs
   (`Status.STALL`, `"stall"`, or `3`) with `BeatOutcome.failed`
   / `InvalidInput` before reconnecting or sending. `Stall` is synthesized

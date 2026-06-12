@@ -110,3 +110,83 @@ func TestUnitUDSReconnectRebuildsSocket(t *testing.T) {
 		t.Fatalf("Send after Reconnect: %v", err)
 	}
 }
+
+func TestUnitUDSFailedReconnectPreservesSocket(t *testing.T) {
+	path := tmpUDSPath(t)
+	listener := bindUDSListener(t, path)
+	transport, err := NewUDS(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer transport.Close()
+
+	oldConn := transport.conn
+	if err := listener.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+		t.Fatal(err)
+	}
+
+	if err := transport.Reconnect(); err == nil {
+		t.Fatal("Reconnect succeeded after the observer path was removed")
+	}
+	if transport.conn != oldConn {
+		t.Fatal("failed Reconnect replaced or cleared the live connection")
+	}
+	if err := oldConn.SetWriteDeadline(time.Time{}); err != nil {
+		t.Fatalf("failed Reconnect closed the live connection: %v", err)
+	}
+}
+
+func TestUnitUDPFailedReconnectPreservesSocket(t *testing.T) {
+	transport, err := NewUDP("127.0.0.1", 9)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer transport.Close()
+
+	oldConn := transport.conn
+	transport.host = "["
+	if err := transport.Reconnect(); err == nil {
+		t.Fatal("Reconnect succeeded with an invalid host")
+	}
+	if transport.conn != oldConn {
+		t.Fatal("failed Reconnect replaced or cleared the live connection")
+	}
+	if err := oldConn.SetWriteDeadline(time.Time{}); err != nil {
+		t.Fatalf("failed Reconnect closed the live connection: %v", err)
+	}
+}
+
+func TestUnitSecureUDPFailedReconnectPreservesSession(t *testing.T) {
+	transport, err := NewSecureUDPShared("127.0.0.1", 9, make([]byte, 32))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer transport.Close()
+
+	transport.SetCounterForTest(17)
+	oldConn := transport.conn
+	oldSalt := transport.sessionSalt
+	oldPrefix := transport.ivPrefix
+	oldPrefixIndex := transport.prefixIndex
+	oldCounter := transport.counter
+
+	transport.host = "["
+	if err := transport.Reconnect(); err == nil {
+		t.Fatal("Reconnect succeeded with an invalid host")
+	}
+	if transport.conn != oldConn {
+		t.Fatal("failed Reconnect replaced or cleared the live connection")
+	}
+	if err := oldConn.SetWriteDeadline(time.Time{}); err != nil {
+		t.Fatalf("failed Reconnect closed the live connection: %v", err)
+	}
+	if transport.sessionSalt != oldSalt ||
+		transport.ivPrefix != oldPrefix ||
+		transport.prefixIndex != oldPrefixIndex ||
+		transport.counter != oldCounter {
+		t.Fatal("failed Reconnect partially replaced secure session state")
+	}
+}

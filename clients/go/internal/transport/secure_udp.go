@@ -75,27 +75,35 @@ func NewSecureUDPMaster(host string, port int, masterKey []byte) (*SecureUDPTran
 }
 
 func (t *SecureUDPTransport) open() error {
-	addr, err := net.ResolveUDPAddr("udp", fmt.Sprintf("%s:%d", t.host, t.port))
+	conn, sessionSalt, ivPrefix, err := prepareSecureUDPSession(t.host, t.port)
 	if err != nil {
 		return err
-	}
-	conn, err := net.DialUDP("udp", nil, addr)
-	if err != nil {
-		return err
-	}
-	if err := setNonblock(conn); err != nil {
-		_ = conn.Close()
-		return err
-	}
-	if _, err := rand.Read(t.sessionSalt[:]); err != nil {
-		_ = conn.Close()
-		return fmt.Errorf("secure-udp: read crypto/rand: %w", err)
 	}
 	t.conn = conn
+	t.sessionSalt = sessionSalt
+	t.ivPrefix = ivPrefix
 	t.prefixIndex = 0
 	t.counter = 0
-	t.ivPrefix = vlpsecure.DeriveIVPrefix(t.sessionSalt, t.prefixIndex)
 	return nil
+}
+
+func prepareSecureUDPSession(
+	host string,
+	port int,
+) (*net.UDPConn, [16]byte, [vlpsecure.IVRandomBytes]byte, error) {
+	var sessionSalt [16]byte
+	var ivPrefix [vlpsecure.IVRandomBytes]byte
+
+	conn, err := dialUDP(host, port)
+	if err != nil {
+		return nil, sessionSalt, ivPrefix, err
+	}
+	if _, err := rand.Read(sessionSalt[:]); err != nil {
+		_ = conn.Close()
+		return nil, sessionSalt, ivPrefix, fmt.Errorf("secure-udp: read crypto/rand: %w", err)
+	}
+	ivPrefix = vlpsecure.DeriveIVPrefix(sessionSalt, 0)
+	return conn, sessionSalt, ivPrefix, nil
 }
 
 func (t *SecureUDPTransport) rotatePrefix() {
@@ -154,8 +162,21 @@ func (t *SecureUDPTransport) Send(buf []byte) (int, error) {
 // Reconnect rebuilds the socket and re-reads crypto/rand for a fresh
 // session salt. Cold path; allocation is fine.
 func (t *SecureUDPTransport) Reconnect() error {
-	_ = t.Close()
-	return t.open()
+	conn, sessionSalt, ivPrefix, err := prepareSecureUDPSession(t.host, t.port)
+	if err != nil {
+		return err
+	}
+
+	old := t.conn
+	t.conn = conn
+	t.sessionSalt = sessionSalt
+	t.ivPrefix = ivPrefix
+	t.prefixIndex = 0
+	t.counter = 0
+	if old != nil {
+		_ = old.Close()
+	}
+	return nil
 }
 
 func (t *SecureUDPTransport) Close() error {
@@ -169,9 +190,9 @@ func (t *SecureUDPTransport) Close() error {
 
 // Test hooks — parity with the Python and Rust transports.
 
-func (t *SecureUDPTransport) SetCounterForTest(v uint32)        { t.counter = v }
-func (t *SecureUDPTransport) CounterForTest() uint32             { return t.counter }
-func (t *SecureUDPTransport) PrefixIndexForTest() uint32         { return t.prefixIndex }
+func (t *SecureUDPTransport) SetCounterForTest(v uint32) { t.counter = v }
+func (t *SecureUDPTransport) CounterForTest() uint32     { return t.counter }
+func (t *SecureUDPTransport) PrefixIndexForTest() uint32 { return t.prefixIndex }
 func (t *SecureUDPTransport) IVPrefixForTest() [vlpsecure.IVRandomBytes]byte {
 	return t.ivPrefix
 }

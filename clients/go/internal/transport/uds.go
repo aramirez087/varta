@@ -24,21 +24,29 @@ func NewUDS(path string) (*UDSTransport, error) {
 }
 
 func (t *UDSTransport) open() error {
-	addr, err := net.ResolveUnixAddr("unixgram", t.path)
+	conn, err := dialUDS(t.path)
 	if err != nil {
-		return err
-	}
-	// DialUnix on "unixgram" returns a connected datagram socket.
-	conn, err := net.DialUnix("unixgram", nil, addr)
-	if err != nil {
-		return err
-	}
-	if err := setNonblock(conn); err != nil {
-		_ = conn.Close()
 		return err
 	}
 	t.conn = conn
 	return nil
+}
+
+func dialUDS(path string) (*net.UnixConn, error) {
+	addr, err := net.ResolveUnixAddr("unixgram", path)
+	if err != nil {
+		return nil, err
+	}
+	// DialUnix on "unixgram" returns a connected datagram socket.
+	conn, err := net.DialUnix("unixgram", nil, addr)
+	if err != nil {
+		return nil, err
+	}
+	if err := setNonblock(conn); err != nil {
+		_ = conn.Close()
+		return nil, err
+	}
+	return conn, nil
 }
 
 // Send transmits buf. Returns the underlying *net.OpError verbatim so
@@ -47,10 +55,18 @@ func (t *UDSTransport) Send(buf []byte) (int, error) {
 	return t.conn.Write(buf)
 }
 
-// Reconnect closes the socket and re-dials. Cold path.
+// Reconnect prepares a replacement before retiring the active socket.
 func (t *UDSTransport) Reconnect() error {
-	_ = t.Close()
-	return t.open()
+	conn, err := dialUDS(t.path)
+	if err != nil {
+		return err
+	}
+	old := t.conn
+	t.conn = conn
+	if old != nil {
+		_ = old.Close()
+	}
+	return nil
 }
 
 func (t *UDSTransport) Close() error {
@@ -65,7 +81,9 @@ func (t *UDSTransport) Close() error {
 // setNonblock toggles O_NONBLOCK on the underlying file descriptor.
 // net.DialUnix returns a blocking socket on most platforms; the Varta
 // contract is non-blocking I/O.
-func setNonblock(conn interface{ SyscallConn() (syscall.RawConn, error) }) error {
+func setNonblock(conn interface {
+	SyscallConn() (syscall.RawConn, error)
+}) error {
 	raw, err := conn.SyscallConn()
 	if err != nil {
 		return err

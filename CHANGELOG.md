@@ -30,6 +30,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Go and Python reconnect failures no longer corrupt the client.** Their
+  UDS, UDP, and secure-UDP transports now prepare replacement sockets and
+  AEAD session state before atomically swapping out the active transport.
+  Failed reconnects preserve the prior connection instead of making the next
+  health beat panic (Go) or raise `AssertionError` (Python).
+
 - **Agent clients reject observer-only `Stall` status before sending.**
   `Status::Stall` / wire byte `0x03` is synthesized by `varta-watch` and
   `Frame::decode` rejects it on the wire. Rust, Python, Node.js, Go, and

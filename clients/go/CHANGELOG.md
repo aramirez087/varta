@@ -8,6 +8,11 @@ governed independently — see `book/src/spec/vlp.md` in the workspace.
 
 ### Fixed
 
+- UDS, UDP, and secure-UDP reconnects are now transactional: replacement
+  sockets and secure-session material are prepared before the active
+  transport is retired. A failed reconnect no longer leaves the agent with
+  a nil connection that panics on the next `Beat()`.
+
 - `Varta.Beat()` now rejects observer-only status byte `3` (for example
   `varta.Status(3)`) with `BeatOutcomeFailed(InvalidInput)` before
   reconnecting or sending. `Stall` is synthesized by `varta-watch` and is

@@ -22,20 +22,28 @@ func NewUDP(host string, port int) (*UDPTransport, error) {
 }
 
 func (t *UDPTransport) open() error {
-	addr, err := net.ResolveUDPAddr("udp", fmt.Sprintf("%s:%d", t.host, t.port))
+	conn, err := dialUDP(t.host, t.port)
 	if err != nil {
-		return err
-	}
-	conn, err := net.DialUDP("udp", nil, addr)
-	if err != nil {
-		return err
-	}
-	if err := setNonblock(conn); err != nil {
-		_ = conn.Close()
 		return err
 	}
 	t.conn = conn
 	return nil
+}
+
+func dialUDP(host string, port int) (*net.UDPConn, error) {
+	addr, err := net.ResolveUDPAddr("udp", fmt.Sprintf("%s:%d", host, port))
+	if err != nil {
+		return nil, err
+	}
+	conn, err := net.DialUDP("udp", nil, addr)
+	if err != nil {
+		return nil, err
+	}
+	if err := setNonblock(conn); err != nil {
+		_ = conn.Close()
+		return nil, err
+	}
+	return conn, nil
 }
 
 func (t *UDPTransport) Send(buf []byte) (int, error) {
@@ -43,8 +51,16 @@ func (t *UDPTransport) Send(buf []byte) (int, error) {
 }
 
 func (t *UDPTransport) Reconnect() error {
-	_ = t.Close()
-	return t.open()
+	conn, err := dialUDP(t.host, t.port)
+	if err != nil {
+		return err
+	}
+	old := t.conn
+	t.conn = conn
+	if old != nil {
+		_ = old.Close()
+	}
+	return nil
 }
 
 func (t *UDPTransport) Close() error {

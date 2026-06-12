@@ -12,7 +12,8 @@ package transport
 
 // BeatTransport is the per-transport contract that the Varta agent
 // drives. Send accepts a 32-byte plaintext frame (the transport may
-// AEAD-wrap before transmission); Reconnect rebuilds session state;
+// AEAD-wrap before transmission); Reconnect rebuilds session state and
+// must leave the current transport usable when replacement setup fails;
 // Close releases the socket. All three may allocate freely on the cold
 // paths; only Send is on the agent's hot path.
 type BeatTransport interface {

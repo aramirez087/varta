@@ -61,7 +61,7 @@ class BeatTransport(abc.ABC):
 
     @abc.abstractmethod
     def reconnect(self) -> None:
-        """Rebuild the underlying socket. Cold path; allocation OK."""
+        """Rebuild the socket without destroying the current one on failure."""
 
     def close(self) -> None:  # pragma: no cover - default is no-op
         """Best-effort cleanup; subclasses override if they own a socket."""
@@ -72,6 +72,17 @@ class BeatTransport(abc.ABC):
 # ---------------------------------------------------------------------------
 
 
+def _uds_socket(path: str) -> socket.socket:
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+    try:
+        sock.setblocking(False)
+        sock.connect(path)
+    except OSError:
+        sock.close()
+        raise
+    return sock
+
+
 class UdsTransport(BeatTransport):
     """Unix-domain-datagram transport. Default for ``Varta.connect``."""
 
@@ -79,26 +90,21 @@ class UdsTransport(BeatTransport):
 
     def __init__(self, path: Union[str, "os.PathLike[str]"]) -> None:
         self._path = os.fspath(path)
-        self._sock: Optional[socket.socket] = None
-        self._open()
-
-    def _open(self) -> None:
-        sock = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
-        try:
-            sock.setblocking(False)
-            sock.connect(self._path)
-        except OSError:
-            sock.close()
-            raise
-        self._sock = sock
+        self._sock: Optional[socket.socket] = _uds_socket(self._path)
 
     def send(self, buf: bytes) -> int:
         assert self._sock is not None
         return self._sock.send(buf)
 
     def reconnect(self) -> None:
-        self.close()
-        self._open()
+        sock = _uds_socket(self._path)
+        old = self._sock
+        self._sock = sock
+        if old is not None:
+            try:
+                old.close()
+            except OSError:
+                pass
 
     def close(self) -> None:
         if self._sock is not None:
@@ -140,19 +146,21 @@ class UdpTransport(BeatTransport):
 
     def __init__(self, addr: Address) -> None:
         self._addr = addr
-        self._sock: Optional[socket.socket] = None
-        self._open()
-
-    def _open(self) -> None:
-        self._sock = _udp_socket(self._addr)
+        self._sock: Optional[socket.socket] = _udp_socket(self._addr)
 
     def send(self, buf: bytes) -> int:
         assert self._sock is not None
         return self._sock.send(buf)
 
     def reconnect(self) -> None:
-        self.close()
-        self._open()
+        sock = _udp_socket(self._addr)
+        old = self._sock
+        self._sock = sock
+        if old is not None:
+            try:
+                old.close()
+            except OSError:
+                pass
 
     def close(self) -> None:
         if self._sock is not None:
@@ -228,11 +236,25 @@ class SecureUdpTransport(BeatTransport):
         self._open()
 
     def _open(self) -> None:
-        self._sock = _udp_socket(self._addr)
-        self._session_salt = os.urandom(16)
+        sock, session_salt, iv_prefix = self._prepare_session()
+        self._sock = sock
+        self._session_salt = session_salt
+        self._iv_prefix = iv_prefix
         self._iv_prefix_index = 0
         self._iv_counter = 0
-        self._iv_prefix = derive_iv_prefix(self._session_salt, self._iv_prefix_index)
+
+    def _prepare_session(self) -> Tuple[socket.socket, bytes, bytes]:
+        sock = _udp_socket(self._addr)
+        try:
+            session_salt = os.urandom(16)
+            iv_prefix = derive_iv_prefix(session_salt, 0)
+        except BaseException:
+            try:
+                sock.close()
+            except OSError:
+                pass
+            raise
+        return sock, session_salt, iv_prefix
 
     def _rotate_prefix(self) -> None:
         self._iv_prefix_index += 1
@@ -265,8 +287,18 @@ class SecureUdpTransport(BeatTransport):
         return sent
 
     def reconnect(self) -> None:
-        self.close()
-        self._open()
+        sock, session_salt, iv_prefix = self._prepare_session()
+        old = self._sock
+        self._sock = sock
+        self._session_salt = session_salt
+        self._iv_prefix = iv_prefix
+        self._iv_prefix_index = 0
+        self._iv_counter = 0
+        if old is not None:
+            try:
+                old.close()
+            except OSError:
+                pass
 
     def close(self) -> None:
         if self._sock is not None:
