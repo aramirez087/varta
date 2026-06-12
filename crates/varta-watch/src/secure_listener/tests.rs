@@ -1,4 +1,5 @@
 use super::*;
+use crate::{ClockSource, EvictionPolicy, Observer};
 use std::net::SocketAddr;
 use varta_vlp::{Frame, Status, NONCE_TERMINAL};
 
@@ -750,6 +751,50 @@ fn aead_attempts_equals_keys_len_on_decrypt_failure() {
         3,
         "decrypt-failure path must still pay the full attempt budget"
     );
+}
+
+#[test]
+fn rejected_ciphertext_reports_consumed_io_to_observer() {
+    let key_bytes = [0xA1u8; 32];
+    let listener = bind_with_keys(vec![Key::from_bytes(key_bytes)]);
+    let target = listener.test_local_addr();
+    let mut observer = Observer::from_listener(
+        listener,
+        Duration::from_secs(60),
+        64,
+        EvictionPolicy::Strict,
+        crate::tracker::DEFAULT_EVICTION_SCAN_WINDOW,
+        None,
+        0,
+        0,
+        ClockSource::Monotonic,
+    )
+    .expect("observer construction");
+
+    let stranger = Key::from_bytes([0xB2u8; 32]);
+    let wire = build_shared_frame(&stranger, test_iv(), 1, &[0xCCu8; 32]);
+    send_wire(target, &wire);
+
+    let deadline = Instant::now() + Duration::from_millis(500);
+    loop {
+        assert!(
+            observer.poll().is_none(),
+            "AEAD-invalid datagram must not produce an observer event"
+        );
+        if observer.drain_decrypt_failures() == 1 {
+            assert!(
+                observer.last_poll_consumed(),
+                "a rejected secure datagram was dequeued, so the main loop \
+                 must keep draining instead of taking the 10 ms idle sleep"
+            );
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "observer did not consume the queued invalid ciphertext"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
 }
 
 #[test]

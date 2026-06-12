@@ -258,6 +258,17 @@ pub trait BeatListener: Send + 'static {
     /// `WouldBlock`, `ShortRead`, or `IoError`.
     fn recv(&mut self) -> RecvResult;
 
+    /// Whether the most recent [`Self::recv`] call dequeued a datagram.
+    ///
+    /// [`Observer`](crate::Observer) can infer this from any result other than
+    /// [`RecvResult::WouldBlock`]. A listener that consumes and deliberately
+    /// rejects a datagram while returning `WouldBlock` to suppress an event
+    /// must override this method so the daemon does not mistake that work for
+    /// an idle poll and sleep while more datagrams remain queued.
+    fn last_recv_consumed(&self) -> bool {
+        false
+    }
+
     /// Drain and reset the AEAD decryption failure counter.
     ///
     /// The default implementation returns 0 — only listeners that perform

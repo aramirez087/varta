@@ -547,7 +547,7 @@ impl Observer {
             // that `continue` without yielding an `Event`. Record it so the
             // main loop keeps draining instead of treating a dropped beat as
             // an idle tick (see `last_poll_consumed`).
-            if !matches!(result, RecvResult::WouldBlock) {
+            if !matches!(result, RecvResult::WouldBlock) || self.listeners[i].last_recv_consumed() {
                 consumed = true;
             }
             match result {

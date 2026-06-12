@@ -193,6 +193,9 @@ pub struct SecureUdpListener {
     /// (see cerebrum 2026-05-14 "Generic `BoundedIndex<K>`").
     sender_index: BoundedIndex<ReplayIdentity>,
     next_eviction_check: Instant,
+    /// Whether the most recent `recv` dequeued a datagram, including a
+    /// ciphertext rejected before it could produce an observer event.
+    last_recv_consumed: bool,
     decrypt_failures: u64,
     truncated_count: u64,
     sender_state_full: u64,
@@ -255,6 +258,7 @@ impl SecureUdpListener {
             sender_free_list,
             sender_index,
             next_eviction_check: Instant::now() + EVICTION_INTERVAL,
+            last_recv_consumed: false,
             decrypt_failures: 0,
             truncated_count: 0,
             sender_state_full: 0,
@@ -288,6 +292,7 @@ impl SecureUdpListener {
             sender_free_list,
             sender_index,
             next_eviction_check: Instant::now() + EVICTION_INTERVAL,
+            last_recv_consumed: false,
             decrypt_failures: 0,
             truncated_count: 0,
             sender_state_full: 0,
@@ -546,6 +551,7 @@ impl SecureUdpListener {
 
 impl BeatListener for SecureUdpListener {
     fn recv(&mut self) -> RecvResult {
+        self.last_recv_consumed = false;
         // Sized for the larger master-key frame; a 60-byte shared-key datagram
         // fills only the first 60 bytes and nread discriminates the path. The
         // extra byte makes overlong datagrams observable before decryption.
@@ -559,7 +565,10 @@ impl BeatListener for SecureUdpListener {
             }
 
             let (nread, _sender) = match self.sock.recv_from(&mut buf) {
-                Ok((n, addr)) => (n, addr),
+                Ok((n, addr)) => {
+                    self.last_recv_consumed = true;
+                    (n, addr)
+                }
                 Err(e) => match e.kind() {
                     io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut => {
                         return RecvResult::WouldBlock;
@@ -744,6 +753,10 @@ impl BeatListener for SecureUdpListener {
                 data: plaintext,
             };
         }
+    }
+
+    fn last_recv_consumed(&self) -> bool {
+        self.last_recv_consumed
     }
 
     fn drain_decrypt_failures(&mut self) -> u64 {
