@@ -32,6 +32,21 @@ fn os_random_yields_distinct_outputs() {
 }
 
 #[test]
+fn os_random_zero_length_returns_without_spinning() {
+    // A zero-length request must terminate immediately: the Linux loop guard
+    // (`filled < buf.len()`) never enters, so the `n == 0` infinite-loop guard
+    // is not even reached; getentropy(_, 0) likewise succeeds. The hazard the
+    // guard exists for is a 0 return on a NON-empty request, which would spin
+    // forever — this test pins the boundary that it stays a fast Ok.
+    let mut empty: [u8; 0] = [];
+    match os_random(&mut empty) {
+        Ok(()) => {}
+        Err(e) if e.kind() == io::ErrorKind::Unsupported => {}
+        Err(e) => panic!("os_random(zero-length) failed: {e}"),
+    }
+}
+
+#[test]
 fn fallback_iv_session_salt_unique_across_calls() {
     use std::collections::HashSet;
     let outputs: HashSet<[u8; 16]> = (0..1000).map(|_| fallback_iv_session_salt()).collect();

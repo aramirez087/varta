@@ -530,6 +530,18 @@ fn os_random(buf: &mut [u8]) -> io::Result<()> {
             }
             return Err(e);
         }
+        if n == 0 {
+            // `getrandom(2)` returns 0 only for a zero-length request, which the
+            // loop guard (`filled < buf.len()`) already excludes. A 0 on a
+            // non-empty request is a contract violation (a buggy seccomp/ptrace
+            // shim, or a non-conforming libc wrapper). Fail instead of looping
+            // forever on `filled += 0` — the caller then falls through to
+            // `/dev/urandom`. An infinite spin here would wedge `connect()`.
+            return Err(io::Error::new(
+                io::ErrorKind::Other,
+                "getrandom returned 0 bytes for a non-empty request",
+            ));
+        }
         filled += n as usize;
     }
     Ok(())
