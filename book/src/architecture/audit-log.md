@@ -107,6 +107,20 @@ In addition, the daemon **unconditionally** syncs:
 - After writing the post-rotation `boot` record.
 - In `Drop` (best-effort; not load-bearing for correctness).
 
+### Directory-entry durability
+
+`fsync(2)` on the audit file does **not** persist the directory entry that
+names it. The daemon therefore also fsyncs the audit file's parent
+directory: once at startup in `create` (a freshly-created file would
+otherwise vanish entirely on power cut — including records whose
+`fdatasync` had already returned), and once per rotation in a dedicated
+final `SyncingDir` state-machine stage covering the generation renames,
+the new live file's `create_new`, and the `EXDEV` fallback's copy/unlink
+pair. The stage runs behind its own budget check so the `Finalizing` tail
+keeps the exact two-fsync cost its `--audit-rotation-budget-ms` model is
+sized for. A directory-fsync failure is a soft durability degradation
+latched on the audit error channel, mirroring the UDS-bind posture.
+
 ## File identity hardening
 
 Audit startup opens the live path once with `O_NOFOLLOW`, verifies the opened

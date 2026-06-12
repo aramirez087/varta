@@ -429,7 +429,7 @@ impl UdsListener {
         // already succeeded — a directory-fsync failure is treated as a soft
         // durability degradation rather than a startup failure (some exotic
         // platforms return EINVAL for directory fsync).
-        if let Err(e) = fsync_parent_dir(&path) {
+        if let Err(e) = crate::file_security::fsync_parent_dir(&path) {
             crate::varta_warn!(
                 "uds bind: parent-directory fsync failed (durability degraded): {e}"
             );
@@ -488,16 +488,6 @@ impl UdsListener {
     pub fn rcvbuf_bytes(&self) -> u32 {
         self.rcvbuf_bytes
     }
-}
-
-/// Fsync the directory containing `path` so the unlink+bind+chmod sequence
-/// is durable across power loss.  Uses `sync_all` (`fsync(2)`) rather than
-/// `sync_data` (`fdatasync(2)`) because directory entries are metadata and
-/// `fdatasync` is not guaranteed to flush them.
-fn fsync_parent_dir(path: &Path) -> io::Result<()> {
-    let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    let dir = std::fs::File::open(parent)?;
-    dir.sync_all()
 }
 
 /// Set and read back `SO_RCVBUF` on `fd`.  Returns the kernel-granted size
@@ -616,7 +606,23 @@ mod tests {
             path.exists(),
             "dropping a UnixDatagram leaves the socket path"
         );
-        assert!(!probe_live(&path).expect("probe stale socket"));
+        // Kernel teardown of a just-closed datagram socket is asynchronous:
+        // under concurrent VFS load (e.g. directory fsyncs from parallel
+        // tests) macOS `connect(2)` can still succeed for a short window
+        // after `close(2)`, so a single immediate probe is racy. Production
+        // never probes within microseconds of the owner's close — startup
+        // probes sockets orphaned by a long-gone process — so poll until the
+        // kernel settles (same retry-loop convention as the exporter's
+        // serve_pending tests).
+        let mut live = true;
+        for _ in 0..200 {
+            live = probe_live(&path).expect("probe stale socket");
+            if !live {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(!live, "stale socket must probe dead once teardown settles");
 
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_dir(&dir);

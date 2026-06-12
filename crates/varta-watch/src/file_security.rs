@@ -158,6 +158,24 @@ pub(crate) fn validate_regular_file(file: &File, path: &Path) -> io::Result<Meta
     Ok(meta)
 }
 
+/// Fsync the directory containing `path` so directory-entry mutations
+/// (create, rename, unlink) are durable across power loss. Per `fsync(2)`,
+/// fsyncing a file does **not** persist the directory entry that names it —
+/// only an explicit fsync of an open descriptor for the directory does.
+/// Uses `sync_all` (`fsync(2)`) rather than `sync_data` (`fdatasync(2)`)
+/// because directory entries are metadata and `fdatasync` is not guaranteed
+/// to flush them. Shared by the UDS bind path and the recovery audit log.
+pub(crate) fn fsync_parent_dir(path: &Path) -> io::Result<()> {
+    let parent = match path.parent() {
+        // `Path::parent()` returns `Some("")` for a bare relative file name;
+        // opening "" fails ENOENT, so normalize both that and `None` to ".".
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => Path::new("."),
+    };
+    let dir = File::open(parent)?;
+    dir.sync_all()
+}
+
 /// Validate an already-open inode as a private regular file owned by the
 /// observer UID.
 pub(crate) fn validate_private_regular_file(file: &File, path: &Path) -> io::Result<Metadata> {
@@ -176,4 +194,30 @@ pub(crate) fn validate_private_regular_file(file: &File, path: &Path) -> io::Res
         ));
     }
     Ok(meta)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fsync_parent_dir_succeeds_for_path_in_real_directory() {
+        // Only the parent is opened and fsynced; the leaf need not exist.
+        let path = std::env::temp_dir().join("varta-fsync-parent-probe");
+        fsync_parent_dir(&path).expect("fsync of a real temp directory");
+    }
+
+    #[test]
+    fn fsync_parent_dir_normalizes_bare_relative_name_to_cwd() {
+        // `Path::parent()` yields `Some("")` here; the helper must open "."
+        // instead of failing ENOENT on the empty path.
+        fsync_parent_dir(Path::new("bare-file-name")).expect("fsync of the CWD");
+    }
+
+    #[test]
+    fn fsync_parent_dir_fails_for_missing_parent() {
+        let err = fsync_parent_dir(Path::new("/nonexistent-varta-bug403/audit.log"))
+            .expect_err("missing parent directory must fail");
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
+    }
 }

@@ -59,6 +59,17 @@ pub(super) enum RotationProgress {
     /// boot's `prev_chain` column equals `.1`'s true on-disk tail and no
     /// record (nor the header) is ever displaced ahead of the boot anchor.
     Finalizing,
+    /// The generation renames and the new live file's `create_new` are
+    /// visible in the directory but not yet durable: per `fsync(2)`, fsyncing
+    /// a file does NOT persist the directory entry that names it. One fsync
+    /// of the parent directory makes the whole rename chain plus the new
+    /// live entry (and the EXDEV fallback's `create_new`/`unlink` pair)
+    /// durable. This runs as its OWN stage — never inside the `Finalizing`
+    /// tail — so the tail keeps the exact two-fsync cost its budget model is
+    /// sized for (bug-363/373/379): per-call worst case stays
+    /// drain(≤budget) + 2·fsync, and this stage's worst case is a budget
+    /// check + 1·fsync on a fresh `call_start`.
+    SyncingDir,
 }
 
 impl RotationProgress {
@@ -289,9 +300,12 @@ impl RecoveryAuditLog {
                     use std::io::Write;
                     if let Err(e) = self.sink.write_all(AUDIT_HEADER_V2.as_bytes()) {
                         self.pending_err = Some(e);
-                        self.rotation_progress = RotationProgress::Idle;
-                        self.needs_rotation = false;
-                        return RotationOutcome::Complete;
+                        // Give up on the boot anchor, but still route through
+                        // `SyncingDir`: the renames and the `create_new` above
+                        // already mutated the directory and deserve durability
+                        // regardless of the header failure.
+                        self.rotation_progress = RotationProgress::SyncingDir;
+                        continue;
                     }
                     self.bytes_written = AUDIT_HEADER_V2.len() as u64;
 
@@ -315,6 +329,36 @@ impl RecoveryAuditLog {
                         self.pending_err = Some(e);
                     } else {
                         self.writes_since_sync = 0;
+                    }
+                    // The boot anchor's bytes are durable, but the directory
+                    // entries (renames + the new live file's `create_new`)
+                    // are not until `SyncingDir` fsyncs the parent directory.
+                    // The residual window — boot fdatasync returned, dirent
+                    // sync pending — lasts at most until the next tick's
+                    // re-entry (vs. unbounded before this stage existed);
+                    // closing it fully would require a third fsync inside
+                    // this tail, re-creating the bug-379 abort hazard.
+                    self.rotation_progress = RotationProgress::SyncingDir;
+                    continue;
+                }
+                RotationProgress::SyncingDir => {
+                    // Same pre-step recheck as the live→`.1` move: the fsync
+                    // below is unbudgeted, so enter it only while budget
+                    // remains; otherwise resume next tick with a fresh
+                    // `call_start` (loop-top `>` alone is not deterministic
+                    // for a `Duration::ZERO` budget on a coarse clock).
+                    if call_start.elapsed() >= budget {
+                        self.audit_rotation_budget_exceeded_total =
+                            self.audit_rotation_budget_exceeded_total.saturating_add(1);
+                        return RotationOutcome::Deferred;
+                    }
+                    // On failure, latch and give up rather than wedge the FSM:
+                    // the in-memory state is already past the renames, the
+                    // error surfaces via `take_pending_err`, and some
+                    // platforms reject directory fsync outright (same soft
+                    // posture as the UDS-bind parent-dir fsync).
+                    if let Err(e) = crate::file_security::fsync_parent_dir(&self.path) {
+                        self.pending_err = Some(e);
                     }
                     self.rotation_progress = RotationProgress::Idle;
                     self.needs_rotation = false;
@@ -881,6 +925,78 @@ mod tests {
              third means emit_boot's cadence fsync was not suppressed (bug-379)"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// After the `Finalizing` tail, the FSM must pass through `SyncingDir` —
+    /// the stage that makes the rename chain and the new live `create_new`
+    /// durable (per `fsync(2)`, fsyncing a file does not persist the
+    /// directory entry naming it). With the budget already exhausted, the
+    /// stage must defer to the next tick rather than stack an unbudgeted
+    /// directory fsync on a spent call (the same abort-class hazard as
+    /// bug-363/373/379).
+    #[test]
+    fn syncing_dir_stage_defers_when_budget_exhausted() {
+        let dir = tmpdir("syncdir-defer");
+        let path = dir.join("audit.log");
+        let (mut log, _) = RecoveryAuditLog::create(&path, cfg(None, 1)).expect("create");
+        log.rotation_progress = RotationProgress::SyncingDir;
+        log.needs_rotation = true;
+
+        let outcome = log.drive_audit_rotation(Duration::ZERO);
+
+        assert_eq!(outcome, RotationOutcome::Deferred);
+        assert!(
+            matches!(log.rotation_progress, RotationProgress::SyncingDir),
+            "must stay in SyncingDir so the next tick retries with a fresh budget"
+        );
+        assert!(log.needs_rotation, "rotation must stay armed");
+        assert_eq!(log.audit_rotation_budget_exceeded_total, 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `SyncingDir` completes the rotation: the parent-directory fsync makes
+    /// the dirent mutations durable, the FSM returns to Idle, and rotation is
+    /// disarmed with no error latched.
+    #[test]
+    fn syncing_dir_stage_completes_and_disarms() {
+        let dir = tmpdir("syncdir-ok");
+        let path = dir.join("audit.log");
+        let (mut log, _) = RecoveryAuditLog::create(&path, cfg(None, 1)).expect("create");
+        log.rotation_progress = RotationProgress::SyncingDir;
+        log.needs_rotation = true;
+
+        let outcome = log.drive_audit_rotation(Duration::from_secs(5));
+
+        assert_eq!(outcome, RotationOutcome::Complete);
+        assert!(log.rotation_progress.is_idle());
+        assert!(!log.needs_rotation);
+        assert!(
+            log.pending_err.is_none(),
+            "a successful directory fsync must not latch an error"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A failed parent-directory fsync must latch the error and complete —
+    /// never wedge the FSM in `SyncingDir`. The in-memory state is already
+    /// past the renames; the error surfaces via `take_pending_err` (same
+    /// soft posture as the UDS-bind parent-directory fsync).
+    #[test]
+    fn syncing_dir_failure_latches_error_and_completes() {
+        let writes = Arc::new(AtomicUsize::new(0));
+        let mut log = synthetic_rotation_log(writes, Duration::from_millis(0));
+        log.path = PathBuf::from("/nonexistent-varta-bug403/audit.log");
+        log.rotation_progress = RotationProgress::SyncingDir;
+
+        let outcome = log.drive_audit_rotation(Duration::from_secs(5));
+
+        assert_eq!(outcome, RotationOutcome::Complete);
+        assert!(log.rotation_progress.is_idle());
+        assert!(!log.needs_rotation);
+        assert!(
+            log.pending_err.is_some(),
+            "directory-fsync failure must be latched for take_pending_err"
+        );
     }
 
     #[test]

@@ -235,6 +235,18 @@ impl RecoveryAuditLog {
             rotation_progress: RotationProgress::Idle,
         };
 
+        // A freshly-created audit file's directory entry is not durable until
+        // the parent directory is fsynced: per `fsync(2)`, fsyncing the file
+        // does not persist the entry that names it. Without this, a power cut
+        // can erase the whole file — including records whose `fdatasync`
+        // already returned Ok. Failure is a soft durability degradation (some
+        // platforms reject directory fsync), latched for the main loop to
+        // surface via `take_pending_err` — mirroring the UDS-bind posture.
+        // Latched before `emit_boot` so a boot-write error takes precedence.
+        if let Err(e) = crate::file_security::fsync_parent_dir(&log.path) {
+            log.pending_err = Some(e);
+        }
+
         let prev_for_boot = match probe.reason {
             BootReason::Resume => Some(probe.last_chain),
             _ => None,
