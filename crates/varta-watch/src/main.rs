@@ -1118,6 +1118,23 @@ fn run(cfg: Config) -> std::io::Result<()> {
                             );
                             continue;
                         }
+                        StallFreshness::UnverifiableGeneration => {
+                            #[cfg(feature = "prometheus-exporter")]
+                            if let Some(pe) = prom_export.as_mut() {
+                                pe.record_recovery_outcome(
+                                    &RecoveryOutcome::SkippedStallUnverifiable { pid: *pid },
+                                    None,
+                                );
+                            }
+                            varta_info_pid!(
+                                *pid,
+                                "recovery for pid {pid} SKIPPED: kernel-attested stall \
+                                 has no start-time generation on this platform, so a PID \
+                                 recycle in the deferral window cannot be ruled out — \
+                                 refusing recovery to avoid targeting a recycled bystander"
+                            );
+                            continue;
+                        }
                     }
                     // Cross-namespace agent: the slot's pinned PID-namespace
                     // inode differs from the observer's. Linux-only signal;
@@ -1242,7 +1259,8 @@ fn run(cfg: Config) -> std::io::Result<()> {
                             unreachable!("on_stall returned a reap-only recovery outcome")
                         }
                         RecoveryOutcome::SkippedAgentResumed { .. }
-                        | RecoveryOutcome::SkippedPidRecycled { .. } => {
+                        | RecoveryOutcome::SkippedPidRecycled { .. }
+                        | RecoveryOutcome::SkippedStallUnverifiable { .. } => {
                             // Synthesized only by the freshness re-check above,
                             // which `continue`s before reaching this match;
                             // on_stall never returns them.

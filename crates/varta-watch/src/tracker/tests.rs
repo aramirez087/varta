@@ -132,29 +132,43 @@ fn stall_recovery_warranted_tracks_resumed_beat() {
     // Untracked pid: nothing to recover.
     assert_eq!(t.stall_freshness(1, None), StallFreshness::AgentResumed);
 
-    // Tracked but not yet stalled: no stall has been emitted.
+    // Tracked but not yet stalled: no stall has been emitted. Pin a generation
+    // (Some(7)) so the KernelAttested slot is recycle-verifiable and the
+    // warrant turns on the silence latch alone, not the platform-degraded path.
     assert_eq!(
-        t.record(&frame(1, 1), 0, threshold_ns, ORIGIN, None),
+        t.record_with_generation(&frame(1, 1), 0, threshold_ns, ORIGIN, None, Some(7)),
         Update::Inserted
     );
-    assert_eq!(t.stall_freshness(1, None), StallFreshness::AgentResumed);
+    assert_eq!(t.stall_freshness(1, Some(7)), StallFreshness::AgentResumed);
 
     // Silence crosses the threshold and the stall is emitted (queued).
-    t.drain_stalled_slots(threshold_ns * 2, threshold_ns, |_, _, _, _, _, _| {});
+    t.drain_stalled_slots_with_generation_check(
+        threshold_ns * 2,
+        threshold_ns,
+        |_, _| false,
+        |_, _, _, _, _, _| {},
+    );
     assert_eq!(
-        t.stall_freshness(1, None),
+        t.stall_freshness_with_recycle_check(1, Some(7), |_, _| false),
         StallFreshness::Warranted,
-        "a freshly-emitted, still-silent stall must remain warranted"
+        "a freshly-emitted, still-silent, generation-verified stall must remain warranted"
     );
 
     // The agent resumes beating before the deferred stall fired — the slot's
     // stall latch clears, so firing recovery now would kill a healthy process.
     assert_eq!(
-        t.record(&frame(1, 2), threshold_ns * 3, threshold_ns, ORIGIN, None),
+        t.record_with_generation(
+            &frame(1, 2),
+            threshold_ns * 3,
+            threshold_ns,
+            ORIGIN,
+            None,
+            Some(7)
+        ),
         Update::Refreshed
     );
     assert_eq!(
-        t.stall_freshness(1, None),
+        t.stall_freshness_with_recycle_check(1, Some(7), |_, _| false),
         StallFreshness::AgentResumed,
         "a resumed beat must withdraw the recovery warrant"
     );
@@ -200,12 +214,51 @@ fn stall_freshness_detects_pid_recycle_in_deferral_window() {
         "a recycled PID must withdraw the recovery warrant"
     );
 
-    // A slot with no pinned generation (non-Linux / non-kernel-attested) skips
-    // the recycle check entirely and degrades to the silence-latch test.
+    // A KernelAttested slot with no generation argument (credential-only
+    // platforms without /proc: FreeBSD/DragonFly/NetBSD/illumos/Solaris) cannot
+    // prove the PID was not recycled. The recovery-eligible stall is withheld
+    // (UnverifiableGeneration) rather than risk a kill against a bystander —
+    // before the fix this returned Warranted and the deferred stall fired blind.
+    assert_eq!(
+        t.stall_freshness_with_recycle_check(1, None, |_, _| true),
+        StallFreshness::UnverifiableGeneration,
+        "a recovery-eligible stall with no generation token must be unverifiable, not warranted"
+    );
+}
+
+/// The missing-generation escalation is scoped to recovery-eligible
+/// (`KernelAttested`) slots. A non-eligible origin (UDP `NetworkUnverified`,
+/// `SocketModeOnly`) keeps the silence-latch verdict (`Warranted`): `on_stall`
+/// refuses those origins regardless, so escalating here would change a metric
+/// label without preventing any kill. Only `KernelAttested` reaches recovery,
+/// so only it must be withheld when freshness is unprovable.
+#[test]
+fn stall_freshness_missing_generation_only_escalates_for_kernel_attested() {
+    let mut t = Tracker::new(4, EvictionPolicy::Strict, DEFAULT_EVICTION_SCAN_WINDOW);
+    let threshold_ns = 100;
+
+    assert_eq!(
+        t.record_with_generation(
+            &frame(1, 1),
+            0,
+            threshold_ns,
+            BeatOrigin::NetworkUnverified,
+            None,
+            None,
+        ),
+        Update::Inserted
+    );
+    t.drain_stalled_slots_with_generation_check(
+        threshold_ns * 2,
+        threshold_ns,
+        |_, _| false,
+        |_, _, _, _, _, _| {},
+    );
+
     assert_eq!(
         t.stall_freshness_with_recycle_check(1, None, |_, _| true),
         StallFreshness::Warranted,
-        "no pinned generation means the recycle check is a no-op"
+        "a non-recovery-eligible origin keeps the silence-latch verdict even with no generation"
     );
 }
 

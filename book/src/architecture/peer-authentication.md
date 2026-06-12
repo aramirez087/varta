@@ -96,9 +96,23 @@ refusal.  See `book/src/architecture/namespaces.md` for the planned gate.
 |---|---|---|---|
 | Linux | `SO_PASSCRED` + `SCM_CREDENTIALS` (`struct ucred`) | Yes | Yes, after `/proc/<pid>/stat` start-time generation is pinned |
 | macOS pathname UDS | socket file permissions only (`LOCAL_PEERTOKEN` requires a connected local socket) | **No** | **No** |
-| FreeBSD / DragonFly / NetBSD | `LOCAL_CREDS` + `SCM_CREDS` (`struct cmsgcred`) | Yes | Yes |
-| illumos / Solaris | `SO_RECVUCRED` + `SCM_UCRED` + `ucred_t` (opaque) | Yes | Yes |
+| FreeBSD / DragonFly / NetBSD | `LOCAL_CREDS` + `SCM_CREDS` (`struct cmsgcred`) | Yes | Yes (recycle-unverifiable¹) |
+| illumos / Solaris | `SO_RECVUCRED` + `SCM_UCRED` + `ucred_t` (opaque) | Yes | Yes (recycle-unverifiable¹) |
 | OpenBSD, AIX, HP-UX, other Unix | none — `--socket-mode 0600` only | **No** | **No** |
+
+> ¹ **Recycle-unverifiable recovery.** These platforms attest the sender
+> PID per datagram (minting `KernelAttested`, so recovery is eligible) but
+> expose no `/proc/<pid>/stat`, so `read_pid_start_time` returns `None` and
+> no start-time *generation* token can be pinned. A PID recycled inside the
+> per-tick spawn-budget deferral window therefore cannot be distinguished
+> from the original process. Rather than risk firing `kill(2)`/restart
+> against an innocent recycled PID, the observer's deferred-stall freshness
+> re-check **withholds** recovery for a `KernelAttested` stall that carries
+> no generation, surfacing it as
+> `varta_recovery_outcomes_total{outcome="skipped_stall_unverifiable"}`. The
+> immediate (same-tick) recovery path is unaffected — it has no deferral
+> window for a recycle to occur in. On Linux a `KernelAttested` slot always
+> carries a generation, so this skip never fires there.
 
 ### Socket-mode-only fallback
 

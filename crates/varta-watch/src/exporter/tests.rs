@@ -925,6 +925,36 @@ fn recovery_skipped_agent_resumed_outcome_drives_only_outcome_counter() {
     }
 }
 
+/// The platform-degraded recovery skip (a `KernelAttested` deferred stall with
+/// no start-time generation on credential-only platforms) surfaces under its
+/// own `skipped_stall_unverifiable` outcome label — distinct from a confirmed
+/// `skipped_pid_recycled` — so operators can see kernel-attested recovery is
+/// running recycle-unverifiable on their host. It is a benign safety skip, not
+/// a structural refusal, so no `refused_*` reason counter moves.
+#[test]
+fn recovery_skipped_stall_unverifiable_outcome_drives_only_outcome_counter() {
+    let mut prom = PromExporter::bind("127.0.0.1:0".parse().unwrap(), make_token()).expect("bind");
+    let outcome = crate::recovery::RecoveryOutcome::SkippedStallUnverifiable { pid: 7 };
+    prom.record_recovery_outcome(&outcome, None);
+    prom.render_body();
+    let body = &prom.body_buf;
+    assert!(
+        body.contains("varta_recovery_outcomes_total{outcome=\"skipped_stall_unverifiable\"} 1"),
+        "outcome counter must increment under skipped_stall_unverifiable; body:\n{body}"
+    );
+    assert!(
+        body.contains("varta_recovery_outcomes_total{outcome=\"skipped_pid_recycled\"} 0"),
+        "an unverifiable skip must not be conflated with a confirmed recycle; body:\n{body}"
+    );
+    for reason in RECOVERY_REFUSED_REASON_LABELS.iter() {
+        let needle = format!("varta_recovery_refused_total{{reason=\"{reason}\"}} 0");
+        assert!(
+            body.contains(&needle),
+            "skipped_stall_unverifiable must not bump refused reason {reason:?}; body:\n{body}"
+        );
+    }
+}
+
 #[test]
 fn recovery_reaped_outcome_records_duration_metrics() {
     use std::os::unix::process::ExitStatusExt;

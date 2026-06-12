@@ -258,6 +258,22 @@ pub enum RecoveryOutcome {
         /// Agent pid whose deferred stall was skipped after PID recycle.
         pid: u32,
     },
+    /// Recovery was skipped because a recovery-eligible (`KernelAttested`)
+    /// deferred stall carries no start-time generation, so a PID recycle inside
+    /// the deferral window cannot be ruled out. This is the platform sibling of
+    /// [`Self::SkippedPidRecycled`]: it fires only on credential-passing
+    /// platforms without `/proc` (FreeBSD/DragonFly/NetBSD/illumos/Solaris),
+    /// where the kernel attests the sender PID but no generation token is
+    /// available. Rather than risk `kill(2)`/restart against a possibly-recycled
+    /// bystander, the observer skips. A non-zero count means kernel-attested
+    /// recovery is operating in a degraded (recycle-unverifiable) mode on this
+    /// platform. Synthesized by the observer's freshness re-check (never
+    /// returned by [`Recovery::on_stall`]) and counted as
+    /// `varta_recovery_outcomes_total{outcome="skipped_stall_unverifiable"}`.
+    SkippedStallUnverifiable {
+        /// Agent pid whose deferred stall was skipped as recycle-unverifiable.
+        pid: u32,
+    },
 }
 
 impl RecoveryOutcome {
