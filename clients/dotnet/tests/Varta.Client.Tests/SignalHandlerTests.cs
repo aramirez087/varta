@@ -12,6 +12,21 @@ namespace Varta.Tests;
 
 public class SignalHandlerTests
 {
+    [Fact]
+    public void TerminalTimestampClaim_IsStrictAcrossClockResetAndCollision()
+    {
+        long highWater = 0;
+        Assert.True(SignalHandler.TryClaimTerminalTimestamp(ref highWater, 100, out ulong first));
+        Assert.Equal(100ul, first);
+        Assert.True(SignalHandler.TryClaimTerminalTimestamp(ref highWater, 5, out ulong reset));
+        Assert.Equal(101ul, reset);
+        Assert.True(SignalHandler.TryClaimTerminalTimestamp(ref highWater, 101, out ulong equal));
+        Assert.Equal(102ul, equal);
+
+        highWater = long.MaxValue;
+        Assert.False(SignalHandler.TryClaimTerminalTimestamp(ref highWater, 1, out _));
+    }
+
     [SkipOnWindowsFact]
     public void InstallUds_BindsSocket_AndEmitFiresCriticalTerminalFrame()
     {
@@ -36,6 +51,7 @@ public class SignalHandlerTests
         var frame = Frame.Decode(buf);
         Assert.Equal(Status.Critical, frame.Status);
         Assert.Equal(Frame.NonceTerminal, frame.Nonce);
+        Assert.InRange(frame.Timestamp, 1ul, ulong.MaxValue - 1);
 
         File.Delete(path);
     }

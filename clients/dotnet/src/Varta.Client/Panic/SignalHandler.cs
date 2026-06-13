@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Net;
 using System.Net.Sockets;
 using System.Runtime.InteropServices;
@@ -74,6 +75,10 @@ public sealed class PanicInstallException : Exception
 public static class SignalHandler
 {
     private static Emitter? s_activeEmitter;
+    // Terminal timestamps are replay-ordering state for the whole PID, so
+    // emitter replacement and coarse clock samples must share one high-water.
+    private static readonly long s_terminalClockEpoch = Stopwatch.GetTimestamp();
+    private static long s_lastTerminalTimestamp;
 
     /// <summary>
     /// Install a UDS-backed signal emitter. The socket is bound at
@@ -242,7 +247,7 @@ public static class SignalHandler
             try
             {
                 Span<byte> buf = stackalloc byte[Frame.Bytes];
-                BuildCriticalFrame(buf);
+                if (!BuildCriticalFrame(buf)) return;
                 EmitFrame(buf);
             }
             catch
@@ -253,18 +258,47 @@ public static class SignalHandler
 
         protected abstract void EmitFrame(ReadOnlySpan<byte> plaintext32);
 
-        private static void BuildCriticalFrame(Span<byte> dest)
+        private static bool BuildCriticalFrame(Span<byte> dest)
         {
             uint pid = (uint)Environment.ProcessId;
-            // Timestamp must not equal u64::MAX; use any safe value.
-            ulong ts = (ulong)DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() * 1_000_000ul;
-            if (ts == ulong.MaxValue) ts = ulong.MaxValue - 1;
+            long elapsedTicks = Stopwatch.GetElapsedTime(s_terminalClockEpoch).Ticks;
+            long raw = elapsedTicks > long.MaxValue / 100
+                ? long.MaxValue
+                : Math.Max(1, elapsedTicks * 100);
+            if (!TryClaimTerminalTimestamp(ref s_lastTerminalTimestamp, raw, out ulong ts))
+            {
+                return false;
+            }
             Codec.EncodeInto(dest, Status.Critical, pid, ts, Frame.NonceTerminal, payload: 0);
+            return true;
         }
 
         public void Dispose()
         {
             try { Socket.Dispose(); } catch { /* best-effort */ }
+        }
+    }
+
+    internal static bool TryClaimTerminalTimestamp(
+        ref long highWater,
+        long raw,
+        out ulong timestamp)
+    {
+        raw = Math.Max(1, raw);
+        while (true)
+        {
+            long previous = Volatile.Read(ref highWater);
+            if (previous == long.MaxValue)
+            {
+                timestamp = 0;
+                return false;
+            }
+            long candidate = Math.Max(raw, previous + 1);
+            if (Interlocked.CompareExchange(ref highWater, candidate, previous) == previous)
+            {
+                timestamp = (ulong)candidate;
+                return true;
+            }
         }
     }
 

@@ -8,6 +8,12 @@ governed independently — see `book/src/spec/vlp.md` in the workspace.
 
 ### Fixed
 
+- Panic emitters now claim terminal timestamps from a process-wide monotonic
+  high-water mark. Clock rollback, equal samples, and handler replacement can
+  no longer make a later genuine panic look like a replay. Forked children
+  also reset the timestamp-claim lock so they cannot inherit it permanently
+  locked by a vanished parent thread.
+
 - UDS, UDP, and secure-UDP reconnects are now transactional: replacement
   sockets and secure-session material are prepared before the active
   transport is retired. A failed reconnect no longer leaves the agent with

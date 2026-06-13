@@ -4,6 +4,7 @@ import (
 	"crypto/rand"
 	"errors"
 	"fmt"
+	"math"
 	"net"
 	"os"
 	"os/signal"
@@ -52,15 +53,45 @@ var installSerial sync.Mutex
 // second Install* call replaces rather than duplicates the handler.
 var installed atomic.Bool
 
-func buildCriticalFrame() [vlp.FrameBytes]byte {
+var terminalClockEpoch = time.Now()
+var lastTerminalTimestamp atomic.Uint64
+
+func claimTerminalTimestamp(last *atomic.Uint64, raw uint64) (uint64, bool) {
+	for {
+		previous := last.Load()
+		if previous >= math.MaxUint64-1 {
+			return 0, false
+		}
+		candidate := raw
+		if candidate <= previous {
+			candidate = previous + 1
+		}
+		if candidate == math.MaxUint64 {
+			return 0, false
+		}
+		if last.CompareAndSwap(previous, candidate) {
+			return candidate, true
+		}
+	}
+}
+
+func nextTerminalTimestamp() (uint64, bool) {
+	elapsed := time.Since(terminalClockEpoch).Nanoseconds()
+	raw := uint64(1)
+	if elapsed > 0 {
+		raw = uint64(elapsed)
+	}
+	return claimTerminalTimestamp(&lastTerminalTimestamp, raw)
+}
+
+func buildCriticalFrame() ([vlp.FrameBytes]byte, bool) {
 	var out [vlp.FrameBytes]byte
-	ts := uint64(time.Now().UnixNano())
-	// Reject the timestamp sentinel; in practice clamp to MaxUint64-1.
-	if ts == 0xFFFFFFFFFFFFFFFF {
-		ts = 0xFFFFFFFFFFFFFFFE
+	ts, ok := nextTerminalTimestamp()
+	if !ok {
+		return out, false
 	}
 	vlp.EncodeInto(&out, vlp.StatusCritical, uint32(os.Getpid()), ts, vlp.NonceTerminal, 0)
-	return out
+	return out, true
 }
 
 // installSignals wires the signal goroutine after the emitter has
@@ -119,7 +150,9 @@ func dialUDP(host string, port int) (net.Conn, error) {
 	return conn, nil
 }
 
-func setNonblockConn(conn interface{ SyscallConn() (syscall.RawConn, error) }) error {
+func setNonblockConn(conn interface {
+	SyscallConn() (syscall.RawConn, error)
+}) error {
 	raw, err := conn.SyscallConn()
 	if err != nil {
 		return err
@@ -145,7 +178,10 @@ func InstallSignalHandlerUDS(path string) error {
 	}
 	em := &emitter{
 		emit: func() {
-			frame := buildCriticalFrame()
+			frame, ok := buildCriticalFrame()
+			if !ok {
+				return
+			}
 			_, _ = conn.Write(frame[:])
 		},
 		desc: "uds:" + path,
@@ -163,7 +199,10 @@ func InstallSignalHandlerUDP(host string, port int) error {
 	}
 	em := &emitter{
 		emit: func() {
-			frame := buildCriticalFrame()
+			frame, ok := buildCriticalFrame()
+			if !ok {
+				return
+			}
 			_, _ = conn.Write(frame[:])
 		},
 		desc: fmt.Sprintf("udp:%s:%d", host, port),
@@ -223,7 +262,10 @@ func InstallSignalHandlerSecureUDP(host string, port int, key []byte) error {
 				state.counter = 0
 			}
 			ivPrefix := vlpsecure.DeriveIVPrefix(state.salt, 0)
-			plain := buildCriticalFrame()
+			plain, ok := buildCriticalFrame()
+			if !ok {
+				return
+			}
 			wire, sealErr := vlpsecure.EncodeShared(keyArr, ivPrefix, state.counter, plain)
 			if sealErr != nil {
 				return

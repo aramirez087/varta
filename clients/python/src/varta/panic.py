@@ -24,8 +24,9 @@ import faulthandler
 import os
 import socket
 import sys
+import threading
 import time
-from typing import Callable, Tuple
+from typing import Callable, Optional, Tuple
 
 from ._vlp import FRAME_BYTES, NONCE_TERMINAL, Status, encode_into
 from ._vlp_secure import (
@@ -46,6 +47,22 @@ __all__ = [
 
 
 Address = Tuple[str, int]
+_TIMESTAMP_INVALID = 0xFFFFFFFFFFFFFFFF
+_TERMINAL_CLOCK_EPOCH_NS = time.monotonic_ns()
+_last_terminal_timestamp = 0
+_terminal_timestamp_lock = threading.Lock()
+
+
+def _reset_terminal_timestamp_lock_after_fork() -> None:
+    global _terminal_timestamp_lock
+
+    # A child cannot release a lock held by a vanished parent thread.
+    _terminal_timestamp_lock = threading.Lock()
+
+
+_register_at_fork = getattr(os, "register_at_fork", None)
+if _register_at_fork is not None:
+    _register_at_fork(after_in_child=_reset_terminal_timestamp_lock_after_fork)
 
 
 class PanicInstallError(Exception):
@@ -60,13 +77,36 @@ class SocketBind(PanicInstallError):
     """The underlying socket could not be created/bound at install time."""
 
 
-def _build_critical_frame(payload: int = 0) -> bytes:
+def _claim_terminal_timestamp(previous: int, raw: int) -> Optional[int]:
+    if previous >= _TIMESTAMP_INVALID - 1:
+        return None
+    candidate = max(1, raw, previous + 1)
+    if candidate >= _TIMESTAMP_INVALID:
+        return None
+    return candidate
+
+
+def _next_terminal_timestamp() -> Optional[int]:
+    global _last_terminal_timestamp
+
+    raw = max(1, time.monotonic_ns() - _TERMINAL_CLOCK_EPOCH_NS)
+    with _terminal_timestamp_lock:
+        candidate = _claim_terminal_timestamp(_last_terminal_timestamp, raw)
+        if candidate is not None:
+            _last_terminal_timestamp = candidate
+        return candidate
+
+
+def _build_critical_frame(payload: int = 0) -> Optional[bytes]:
+    timestamp = _next_terminal_timestamp()
+    if timestamp is None:
+        return None
     buf = bytearray(FRAME_BYTES)
     encode_into(
         buf,
         Status.CRITICAL,
         os.getpid() & 0xFFFFFFFF,
-        time.monotonic_ns() & 0xFFFFFFFFFFFFFFFF,
+        timestamp,
         NONCE_TERMINAL,
         payload & 0xFFFFFFFF,
     )
@@ -111,7 +151,9 @@ def install_excepthook_uds(
 
     def emit() -> None:
         try:
-            sock.send(_build_critical_frame())
+            frame = _build_critical_frame()
+            if frame is not None:
+                sock.send(frame)
         except OSError:
             pass
 
@@ -137,7 +179,9 @@ def install_excepthook_udp(
 
     def emit() -> None:
         try:
-            sock.send(_build_critical_frame())
+            frame = _build_critical_frame()
+            if frame is not None:
+                sock.send(frame)
         except OSError:
             pass
 
@@ -204,9 +248,11 @@ def install_excepthook_secure_udp(addr: Address, key: bytes) -> None:
                 state["pid"] = pid
                 state["counter"] = 0
             iv_prefix = derive_iv_prefix(state["salt"], 0)
+            plaintext = _build_critical_frame()
+            if plaintext is None:
+                return
             counter = int(state["counter"])
             state["counter"] = counter + 1
-            plaintext = _build_critical_frame()
             wire = encode_shared(key, iv_prefix, counter, plaintext)
             sock.send(wire)
         except OSError:
@@ -215,5 +261,3 @@ def install_excepthook_secure_udp(addr: Address, key: bytes) -> None:
             pass
 
     _chain_excepthook(emit)
-
-

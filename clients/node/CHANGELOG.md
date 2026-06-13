@@ -8,6 +8,10 @@ governed independently — see `book/src/spec/vlp.md` in the workspace.
 
 ### Fixed
 
+- Panic emitters now claim terminal timestamps from a process-wide monotonic
+  high-water mark. Equal clock samples and handler replacement can no longer
+  make a later genuine panic look like a replay.
+
 - Panic dispatch now uses one process-level handler set and a replaceable
   one-shot active emitter. `panic.run(fn)` emits before rethrowing even when
   its caller catches the error, and `uncaughtException` removes Varta's

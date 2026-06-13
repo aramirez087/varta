@@ -30,6 +30,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Go, Python, Node.js, and .NET panic emitters preserve terminal replay
+  ordering.** Terminal frames now claim timestamps from one process-wide
+  monotonic high-water mark in each runtime. Clock rollback, coarse equal
+  samples, and handler replacement can no longer make a genuine later panic
+  look like a replay; exhausted timestamp space fails closed.
+
 - **Rust panic hooks preserve terminal replay ordering across reinstallation.**
   UDS, UDP, and secure-UDP panic emitters now claim timestamps from one
   process-wide atomic high-water mark. Concurrent panics and a newly installed

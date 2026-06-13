@@ -11,6 +11,7 @@ import { spawn } from "node:child_process";
 import { join } from "node:path";
 
 import {
+  __claimTerminalTimestampForTest,
   PanicInstallError,
   installSignalHandlerSecureUdp,
   installSignalHandlerUds,
@@ -18,6 +19,19 @@ import {
 import { decode, NONCE_TERMINAL, Status } from "../src/vlp.js";
 import { decodeShared } from "../src/vlp_secure.js";
 import { bindUdpRecorder, bindUdsRecorder, repoRoot } from "./helpers.js";
+
+test("terminal timestamp claim survives clock reset and equal samples", () => {
+  const first = __claimTerminalTimestampForTest(0n, 100n);
+  assert.equal(first, 100n);
+  const reset = __claimTerminalTimestampForTest(first!, 5n);
+  assert.equal(reset, 101n);
+  const equal = __claimTerminalTimestampForTest(reset!, 101n);
+  assert.equal(equal, 102n);
+  assert.equal(
+    __claimTerminalTimestampForTest(0xfffffffffffffffen, 1n),
+    undefined,
+  );
+});
 
 test("installSignalHandlerSecureUdp rejects wrong-length keys", () => {
   try {
@@ -72,6 +86,7 @@ test("uncaughtException triggers critical+NONCE_TERMINAL beat (via child process
     const frame = decode(listener.received[0]!);
     assert.equal(frame.status, Status.Critical, "panic beat is Critical");
     assert.equal(frame.nonce, NONCE_TERMINAL, "panic beat carries NONCE_TERMINAL");
+    assert.ok(frame.timestamp > 0n && frame.timestamp < 0xffffffffffffffffn);
     assert.notEqual(status.code, 0, `uncaught exception must terminate the child: ${JSON.stringify(status)}`);
     assert.equal(listener.received.length, 1, "uncaught exception should emit exactly once");
   } finally {

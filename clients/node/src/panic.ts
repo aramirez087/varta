@@ -45,14 +45,40 @@ const FATAL_SIGNALS: NodeJS.Signals[] = ["SIGTERM", "SIGINT", "SIGQUIT", "SIGHUP
 
 let activeTrigger: (() => void) | undefined;
 let handlersInstalled = false;
+const TIMESTAMP_INVALID = 0xffffffffffffffffn;
+const TERMINAL_CLOCK_EPOCH_NS = process.hrtime.bigint();
+let lastTerminalTimestamp = 0n;
 
-function buildCriticalFrame(payload: number = 0): Buffer {
+function claimTerminalTimestamp(previous: bigint, raw: bigint): bigint | undefined {
+  if (previous >= TIMESTAMP_INVALID - 1n) return undefined;
+  const candidate = raw > previous ? raw : previous + 1n;
+  return candidate < TIMESTAMP_INVALID ? candidate : undefined;
+}
+
+export function __claimTerminalTimestampForTest(
+  previous: bigint,
+  raw: bigint,
+): bigint | undefined {
+  return claimTerminalTimestamp(previous, raw);
+}
+
+function nextTerminalTimestamp(): bigint | undefined {
+  const rawElapsed = process.hrtime.bigint() - TERMINAL_CLOCK_EPOCH_NS;
+  const raw = rawElapsed > 0n ? rawElapsed : 1n;
+  const candidate = claimTerminalTimestamp(lastTerminalTimestamp, raw);
+  if (candidate !== undefined) lastTerminalTimestamp = candidate;
+  return candidate;
+}
+
+function buildCriticalFrame(payload: number = 0): Buffer | undefined {
+  const timestamp = nextTerminalTimestamp();
+  if (timestamp === undefined) return undefined;
   const buf = Buffer.alloc(FRAME_BYTES);
   encodeInto(
     buf,
     Status.Critical,
     process.pid >>> 0,
-    process.hrtime.bigint(),
+    timestamp,
     NONCE_TERMINAL,
     payload >>> 0,
   );
@@ -129,9 +155,10 @@ export function installSignalHandlerUdp(host: string, port: number): void {
   } catch (err) {
     throw new PanicInstallError("SocketBind", (err as Error).message);
   }
-  const frame = buildCriticalFrame();
   installEmitter(() => {
     try {
+      const frame = buildCriticalFrame();
+      if (frame === undefined) return;
       sock.send(frame);
     } catch {
       // Best effort.
@@ -154,9 +181,10 @@ export function installSignalHandlerUds(path: string): void {
     }
     throw new PanicInstallError("SocketBind", (err as Error).message);
   }
-  const frame = buildCriticalFrame();
   installEmitter(() => {
     try {
+      const frame = buildCriticalFrame();
+      if (frame === undefined) return;
       transport.send(frame);
     } catch {
       // Best effort.
@@ -214,6 +242,7 @@ export function installSignalHandlerSecureUdp(
       const counter = state.counter;
       state.counter = (state.counter + 1) >>> 0;
       const plaintext = buildCriticalFrame();
+      if (plaintext === undefined) return;
       const wire = encodeShared(keyCopy, ivPrefix, counter, plaintext);
       sock.send(wire);
     } catch {

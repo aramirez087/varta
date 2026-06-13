@@ -1,11 +1,61 @@
 package panic
 
 import (
+	"math"
 	"net"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/aramirez087/Varta/clients/go/internal/vlp"
 )
+
+func TestClaimTerminalTimestampIsStrictAcrossClockResetAndCollision(t *testing.T) {
+	var last atomic.Uint64
+
+	first, ok := claimTerminalTimestamp(&last, 100)
+	if !ok || first != 100 {
+		t.Fatalf("first claim = (%d, %v), want (100, true)", first, ok)
+	}
+	reset, ok := claimTerminalTimestamp(&last, 5)
+	if !ok || reset != 101 {
+		t.Fatalf("reset claim = (%d, %v), want (101, true)", reset, ok)
+	}
+	equal, ok := claimTerminalTimestamp(&last, 101)
+	if !ok || equal != 102 {
+		t.Fatalf("equal claim = (%d, %v), want (102, true)", equal, ok)
+	}
+
+	last.Store(math.MaxUint64 - 1)
+	if _, ok := claimTerminalTimestamp(&last, 1); ok {
+		t.Fatal("exhausted timestamp space must fail closed")
+	}
+
+	firstWire, ok := buildCriticalFrame()
+	if !ok {
+		t.Fatal("first critical frame unexpectedly dropped")
+	}
+	secondWire, ok := buildCriticalFrame()
+	if !ok {
+		t.Fatal("second critical frame unexpectedly dropped")
+	}
+	firstFrame, err := vlp.Decode(firstWire[:])
+	if err != nil {
+		t.Fatalf("decode first critical frame: %v", err)
+	}
+	secondFrame, err := vlp.Decode(secondWire[:])
+	if err != nil {
+		t.Fatalf("decode second critical frame: %v", err)
+	}
+	if secondFrame.Timestamp <= firstFrame.Timestamp {
+		t.Fatalf(
+			"critical frame timestamps = %d then %d, want strictly increasing",
+			firstFrame.Timestamp,
+			secondFrame.Timestamp,
+		)
+	}
+}
 
 // Regression: the secure-UDP panic emitter is shared between the signal
 // goroutine and Run's recover path, which can fire concurrently. Every sealed

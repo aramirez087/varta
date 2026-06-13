@@ -13,10 +13,21 @@ import pytest
 from varta import NONCE_TERMINAL, Status
 from varta._vlp import decode
 from varta.panic import (
+    _claim_terminal_timestamp,
     PanicInstallError,
     SocketBind,
     install_excepthook_uds,
 )
+
+
+def test_terminal_timestamp_claim_is_strict_across_clock_reset_and_collision() -> None:
+    first = _claim_terminal_timestamp(0, 100)
+    assert first == 100
+    reset = _claim_terminal_timestamp(first, 5)
+    assert reset == 101
+    equal = _claim_terminal_timestamp(reset, 101)
+    assert equal == 102
+    assert _claim_terminal_timestamp(0xFFFFFFFFFFFFFFFE, 1) is None
 
 
 @pytest.fixture
@@ -46,6 +57,7 @@ def test_install_excepthook_uds_emits_critical_frame(
     assert frame.status is Status.CRITICAL
     assert frame.nonce == NONCE_TERMINAL
     assert frame.pid == os.getpid()
+    assert 0 < frame.timestamp < 0xFFFFFFFFFFFFFFFF
 
 
 def test_install_excepthook_uds_chains_previous_hook(

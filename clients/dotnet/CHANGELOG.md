@@ -8,6 +8,10 @@ here. Versioning is independent of the Rust workspace and follows
 
 ### Fixed
 
+- Panic emitters now claim terminal timestamps from a process-wide monotonic
+  high-water mark. Wall-clock rollback, equal samples, and handler replacement
+  can no longer make a later genuine panic look like a replay.
+
 - `Varta.Beat()` now rejects observer-only status byte `0x03` (for example
   `(Status)0x03`) with `BeatOutcome.Failed(InvalidInput)` before
   reconnecting or sending. `Stall` is synthesized by `varta-watch` and is
