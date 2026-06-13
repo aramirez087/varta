@@ -31,7 +31,7 @@ use super::types::{
     DEFAULT_PROM_RATE_LIMIT_PER_SEC, DEFAULT_READ_TIMEOUT_MS, DEFAULT_RECOVERY_CAPTURE_BYTES,
     DEFAULT_RECOVERY_DEBOUNCE_MS, DEFAULT_SHUTDOWN_GRACE_MS, DEFAULT_SOCKET_MODE,
     MAX_AUDIT_ROTATION_BUDGET_MS, MAX_ITERATION_BUDGET_MS, MAX_RECOVERY_CAPTURE_BYTES,
-    MAX_SCRAPE_BUDGET_MS, MIN_EXPORT_FILE_MAX_BYTES, MIN_ITERATION_BUDGET_MS,
+    MAX_SCRAPE_BUDGET_MS, MIN_EXPORT_FILE_MAX_BYTES, MIN_ITERATION_BUDGET_MS, MIN_READ_TIMEOUT_MS,
     MIN_RECOVERY_AUDIT_MAX_BYTES, MIN_RECOVERY_TIMEOUT_MS, MIN_SCRAPE_BUDGET_MS,
     MIN_SELF_WATCHDOG_SECS, MIN_SHUTDOWN_GRACE_MS, MIN_THRESHOLD_MS,
 };
@@ -779,6 +779,16 @@ impl Config {
             return Err(ConfigError::ReadTimeoutTooLarge {
                 value: read_timeout_ms_resolved,
                 max: read_timeout_ceiling_ms,
+            });
+        }
+        // --read-timeout-ms floor. A `0` becomes `Duration::ZERO`, which
+        // `UnixDatagram::set_read_timeout` rejects (`cannot set a 0 duration
+        // timeout`), failing the bind and preventing the observer from
+        // starting. The default is reached by omitting the flag, never by `0`.
+        if read_timeout_ms_resolved < MIN_READ_TIMEOUT_MS {
+            return Err(ConfigError::ReadTimeoutTooLow {
+                value: read_timeout_ms_resolved,
+                min: MIN_READ_TIMEOUT_MS,
             });
         }
 

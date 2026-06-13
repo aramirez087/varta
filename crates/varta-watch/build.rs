@@ -317,6 +317,24 @@ pub fn parse_kv(input: &str) -> Result<ParsedConfig, String> {
             );
         }
     }
+    if let Some(v) = out.singletons.get("read_timeout_ms") {
+        // Keep `1` in sync with config::types::MIN_READ_TIMEOUT_MS (build.rs
+        // cannot import crate consts). A baked `0` becomes Duration::ZERO,
+        // which set_read_timeout rejects ("cannot set a 0 duration timeout"),
+        // so the UDS bind fails and the sealed Class-A image never starts;
+        // omit the key for the 100 ms default.
+        let n: u64 = v
+            .parse()
+            .map_err(|_| format!("read_timeout_ms: not a valid u64: {v:?}"))?;
+        if n < 1 {
+            return Err(
+                "read_timeout_ms must be >= 1 (0 fails the UDS bind with \"cannot set a 0 \
+                 duration timeout\" and the observer never starts; omit the key for the \
+                 100 ms default)"
+                    .into(),
+            );
+        }
+    }
     if let Some(v) = out.singletons.get("eviction_scan_window") {
         let n: usize = v
             .parse()

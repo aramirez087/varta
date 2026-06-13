@@ -572,6 +572,44 @@ fn export_file_max_bytes_below_minimum_is_rejected() {
 }
 
 #[test]
+fn read_timeout_ms_zero_is_rejected() {
+    // `0` becomes `Duration::ZERO`, which `set_read_timeout` rejects with
+    // "cannot set a 0 duration timeout" — the UDS bind fails and the observer
+    // never starts. The parser must reject it before that happens.
+    match Config::from_args(args(&[
+        "--socket",
+        "/s",
+        "--threshold-ms",
+        "100",
+        "--read-timeout-ms",
+        "0",
+    ])) {
+        Err(ConfigError::ReadTimeoutTooLow { value, min }) => {
+            assert_eq!(value, 0);
+            assert_eq!(min, super::types::MIN_READ_TIMEOUT_MS);
+        }
+        other => panic!("expected ReadTimeoutTooLow, got {other:?}"),
+    }
+
+    // The floor value itself parses cleanly into a non-zero timeout.
+    let min_s = super::types::MIN_READ_TIMEOUT_MS.to_string();
+    let cfg = Config::from_args(args(&[
+        "--socket",
+        "/s",
+        "--threshold-ms",
+        "100",
+        "--read-timeout-ms",
+        &min_s,
+    ]))
+    .expect("floor value must parse");
+    assert_eq!(
+        cfg.read_timeout,
+        Duration::from_millis(super::types::MIN_READ_TIMEOUT_MS)
+    );
+    assert!(!cfg.read_timeout.is_zero());
+}
+
+#[test]
 fn parses_socket_mode_octal() {
     let cfg = Config::from_args(args(&[
         "--socket",

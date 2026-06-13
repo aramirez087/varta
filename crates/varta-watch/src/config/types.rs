@@ -19,6 +19,15 @@ pub const DEFAULT_SOCKET_MODE: u32 = 0o600;
 /// cannot hold the observer poll loop indefinitely.
 pub const DEFAULT_READ_TIMEOUT_MS: u64 = 100;
 
+/// Minimum accepted `--read-timeout-ms`. `std`'s `set_read_timeout`
+/// rejects a zero `Duration` with `cannot set a 0 duration timeout`, so a
+/// baked or parsed `0` makes `UdsListener::bind` fail and the observer never
+/// starts — and for a `compile-time-config` Class-A image the `0` is sealed
+/// into the binary, bricking it permanently with no runtime override. The
+/// floor is the smallest non-zero timeout; omit the flag for the
+/// [`DEFAULT_READ_TIMEOUT_MS`] default.
+pub const MIN_READ_TIMEOUT_MS: u64 = 1;
+
 /// Hard self-watchdog abort threshold for the `Poll` iteration stage, in
 /// milliseconds. `STAGE_ABORT_NS[IterStage::Poll]` in `main.rs` references
 /// this constant so the two cannot drift.
@@ -736,6 +745,16 @@ pub enum ConfigError {
         /// The maximum allowed value, in milliseconds.
         max: u64,
     },
+    /// `--read-timeout-ms` was below [`MIN_READ_TIMEOUT_MS`]. A value of `0`
+    /// makes `set_read_timeout` reject the UDS socket (`cannot set a 0
+    /// duration timeout`), so `bind` fails and the observer never starts; the
+    /// default is reached by omitting the flag, never by `0`.
+    ReadTimeoutTooLow {
+        /// The value provided, in milliseconds.
+        value: u64,
+        /// The minimum allowed value, in milliseconds.
+        min: u64,
+    },
     /// `--audit-rotation-budget-ms` exceeded [`MAX_AUDIT_ROTATION_BUDGET_MS`].
     /// `drive_audit_rotation` is spent inside the `Maintenance` stage and runs
     /// up to its full budget per tick, so a budget at/above the Maintenance
@@ -912,6 +931,12 @@ impl core::fmt::Display for ConfigError {
                 "--read-timeout-ms: {value} ms exceeds the maximum {max} ms \
                  (must stay below the active self-watchdog budget)"
             ),
+            ConfigError::ReadTimeoutTooLow { value, min } => write!(
+                f,
+                "--read-timeout-ms: {value} is below the minimum {min} ms \
+                 (0 makes the UDS bind fail with \"cannot set a 0 duration timeout\" \
+                 and the observer never starts; omit the flag for the default)"
+            ),
             ConfigError::AuditRotationBudgetTooLarge { value, max } => write!(
                 f,
                 "--audit-rotation-budget-ms: {value} ms exceeds the maximum {max} ms \
@@ -992,6 +1017,10 @@ impl core::fmt::Display for ConfigError {
             ConfigError::ReadTimeoutTooLarge { value, max } => write!(
                 f,
                 "read timeout out of range: {value} ms exceeds {max} ms ({REF})"
+            ),
+            ConfigError::ReadTimeoutTooLow { value, min } => write!(
+                f,
+                "read timeout below minimum: {value} ms < {min} ms ({REF})"
             ),
             ConfigError::AuditRotationBudgetTooLarge { value, max } => write!(
                 f,

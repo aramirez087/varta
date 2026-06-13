@@ -39,9 +39,9 @@ impl super::types::Config {
         use super::types::{
             max_read_timeout_ms, ConfigError, MAX_AUDIT_ROTATION_BUDGET_MS,
             MAX_ITERATION_BUDGET_MS, MAX_RECOVERY_CAPTURE_BYTES, MAX_SCRAPE_BUDGET_MS,
-            MIN_EXPORT_FILE_MAX_BYTES, MIN_ITERATION_BUDGET_MS, MIN_RECOVERY_AUDIT_MAX_BYTES,
-            MIN_RECOVERY_TIMEOUT_MS, MIN_SCRAPE_BUDGET_MS, MIN_SELF_WATCHDOG_SECS,
-            MIN_SHUTDOWN_GRACE_MS, MIN_THRESHOLD_MS,
+            MIN_EXPORT_FILE_MAX_BYTES, MIN_ITERATION_BUDGET_MS, MIN_READ_TIMEOUT_MS,
+            MIN_RECOVERY_AUDIT_MAX_BYTES, MIN_RECOVERY_TIMEOUT_MS, MIN_SCRAPE_BUDGET_MS,
+            MIN_SELF_WATCHDOG_SECS, MIN_SHUTDOWN_GRACE_MS, MIN_THRESHOLD_MS,
         };
 
         if self.threshold < std::time::Duration::from_millis(MIN_THRESHOLD_MS) {
@@ -112,6 +112,15 @@ impl super::types::Config {
             return Err(ConfigError::ReadTimeoutTooLarge {
                 value: read_timeout_ms,
                 max: read_timeout_ceiling_ms,
+            });
+        }
+        // A baked `0` becomes `Duration::ZERO`, which `set_read_timeout`
+        // rejects (`cannot set a 0 duration timeout`); the UDS bind fails and
+        // the sealed Class-A image never starts, with no runtime override.
+        if read_timeout_ms < MIN_READ_TIMEOUT_MS {
+            return Err(ConfigError::ReadTimeoutTooLow {
+                value: read_timeout_ms,
+                min: MIN_READ_TIMEOUT_MS,
             });
         }
 
@@ -395,6 +404,19 @@ mod tests {
                 value: 0,
                 min: 4096
             })
+        ));
+    }
+
+    #[test]
+    fn validate_runtime_rejects_read_timeout_zero() {
+        // A baked `read_timeout = 0` becomes `Duration::ZERO`, which
+        // `set_read_timeout` rejects, bricking a sealed Class-A image at bind.
+        let mut cfg = valid_config();
+        cfg.read_timeout = Duration::from_millis(0);
+
+        assert!(matches!(
+            cfg.validate_runtime(),
+            Err(ConfigError::ReadTimeoutTooLow { value: 0, min: 1 })
         ));
     }
 
