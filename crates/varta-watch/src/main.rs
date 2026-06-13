@@ -80,6 +80,23 @@ compile_error!(
 /// targets could in theory let a healthy main thread look wedged.
 static LAST_TICK_NS: AtomicU64 = AtomicU64::new(0);
 
+/// Forward-only high-water mark for [`watchdog_now_ns`].
+///
+/// `CLOCK_MONOTONIC` can still *appear* to step backward on virtualized hosts
+/// (TSC drift across cores, live-migration pause/resume) — the same hazard
+/// `observer::Observer::apply_raw_clock` already clamps on the stall-detection
+/// path.  The self-watchdog left its clock unclamped: a backward excursion
+/// drove [`watchdog_expired`]'s `saturating_sub` to `0`, so a genuinely wedged
+/// poll loop was neither `process::abort()`ed nor stopped from petting the
+/// systemd watchdog (`WATCHDOG=1`, emitted at the foot of the watchdog loop)
+/// until the clock climbed back — silently defeating BOTH liveness layers for
+/// the width of the regression.  A backward-dipped *stamp* is the mirror
+/// failure: it inflates a later `now - last` into a spurious abort of a
+/// healthy observer.  Clamping every reading forward through one shared
+/// high-water mark removes both, and keeps the watchdog thread's `now` and the
+/// main thread's stamps on a single monotonic timeline.
+static WATCHDOG_LAST_NS: AtomicU64 = AtomicU64::new(0);
+
 /// Per-stage entry timestamps written by the main thread at the START of each
 /// poll-loop phase.  The self-watchdog thread reads these to detect a wedge
 /// inside a single stage (e.g. a hung `serve_pending`) without waiting for
@@ -181,11 +198,26 @@ fn watchdog_now_ns() -> u64 {
     // `Monotonic.clk_id()` is `Some(CLOCK_MONOTONIC)` on every supported
     // platform; the `None` arm is unreachable and its defensive 0 keeps
     // `watchdog_expired`'s `last == 0` skip-before-first-tick semantics from
-    // misfiring.
-    match WATCHDOG_CLOCK.clk_id() {
+    // misfiring (before the first tick the high-water is also 0, so the clamp
+    // is a no-op).
+    let raw = match WATCHDOG_CLOCK.clk_id() {
         Some(clk_id) => varta_watch::clock::clock_gettime_raw(clk_id).unwrap_or(0),
         None => 0,
-    }
+    };
+    watchdog_clamp_forward(raw, &WATCHDOG_LAST_NS)
+}
+
+/// Clamp `raw` forward against a shared high-water mark, returning a value that
+/// never decreases across calls.  Structural mirror of `observer`'s
+/// `apply_raw_clock`; see [`WATCHDOG_LAST_NS`] for why the watchdog needs it.
+/// `fetch_max` keeps it correct when the main thread (stamping [`LAST_TICK_NS`]
+/// and the stage-entry timestamps) and the watchdog thread (reading `now`)
+/// share the same high-water mark; `Relaxed` is sufficient because this only
+/// orders the time source against itself — the cross-thread publication edges
+/// on `LAST_TICK_NS` / `CURRENT_STAGE` carry the happens-before for the values.
+fn watchdog_clamp_forward(raw: u64, high_water: &AtomicU64) -> u64 {
+    let prior = high_water.fetch_max(raw, Ordering::Relaxed);
+    raw.max(prior)
 }
 
 /// Returns `true` when the poll loop has not ticked for longer than
@@ -1979,6 +2011,61 @@ mod tests {
         assert!(
             watchdog_expired(now_boottime, last_tick_ns, deadline_ns),
             "sanity: a suspend-inclusive clock would have tripped — the defect this fix removes"
+        );
+    }
+
+    #[test]
+    fn watchdog_clock_clamps_backward_excursion_forward() {
+        // CLOCK_MONOTONIC can appear to step backward on VMs (TSC drift,
+        // live-migration resume). The watchdog clamps every reading forward
+        // through a shared high-water mark so a backward dip can neither
+        // suppress wedge detection nor manufacture a spurious abort.
+        let hw = AtomicU64::new(0);
+
+        // Normal forward progress passes through unchanged.
+        assert_eq!(watchdog_clamp_forward(1_000, &hw), 1_000);
+        assert_eq!(watchdog_clamp_forward(2_000, &hw), 2_000);
+
+        // A backward excursion is pinned to the high-water mark, NOT returned
+        // raw — otherwise `watchdog_expired`'s saturating_sub would read 0.
+        assert_eq!(watchdog_clamp_forward(500, &hw), 2_000);
+        assert_eq!(watchdog_clamp_forward(1_999, &hw), 2_000);
+
+        // Recovery above the high-water resumes true progress.
+        assert_eq!(watchdog_clamp_forward(3_000, &hw), 3_000);
+    }
+
+    #[test]
+    fn watchdog_wedge_still_detected_when_monotonic_clock_dips() {
+        // Model a wedged poll loop whose last successful tick stamped `last`,
+        // then the monotonic clock dips backward before the watchdog samples.
+        let deadline_ns = 4 * 1_000_000_000u64; // AUTO_DEADLINE_SECS
+        let hw = AtomicU64::new(0);
+
+        // Main thread stamps its last tick at t = 100 s (clamped path).
+        let last = watchdog_clamp_forward(100 * 1_000_000_000, &hw);
+
+        // The loop wedges; the raw clock then dips to 95 s before the watchdog
+        // samples. UNCLAMPED, `95 s - 100 s` saturates to 0 and the wedge is
+        // silently masked (the bug). Clamped, `now` is pinned to the 100 s
+        // high-water and can never precede the last stamp.
+        let raw_dipped = 95 * 1_000_000_000u64;
+        let now = watchdog_clamp_forward(raw_dipped, &hw);
+        assert!(now >= last, "clamped now must never precede the last stamp");
+
+        // Direct proof of the pre-fix defect: feeding the raw dip straight into
+        // watchdog_expired suppresses detection entirely.
+        assert!(
+            !watchdog_expired(raw_dipped, last, deadline_ns),
+            "sanity: the unclamped backward dip is exactly what masked the wedge"
+        );
+
+        // Once the clock recovers past `last + deadline`, the wedge fires; the
+        // clamp guarantees the dip cannot indefinitely mask a real wedge.
+        let now_recovered = watchdog_clamp_forward(105 * 1_000_000_000, &hw);
+        assert!(
+            watchdog_expired(now_recovered, last, deadline_ns),
+            "a wedge longer than the deadline must still abort after a clock dip"
         );
     }
 
