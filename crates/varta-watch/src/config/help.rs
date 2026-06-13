@@ -175,9 +175,11 @@ OPTIONAL:
                                      counted via varta_rate_limited_total
                                      {reason=\"per_pid\"}.  Default: 100.
                                      Set to 0 to disable.
-    --global-beat-rate <N>         Global beat rate cap across all senders
-                                     (beats/sec).  Defends against per-pid
-                                     rotation attacks.  Default: 5000.
+    --global-beat-rate <N>         Global frame admission cap across all
+                                     senders (frames/sec), including
+                                     authenticated rejection events.
+                                     Defends against per-pid rotation
+                                     attacks.  Default: 5000.
                                      Set to 0 to disable.
     --global-beat-burst <N>        Global token-bucket burst capacity.
                                      Default: 10000.

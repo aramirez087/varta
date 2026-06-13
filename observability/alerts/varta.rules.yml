@@ -246,11 +246,11 @@ groups:
           severity: warning
           service: varta-watch
         annotations:
-          summary: "Beats are being rate-limited on {{ $labels.instance }} (reason={{ $labels.reason }})"
+          summary: "Frames are being rate-limited on {{ $labels.instance }} (reason={{ $labels.reason }})"
           description: |
             Sustained drops on either the per-pid (100 bps default) or global
-            (5000 bps / 10k burst) bucket. Either an agent is hot-looping or
-            the limit needs raising via `--max-beat-rate` / `--global-beat-rate`.
+            (5000 bps / 10k burst) bucket. An agent may be hot-looping, or an
+            authenticated sender may be generating malformed frames.
           runbook_url: "https://github.com/aramirez087/Varta/blob/main/book/src/operations/monitoring.md#vartaratelimitingactive"
 
       - alert: VartaClockJump
