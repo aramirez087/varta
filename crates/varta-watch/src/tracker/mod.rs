@@ -784,10 +784,11 @@ impl Tracker {
     /// looking for one anyway.
     ///
     /// When the policy is [`EvictionPolicy::Balanced`] and no
-    /// strictly-evictable slot is found in the window, a second windowed
-    /// pass picks the first slot whose silence exceeds the threshold
-    /// (disregarding `stall_emitted`). This prevents capacity-exhaustion
-    /// attacks at the cost of possibly evicting a slow-but-alive agent.
+    /// strictly-evictable slot is found in the window, a second pass over
+    /// that **same** window picks the first slot whose silence exceeds the
+    /// threshold (disregarding `stall_emitted`). This prevents
+    /// capacity-exhaustion attacks at the cost of possibly evicting a
+    /// slow-but-alive agent.
     fn find_evictable_slot(&mut self, now_ns: u64, threshold_ns: u64) -> Option<usize> {
         let evict_threshold = threshold_ns.saturating_mul(EVICTION_MULTIPLIER as u64);
 
@@ -799,6 +800,22 @@ impl Tracker {
         // `--eviction-scan-window`.
         let mut scanned = false;
 
+        // The strict and balanced passes must inspect the SAME window: the
+        // balanced pass is a fallback that re-scans the slots the strict pass
+        // just rejected, relaxing `require_stall`. `scan_window` advances
+        // `eviction_scan_cursor` past the window on a miss, so without
+        // restoring it the balanced pass would scan the NEXT window — and when
+        // `eviction_scan_window == len / 2` the two consecutive windows tile
+        // the table exactly, so a both-miss call returns the cursor to its
+        // start and pins the balanced pass permanently off the strict pass's
+        // half. A stale, non-`stall_emitted` slot stranded in that half is then
+        // never evicted, and every new pid gets a spurious `CapacityExceeded`
+        // (the agent goes untracked → its stall is never detected → recovery
+        // never fires). Snapshot before the strict pass; restore before the
+        // balanced pass so both scan the same window and the cursor advances
+        // by exactly one window per failing call.
+        let window_start = self.eviction_scan_cursor;
+
         // Strict pass — cheap bail when no slots have stalled yet.
         if self.stall_emitted_count > 0 {
             scanned = true;
@@ -808,6 +825,7 @@ impl Tracker {
         }
         if self.eviction_policy == EvictionPolicy::Balanced {
             scanned = true;
+            self.eviction_scan_cursor = window_start;
             if let Some(idx) = self.scan_window(now_ns, evict_threshold, false) {
                 return Some(idx);
             }

@@ -406,6 +406,61 @@ fn eviction_scan_window_is_plumbed_through() {
     );
 }
 
+/// Regression (bug-443): with `EvictionPolicy::Balanced` and
+/// `eviction_scan_window == capacity / 2`, the strict pass advanced
+/// `eviction_scan_cursor` past its window *before* the balanced fallback ran,
+/// so the balanced pass scanned the NEXT (disjoint) window. Two consecutive
+/// half-table windows tile the ring exactly, so a both-miss call returned the
+/// cursor to its start — pinning the balanced pass forever off the strict
+/// pass's half. A stale, non-`stall_emitted` slot stranded there was never
+/// evicted, so every new pid got a spurious `CapacityExceeded`: the agent went
+/// untracked, its stall was never detected, recovery never fired. The fix
+/// makes both passes scan the same window.
+#[test]
+fn balanced_eviction_rescans_strict_window_at_half_capacity() {
+    let cap = 8;
+    let window = cap / 2; // 4 == len/2 — the exact cursor-pinning case.
+    let mut t = Tracker::new(cap, EvictionPolicy::Balanced, window);
+    let threshold_ns = 100; // evict_threshold = 10× = 1_000.
+    for pid in 1u32..=(cap as u32) {
+        assert_eq!(
+            t.record(&frame(pid, 1), 0, threshold_ns, ORIGIN, None),
+            Update::Inserted
+        );
+    }
+    assert_eq!(t.eviction_scan_cursor, 0);
+
+    // Hand-craft the pathological state at `now_ns`.
+    let now_ns = 10_000;
+    // idx0 (strict window): a valid BALANCED victim — long silent but NOT
+    // `stall_emitted`, so the strict (require_stall) pass skips it.
+    t.entries[0].last_ns = 0; // silence 10_000 > 1_000 → evictable
+    t.entries[0].stall_emitted = false;
+    // idx1 (strict window): the only `stall_emitted` slot — engages the strict
+    // pass — but fresh, so the strict pass finds no strictly-evictable victim.
+    t.entries[1].last_ns = now_ns;
+    t.entries[1].stall_emitted = true;
+    t.stall_emitted_count = 1;
+    // Everything else fresh: the balanced pass's NEXT window holds no victim,
+    // so only idx0 — inside the strict pass's window — is evictable.
+    for i in 2..cap {
+        t.entries[i].last_ns = now_ns;
+        t.entries[i].stall_emitted = false;
+    }
+
+    // Pre-fix: strict scans [0,4) (miss) → cursor 4; balanced scans [4,8)
+    // (miss) → cursor 0 → None, pinned. Post-fix: balanced re-scans [0,4) and
+    // evicts the stale slot at idx0.
+    let victim = t.find_evictable_slot(now_ns, threshold_ns);
+    assert_eq!(
+        victim,
+        Some(0),
+        "balanced fallback must re-scan the strict pass's window and evict idx0"
+    );
+    // Cursor advanced just past the hit (idx0+1), not pinned at the start.
+    assert_eq!(t.eviction_scan_cursor, 1);
+}
+
 /// Cursor must wrap past `len` correctly so a long sequence of failed
 /// evictions doesn't go out of bounds.
 #[test]
