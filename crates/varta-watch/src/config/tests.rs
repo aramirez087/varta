@@ -510,6 +510,68 @@ fn recovery_audit_max_bytes_below_minimum_is_rejected() {
 }
 
 #[test]
+fn export_file_max_bytes_below_minimum_is_rejected() {
+    // `0` is the worst case: it makes `bytes_written < max` never true, so the
+    // file exporter rotates on every single record and recreates the live file
+    // empty — silently shredding the operator's event stream.
+    match Config::from_args(args(&[
+        "--socket",
+        "/s",
+        "--threshold-ms",
+        "100",
+        "--export-file",
+        "/tmp/varta-export.tsv",
+        "--export-file-max-bytes",
+        "0",
+    ])) {
+        Err(ConfigError::ExportFileMaxBytesTooLow { value, min }) => {
+            assert_eq!(value, 0);
+            assert_eq!(min, super::types::MIN_EXPORT_FILE_MAX_BYTES);
+        }
+        other => panic!("expected ExportFileMaxBytesTooLow, got {other:?}"),
+    }
+
+    // A small-but-nonzero pathological value is rejected too, and the error
+    // message names the floor.
+    let err = Config::from_args(args(&[
+        "--socket",
+        "/s",
+        "--threshold-ms",
+        "100",
+        "--export-file",
+        "/tmp/varta-export.tsv",
+        "--export-file-max-bytes",
+        "1",
+    ]))
+    .expect_err("a 1-byte cap must be rejected");
+    assert!(matches!(
+        err,
+        ConfigError::ExportFileMaxBytesTooLow { value: 1, .. }
+    ));
+    assert!(err
+        .to_string()
+        .contains(&super::types::MIN_EXPORT_FILE_MAX_BYTES.to_string()));
+
+    // The floor value itself parses cleanly.
+    let min_s = super::types::MIN_EXPORT_FILE_MAX_BYTES.to_string();
+    let cfg = Config::from_args(args(&[
+        "--socket",
+        "/s",
+        "--threshold-ms",
+        "100",
+        "--export-file",
+        "/tmp/varta-export.tsv",
+        "--export-file-max-bytes",
+        &min_s,
+    ]))
+    .expect("floor value must parse");
+    assert_eq!(
+        cfg.export_file_max_bytes,
+        Some(super::types::MIN_EXPORT_FILE_MAX_BYTES)
+    );
+}
+
+#[test]
 fn parses_socket_mode_octal() {
     let cfg = Config::from_args(args(&[
         "--socket",

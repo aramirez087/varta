@@ -231,6 +231,21 @@ pub const DEFAULT_AUDIT_ROTATION_BUDGET_MS: u32 = 50;
 /// value.
 pub const MIN_RECOVERY_AUDIT_MAX_BYTES: u64 = 4096;
 
+/// Minimum accepted `--export-file-max-bytes`.
+///
+/// The file exporter rotates the live file once `bytes_written >= max_bytes`
+/// (see [`crate::exporter::FileExporter`]). A tiny or zero cap therefore arms
+/// per-record rotation: every single exported event triggers a buffer flush, a
+/// 5-generation rename shuffle, and a fresh `create`, all on the single poll
+/// thread and — unlike the audit log — with no wall-clock budget. Worse, the
+/// live file is recreated empty on every write, so it never holds more than the
+/// most-recent record and the operator's configured event stream is silently
+/// shredded. A value of `0` is especially pathological: `bytes_written < 0` is
+/// never true, so rotation fires on *every* record unconditionally. The floor
+/// keeps a meaningful run of events before the first rotation. To let the
+/// export file grow unbounded, omit the flag — `None`, not a tiny value.
+pub const MIN_EXPORT_FILE_MAX_BYTES: u64 = 4096;
+
 /// Parsed daemon configuration.
 #[derive(Clone, Debug)]
 pub struct Config {
@@ -633,6 +648,17 @@ pub enum ConfigError {
         /// The minimum allowed value, in bytes.
         min: u64,
     },
+    /// `--export-file-max-bytes` was below [`MIN_EXPORT_FILE_MAX_BYTES`].
+    /// A tiny cap arms per-record rotation that recreates the live export file
+    /// empty on every write, silently shredding the event stream to the last
+    /// record; the unbounded default is reached by omitting the flag, never by
+    /// a tiny value.
+    ExportFileMaxBytesTooLow {
+        /// The value that was provided, in bytes.
+        value: u64,
+        /// The minimum allowed value, in bytes.
+        min: u64,
+    },
     /// Shell-mode recovery flags were passed (removed feature).  Use
     /// `--recovery-exec` instead.
     ShellRecoveryNotCompiledIn,
@@ -827,6 +853,13 @@ impl core::fmt::Display for ConfigError {
                  (a tiny cap rotates per record and shreds the audit trail with no \
                  tamper signal; omit the flag to grow the audit file unbounded)"
             ),
+            ConfigError::ExportFileMaxBytesTooLow { value, min } => write!(
+                f,
+                "--export-file-max-bytes: {value} is below the minimum {min} bytes \
+                 (a tiny cap rotates per record and recreates the export file empty \
+                 on every write, shredding the event stream; omit the flag to grow \
+                 the export file unbounded)"
+            ),
             ConfigError::RecoveryCaptureBytesTooLarge { value, max } => write!(
                 f,
                 "--recovery-capture-bytes: {value} exceeds the maximum allowed value ({max} bytes)"
@@ -971,6 +1004,10 @@ impl core::fmt::Display for ConfigError {
             ConfigError::RecoveryAuditMaxBytesTooLow { value, min } => write!(
                 f,
                 "recovery audit max bytes below minimum: {value} < {min} ({REF})"
+            ),
+            ConfigError::ExportFileMaxBytesTooLow { value, min } => write!(
+                f,
+                "export file max bytes below minimum: {value} < {min} ({REF})"
             ),
             ConfigError::ThresholdTooLow { value, min } => {
                 write!(f, "threshold below minimum: {value} ms < {min} ms ({REF})")

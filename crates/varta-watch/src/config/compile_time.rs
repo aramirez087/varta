@@ -39,8 +39,9 @@ impl super::types::Config {
         use super::types::{
             max_read_timeout_ms, ConfigError, MAX_AUDIT_ROTATION_BUDGET_MS,
             MAX_ITERATION_BUDGET_MS, MAX_RECOVERY_CAPTURE_BYTES, MAX_SCRAPE_BUDGET_MS,
-            MIN_ITERATION_BUDGET_MS, MIN_RECOVERY_AUDIT_MAX_BYTES, MIN_RECOVERY_TIMEOUT_MS,
-            MIN_SCRAPE_BUDGET_MS, MIN_SELF_WATCHDOG_SECS, MIN_SHUTDOWN_GRACE_MS, MIN_THRESHOLD_MS,
+            MIN_EXPORT_FILE_MAX_BYTES, MIN_ITERATION_BUDGET_MS, MIN_RECOVERY_AUDIT_MAX_BYTES,
+            MIN_RECOVERY_TIMEOUT_MS, MIN_SCRAPE_BUDGET_MS, MIN_SELF_WATCHDOG_SECS,
+            MIN_SHUTDOWN_GRACE_MS, MIN_THRESHOLD_MS,
         };
 
         if self.threshold < std::time::Duration::from_millis(MIN_THRESHOLD_MS) {
@@ -187,6 +188,18 @@ impl super::types::Config {
                 return Err(ConfigError::RecoveryAuditMaxBytesTooLow {
                     value: max_bytes,
                     min: MIN_RECOVERY_AUDIT_MAX_BYTES,
+                });
+            }
+        }
+        // A `--export-file-max-bytes` below the floor arms per-record rotation
+        // that recreates the live export file empty on every write, shredding
+        // the event stream. Mirror the argv parser's floor. `None` means
+        // unbounded growth.
+        if let Some(max_bytes) = self.export_file_max_bytes {
+            if max_bytes < MIN_EXPORT_FILE_MAX_BYTES {
+                return Err(ConfigError::ExportFileMaxBytesTooLow {
+                    value: max_bytes,
+                    min: MIN_EXPORT_FILE_MAX_BYTES,
                 });
             }
         }
@@ -366,6 +379,20 @@ mod tests {
             cfg.validate_runtime(),
             Err(ConfigError::RecoveryAuditMaxBytesTooLow {
                 value: 100,
+                min: 4096
+            })
+        ));
+    }
+
+    #[test]
+    fn validate_runtime_rejects_export_file_max_bytes_too_low() {
+        let mut cfg = valid_config();
+        cfg.export_file_max_bytes = Some(0);
+
+        assert!(matches!(
+            cfg.validate_runtime(),
+            Err(ConfigError::ExportFileMaxBytesTooLow {
+                value: 0,
                 min: 4096
             })
         ));

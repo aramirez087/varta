@@ -301,6 +301,22 @@ pub fn parse_kv(input: &str) -> Result<ParsedConfig, String> {
             );
         }
     }
+    if let Some(v) = out.singletons.get("export_file_max_bytes") {
+        // Keep `4096` in sync with config::types::MIN_EXPORT_FILE_MAX_BYTES
+        // (build.rs cannot import crate consts). A tiny cap arms per-record
+        // rotation that recreates the export file empty on every write,
+        // shredding the event stream; omit the key to grow it unbounded.
+        let n: u64 = v
+            .parse()
+            .map_err(|_| format!("export_file_max_bytes: not a valid u64: {v:?}"))?;
+        if n < 4096 {
+            return Err(
+                "export_file_max_bytes must be >= 4096 (a smaller cap shreds the export stream by \
+                 recreating the file empty per record; omit the key for unbounded growth)"
+                    .into(),
+            );
+        }
+    }
     if let Some(v) = out.singletons.get("eviction_scan_window") {
         let n: usize = v
             .parse()

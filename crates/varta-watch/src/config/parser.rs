@@ -31,9 +31,9 @@ use super::types::{
     DEFAULT_PROM_RATE_LIMIT_PER_SEC, DEFAULT_READ_TIMEOUT_MS, DEFAULT_RECOVERY_CAPTURE_BYTES,
     DEFAULT_RECOVERY_DEBOUNCE_MS, DEFAULT_SHUTDOWN_GRACE_MS, DEFAULT_SOCKET_MODE,
     MAX_AUDIT_ROTATION_BUDGET_MS, MAX_ITERATION_BUDGET_MS, MAX_RECOVERY_CAPTURE_BYTES,
-    MAX_SCRAPE_BUDGET_MS, MIN_ITERATION_BUDGET_MS, MIN_RECOVERY_AUDIT_MAX_BYTES,
-    MIN_RECOVERY_TIMEOUT_MS, MIN_SCRAPE_BUDGET_MS, MIN_SELF_WATCHDOG_SECS, MIN_SHUTDOWN_GRACE_MS,
-    MIN_THRESHOLD_MS,
+    MAX_SCRAPE_BUDGET_MS, MIN_EXPORT_FILE_MAX_BYTES, MIN_ITERATION_BUDGET_MS,
+    MIN_RECOVERY_AUDIT_MAX_BYTES, MIN_RECOVERY_TIMEOUT_MS, MIN_SCRAPE_BUDGET_MS,
+    MIN_SELF_WATCHDOG_SECS, MIN_SHUTDOWN_GRACE_MS, MIN_THRESHOLD_MS,
 };
 
 #[cfg(not(feature = "compile-time-config"))]
@@ -182,7 +182,14 @@ impl Config {
                     let v = iter
                         .next()
                         .ok_or(ConfigError::MissingValue("--export-file-max-bytes"))?;
-                    export_file_max_bytes = Some(parse_u64("--export-file-max-bytes", &v)?);
+                    let parsed = parse_u64("--export-file-max-bytes", &v)?;
+                    if parsed < MIN_EXPORT_FILE_MAX_BYTES {
+                        return Err(ConfigError::ExportFileMaxBytesTooLow {
+                            value: parsed,
+                            min: MIN_EXPORT_FILE_MAX_BYTES,
+                        });
+                    }
+                    export_file_max_bytes = Some(parsed);
                 }
                 "--export-file-sync-every" => {
                     let v = iter
