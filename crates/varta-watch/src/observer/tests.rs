@@ -401,6 +401,42 @@ impl ScriptedListener {
         }
         Self { results }
     }
+
+    fn with_authenticated_invalid_frames(count: usize) -> Self {
+        let mut results = VecDeque::new();
+        for nonce in 1..=count as u64 {
+            let frame = Frame::new(Status::Stall, 10, 1, nonce, 0);
+            let mut data = [0u8; 32];
+            frame.encode(&mut data);
+            results.push_back(RecvResult::Authenticated {
+                peer_pid: 0,
+                peer_uid: 0,
+                peer_pid_ns_inode: None,
+                peer_pidfd: None,
+                origin: BeatOrigin::OperatorAttestedTransport,
+                data,
+            });
+        }
+        Self { results }
+    }
+
+    fn with_auth_failures(count: usize) -> Self {
+        let mut results = VecDeque::new();
+        for nonce in 1..=count as u64 {
+            let frame = Frame::new(Status::Ok, 10, 1, nonce, 0);
+            let mut data = [0u8; 32];
+            frame.encode(&mut data);
+            results.push_back(RecvResult::Authenticated {
+                peer_pid: 20,
+                peer_uid: 0,
+                peer_pid_ns_inode: None,
+                peer_pidfd: None,
+                origin: BeatOrigin::KernelAttested,
+                data,
+            });
+        }
+        Self { results }
+    }
 }
 
 impl BeatListener for ScriptedListener {
@@ -572,6 +608,92 @@ fn per_pid_limited_frame_does_not_spend_global_token() {
         obs.drain_global_rate_limited(),
         0,
         "no frame should have exhausted the global bucket"
+    );
+}
+
+#[test]
+fn authenticated_decode_errors_pay_global_rate_limit() {
+    let mut obs = Observer::new(
+        Duration::from_secs(60),
+        64,
+        EvictionPolicy::Strict,
+        DEFAULT_EVICTION_SCAN_WINDOW,
+        None,
+        1,
+        1,
+        ClockSource::Monotonic,
+    )
+    .expect("Observer::new should succeed");
+
+    obs.add_listener(Box::new(
+        ScriptedListener::with_authenticated_invalid_frames(2),
+    ));
+
+    let first = obs.poll();
+    assert!(
+        matches!(first, Some(Event::Decode(DecodeError::StallOnWire, _))),
+        "the first authenticated decode error should consume the burst token, got {first:?}"
+    );
+    assert_eq!(obs.drain_global_rate_limited(), 0);
+
+    let second = obs.poll();
+    assert!(
+        second.is_none(),
+        "the exhausted global bucket must shed repeated authenticated decode errors, got {second:?}"
+    );
+    assert_eq!(
+        obs.drain_global_rate_limited(),
+        1,
+        "the shed malformed frame must be visible in global limiter metrics"
+    );
+    assert!(
+        obs.last_poll_consumed(),
+        "a rate-limited malformed datagram is still consumed I/O"
+    );
+}
+
+#[test]
+fn authenticated_pid_mismatches_pay_global_rate_limit() {
+    let mut obs = Observer::new(
+        Duration::from_secs(60),
+        64,
+        EvictionPolicy::Strict,
+        DEFAULT_EVICTION_SCAN_WINDOW,
+        None,
+        1,
+        1,
+        ClockSource::Monotonic,
+    )
+    .expect("Observer::new should succeed");
+
+    obs.add_listener(Box::new(ScriptedListener::with_auth_failures(2)));
+
+    let first = obs.poll();
+    assert!(
+        matches!(
+            first,
+            Some(Event::AuthFailure {
+                claimed_pid: 10,
+                ..
+            })
+        ),
+        "the first authenticated PID mismatch should consume the burst token, got {first:?}"
+    );
+    assert_eq!(obs.drain_global_rate_limited(), 0);
+
+    let second = obs.poll();
+    assert!(
+        second.is_none(),
+        "the exhausted global bucket must shed repeated PID-mismatch events, got {second:?}"
+    );
+    assert_eq!(
+        obs.drain_global_rate_limited(),
+        1,
+        "the shed PID mismatch must be visible in global limiter metrics"
+    );
+    assert!(
+        obs.last_poll_consumed(),
+        "a rate-limited PID mismatch is still consumed I/O"
     );
 }
 

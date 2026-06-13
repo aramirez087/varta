@@ -37,6 +37,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   refresh and reuse an inherited ChaCha20-Poly1305 nonce. The beat path adds
   one lock-free atomic load and preserves the zero-allocation, non-blocking,
   zero-dependency, and wire-compatibility contracts.
+- **Authenticated rejection events can no longer bypass global rate limiting
+  (bug-441).** AEAD-valid secure-UDP payloads that failed inner VLP decoding,
+  and kernel-authenticated UDS frames with a forged PID, previously produced
+  unbounded rejection events without consuming the shared token bucket.
+  Decode and authentication failures now use the same global admission
+  accounting as valid frames, while preserving per-PID-first accounting and
+  the tracked terminal-frame exception.
 - **`--hw-watchdog` now rejects non-device paths (bug-439).** Previously any
   writable regular file was accepted, received NUL kicks, and let the observer
   start with no hardware reboot protection. `HwWatchdog::open` now validates

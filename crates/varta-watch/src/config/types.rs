@@ -121,10 +121,10 @@ pub const DEFAULT_PROM_RATE_LIMIT_BURST: u32 = 10;
 #[cfg(not(feature = "compile-time-config"))]
 pub const DEFAULT_MAX_BEAT_RATE: u32 = 100;
 
-/// Default global beat rate cap across all senders combined, in beats per
-/// second.  Provides a hard ceiling that defeats per-pid rotation attacks.
-/// Set `--global-beat-rate 0` to disable.  Sized for 50 concurrent agents
-/// × 100 bps.
+/// Default global frame-admission cap across all senders combined, in frames
+/// per second. Applies to valid frames and authenticated rejection events,
+/// providing a hard ceiling that defeats per-pid rotation attacks. Set
+/// `--global-beat-rate 0` to disable. Sized for 50 concurrent agents × 100 bps.
 #[cfg(not(feature = "compile-time-config"))]
 pub const DEFAULT_GLOBAL_BEAT_RATE: u32 = 5_000;
 
@@ -357,9 +357,10 @@ pub struct Config {
     /// than this rate from the same pid are dropped and counted via
     /// `varta_rate_limited_total{reason="per_pid"}`.
     pub max_beat_rate: Option<u32>,
-    /// Global beat rate cap across all senders combined, in beats per
-    /// second.  Provides a ceiling that defeats per-pid rotation attacks.
-    /// `0` disables (`--global-beat-rate 0`).  Defaults to
+    /// Global frame-admission cap across all senders combined, in frames per
+    /// second. Includes authenticated rejection events and provides a ceiling
+    /// that defeats per-pid rotation attacks. `0` disables
+    /// (`--global-beat-rate 0`). Defaults to
     /// [`DEFAULT_GLOBAL_BEAT_RATE`].
     pub global_beat_rate: u32,
     /// Global token-bucket burst capacity.  Defaults to

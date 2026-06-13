@@ -81,7 +81,7 @@ zero), so `by (label)` queries and `absent()` rules are safe day-one.
 | `varta_stalls_total`            | counter | `pid`    | Observer-detected stalls per agent.                              |
 | `varta_status`                  | gauge   | `pid`    | Last classification (0=Ok, 1=Degraded, 2=Critical, 3=Stall). Stall is **observer-synthesised** when the silence threshold is crossed — it is never on the wire (see [VLP — Base Frame](../spec/vlp.md) §3.7). |
 | `varta_nonce_wrap_total`        | counter |          | Agent exhausted its u64 nonce — must be unreachable in practice. |
-| `varta_rate_limited_total`      | counter | `reason` | Beats dropped by per-pid or global token bucket.                 |
+| `varta_rate_limited_total`      | counter | `reason` | Frames dropped by per-pid or global token bucket.                |
 
 ### Decode / authentication (5 metrics)
 
@@ -266,7 +266,7 @@ in the YAML references `#<lowercased alertname>` in its
 | `VartaAuditFlushBudgetPressure`    | `fdatasync(2)` over budget consistently. Check disk; raise `--audit-fsync-budget-ms` if disk is healthy.|
 | `VartaRecoveryReapTruncated`       | >64 children completing per tick. Reap is keeping up; queue may grow.                                   |
 | `VartaAuditRingWatermarkCritical`  | Ring crossed 95% fill at least once. Drops are imminent.                                                |
-| `VartaRateLimitingActive`          | Rate-limit dropping beats. Either agent hot-loop or raise `--max-beat-rate` / `--global-beat-rate`.    |
+| `VartaRateLimitingActive`          | Frames are being shed. Check for agent hot loops or authenticated malformed traffic before tuning limits. |
 | `VartaClockJump`                   | Forward wall-clock jump > 5s. VM migration / NTP step. Stall windows may be off.                        |
 
 ### Info (record for trend analysis)

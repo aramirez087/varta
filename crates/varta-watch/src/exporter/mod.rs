@@ -977,7 +977,7 @@ impl PromExporter {
         self.rate_limited_total[0] = self.rate_limited_total[0].saturating_add(count);
     }
 
-    /// Record one or more beats dropped by the global rate limiter.
+    /// Record one or more frames dropped by the global rate limiter.
     pub fn record_global_rate_limited(&mut self, count: u64) {
         self.rate_limited_total[1] = self.rate_limited_total[1].saturating_add(count);
     }

@@ -22,7 +22,7 @@ use crate::listener::{BeatListener, PreThreadAttestation, UdsListener};
 use crate::peer_cred::{BeatOrigin, RecvResult};
 use crate::tracker::{EvictionPolicy, StallFreshness, Tracker, Update};
 
-/// Reason a beat was dropped by the rate limiter.
+/// Reason a frame was dropped by the rate limiter.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum RateLimitReason {
     PerPid = 0,
@@ -88,7 +88,8 @@ fn origin_repair_bypasses_per_pid(incoming: BeatOrigin, pinned: BeatOrigin) -> b
 /// Global per-observer token bucket — one shared across all senders.
 ///
 /// Guards against per-pid rotation attacks where an attacker cycles through
-/// fake pids to keep every per-pid bucket empty.
+/// fake pids to keep every per-pid bucket empty, and bounds authenticated
+/// rejection-event pressure before it reaches exporters.
 ///
 /// Disabled when `capacity_milli == 0`.  All arithmetic is integer-only
 /// (milli-tokens) to stay allocation-free on the hot path.
@@ -308,7 +309,7 @@ pub struct Observer {
     /// Minimum inter-beat interval applied per pid, in nanoseconds.
     /// `None` means no rate limiting (the default).
     rate_limit_interval_ns: Option<u64>,
-    /// Beats dropped by the per-pid and global rate limiters since the last drain.
+    /// Frames dropped by the per-pid and global rate limiters since the last drain.
     /// Index 0 = per-pid (`RateLimitReason::PerPid`), 1 = global (`RateLimitReason::Global`).
     rate_limited_total: [u64; RATE_LIMIT_N],
     /// Global per-observer token bucket for defeating per-pid rotation attacks.
@@ -361,6 +362,17 @@ pub struct Observer {
 }
 
 impl Observer {
+    #[inline]
+    fn try_admit_global(&mut self, now_ns: u64) -> bool {
+        if self.global_rl.try_consume(now_ns) {
+            return true;
+        }
+
+        self.rate_limited_total[RateLimitReason::Global as usize] =
+            self.rate_limited_total[RateLimitReason::Global as usize].saturating_add(1);
+        false
+    }
+
     /// Create an empty observer with no listeners. Use
     /// [`Observer::add_listener`] to attach transports, or call
     /// [`Observer::bind`] for the common single-UDS case.
@@ -583,6 +595,9 @@ impl Observer {
                             // without kernel credential support, peer_pid is 0
                             // and this check is a no-op.
                             if peer_pid != 0 && frame.pid != peer_pid {
+                                if !self.try_admit_global(now_ns) {
+                                    continue;
+                                }
                                 if first_event.is_none() {
                                     first_event = Some(Event::AuthFailure {
                                         claimed_pid: frame.pid,
@@ -660,10 +675,7 @@ impl Observer {
                             // erase a dying agent's only Critical signal, but
                             // untracked / UDP terminal traffic and repeated
                             // terminal frames still pay the global bucket.
-                            if !terminal_global_bypass && !self.global_rl.try_consume(now_ns) {
-                                self.rate_limited_total[RateLimitReason::Global as usize] =
-                                    self.rate_limited_total[RateLimitReason::Global as usize]
-                                        .saturating_add(1);
+                            if !terminal_global_bypass && !self.try_admit_global(now_ns) {
                                 continue;
                             }
                             // Resolve the peer's PID-namespace inode now —
@@ -785,6 +797,16 @@ impl Observer {
                             }
                         }
                         Err(e) => {
+                            // Secure UDP intentionally forwards AEAD-valid
+                            // plaintext that fails inner VLP decoding without
+                            // allocating replay state. Make those authenticated
+                            // malformed frames pay the shared bucket too;
+                            // otherwise a key holder can bypass both replay
+                            // state and global admission with an unbounded
+                            // stream of decode events.
+                            if !self.try_admit_global(now_ns) {
+                                continue;
+                            }
                             if first_event.is_none() {
                                 first_event = Some(Event::Decode(e, now_ns));
                             }
