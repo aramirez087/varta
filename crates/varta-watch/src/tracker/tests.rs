@@ -119,6 +119,91 @@ fn stall_counter_decrements_on_refresh() {
     assert_eq!(t.stall_emitted_count, 0);
 }
 
+/// A secure/plaintext-UDP slot carries no kernel start-time generation, so the
+/// `Some`/`Some` recycle gate never fires for it. When such a slot has gone
+/// silent past the stall threshold and a fresh process recycles the PID — its
+/// monotonic VLP nonce restarting low — the network recycle gate must reset the
+/// slot rather than freezing the dead predecessor and false-stalling the
+/// newcomer.
+#[test]
+fn network_origin_recycle_resets_silent_slot() {
+    let mut t = Tracker::new(4, EvictionPolicy::Strict, DEFAULT_EVICTION_SCAN_WINDOW);
+    let threshold_ns = 100;
+    let origin = BeatOrigin::OperatorAttestedTransport;
+
+    assert_eq!(
+        t.record_with_generation(&frame(1, 5_000), 0, threshold_ns, origin, None, None),
+        Update::Inserted
+    );
+    // Surface the stall so the reset's latch-clear is observable.
+    t.drain_stalled_slots(threshold_ns * 2, threshold_ns, |_, _, _, _, _, _| {});
+    assert_eq!(t.stall_emitted_count, 1);
+
+    // Recycled PID: fresh process, nonce restarts at 1, arriving past threshold.
+    let now_ns = threshold_ns * 3;
+    assert_eq!(
+        t.record_with_generation(&frame(1, 1), now_ns, threshold_ns, origin, None, None),
+        Update::Inserted,
+        "a recycled network-origin PID must reset the slot, not drop as OutOfOrder"
+    );
+    assert_eq!(
+        t.stall_emitted_count, 0,
+        "the dead predecessor's stall latch must clear on reset"
+    );
+    assert_eq!(t.take_pid_recycles(), 1);
+    assert_eq!(t.last_observed_nonce_of(1), Some(1));
+}
+
+/// The network recycle gate is scoped to UDP transports. A kernel-attested UDS
+/// slot with no generation token (BSD/illumos-style) must keep its existing
+/// monotonicity / `UnverifiableGeneration` semantics — a low nonce after
+/// silence stays `OutOfOrder`, never silently resetting an attested slot.
+#[test]
+fn kernel_attested_slot_not_recycled_by_low_nonce_after_silence() {
+    let mut t = Tracker::new(4, EvictionPolicy::Strict, DEFAULT_EVICTION_SCAN_WINDOW);
+    let threshold_ns = 100;
+    let origin = BeatOrigin::KernelAttested;
+
+    assert_eq!(
+        t.record_with_generation(&frame(1, 5_000), 0, threshold_ns, origin, None, None),
+        Update::Inserted
+    );
+    let now_ns = threshold_ns * 3;
+    assert_eq!(
+        t.record_with_generation(&frame(1, 1), now_ns, threshold_ns, origin, None, None),
+        Update::OutOfOrder,
+        "kernel-attested UDS slots must not be reset by the network recycle gate"
+    );
+    assert_eq!(t.take_pid_recycles(), 0);
+}
+
+/// The recycle gate only engages past the stall threshold. While a network slot
+/// is still within its threshold a low nonce is an ordinary reorder/replay and
+/// must stay `OutOfOrder`, preserving an active sender's monotonicity.
+#[test]
+fn network_origin_low_nonce_within_threshold_stays_out_of_order() {
+    let mut t = Tracker::new(4, EvictionPolicy::Strict, DEFAULT_EVICTION_SCAN_WINDOW);
+    let threshold_ns = 100;
+    let origin = BeatOrigin::OperatorAttestedTransport;
+
+    assert_eq!(
+        t.record_with_generation(&frame(1, 5_000), 0, threshold_ns, origin, None, None),
+        Update::Inserted
+    );
+    assert_eq!(
+        t.record_with_generation(
+            &frame(1, 1),
+            threshold_ns - 1,
+            threshold_ns,
+            origin,
+            None,
+            None
+        ),
+        Update::OutOfOrder
+    );
+    assert_eq!(t.take_pid_recycles(), 0);
+}
+
 /// Freshness predicate behind the deferred-stall recovery guard: a stall is
 /// "still warranted" only while its slot stays silence-latched. A fresh beat
 /// (the agent resumed beating inside the per-tick-spawn-budget deferral

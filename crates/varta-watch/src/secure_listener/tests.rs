@@ -57,6 +57,47 @@ fn genuine_rotation_with_newer_nonce_still_accepted() {
 }
 
 #[test]
+fn recycled_pid_after_session_gap_is_admitted_and_resets_baseline() {
+    let mut listener = new_listener();
+    let identity = test_identity();
+    let t0 = Instant::now();
+
+    // A long-lived predecessor climbs to a high regular-nonce high-water mark.
+    assert!(listener.try_record_replay_state_at(t0, identity, test_iv(), 100, 5_000, 5_000));
+    assert_eq!(listener.sender_max_regular_nonce(identity), Some(5_000));
+
+    // The OS recycles the PID to a brand-new process: a freshly-derived IV
+    // prefix and a monotonic VLP nonce that restarts at 1. WITHIN the session
+    // gap the high-water mark still rejects it (replay protection preserved)
+    // and committed state is untouched.
+    let within = t0 + SESSION_RESTART_GAP / 2;
+    assert!(!listener.try_record_replay_state_at(within, identity, test_iv2(), 0, 1, 9_999));
+    assert_eq!(
+        listener.sender_max_regular_nonce(identity),
+        Some(5_000),
+        "a rejected frame must not perturb the high-water mark"
+    );
+    assert_eq!(listener.sender_iv_random(identity), Some(test_iv()));
+
+    // Once the predecessor has been silent past SESSION_RESTART_GAP the
+    // recycled process is admitted as a fresh session and the baseline resets,
+    // bounding the lockout to the gap instead of EVICTION_TTL.
+    let after = t0 + SESSION_RESTART_GAP + Duration::from_secs(1);
+    assert!(listener.try_record_replay_state_at(after, identity, test_iv2(), 0, 1, 9_999));
+    assert_eq!(
+        listener.sender_max_regular_nonce(identity),
+        Some(1),
+        "session restart must reset the high-water mark to the new baseline"
+    );
+    assert_eq!(listener.sender_iv_random(identity), Some(test_iv2()));
+    assert_eq!(
+        listener.sender_prev_iv_random(identity),
+        Some([0u8; 8]),
+        "a session restart clears the 1-deep prefix history"
+    );
+}
+
+#[test]
 fn terminal_panic_nonce_does_not_poison_regular_rotation() {
     let mut listener = new_listener();
     let identity = test_identity();

@@ -25,6 +25,16 @@
 //!    the decrypted frame (a backstop that is lost if the tracker slot is
 //!    evicted under capacity pressure, which is why layer 3 enforces the same
 //!    invariant at the dedicated replay layer).
+//!
+//! Layer 3's high-water mark would otherwise permanently lock out the one
+//! legitimate case that is byte-indistinguishable from an aged-out replay: a
+//! brand-new process that the OS handed a recently-vacated PID and that
+//! restarted its monotonic VLP nonce. A wall-clock staleness gate
+//! ([`SESSION_RESTART_GAP`]) separates the two — see that constant — admitting
+//! a genuine recycle as a fresh session while still rejecting replays against
+//! an actively-beating sender. The tracker applies the matching reset for
+//! generation-less network-origin slots so the recycled agent is not
+//! false-stalled or recovery-killed.
 
 use std::io;
 use std::net::{SocketAddr, UdpSocket};
@@ -55,6 +65,33 @@ const EVICTION_TTL: Duration = Duration::from_secs(600); // 10 minutes
 
 /// How often the stale-sender sweep runs.
 const EVICTION_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Silence after which an existing sender's replay state is treated as a
+/// *stale predecessor* and may be reset by a fresh session on the same PID.
+///
+/// The cross-prefix high-water mark (`SenderState::max_regular_nonce`) rejects
+/// any aged-out prefix whose nonce is not strictly newer than everything seen
+/// for the PID. That is correct for replay, but it also locks out the **one**
+/// legitimate case that presents identically: a brand-new process that the OS
+/// gave a recently-vacated PID. Such a process calls `connect_secure_udp`,
+/// which restarts the monotonic VLP nonce at 1 on a freshly-derived IV prefix,
+/// so its first beat lands in the third (aged-out prefix) arm with a nonce
+/// below the dead predecessor's high-water and is dropped — false-stalling, and
+/// (under `OperatorAttestedTransport`) recovery-killing, the healthy newcomer.
+///
+/// A *live* sender never reaches that arm with a non-advancing nonce: both
+/// counter-wrap rotation and manual `reconnect()` preserve the monotonic VLP
+/// nonce (so a genuine rotation always carries a newer one — see
+/// `genuine_rotation_with_newer_nonce_still_accepted`), and `fork(2)` changes
+/// the PID. So the third arm with a non-advancing nonce is exclusively a
+/// recycle (accept) or a replay (reject), and the only separating signal is
+/// wall-clock silence — a recycle requires the prior process to die and the PID
+/// to cycle, which takes real time. Resetting the slot once the predecessor has
+/// been quiet this long bounds the recycled-agent lockout (and the residual
+/// aged-out-replay window) to this interval instead of [`EVICTION_TTL`]. Kept
+/// well above any beat interval and well below the eviction TTL; on the
+/// trusted-local-network transport this is defense-in-depth behind the PSK.
+const SESSION_RESTART_GAP: Duration = Duration::from_secs(5);
 
 /// Authenticated replay identity.
 ///
@@ -122,6 +159,7 @@ impl SenderState {
         counter: u32,
         frame_nonce: u64,
         frame_timestamp: u64,
+        now: Instant,
     ) -> Self {
         let mut state = SenderState {
             identity,
@@ -131,7 +169,7 @@ impl SenderState {
             prev_last_counter: 0,
             max_regular_nonce: 0,
             max_terminal_timestamp: None,
-            last_seen: Instant::now(),
+            last_seen: now,
         };
         state.observe_frame_clock(frame_nonce, frame_timestamp);
         state
@@ -393,8 +431,32 @@ impl SecureUdpListener {
     /// per-prefix counter alone (arms 1 & 2 do not gate on the high-water
     /// marks), preserving the existing tolerance for in-flight reordering
     /// inside the recent epochs.
+    #[cfg(test)]
     fn try_record_replay_state(
         &mut self,
+        identity: ReplayIdentity,
+        iv_random: [u8; 8],
+        counter: u32,
+        frame_nonce: u64,
+        frame_timestamp: u64,
+    ) -> bool {
+        self.try_record_replay_state_at(
+            Instant::now(),
+            identity,
+            iv_random,
+            counter,
+            frame_nonce,
+            frame_timestamp,
+        )
+    }
+
+    /// `now`-injectable core of [`Self::try_record_replay_state`]. Splitting the
+    /// clock read out (mirrors [`Self::evict_stale_senders_at`]) lets the recv
+    /// loop share a single per-datagram `Instant` and lets tests drive the
+    /// [`SESSION_RESTART_GAP`] session-restart logic deterministically.
+    fn try_record_replay_state_at(
+        &mut self,
+        now: Instant,
         identity: ReplayIdentity,
         iv_random: [u8; 8],
         counter: u32,
@@ -417,7 +479,7 @@ impl SecureUdpListener {
                 if counter > state.last_counter {
                     state.last_counter = counter;
                     state.observe_frame_clock(frame_nonce, frame_timestamp);
-                    state.last_seen = Instant::now();
+                    state.last_seen = now;
                     return true;
                 }
                 return false;
@@ -427,7 +489,7 @@ impl SecureUdpListener {
                 if counter > state.prev_last_counter {
                     state.prev_last_counter = counter;
                     state.observe_frame_clock(frame_nonce, frame_timestamp);
-                    state.last_seen = Instant::now();
+                    state.last_seen = now;
                     return true;
                 }
                 return false;
@@ -438,7 +500,25 @@ impl SecureUdpListener {
             // authenticated regular nonce, or the authenticated terminal
             // timestamp for panic-hook sentinel frames.
             if !state.accepts_aged_out_prefix(frame_nonce, frame_timestamp) {
-                return false;
+                // A non-advancing nonce on an aged-out prefix is either a
+                // replay (reject) or a fresh process that recycled this PID
+                // (accept) — indistinguishable from frame content, separable
+                // only by silence. If the predecessor has been quiet for at
+                // least SESSION_RESTART_GAP, treat this as a new session and
+                // reset the per-sender baseline; otherwise the high-water mark
+                // still rejects it. See [`SESSION_RESTART_GAP`].
+                if now.saturating_duration_since(state.last_seen) < SESSION_RESTART_GAP {
+                    return false;
+                }
+                *state = SenderState::new(
+                    identity,
+                    iv_random,
+                    counter,
+                    frame_nonce,
+                    frame_timestamp,
+                    now,
+                );
+                return true;
             }
 
             state.prev_iv_random = state.iv_random;
@@ -446,12 +526,18 @@ impl SecureUdpListener {
             state.iv_random = iv_random;
             state.last_counter = counter;
             state.observe_frame_clock(frame_nonce, frame_timestamp);
-            state.last_seen = Instant::now();
+            state.last_seen = now;
             return true;
         }
 
-        let new_state =
-            SenderState::new(identity, iv_random, counter, frame_nonce, frame_timestamp);
+        let new_state = SenderState::new(
+            identity,
+            iv_random,
+            counter,
+            frame_nonce,
+            frame_timestamp,
+            now,
+        );
         self.allocate_sender_slot(identity, new_state)
     }
 
@@ -725,8 +811,11 @@ impl BeatListener for SecureUdpListener {
                 return RecvResult::WouldBlock;
             }
 
-            // Atomic replay check + state update after AEAD success.
-            if !self.try_record_replay_state(
+            // Atomic replay check + state update after AEAD success. Reuses the
+            // per-iteration `now` so the session-restart staleness test shares
+            // the same clock read as the eviction sweep above.
+            if !self.try_record_replay_state_at(
+                now,
                 replay_identity,
                 iv_random,
                 iv_counter,

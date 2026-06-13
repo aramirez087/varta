@@ -30,6 +30,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Secure-UDP PID recycle no longer false-stalls or recovery-kills the
+  healthy newcomer.** When the OS handed a recently-vacated PID to a new
+  process, its fresh secure session (new IV prefix, VLP nonce restarting at 1)
+  was rejected as an aged-out replay by both the listener's per-sender
+  high-water mark and the tracker's nonce-monotonicity check — neither carries a
+  kernel start-time generation on the network path. The dead predecessor's slot
+  stayed silence-latched for up to the 10-minute eviction TTL, false-stalling
+  the newcomer and, under `--i-accept-recovery-on-secure-udp`, firing recovery
+  against it. A wall-clock `SESSION_RESTART_GAP` (5 s) now separates a genuine
+  recycle from a replay — a live sender never presents a non-advancing nonce on
+  an aged-out prefix — so the listener admits the recycled session and the
+  tracker resets the slot (surfaced as `varta_tracker_pid_recycle_total`),
+  bounding the lockout to the gap. Replays against an actively-beating sender,
+  and all kernel-attested UDS paths, are unaffected.
+
 - **Go, Python, Node.js, and .NET panic emitters preserve terminal replay
   ordering.** Terminal frames now claim timestamps from one process-wide
   monotonic high-water mark in each runtime. Clock rollback, coarse equal

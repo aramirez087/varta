@@ -541,6 +541,48 @@ impl Tracker {
                         return Update::Inserted;
                     }
                 }
+                // Generation-less network-transport recycle gate. UDP-class
+                // transports (secure or plaintext) carry no kernel start-time
+                // generation, so the `Some`/`Some` gate above can never reset
+                // them. A fresh process that recycles the PID restarts its
+                // monotonic VLP nonce low; without this gate its first beat is
+                // rejected as `OutOfOrder` below, freezing the dead
+                // predecessor's slot and false-stalling — or, under
+                // `OperatorAttestedTransport`, recovery-KILLING — the healthy
+                // newcomer. Treat a non-advancing regular nonce as a recycle
+                // only once the slot has been silent past the stall threshold:
+                // a live sender advances its nonce, and an aged-out replay is
+                // filtered by the secure listener's per-sender high-water
+                // before it ever reaches the tracker. Restricted to network
+                // origins so kernel-attested / socket-mode UDS slots keep their
+                // existing generation / `UnverifiableGeneration` semantics
+                // byte-for-byte.
+                if peer_generation.is_none()
+                    && slot.generation.is_none()
+                    && slot.origin == origin
+                    && matches!(
+                        origin,
+                        BeatOrigin::OperatorAttestedTransport | BeatOrigin::NetworkUnverified
+                    )
+                    && frame.nonce != NONCE_TERMINAL
+                    && slot.has_regular_nonce
+                    && frame.nonce <= slot.last_nonce
+                    && now_ns.saturating_sub(slot.last_ns) >= threshold_ns
+                {
+                    if slot.stall_emitted {
+                        self.stall_emitted_count = self.stall_emitted_count.saturating_sub(1);
+                    }
+                    *slot = Slot::from_frame(
+                        frame,
+                        now_ns,
+                        status,
+                        origin,
+                        peer_pid_ns_inode,
+                        peer_generation,
+                    );
+                    self.pid_recycles = self.pid_recycles.saturating_add(1);
+                    return Update::Inserted;
+                }
                 if slot.origin != origin {
                     if origin.can_replace(slot.origin) {
                         if slot.stall_emitted {
