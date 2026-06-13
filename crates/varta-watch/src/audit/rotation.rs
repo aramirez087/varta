@@ -2,7 +2,7 @@
 
 use std::fs::OpenOptions;
 use std::io::{self, Read, Seek, SeekFrom};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use super::schema::{parse_record, BootReason, AUDIT_HEADER_V1_PREFIX, AUDIT_HEADER_V2};
@@ -148,7 +148,6 @@ impl RecoveryAuditLog {
                     return RotationOutcome::Complete;
                 }
                 RotationProgress::Renaming { next_gen } => {
-                    let path_str = self.path.to_string_lossy().into_owned();
                     // Recheck budget before the last Renaming step (live→`.1`).
                     // The fast path is a single `rename(2)`, but on EXDEV
                     // (overlayfs / cross-device bind mounts) `rotate_live_to_first`
@@ -166,15 +165,15 @@ impl RecoveryAuditLog {
                         return RotationOutcome::Deferred;
                     }
                     let sub_result = if next_gen == AUDIT_ROTATION_GENERATIONS {
-                        let oldest = format!("{path_str}.{AUDIT_ROTATION_GENERATIONS}");
+                        let oldest = generation_path(&self.path, AUDIT_ROTATION_GENERATIONS);
                         match std::fs::remove_file(&oldest) {
                             Ok(()) => Ok(()),
                             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
                             Err(e) => Err(e),
                         }
                     } else {
-                        let src = format!("{path_str}.{next_gen}");
-                        let dst = format!("{path_str}.{}", next_gen + 1);
+                        let src = generation_path(&self.path, next_gen);
+                        let dst = generation_path(&self.path, next_gen + 1);
                         match std::fs::rename(&src, &dst) {
                             Ok(()) => Ok(()),
                             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
@@ -192,7 +191,7 @@ impl RecoveryAuditLog {
                             next_gen: next_gen - 1,
                         };
                     } else {
-                        let first = format!("{path_str}.1");
+                        let first = generation_path(&self.path, 1);
                         if let Err(e) = self.rotate_live_to_first(&first) {
                             self.pending_err = Some(e);
                             self.rotation_progress = RotationProgress::Idle;
@@ -377,7 +376,7 @@ impl RecoveryAuditLog {
     /// splits, certain bind-mount layouts) rename is impossible and we fall
     /// back to copy+unlink, which needs the inode re-point in
     /// [`Self::copy_live_to_first`].
-    fn rotate_live_to_first(&mut self, first: &str) -> io::Result<()> {
+    fn rotate_live_to_first(&mut self, first: &Path) -> io::Result<()> {
         match std::fs::rename(&self.path, first) {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
@@ -399,9 +398,8 @@ impl RecoveryAuditLog {
     /// durable byte, never a half-written buffer) then re-point `self.sink` at
     /// `.1` so `Finalizing` appends and fsyncs there exactly as the rename path
     /// does.
-    fn copy_live_to_first(&mut self, first: &str) -> io::Result<()> {
+    fn copy_live_to_first(&mut self, first: &Path) -> io::Result<()> {
         self.flush_and_sync()?;
-        let first_path = Path::new(first);
         // Read from the writer's exact inode, not from a fresh pathname open:
         // an attacker cannot replace `self.path` between flush and copy and
         // redirect the fallback into an unrelated same-UID file.
@@ -414,18 +412,17 @@ impl RecoveryAuditLog {
             .create_new(true)
             .append(true)
             .mode(0o600);
-        let mut destination =
-            crate::file_security::open_nofollow(first_path, &mut destination_options)?;
+        let mut destination = crate::file_security::open_nofollow(first, &mut destination_options)?;
         if let Err(e) = std::io::copy(&mut source, &mut destination) {
-            let _ = std::fs::remove_file(first_path);
+            let _ = std::fs::remove_file(first);
             return Err(e);
         }
         if let Err(e) = destination.sync_all() {
-            let _ = std::fs::remove_file(first_path);
+            let _ = std::fs::remove_file(first);
             return Err(e);
         }
         if let Err(e) = std::fs::remove_file(&self.path) {
-            let _ = std::fs::remove_file(first_path);
+            let _ = std::fs::remove_file(first);
             return Err(e);
         }
         use super::writer::{DurableSink, FileSink};
@@ -701,6 +698,12 @@ fn is_cross_device_error(e: &io::Error) -> bool {
     e.raw_os_error() == Some(EXDEV)
 }
 
+fn generation_path(path: &Path, generation: u32) -> PathBuf {
+    let mut value = path.as_os_str().to_os_string();
+    value.push(format!(".{generation}"));
+    PathBuf::from(value)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -973,6 +976,38 @@ mod tests {
         assert!(
             log.pending_err.is_none(),
             "a successful directory fsync must not latch an error"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn rotation_preserves_non_utf8_generation_path_identity() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let dir = tmpdir("non-utf8");
+        let path = dir.join(std::ffi::OsString::from_vec(b"audit-\xff.log".to_vec()));
+        let first = generation_path(&path, 1);
+        let lossy_first = PathBuf::from(format!("{}.1", path.to_string_lossy()));
+        assert_ne!(first, lossy_first, "fixture paths must be distinct");
+
+        let victim = b"unrelated lossy-path file\n";
+        std::fs::write(&lossy_first, victim).expect("seed lossy-path victim");
+        let (mut log, _) = RecoveryAuditLog::create(&path, cfg(None, 1)).expect("create");
+        log.rotation_progress = RotationProgress::Renaming { next_gen: 1 };
+        log.needs_rotation = true;
+
+        let outcome = log.drive_audit_rotation(Duration::from_secs(5));
+
+        assert_eq!(outcome, RotationOutcome::Complete);
+        assert!(
+            first.exists(),
+            "rotation must append `.1` to the exact Unix pathname bytes"
+        );
+        assert_eq!(
+            std::fs::read(&lossy_first).expect("read lossy-path victim"),
+            victim,
+            "rotation must not overwrite the distinct lossy UTF-8 pathname"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1257,16 +1292,13 @@ mod tests {
         });
         log.flush_pending(Duration::from_secs(5));
 
-        let first = format!("{}.1", path.to_string_lossy());
+        let first = generation_path(&path, 1);
         log.copy_live_to_first(&first)
             .expect("cross-device fallback");
 
         // The live file was unlinked; the snapshot copy now lives at `.1`.
         assert!(!path.exists(), "original live file must be unlinked");
-        assert!(
-            std::path::Path::new(&first).exists(),
-            "rotated `.1` generation must exist"
-        );
+        assert!(first.exists(), "rotated `.1` generation must exist");
         let first_body = std::fs::read_to_string(&first).expect("read .1");
         assert!(
             first_body.contains("/bin/before-rotation"),
@@ -1315,7 +1347,7 @@ mod tests {
         symlink(&target, &first).expect("create destination symlink");
 
         let err = log
-            .copy_live_to_first(first.to_str().expect("utf8 path"))
+            .copy_live_to_first(&first)
             .expect_err("copy fallback must refuse an existing symlink");
 
         assert!(matches!(
@@ -1356,8 +1388,7 @@ mod tests {
         std::fs::rename(&path, &displaced).expect("displace live audit path");
         symlink(&target, &path).expect("replace live path with symlink");
 
-        log.copy_live_to_first(first.to_str().expect("utf8 path"))
-            .expect("copy fallback");
+        log.copy_live_to_first(&first).expect("copy fallback");
 
         assert_eq!(
             std::fs::read(&target).expect("read target"),
