@@ -9,6 +9,7 @@
 
 use std::os::unix::net::UnixDatagram;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 #[cfg(any(feature = "udp", feature = "secure-udp"))]
@@ -16,6 +17,36 @@ use crate::transport::bind_ephemeral;
 #[cfg(all(feature = "panic-handler", feature = "secure-udp"))]
 use varta_vlp::crypto::Key;
 use varta_vlp::{Frame, Status, NONCE_TERMINAL};
+
+const MAX_VALID_TERMINAL_TIMESTAMP: u64 = u64::MAX - 1;
+// Terminal timestamps are replay-ordering state, so per-install clocks must
+// commit through one process-wide high-water mark.
+static LAST_TERMINAL_TIMESTAMP: AtomicU64 = AtomicU64::new(0);
+
+fn claim_terminal_timestamp(raw_timestamp: u64, high_water: &AtomicU64) -> Option<u64> {
+    let raw_timestamp = raw_timestamp.min(MAX_VALID_TERMINAL_TIMESTAMP);
+    let mut previous = high_water.load(Ordering::Relaxed);
+    loop {
+        if previous >= MAX_VALID_TERMINAL_TIMESTAMP {
+            return None;
+        }
+        let candidate = raw_timestamp.max(previous + 1);
+        match high_water.compare_exchange_weak(
+            previous,
+            candidate,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => return Some(candidate),
+            Err(observed) => previous = observed,
+        }
+    }
+}
+
+fn next_terminal_timestamp(start: &Instant) -> Option<u64> {
+    let elapsed = start.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+    claim_terminal_timestamp(elapsed, &LAST_TERMINAL_TIMESTAMP)
+}
 
 /// Error returned by [`install_panic_handler_secure_udp`] when installation
 /// fails — either entropy is unavailable at install time, or the underlying
@@ -126,17 +157,18 @@ pub fn install(socket_path: impl Into<PathBuf>) -> std::io::Result<()> {
     std::panic::set_hook(Box::new(move |info| {
         // All errors are swallowed. Panicking inside a panic hook triggers an
         // immediate process abort, bypassing unwinding entirely.
-        let timestamp = start.elapsed().as_nanos().min(u64::MAX as u128) as u64;
-        let frame = Frame::new(
-            Status::Critical,
-            std::process::id(),
-            timestamp,
-            NONCE_TERMINAL,
-            0,
-        );
-        let mut buf = [0u8; 32];
-        frame.encode(&mut buf);
-        let _ = sock.send(&buf);
+        if let Some(timestamp) = next_terminal_timestamp(&start) {
+            let frame = Frame::new(
+                Status::Critical,
+                std::process::id(),
+                timestamp,
+                NONCE_TERMINAL,
+                0,
+            );
+            let mut buf = [0u8; 32];
+            frame.encode(&mut buf);
+            let _ = sock.send(&buf);
+        }
         prev(info);
     }));
     Ok(())
@@ -189,17 +221,18 @@ pub fn install_panic_handler_udp(addr: std::net::SocketAddr) -> std::io::Result<
     sock.set_nonblocking(true)?;
     let prev = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        let timestamp = start.elapsed().as_nanos().min(u64::MAX as u128) as u64;
-        let frame = Frame::new(
-            Status::Critical,
-            std::process::id(),
-            timestamp,
-            NONCE_TERMINAL,
-            0,
-        );
-        let mut buf = [0u8; 32];
-        frame.encode(&mut buf);
-        let _ = sock.send(&buf);
+        if let Some(timestamp) = next_terminal_timestamp(&start) {
+            let frame = Frame::new(
+                Status::Critical,
+                std::process::id(),
+                timestamp,
+                NONCE_TERMINAL,
+                0,
+            );
+            let mut buf = [0u8; 32];
+            frame.encode(&mut buf);
+            let _ = sock.send(&buf);
+        }
         prev(info);
     }));
     Ok(())
@@ -278,8 +311,6 @@ pub(crate) fn install_with_entropy_provider<F>(
 where
     F: FnOnce() -> std::io::Result<SecurePanicEntropy>,
 {
-    use std::sync::atomic::AtomicU64;
-
     let start = Instant::now();
     // Pre-compute all IV material at install time — /dev/urandom reads are
     // not async-signal-safe and must never happen inside the panic hook.
@@ -314,7 +345,7 @@ where
     std::panic::set_hook(Box::new(move |info| {
         let _ = (|| {
             let panic_pid = std::process::id();
-            let timestamp = start.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+            let timestamp = next_terminal_timestamp(&start)?;
             // Claim a unique counter for this fire. The first panic frame uses
             // iv_counter = 0, then 1, 2, ... matching vlp-secure.md §5.
             let iv_counter = claim_secure_panic_counter(&iv_counter_atom)?;
@@ -456,6 +487,31 @@ pub fn install_panic_handler_secure_udp_accept_degraded_entropy(
     }
 }
 
+#[cfg(test)]
+mod timestamp_tests {
+    use super::*;
+
+    #[test]
+    fn terminal_timestamp_claim_survives_clock_reset() {
+        let high_water = AtomicU64::new(0);
+
+        assert_eq!(claim_terminal_timestamp(100, &high_water), Some(100));
+        assert_eq!(claim_terminal_timestamp(0, &high_water), Some(101));
+        assert_eq!(claim_terminal_timestamp(100, &high_water), Some(102));
+    }
+
+    #[test]
+    fn terminal_timestamp_claim_drops_before_invalid_sentinel() {
+        let high_water = AtomicU64::new(MAX_VALID_TERMINAL_TIMESTAMP);
+
+        assert_eq!(claim_terminal_timestamp(0, &high_water), None);
+        assert_eq!(
+            high_water.load(Ordering::Relaxed),
+            MAX_VALID_TERMINAL_TIMESTAMP
+        );
+    }
+}
+
 #[cfg(all(test, feature = "panic-handler", feature = "secure-udp"))]
 mod tests {
     use super::*;
@@ -568,7 +624,6 @@ mod tests {
     /// closure body relies on this invariant for AEAD nonce uniqueness.
     #[test]
     fn atomic_fetch_add_claims_distinct_counters_under_contention() {
-        use std::sync::atomic::AtomicU64;
         use std::sync::Arc;
         use std::thread;
 
@@ -603,8 +658,6 @@ mod tests {
 
     #[test]
     fn secure_panic_counter_exhaustion_drops_before_reuse() {
-        use std::sync::atomic::AtomicU64;
-
         let atom = AtomicU64::new(u32::MAX as u64);
 
         assert_eq!(

@@ -30,6 +30,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Rust panic hooks preserve terminal replay ordering across reinstallation.**
+  UDS, UDP, and secure-UDP panic emitters now claim timestamps from one
+  process-wide atomic high-water mark. Concurrent panics and a newly installed
+  hook can no longer emit equal or decreasing terminal timestamps that the
+  observer rejects as replays; exhaustion drops before the invalid
+  `u64::MAX` timestamp sentinel.
+
 - **Node reconnects are transactional and generation-safe.** UDS, UDP, and
   secure-UDP transports now prepare a replacement before closing the active
   socket, preserving the current connection and AEAD session when setup fails.

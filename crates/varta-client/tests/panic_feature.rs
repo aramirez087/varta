@@ -71,6 +71,53 @@ fn panic_handler_preserves_original_panic_outcome() {
 }
 
 #[test]
+fn reinstalled_panic_handler_keeps_terminal_timestamps_strictly_increasing() {
+    let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _ = std::panic::take_hook();
+
+    let first_temp = TempSocket::new("panic-r1");
+    let first_server = UnixDatagram::bind(&first_temp.path).expect("bind first server");
+    first_server
+        .set_read_timeout(Some(Duration::from_millis(500)))
+        .expect("set first read timeout");
+    install_panic_handler(first_temp.path.clone()).expect("install first hook");
+
+    std::thread::sleep(Duration::from_millis(100));
+    let first_panic = std::panic::catch_unwind(|| panic!("first boom"));
+    assert!(first_panic.is_err(), "first call must panic");
+
+    let mut first_buf = [0u8; 32];
+    first_server
+        .recv(&mut first_buf)
+        .expect("receive first terminal frame");
+    let first = Frame::decode(&first_buf).expect("decode first terminal frame");
+
+    let second_temp = TempSocket::new("panic-r2");
+    let second_server = UnixDatagram::bind(&second_temp.path).expect("bind second server");
+    second_server
+        .set_read_timeout(Some(Duration::from_millis(500)))
+        .expect("set second read timeout");
+    install_panic_handler(second_temp.path.clone()).expect("install second hook");
+
+    let second_panic = std::panic::catch_unwind(|| panic!("second boom"));
+    assert!(second_panic.is_err(), "second call must panic");
+
+    let mut second_buf = [0u8; 32];
+    second_server
+        .recv(&mut second_buf)
+        .expect("receive second terminal frame");
+    let second = Frame::decode(&second_buf).expect("decode second terminal frame");
+
+    let _ = std::panic::take_hook();
+    assert!(
+        second.timestamp > first.timestamp,
+        "terminal timestamps must survive hook reinstallation: first={}, second={}",
+        first.timestamp,
+        second.timestamp
+    );
+}
+
+#[test]
 fn panic_module_excluded_without_feature() {
     // This test exists only when compiled with --features panic-handler.
     // The #![cfg(feature = "panic-handler")] gate at the top of this file
