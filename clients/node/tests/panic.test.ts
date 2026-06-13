@@ -53,17 +53,66 @@ test("uncaughtException triggers critical+NONCE_TERMINAL beat (via child process
     // Drain stderr so the child doesn't block on its crash output.
     child.stderr.resume();
     child.stdout.resume();
+    const exited = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>(
+      (resolveExit, rejectExit) => {
+        const timer = setTimeout(() => {
+          child.kill("SIGKILL");
+          rejectExit(new Error("panic handler kept the child alive after uncaughtException"));
+        }, 3000);
+        child.once("exit", (code, signal) => {
+          clearTimeout(timer);
+          resolveExit({ code, signal });
+        });
+      },
+    );
 
     await listener.wait(1, 5000);
-    try {
-      child.kill("SIGKILL");
-    } catch {
-      // Already dead.
-    }
+    const status = await exited;
 
     const frame = decode(listener.received[0]!);
     assert.equal(frame.status, Status.Critical, "panic beat is Critical");
     assert.equal(frame.nonce, NONCE_TERMINAL, "panic beat carries NONCE_TERMINAL");
+    assert.notEqual(status.code, 0, `uncaught exception must terminate the child: ${JSON.stringify(status)}`);
+    assert.equal(listener.received.length, 1, "uncaught exception should emit exactly once");
+  } finally {
+    await listener.close();
+  }
+});
+
+test("run emits before rethrow even when the caller catches the error", async () => {
+  const listener = await bindUdpRecorder();
+  try {
+    const script = `
+      import("${join(repoRoot(), "clients", "node", "src", "panic.ts").replace(/\\\\/g, "\\\\\\\\")}")
+        .then(async ({ installSignalHandlerUdp, run }) => {
+          installSignalHandlerUdp("${listener.host}", ${listener.port});
+          await new Promise((resolve) => setTimeout(resolve, 50));
+          try {
+            await run(async () => { throw new Error("intentional run failure"); });
+          } catch {
+            process.exitCode = 0;
+          }
+          await new Promise((resolve) => setTimeout(resolve, 100));
+        });
+    `;
+    const child = spawn(
+      process.execPath,
+      ["--import", "tsx", "-e", script],
+      { stdio: ["ignore", "pipe", "pipe"] },
+    );
+    child.stderr.resume();
+    child.stdout.resume();
+
+    await listener.wait(1, 5000);
+    const status = await new Promise<number | null>((resolveExit) => {
+      child.once("exit", (code) => resolveExit(code));
+    });
+
+    assert.equal(status, 0, "caller-caught run failure should preserve caller exit handling");
+    assert.equal(listener.received.length, 1, "run should emit exactly one terminal beat");
+    const frame = decode(listener.received[0]!);
+    assert.equal(frame.status, Status.Critical);
+    assert.equal(frame.nonce, NONCE_TERMINAL);
   } finally {
     await listener.close();
   }

@@ -43,6 +43,9 @@ export class PanicInstallError extends Error {
 
 const FATAL_SIGNALS: NodeJS.Signals[] = ["SIGTERM", "SIGINT", "SIGQUIT", "SIGHUP"];
 
+let activeTrigger: (() => void) | undefined;
+let handlersInstalled = false;
+
 function buildCriticalFrame(payload: number = 0): Buffer {
   const buf = Buffer.alloc(FRAME_BYTES);
   encodeInto(
@@ -56,12 +59,16 @@ function buildCriticalFrame(payload: number = 0): Buffer {
   return buf;
 }
 
-// Wire emit() into the three terminating event sources. Each callback
-// is one-shot: after the first invocation we tear down the listeners
-// so process exit isn't blocked by lingering handlers.
-function arm(emit: () => void): void {
+function triggerActive(): void {
+  activeTrigger?.();
+}
+
+// Publish the latest emitter and install one process-wide handler set.
+// The active trigger is one-shot so panic.run() followed by the resulting
+// uncaughtException cannot emit the same terminal event twice.
+function installEmitter(emit: () => void): void {
   let fired = false;
-  const trigger = (): void => {
+  activeTrigger = (): void => {
     if (fired) return;
     fired = true;
     try {
@@ -71,23 +78,31 @@ function arm(emit: () => void): void {
     }
   };
 
-  process.on("uncaughtException", (err) => {
-    trigger();
+  if (handlersInstalled) return;
+  handlersInstalled = true;
+
+  const onUncaughtException = (err: unknown): void => {
+    triggerActive();
+    process.removeListener("uncaughtException", onUncaughtException);
     setImmediate(() => {
       throw err;
     });
-  });
+  };
 
-  process.on("unhandledRejection", (reason) => {
-    trigger();
+  const onUnhandledRejection = (reason: unknown): void => {
+    triggerActive();
+    process.removeListener("unhandledRejection", onUnhandledRejection);
     setImmediate(() => {
       throw reason instanceof Error ? reason : new Error(String(reason));
     });
-  });
+  };
+
+  process.on("uncaughtException", onUncaughtException);
+  process.on("unhandledRejection", onUnhandledRejection);
 
   for (const sig of FATAL_SIGNALS) {
     process.on(sig, () => {
-      trigger();
+      triggerActive();
       process.removeAllListeners(sig);
       process.kill(process.pid, sig);
     });
@@ -115,7 +130,7 @@ export function installSignalHandlerUdp(host: string, port: number): void {
     throw new PanicInstallError("SocketBind", (err as Error).message);
   }
   const frame = buildCriticalFrame();
-  arm(() => {
+  installEmitter(() => {
     try {
       sock.send(frame);
     } catch {
@@ -140,7 +155,7 @@ export function installSignalHandlerUds(path: string): void {
     throw new PanicInstallError("SocketBind", (err as Error).message);
   }
   const frame = buildCriticalFrame();
-  arm(() => {
+  installEmitter(() => {
     try {
       transport.send(frame);
     } catch {
@@ -184,7 +199,7 @@ export function installSignalHandlerSecureUdp(
   };
 
   const keyCopy = Buffer.from(key);
-  arm(() => {
+  installEmitter(() => {
     try {
       if (process.pid !== state.installPid) {
         try {
@@ -215,6 +230,7 @@ export async function run(fn: () => void | Promise<void>): Promise<void> {
   try {
     await fn();
   } catch (err) {
+    triggerActive();
     throw err;
   }
 }

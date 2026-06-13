@@ -8,6 +8,12 @@ governed independently — see `book/src/spec/vlp.md` in the workspace.
 
 ### Fixed
 
+- Panic dispatch now uses one process-level handler set and a replaceable
+  one-shot active emitter. `panic.run(fn)` emits before rethrowing even when
+  its caller catches the error, and `uncaughtException` removes Varta's
+  listener before rethrowing so the process terminates instead of catching
+  its own rethrow forever.
+
 - UDS, UDP, and secure-UDP reconnects now construct the replacement
   socket before retiring the active one. A failed reconnect preserves
   the usable connection and, for secure UDP, the complete AEAD session.
