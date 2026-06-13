@@ -240,6 +240,28 @@ fn reconnect_success_updates_all_iv_state_and_socket_port() {
     );
 }
 
+#[test]
+fn direct_transport_refreshes_a_stale_fork_epoch_before_send() {
+    let receiver = std::net::UdpSocket::bind((Ipv6Addr::LOCALHOST, 0)).expect("bind receiver");
+    let port = receiver.local_addr().expect("local_addr").port();
+    let addr = SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::LOCALHOST, port, 0, 0));
+    let key = Key::from_bytes([0x42; 32]);
+    let mut tx = SecureUdpTransport::connect(addr, key).expect("connect");
+
+    let prefix_before = tx.iv_prefix;
+    tx.connect_fork_epoch = tx.connect_fork_epoch.wrapping_add(1);
+
+    let sent = <SecureUdpTransport as BeatTransport>::send(&mut tx, &[0u8; 32])
+        .expect("send after fork-epoch mismatch");
+
+    assert_eq!(sent, SECURE_FRAME_LEN);
+    assert_eq!(tx.connect_fork_epoch, fork_epoch::current());
+    assert_ne!(
+        tx.iv_prefix, prefix_before,
+        "stale inherited epoch must refresh the AEAD session before sealing"
+    );
+}
+
 /// Commit-on-success contract: a failed `send(2)` (e.g. `WouldBlock` on
 /// the beat path) must NOT advance `iv_counter`. The kernel never
 /// accepted the datagram, so the speculative nonce is unobserved on

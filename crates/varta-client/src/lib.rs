@@ -32,6 +32,8 @@ compile_error!(
 pub mod client;
 pub mod transport;
 
+mod fork_epoch;
+
 #[cfg(feature = "secure-udp")]
 pub mod secure_transport;
 

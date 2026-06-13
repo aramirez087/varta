@@ -44,29 +44,27 @@
 //! the parent has already emitted under the same key — a catastrophic
 //! confidentiality and integrity failure.
 //!
-//! [`crate::Varta`] enforces fork-safety **structurally** by snapshotting
-//! [`std::process::id`] at [`crate::Varta::connect`] time and comparing on
-//! every [`crate::Varta::beat`]. On mismatch, the wrapper calls
-//! [`BeatTransport::reconnect`] *before* the frame is built — re-reading
-//! OS entropy into a fresh 16-byte session salt and resetting
-//! `iv_prefix_index`/`iv_counter` to zero. The forked child therefore
-//! emits frames keyed by an IV prefix derived from independent entropy,
-//! making nonce collision across the fork boundary impossible. The
-//! recovery is silent to the caller and observable via
-//! [`crate::Varta::fork_recoveries`].
+//! [`crate::Varta`] enforces fork-safety **structurally** using both the
+//! current PID and a process-lineage epoch advanced by `pthread_atfork` in
+//! every child. The epoch cannot alias when a descendant is later assigned
+//! the original PID. On mismatch, the wrapper calls
+//! [`BeatTransport::reconnect`] *before* the frame is built — re-reading OS
+//! entropy into a fresh 16-byte session salt and resetting
+//! `iv_prefix_index`/`iv_counter` to zero. The forked child therefore emits
+//! frames keyed by an IV prefix derived from independent entropy, making
+//! nonce collision across the fork boundary impossible. The recovery is
+//! silent to the caller and observable via [`crate::Varta::fork_recoveries`].
 //!
-//! **Advanced callers using `SecureUdpTransport` directly** (without the
-//! `Varta` wrapper) do not get this auto-detection — they must call
-//! [`SecureUdpTransport::reconnect`] in the child themselves. The
-//! [`BeatTransport`] trait is intentionally low-level; the safety policy
-//! lives one layer up.
+//! `SecureUdpTransport` also snapshots and enforces the same lineage epoch
+//! itself, so advanced callers using the transport directly receive the same
+//! nonce-safety guarantee.
 //!
 //! Historical note (cerebrum 2026-05-13): a prior `last_pid` field in
 //! `Varta` was removed because it detected fork but only reset clock
 //! state — the IV state was still inherited, so the "fix" was theatre.
-//! The current design is structurally different in that the PID-mismatch
-//! response is `transport.reconnect()`, which is precisely where the IV
-//! salt rotates.
+//! The current design is structurally different in that a process-identity
+//! mismatch triggers `transport.reconnect()`, which is precisely where the
+//! IV salt rotates.
 //!
 //! **This transport is designed for trusted local networks.**
 
@@ -75,6 +73,7 @@ use std::net::{SocketAddr, UdpSocket};
 
 use varta_vlp::crypto::{self, Key, NONCE_BYTES, SECURE_FRAME_MASTER_BYTES};
 
+use crate::fork_epoch;
 use crate::transport::{bind_ephemeral, BeatTransport};
 
 /// Wire length for a shared-key frame.
@@ -126,6 +125,8 @@ pub struct SecureUdpTransport {
     /// Retained only in master-key mode so `reconnect()` can re-derive
     /// `self.key` from the forked child's PID.
     master_key: Option<Key>,
+    /// Process-lineage epoch for direct-transport fork detection.
+    connect_fork_epoch: usize,
 }
 
 impl SecureUdpTransport {
@@ -138,10 +139,12 @@ impl SecureUdpTransport {
     /// # Errors
     ///
     /// Returns an [`io::Error`] if the socket cannot be created, connected,
-    /// switched to non-blocking mode, or if OS entropy is unavailable.
+    /// switched to non-blocking mode, if OS entropy is unavailable, or if the
+    /// process-wide fork callback cannot be registered.
     pub fn connect(addr: SocketAddr, key: Key) -> io::Result<Self> {
         use varta_vlp::crypto::kdf;
 
+        let connect_fork_epoch = fork_epoch::register()?;
         let sock = bind_ephemeral(&addr)?;
         sock.connect(addr)?;
         sock.set_nonblocking(true)?;
@@ -160,6 +163,7 @@ impl SecureUdpTransport {
             iv_prefix,
             is_master_mode: false,
             master_key: None,
+            connect_fork_epoch,
         })
     }
 
@@ -192,6 +196,7 @@ impl SecureUdpTransport {
     pub fn connect_with_master(addr: SocketAddr, master_key: Key) -> io::Result<Self> {
         use varta_vlp::crypto::kdf;
 
+        let connect_fork_epoch = fork_epoch::register()?;
         let peer_pid = std::process::id();
         let agent_key = kdf::derive_agent_key(&master_key, peer_pid)
             .map_err(|_| io::Error::new(io::ErrorKind::Other, "key derivation failure"))?;
@@ -221,6 +226,7 @@ impl SecureUdpTransport {
             iv_prefix,
             is_master_mode: true,
             master_key: Some(retained_master),
+            connect_fork_epoch,
         })
     }
 
@@ -346,6 +352,10 @@ impl SecureUdpTransport {
 
 impl BeatTransport for SecureUdpTransport {
     fn send(&mut self, buf: &[u8; 32]) -> io::Result<usize> {
+        if fork_epoch::current() != self.connect_fork_epoch {
+            self.reconnect()?;
+        }
+
         // Speculatively compute what the next frame should use. For the
         // common path and the wrap path, no `self.*` IV state has been
         // mutated yet — those mutations are deferred to send-success
@@ -445,13 +455,10 @@ impl BeatTransport for SecureUdpTransport {
     /// state. This is the **only** path after `connect()` that touches OS
     /// entropy.
     ///
-    /// Called automatically by [`crate::Varta::beat`] when a `fork(2)`
-    /// transition is detected (PID mismatch against the connect-time
-    /// snapshot). Advanced callers using `SecureUdpTransport` directly
-    /// must invoke this themselves in the forked child — the inherited
-    /// `iv_session_salt` would otherwise cause catastrophic AEAD nonce
-    /// reuse. Also called by operators wanting a fresh session for
-    /// forward-secrecy hygiene.
+    /// Called automatically by [`crate::Varta::beat`] and by this transport's
+    /// own [`send`](BeatTransport::send) implementation when a `fork(2)`
+    /// transition is detected. Also called by operators wanting a fresh
+    /// session for forward-secrecy hygiene.
     fn reconnect(&mut self) -> io::Result<()> {
         use varta_vlp::crypto::kdf;
 
@@ -494,6 +501,7 @@ impl BeatTransport for SecureUdpTransport {
         if let Some(k) = new_key {
             self.key = k;
         }
+        self.connect_fork_epoch = fork_epoch::current();
         Ok(())
     }
 }

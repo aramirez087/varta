@@ -306,10 +306,12 @@ key recovery, plaintext XOR leak).
 
 ### How `Varta` enforces fork-safety structurally
 
-`Varta::connect` snapshots `std::process::id()` into a private
-`connect_pid` field. Every `Varta::beat` reads the current PID and
-compares — on mismatch (i.e. the handle is now in a forked child), the
-wrapper invokes `transport.reconnect()` **before** building the frame.
+`Varta::connect` snapshots both `std::process::id()` and a process-lineage
+epoch maintained by a one-time `pthread_atfork` child callback. Every
+`Varta::beat` reads the current PID and epoch and compares both — on either
+mismatch, the wrapper invokes `transport.reconnect()` **before** building the
+frame. The epoch changes on every fork and therefore remains distinct even
+if a later descendant is assigned the original connect-time PID.
 `SecureUdpTransport::reconnect()` re-reads OS entropy into a fresh
 16-byte session salt, recomputes the IV prefix, and resets the prefix
 index and counter to zero. The child's first emitted frame therefore
@@ -335,11 +337,10 @@ signal required. Fork-recovery is *entirely transparent* to the wire format.
 
 ### Advanced callers
 
-Callers using `SecureUdpTransport` directly (without the `Varta`
-wrapper) do **not** get auto-detection. The `BeatTransport` trait is
-intentionally low-level; the safety policy lives one layer up.
-Direct-transport users must call `SecureUdpTransport::reconnect()`
-themselves in the forked child before the first beat.
+Callers using `SecureUdpTransport` directly receive the same protection.
+The transport snapshots the process-lineage epoch at construction and checks
+it before every seal, reconnecting before inherited AEAD state can be used in
+a child.
 
 ### Parent-pid stall window (transport-agnostic)
 

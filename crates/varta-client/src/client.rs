@@ -8,6 +8,7 @@ use std::time::Instant;
 
 use varta_vlp::{Frame, Status, NONCE_TERMINAL};
 
+use crate::fork_epoch;
 use crate::transport::{BeatTransport, UdsTransport};
 
 #[cfg(feature = "udp")]
@@ -285,8 +286,11 @@ impl fmt::Display for BeatOutcome {
 /// the handle into a dedicated emitter thread or channel.
 ///
 /// After `fork(2)` the child inherits this handle. Fork is **auto-detected**
-/// on the next [`beat`](Self::beat): if `std::process::id()` differs from the
-/// PID captured at [`connect`](Self::connect) time, the underlying transport's
+/// on the next [`beat`](Self::beat) using both the current PID and a
+/// process-lineage epoch advanced by `pthread_atfork` in every child. The
+/// epoch closes the PID-recycling hole: even a descendant later assigned the
+/// original connect-time PID cannot reuse inherited session state. On either
+/// mismatch, the underlying transport's
 /// [`reconnect`](crate::transport::BeatTransport::reconnect) is invoked
 /// **before** the frame is built. On secure-UDP this re-reads OS entropy and
 /// rotates the AEAD session salt, making catastrophic nonce reuse across the
@@ -315,6 +319,10 @@ pub struct Varta<T: BeatTransport = UdsTransport> {
     /// and trigger transport refresh before any frame leaves the process.
     /// See the struct-level docstring for the safety contract.
     connect_pid: u32,
+    /// Process-lineage epoch captured at `connect` / `reconnect` time.
+    /// Unlike PID equality, this changes on every fork and cannot alias after
+    /// PID recycling.
+    connect_fork_epoch: usize,
     /// Saturating count of fork-recovery events surfaced via
     /// [`fork_recoveries`](Self::fork_recoveries).
     fork_recoveries: u64,
@@ -338,8 +346,10 @@ impl Varta<UdsTransport> {
     /// # Errors
     ///
     /// Returns an [`io::Error`] if the socket cannot be created, the peer
-    /// path cannot be reached, or non-blocking mode cannot be enabled.
+    /// path cannot be reached, non-blocking mode cannot be enabled, or the
+    /// process-wide fork callback cannot be registered.
     pub fn connect<P: AsRef<Path>>(path: P) -> io::Result<Self> {
+        let connect_fork_epoch = fork_epoch::register()?;
         let transport = UdsTransport::connect(path)?;
         Ok(Self {
             transport,
@@ -351,6 +361,7 @@ impl Varta<UdsTransport> {
             last_timestamp: 0,
             clock_regressions: 0,
             connect_pid: std::process::id(),
+            connect_fork_epoch,
             fork_recoveries: 0,
         })
     }
@@ -374,8 +385,10 @@ impl Varta<UdpTransport> {
     /// # Errors
     ///
     /// Returns an [`io::Error`] if the socket cannot be created, connected,
-    /// or switched to non-blocking mode.
+    /// switched to non-blocking mode, or the process-wide fork callback
+    /// cannot be registered.
     pub fn connect_udp(addr: std::net::SocketAddr) -> io::Result<Self> {
+        let connect_fork_epoch = fork_epoch::register()?;
         let transport = UdpTransport::connect(addr)?;
         Ok(Self {
             transport,
@@ -387,6 +400,7 @@ impl Varta<UdpTransport> {
             last_timestamp: 0,
             clock_regressions: 0,
             connect_pid: std::process::id(),
+            connect_fork_epoch,
             fork_recoveries: 0,
         })
     }
@@ -408,8 +422,10 @@ impl Varta<SecureUdpTransport> {
     /// # Errors
     ///
     /// Returns an [`io::Error`] if the socket cannot be created, connected,
-    /// or switched to non-blocking mode.
+    /// switched to non-blocking mode, OS entropy is unavailable, or the
+    /// process-wide fork callback cannot be registered.
     pub fn connect_secure_udp(addr: std::net::SocketAddr, key: Key) -> io::Result<Self> {
+        let connect_fork_epoch = fork_epoch::register()?;
         let transport = SecureUdpTransport::connect(addr, key)?;
         Ok(Self {
             transport,
@@ -421,6 +437,7 @@ impl Varta<SecureUdpTransport> {
             last_timestamp: 0,
             clock_regressions: 0,
             connect_pid: std::process::id(),
+            connect_fork_epoch,
             fork_recoveries: 0,
         })
     }
@@ -439,11 +456,13 @@ impl Varta<SecureUdpTransport> {
     /// # Errors
     ///
     /// Returns an [`io::Error`] if the socket cannot be created, connected,
-    /// or switched to non-blocking mode.
+    /// switched to non-blocking mode, OS entropy is unavailable, or the
+    /// process-wide fork callback cannot be registered.
     pub fn connect_secure_udp_with_master(
         addr: std::net::SocketAddr,
         master_key: Key,
     ) -> io::Result<Self> {
+        let connect_fork_epoch = fork_epoch::register()?;
         let transport = SecureUdpTransport::connect_with_master(addr, master_key)?;
         Ok(Self {
             transport,
@@ -455,6 +474,7 @@ impl Varta<SecureUdpTransport> {
             last_timestamp: 0,
             clock_regressions: 0,
             connect_pid: std::process::id(),
+            connect_fork_epoch,
             fork_recoveries: 0,
         })
     }
@@ -568,7 +588,8 @@ impl<T: BeatTransport> Varta<T> {
         }
 
         let pid = std::process::id();
-        if pid != self.connect_pid {
+        let current_fork_epoch = fork_epoch::current();
+        if pid != self.connect_pid || current_fork_epoch != self.connect_fork_epoch {
             // Fork detected. Refresh the underlying transport so any
             // session-keyed state (e.g. secure-UDP iv_session_salt /
             // iv_prefix_index / iv_counter) is re-seeded from OS entropy
@@ -583,6 +604,7 @@ impl<T: BeatTransport> Varta<T> {
             match self.transport.reconnect() {
                 Ok(()) => {
                     self.connect_pid = pid;
+                    self.connect_fork_epoch = fork_epoch::current();
                     self.fork_recoveries = self.fork_recoveries.saturating_add(1);
                     self.nonce = 0;
                     self.start = Instant::now();
@@ -658,10 +680,10 @@ impl<T: BeatTransport> Varta<T> {
     /// a fresh connection to the target stored at [`connect`](Self::connect)
     /// time. Agent identity (`nonce`, `start` clock) is preserved.
     ///
-    /// Also refreshes the internal fork-detection snapshot so an explicit
-    /// reconnect issued from a forked child (the documented manual escape
-    /// hatch) cannot leave a stale parent PID behind that would re-trigger
-    /// auto-recovery on the next beat.
+    /// Also refreshes the internal PID and process-lineage snapshots so an
+    /// explicit reconnect issued from a forked child cannot leave stale
+    /// parent identity behind that would re-trigger auto-recovery on the next
+    /// beat.
     ///
     /// This is the only post-[`connect`](Self::connect) allocation site and
     /// should only be called when recovery is needed, not on the steady-state
@@ -669,6 +691,7 @@ impl<T: BeatTransport> Varta<T> {
     pub fn reconnect(&mut self) -> io::Result<()> {
         self.transport.reconnect()?;
         self.connect_pid = std::process::id();
+        self.connect_fork_epoch = fork_epoch::current();
         Ok(())
     }
 
@@ -936,6 +959,7 @@ mod tests {
             last_timestamp: 0,
             clock_regressions: 0,
             connect_pid: std::process::id(),
+            connect_fork_epoch: fork_epoch::register().expect("register pthread_atfork"),
             fork_recoveries: 0,
         }
     }

@@ -283,16 +283,19 @@ pub(super) fn secure_udp_counter_wrap_continues_under_load() {
 
 /// Fork-safety contract: a `fork(2)` followed by `beat()` in the child
 /// MUST NOT cause AEAD nonce reuse on the secure-UDP transport. The
-/// `Varta` wrapper detects the PID mismatch and invokes
+/// `Varta` wrapper detects a process-lineage epoch mismatch and invokes
 /// `transport.reconnect()` to refresh the IV salt before encrypting any
-/// frame in the child. Verified end-to-end by:
+/// frame in the child, even when PID equality is deliberately made to alias.
+/// Verified end-to-end by:
 ///
 /// 1. Spawning `varta-watch` with a secure-UDP listener.
 /// 2. Connecting a `Varta::connect_secure_udp` agent in the test process.
 /// 3. Beating once, then calling `fork(2)`.
-/// 4. Child beats N times under the auto-recovered transport, then `_exit`s.
-/// 5. Parent beats N times.
-/// 6. Scraping `/metrics`: parent AND child must appear as distinct
+/// 4. With `test-hooks`, the child overwrites the inherited PID snapshot with
+///    its own PID, masking the ordinary PID-mismatch detector.
+/// 5. Child beats N times under the epoch-recovered transport, then `_exit`s.
+/// 6. Parent beats N times.
+/// 7. Scraping `/metrics`: parent AND child must appear as distinct
 ///    `varta_beats_total{pid=...}` entries, and `varta_io_errors_total`
 ///    plus every `varta_decode_errors_total{kind=...}` entry must stay
 ///    at zero (no AEAD-tag failures or nonce-replay rejections).
@@ -376,10 +379,18 @@ pub(super) fn secure_udp_fork_safe_under_real_fork() {
     }
 
     if child_pid == 0 {
-        // CHILD. Fork-recovery must fire on the first beat — `agent` was
-        // built before fork, so connect_pid is the parent's PID.
+        #[cfg(feature = "test-hooks")]
+        {
+            // Mask the normal PID mismatch by making the inherited snapshot
+            // equal the child's PID. Only the pthread_atfork lineage epoch
+            // can now force session refresh before the first seal.
+            agent.set_connect_pid_for_test(std::process::id());
+        }
         for _ in 0..20 {
             let _ = agent.beat(varta_client::Status::Ok, 0);
+        }
+        if agent.fork_recoveries() != 1 {
+            unsafe { _exit(2) };
         }
         // _exit, not exit: skip Rust runtime teardown / atexit handlers
         // that would re-run cargo-test machinery and break the parent.
@@ -400,6 +411,10 @@ pub(super) fn secure_udp_fork_safe_under_real_fork() {
         child_pid,
         "waitpid did not return the child pid (errno={})",
         std::io::Error::last_os_error()
+    );
+    assert_eq!(
+        status, 0,
+        "child exited unsuccessfully; fork epoch did not trigger exactly one recovery"
     );
 
     // Sanity: parent's fork-recovery counter MUST remain at zero (the
