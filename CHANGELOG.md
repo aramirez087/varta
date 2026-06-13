@@ -30,6 +30,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`--hw-watchdog` now rejects non-device paths (bug-439).** Previously any
+  writable regular file was accepted, received NUL kicks, and let the observer
+  start with no hardware reboot protection. `HwWatchdog::open` now validates
+  the opened descriptor and fails startup unless it is a character device.
 - **`--recovery-timeout-ms 0` no longer silently neuters recovery (bug-434).**
   The flag is the kill-after deadline for a still-running recovery child; the
   reap gate kills a child once `spawned_at.elapsed() >= recovery_timeout`. A

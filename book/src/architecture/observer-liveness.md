@@ -129,6 +129,10 @@ host — even if the OS itself is wedged.
 varta-watch --hw-watchdog /dev/watchdog ...
 ```
 
+At startup, `varta-watch` verifies that the opened descriptor is a character
+device. A regular file, FIFO, or socket is rejected rather than silently
+accepting writes while providing no watchdog protection.
+
 **Magic close:** on a clean shutdown (SIGTERM/SIGINT followed by graceful exit)
 `varta-watch` writes the magic byte `'V'` to disarm the watchdog before
 exiting.  A crash or hang leaves the watchdog armed; the kernel reboots after

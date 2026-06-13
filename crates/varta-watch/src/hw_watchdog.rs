@@ -13,6 +13,7 @@
 
 use std::fs::{File, OpenOptions};
 use std::io::Write;
+use std::os::unix::fs::FileTypeExt;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -31,9 +32,27 @@ pub struct HwWatchdog {
 }
 
 impl HwWatchdog {
-    /// Open `path` for writing.  Fails if the path cannot be opened.
+    /// Open `path` for writing.
+    ///
+    /// The opened descriptor must refer to a character device. This rejects
+    /// regular files, FIFOs, and sockets that would accept writes without
+    /// providing any watchdog protection.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the path cannot be opened or the opened descriptor
+    /// is not a character device.
     pub fn open(path: &Path) -> std::io::Result<Self> {
         let file = OpenOptions::new().write(true).open(path)?;
+        if !file.metadata()?.file_type().is_char_device() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "{}: hardware watchdog must be a character device",
+                    path.display()
+                ),
+            ));
+        }
         Ok(Self {
             file,
             disarm_on_drop: AtomicBool::new(false),
@@ -82,12 +101,42 @@ mod tests {
         p
     }
 
+    fn file_backed_watchdog(path: &Path) -> HwWatchdog {
+        let file = OpenOptions::new()
+            .write(true)
+            .open(path)
+            .expect("open test sink");
+        HwWatchdog {
+            file,
+            disarm_on_drop: AtomicBool::new(false),
+        }
+    }
+
+    #[test]
+    fn open_rejects_regular_file() {
+        let path = tmp_path("regular");
+        std::fs::write(&path, b"").unwrap();
+
+        let err = HwWatchdog::open(&path)
+            .err()
+            .expect("regular file must not be accepted as a watchdog");
+
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn open_accepts_character_device() {
+        let watchdog = HwWatchdog::open(Path::new("/dev/null"))
+            .expect("/dev/null is a portable character-device test fixture");
+        drop(watchdog);
+    }
+
     #[test]
     fn kick_writes_byte_to_device() {
         let path = tmp_path("kick");
-        // Pre-create the file so open() succeeds.
         std::fs::write(&path, b"").unwrap();
-        let mut w = HwWatchdog::open(&path).expect("open");
+        let mut w = file_backed_watchdog(&path);
         w.kick();
         drop(w); // disarm_on_drop = false → no 'V' written
         let contents = std::fs::read(&path).unwrap();
@@ -99,7 +148,7 @@ mod tests {
     fn magic_close_writes_v_on_clean_shutdown() {
         let path = tmp_path("magic");
         std::fs::write(&path, b"").unwrap();
-        let mut w = HwWatchdog::open(&path).expect("open");
+        let mut w = file_backed_watchdog(&path);
         w.kick();
         w.arm_disarm_on_drop(); // clean shutdown
         drop(w); // Drop writes 'V'
@@ -116,7 +165,7 @@ mod tests {
     fn no_magic_close_without_arm() {
         let path = tmp_path("nomagic");
         std::fs::write(&path, b"").unwrap();
-        let mut w = HwWatchdog::open(&path).expect("open");
+        let mut w = file_backed_watchdog(&path);
         w.kick();
         // do NOT call arm_disarm_on_drop
         drop(w);
