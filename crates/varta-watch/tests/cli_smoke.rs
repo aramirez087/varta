@@ -17,7 +17,6 @@
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::time::Duration;
 
 static UDS_COUNTER: AtomicU32 = AtomicU32::new(0);
 
@@ -697,16 +696,13 @@ fn cli_recovery_plus_udp_port_with_accept_flag_parses() {
 
 // ---------------------------------------------------------------------------
 // Hardware watchdog (--hw-watchdog) — L3 observer-liveness contract.
-// Uses a regular tempfile to stand in for /dev/watchdog: HwWatchdog::open
-// requires only writability, not a character device.
 // ---------------------------------------------------------------------------
 
-/// On a clean shutdown (`--shutdown-after-secs`), `varta-watch` must kick the
-/// watchdog at least once and then write the magic-close byte `'V'` to disarm
-/// it.
+/// A writable regular file must not be accepted as a hardware watchdog. It
+/// would accept every kick while providing no reboot protection.
 #[cfg_attr(miri, ignore)] // JUSTIFY: miri cannot model process spawning (Command::new)
 #[test]
-fn cli_hw_watchdog_kicks_and_writes_magic_close_on_clean_shutdown() {
+fn cli_hw_watchdog_rejects_regular_file() {
     use std::fs::OpenOptions;
     use std::os::unix::fs::PermissionsExt;
 
@@ -743,94 +739,51 @@ fn cli_hw_watchdog_kicks_and_writes_magic_close_on_clean_shutdown() {
             "--shutdown-after-secs",
             "1",
         ])
-        .stderr(std::process::Stdio::null())
+        .output()
+        .expect("spawn varta-watch with --hw-watchdog");
+
+    assert!(
+        !out.status.success(),
+        "regular file must be rejected as a hardware watchdog"
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("must be a character device"),
+        "startup error must explain the watchdog device requirement; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        std::fs::read(&wdt_path).expect("read rejected regular file"),
+        b"",
+        "validation must happen before the first kick"
+    );
+}
+
+/// A character device passes the CLI validation and does not prevent a clean
+/// observer shutdown. `/dev/null` is used only to exercise the descriptor-type
+/// gate; unit tests cover the exact kick and magic-close bytes.
+#[cfg_attr(miri, ignore)] // JUSTIFY: miri cannot model process spawning (Command::new)
+#[test]
+fn cli_hw_watchdog_accepts_character_device() {
+    let socket = unique_uds_path("hwwdt-char");
+    let out = Command::new(env!("CARGO_BIN_EXE_varta-watch"))
+        .args([
+            "--socket",
+            socket.as_str(),
+            "--threshold-ms",
+            "100",
+            "--hw-watchdog",
+            "/dev/null",
+            "--shutdown-after-secs",
+            "1",
+        ])
         .output()
         .expect("spawn varta-watch with --hw-watchdog");
 
     assert!(
         out.status.success(),
-        "--hw-watchdog must not prevent clean exit; got {:?}",
-        out.status
-    );
-
-    let contents = std::fs::read(&wdt_path).expect("read wdt file");
-
-    assert!(
-        !contents.is_empty(),
-        "watchdog file must not be empty after run (expected kicks + magic-close)"
-    );
-    assert_eq!(
-        contents.last().copied(),
-        Some(b'V'),
-        "clean shutdown must write magic-close byte 'V' last; contents: {:?}",
-        contents
-    );
-    // At least one kick (NUL byte) must precede the magic-close.
-    assert!(
-        contents.contains(&0),
-        "at least one kick (NUL byte) must be written before magic-close; contents: {:?}",
-        contents
-    );
-}
-
-/// When `varta-watch` is killed abruptly (SIGKILL — cannot be caught), the
-/// magic-close byte must NOT appear, leaving the watchdog armed so the kernel
-/// would reboot.
-#[cfg(unix)]
-#[cfg_attr(miri, ignore)] // JUSTIFY: miri cannot model process spawning (Command::new)
-#[test]
-fn cli_hw_watchdog_does_not_write_magic_close_on_abrupt_kill() {
-    use std::fs::OpenOptions;
-    use std::os::unix::fs::PermissionsExt;
-
-    let dir_path = {
-        let pid = std::process::id();
-        let mut p = std::env::temp_dir();
-        p.push(format!("varta-hwwdt-kill-{pid}"));
-        std::fs::create_dir_all(&p).expect("create tempdir");
-        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755))
-            .expect("chmod tempdir");
-        p
-    };
-    let _dir_guard = scopeguard(&dir_path);
-
-    let socket_path = dir_path.join("agents.sock");
-    let wdt_path = dir_path.join("wdt");
-
-    OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(&wdt_path)
-        .expect("pre-create wdt file");
-
-    let mut child = Command::new(env!("CARGO_BIN_EXE_varta-watch"))
-        .args([
-            "--socket",
-            socket_path.to_str().unwrap(),
-            "--threshold-ms",
-            "100",
-            "--hw-watchdog",
-            wdt_path.to_str().unwrap(),
-            // No --shutdown-after-secs — run until killed.
-        ])
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .expect("spawn varta-watch with --hw-watchdog");
-
-    // Give the binary time to start and write at least one kick, then
-    // SIGKILL — cannot be caught, so arm_disarm_on_drop is never called.
-    std::thread::sleep(Duration::from_millis(300));
-    child.kill().expect("SIGKILL child");
-    child.wait().expect("wait child");
-
-    let contents = std::fs::read(&wdt_path).expect("read wdt file");
-
-    assert_ne!(
-        contents.last().copied(),
-        Some(b'V'),
-        "abrupt kill must not write magic-close byte; contents: {:?}",
-        contents
+        "character device should pass watchdog validation; status={:?}, stderr={}",
+        out.status,
+        String::from_utf8_lossy(&out.stderr)
     );
 }
 

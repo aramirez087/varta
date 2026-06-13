@@ -1,8 +1,8 @@
 # name	file	kind — consumed by ci.yml acceptance audit (see book/src/architecture/nits-cleanup-decisions.md §n10). Session 07 populates the data rows by migrating the 22 entries currently in .github/workflows/ci.yml lines 58-80. Columns are tab-separated (literal 0x09); the leading `#` on this line marks it as a comment for the workflow loop.
 sd_notify_emits_ready_watchdog_stopping_on_clean_exit	crates/varta-watch/tests/notify.rs	test
 sd_notify_no_op_when_env_unset	crates/varta-watch/tests/notify.rs	test
-cli_hw_watchdog_kicks_and_writes_magic_close_on_clean_shutdown	crates/varta-watch/tests/cli_smoke.rs	test
-cli_hw_watchdog_does_not_write_magic_close_on_abrupt_kill	crates/varta-watch/tests/cli_smoke.rs	test
+cli_hw_watchdog_rejects_regular_file	crates/varta-watch/tests/cli_smoke.rs	test
+cli_hw_watchdog_accepts_character_device	crates/varta-watch/tests/cli_smoke.rs	test
 self_watchdog_aborts_on_wedged_poll_loop	crates/varta-watch/tests/self_watchdog.rs	test
 client_to_observer_to_recovery_full_loop	crates/varta-tests/tests/end_to_end/basic.rs	no-harness
 panic_handler_critical_beat_visible_in_metrics	crates/varta-tests/tests/end_to_end/basic.rs	no-harness

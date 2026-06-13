@@ -215,8 +215,9 @@ pub(super) fn file_export_writes_tsv() {
     );
 }
 
-/// Spawns varta-watch with `--export-file-max-bytes 200`, sends enough beats
-/// to trigger rotation, and asserts rotated files exist.
+/// Spawns varta-watch with the minimum accepted export-file rotation cap,
+/// sends enough beats to trigger rotation, and asserts the first generation
+/// exists and is non-empty.
 pub(super) fn file_export_rotation() {
     let tmp = TempDir::new("frot");
     let socket = tmp.path().join("varta.sock");
@@ -231,7 +232,7 @@ pub(super) fn file_export_rotation() {
             "--export-file",
             export.to_str().unwrap(),
             "--export-file-max-bytes",
-            "200",
+            "4096",
             "--max-beat-rate",
             "0",
             "--shutdown-after-secs",
@@ -248,10 +249,10 @@ pub(super) fn file_export_rotation() {
         "varta-watch did not bind socket within 3s"
     );
 
-    // Send many beats from two PIDs to push file size over 200 bytes
+    // Push the export file well beyond the 4096-byte minimum rotation cap.
     {
         let mut agent1 = Varta::connect(&socket).expect("Varta::connect agent1");
-        for _ in 0..30 {
+        for _ in 0..160 {
             let mut tries = 0u32;
             loop {
                 match agent1.beat(Status::Ok, 0) {
@@ -269,30 +270,17 @@ pub(super) fn file_export_rotation() {
         }
     }
 
-    // Give the observer time to flush and rotate
-    std::thread::sleep(Duration::from_millis(300));
-
-    // At least one rotation file should exist or the main file should be
-    // under the rotation limit (proving a rotation happened and a new file
-    // was started).
-    let main_size = std::fs::metadata(&export).map(|m| m.len()).unwrap_or(0);
     let rot1 = tmp.path().join("rot.tsv.1");
-    let rot1_exists = rot1.exists();
-
     assert!(
-        rot1_exists || main_size > 0,
-        "expected rotation file rot.tsv.1 or main file with content; \
-         main_size={main_size}, rot1_exists={rot1_exists}"
+        wait_until(|| rot1.exists(), Duration::from_secs(3)),
+        "expected rotation file rot.tsv.1"
     );
 
-    // If rot.tsv.1 exists, it should be non-empty
-    if rot1_exists {
-        let rot1_size = std::fs::metadata(&rot1).map(|m| m.len()).unwrap_or(0);
-        assert!(
-            rot1_size > 0,
-            "rotation file rot.tsv.1 should be non-empty; size={rot1_size}"
-        );
-    }
+    let rot1_size = std::fs::metadata(&rot1).map(|m| m.len()).unwrap_or(0);
+    assert!(
+        rot1_size > 0,
+        "rotation file rot.tsv.1 should be non-empty; size={rot1_size}"
+    );
 }
 
 /// Spawns varta-watch with `--tracker-capacity 2` and a short threshold.
