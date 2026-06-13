@@ -8,6 +8,13 @@ governed independently — see `book/src/spec/vlp.md` in the workspace.
 
 ### Fixed
 
+- UDS, UDP, and secure-UDP reconnects now construct the replacement
+  socket before retiring the active one. A failed reconnect preserves
+  the usable connection and, for secure UDP, the complete AEAD session.
+  Late error/connect/send callbacks from a retired UDP socket are also
+  generation-scoped, so they can no longer poison or flush frames
+  through the replacement socket.
+
 - `Varta.beat()` now rejects observer-only `Status.Stall` inputs
   (`Status.Stall`, `"stall"`, or `3`) with `{ kind: "failed",
   error.kind: "InvalidInput" }` before reconnecting or sending. `Stall`

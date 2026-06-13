@@ -62,6 +62,67 @@ test("UdpTransport.reconnect rebuilds the socket and continues to send", async (
   }
 });
 
+test("UdpTransport failed reconnect preserves the active socket", async () => {
+  const listener = await bindUdpRecorder();
+  try {
+    const t = new UdpTransport(listener.host, listener.port);
+    const buf = Buffer.alloc(FRAME_BYTES);
+    encodeInto(buf, Status.Ok, 12345, 1n, 1n, 1);
+    t.send(buf);
+    await listener.wait(1);
+
+    const internal = t as unknown as {
+      openSocket: () => never;
+    };
+    internal.openSocket = () => {
+      const err: NodeJS.ErrnoException = new Error("simulated fd exhaustion");
+      err.code = "EMFILE";
+      throw err;
+    };
+
+    assert.throws(() => t.reconnect(), /simulated fd exhaustion/);
+
+    encodeInto(buf, Status.Ok, 12345, 2n, 2n, 2);
+    t.send(buf);
+    await listener.wait(2);
+    assert.equal(decode(listener.received[1]!).payload, 2);
+    t.close();
+  } finally {
+    await listener.close();
+  }
+});
+
+test("UdpTransport ignores errors from a retired socket generation", async () => {
+  const listener = await bindUdpRecorder();
+  try {
+    const t = new UdpTransport(listener.host, listener.port);
+    const buf = Buffer.alloc(FRAME_BYTES);
+    encodeInto(buf, Status.Ok, 12345, 1n, 1n, 1);
+    t.send(buf);
+    await listener.wait(1);
+
+    const oldSocket = (
+      t as unknown as {
+        socket: { emit(event: "error", error: Error): boolean };
+      }
+    ).socket;
+    t.reconnect();
+    await new Promise((r) => setImmediate(r));
+
+    const stale: NodeJS.ErrnoException = new Error("stale socket error");
+    stale.code = "ECONNREFUSED";
+    oldSocket.emit("error", stale);
+
+    encodeInto(buf, Status.Ok, 12345, 2n, 2n, 2);
+    t.send(buf);
+    await listener.wait(2);
+    assert.equal(decode(listener.received[1]!).payload, 2);
+    t.close();
+  } finally {
+    await listener.close();
+  }
+});
+
 test("SecureUdpTransport (shared) wraps a frame and opens with same key", async () => {
   const listener = await bindUdpRecorder();
   try {
@@ -171,6 +232,40 @@ test("UdsTransport.reconnect rebuilds the socket", async (t) => {
   }
 });
 
+test("UdsTransport failed reconnect preserves the active socket", async (t) => {
+  const listener = await bindUdsRecorder();
+  if (listener === null) {
+    t.skip("node-unix-socket addon not installed; skipping UDS transport test");
+    return;
+  }
+  try {
+    const tx = new UdsTransport(listener.path);
+    const buf = Buffer.alloc(FRAME_BYTES);
+    encodeInto(buf, Status.Ok, 12345, 1n, 1n, 1);
+    tx.send(buf);
+    await listener.wait(1);
+
+    const internal = tx as unknown as {
+      openSocket: () => never;
+    };
+    internal.openSocket = () => {
+      const err: NodeJS.ErrnoException = new Error("simulated fd exhaustion");
+      err.code = "EMFILE";
+      throw err;
+    };
+
+    assert.throws(() => tx.reconnect(), /simulated fd exhaustion/);
+
+    encodeInto(buf, Status.Ok, 12345, 2n, 2n, 2);
+    tx.send(buf);
+    await listener.wait(2);
+    assert.equal(decode(listener.received[1]!).payload, 2);
+    tx.close();
+  } finally {
+    await listener.close();
+  }
+});
+
 test("UdsTransport surfaces ENOENT when the observer path does not exist", async (t) => {
   let installed = false;
   try {
@@ -235,6 +330,44 @@ test("SecureUdpTransport.reconnect rotates session salt + resets counter", async
       afterPrefix.toString("hex"),
       "session salt rotated → IV prefix differs",
     );
+    t.close();
+  } finally {
+    await listener.close();
+  }
+});
+
+test("SecureUdpTransport failed reconnect preserves socket and AEAD state", async () => {
+  const listener = await bindUdpRecorder();
+  try {
+    const key = randomBytes(32);
+    const t = SecureUdpTransport.shared(listener.host, listener.port, key);
+    const buf = Buffer.alloc(FRAME_BYTES);
+    encodeInto(buf, Status.Ok, 12345, 1n, 1n, 1);
+    t.send(buf);
+    await listener.wait(1);
+
+    const prefixBefore = t.__getIvPrefixForTest();
+    const prefixIndexBefore = t.__getPrefixIndexForTest();
+    const counterBefore = t.__getCounterForTest();
+    const internal = t as unknown as {
+      openSocket: () => never;
+    };
+    internal.openSocket = () => {
+      const err: NodeJS.ErrnoException = new Error("simulated fd exhaustion");
+      err.code = "EMFILE";
+      throw err;
+    };
+
+    assert.throws(() => t.reconnect(), /simulated fd exhaustion/);
+    assert.deepEqual(t.__getIvPrefixForTest(), prefixBefore);
+    assert.equal(t.__getPrefixIndexForTest(), prefixIndexBefore);
+    assert.equal(t.__getCounterForTest(), counterBefore);
+
+    encodeInto(buf, Status.Ok, 12345, 2n, 2n, 2);
+    t.send(buf);
+    await listener.wait(2);
+    const plaintext = decodeShared(key, listener.received[1]!);
+    assert.equal(decode(plaintext).payload, 2);
     t.close();
   } finally {
     await listener.close();

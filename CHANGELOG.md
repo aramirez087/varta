@@ -30,6 +30,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Node reconnects are transactional and generation-safe.** UDS, UDP, and
+  secure-UDP transports now prepare a replacement before closing the active
+  socket, preserving the current connection and AEAD session when setup fails.
+  Async callbacks from retired UDP sockets are scoped to their socket
+  generation and can no longer poison or flush frames through the replacement.
+
 - **Go and Python reconnect failures no longer corrupt the client.** Their
   UDS, UDP, and secure-UDP transports now prepare replacement sockets and
   AEAD session state before atomically swapping out the active transport.

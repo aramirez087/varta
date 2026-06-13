@@ -35,6 +35,9 @@ export interface BeatTransport {
   // ICMP error event; transports drain those into `pendingError` so
   // callers see Rust-style synchronous semantics.
   send(buf: Buffer): void;
+  // Rebuild the transport with the strong exception guarantee: if
+  // replacement setup throws, the current socket and any secure-session
+  // state remain usable and unchanged.
   reconnect(): void;
   close(): void;
 }
@@ -140,7 +143,9 @@ export class UdsTransport implements BeatTransport {
     // arrive on the per-call callback (not this event), so this path
     // is rare.
     s.on("error", (err) => {
-      this.pendingError = normalizeUdsError(err);
+      if (this.socket === s) {
+        this.pendingError = normalizeUdsError(err);
+      }
     });
     return s;
   }
@@ -152,21 +157,24 @@ export class UdsTransport implements BeatTransport {
     // matching the UDP transports' guard. The agent reuses a single
     // 32-byte buffer across beats.
     const owned = Buffer.from(buf);
-    this.socket.sendTo(owned, 0, owned.length, this.path, (err) => {
-      if (err !== null && err !== undefined) {
+    const socket = this.socket;
+    socket.sendTo(owned, 0, owned.length, this.path, (err) => {
+      if (this.socket === socket && err !== null && err !== undefined) {
         this.pendingError = normalizeUdsError(err);
       }
     });
   }
 
   reconnect(): void {
+    const replacement = this.openSocket();
+    const old = this.socket;
+    this.socket = replacement;
+    this.pendingError = null;
     try {
-      this.socket.close();
+      old.close();
     } catch {
       // Already closed — fine.
     }
-    this.pendingError = null;
-    this.socket = this.openSocket();
   }
 
   close(): void {
@@ -208,25 +216,36 @@ export class UdpTransport implements BeatTransport {
     // out-of-band socket errors. Swallow into pendingError so the next
     // `send()` call surfaces it instead of crashing the process.
     s.on("error", (err) => {
-      this.pendingError = err as NodeJS.ErrnoException;
+      if (this.socket === s) {
+        this.pendingError = err as NodeJS.ErrnoException;
+      }
     });
     s.unref();
     // Connect for ICMP error propagation. Node's `dgram.Socket.send`
     // rejects the connected-mode (no-port/host) signature while the
     // socket is still CONNECTING; queue pre-connect-event beats and
     // flush them once the `connect` callback fires.
-    this.connected = false;
-    s.connect(this.port, this.host, () => {
-      this.connected = true;
-      while (this.preConnectQueue.length > 0) {
-        const owned = this.preConnectQueue.shift()!;
-        s.send(owned, (err) => {
-          if (err !== null && err !== undefined) {
-            this.pendingError = err as NodeJS.ErrnoException;
-          }
-        });
+    try {
+      s.connect(this.port, this.host, () => {
+        if (this.socket !== s) return;
+        this.connected = true;
+        while (this.preConnectQueue.length > 0) {
+          const owned = this.preConnectQueue.shift()!;
+          s.send(owned, (err) => {
+            if (this.socket === s && err !== null && err !== undefined) {
+              this.pendingError = err as NodeJS.ErrnoException;
+            }
+          });
+        }
+      });
+    } catch (err) {
+      try {
+        s.close();
+      } catch {
+        // Socket never became active.
       }
-    });
+      throw err;
+    }
     return s;
   }
 
@@ -247,22 +266,26 @@ export class UdpTransport implements BeatTransport {
       this.preConnectQueue.push(owned);
       return;
     }
-    this.socket.send(owned, (err) => {
-      if (err !== null && err !== undefined) {
+    const socket = this.socket;
+    socket.send(owned, (err) => {
+      if (this.socket === socket && err !== null && err !== undefined) {
         this.pendingError = err as NodeJS.ErrnoException;
       }
     });
   }
 
   reconnect(): void {
+    const replacement = this.openSocket();
+    const old = this.socket;
+    this.socket = replacement;
+    this.connected = false;
+    this.pendingError = null;
+    this.preConnectQueue = [];
     try {
-      this.socket.close();
+      old.close();
     } catch {
       // Already closed — fine.
     }
-    this.pendingError = null;
-    this.preConnectQueue = [];
-    this.socket = this.openSocket();
   }
 
   close(): void {
@@ -333,21 +356,32 @@ export class SecureUdpTransport implements BeatTransport {
     const family: "udp4" | "udp6" = this.host.includes(":") ? "udp6" : "udp4";
     const s = createSocket(family);
     s.on("error", (err) => {
-      this.pendingError = err as NodeJS.ErrnoException;
-    });
-    s.unref();
-    this.connected = false;
-    s.connect(this.port, this.host, () => {
-      this.connected = true;
-      while (this.preConnectQueue.length > 0) {
-        const wire = this.preConnectQueue.shift()!;
-        s.send(wire, (err) => {
-          if (err !== null && err !== undefined) {
-            this.pendingError = err as NodeJS.ErrnoException;
-          }
-        });
+      if (this.socket === s) {
+        this.pendingError = err as NodeJS.ErrnoException;
       }
     });
+    s.unref();
+    try {
+      s.connect(this.port, this.host, () => {
+        if (this.socket !== s) return;
+        this.connected = true;
+        while (this.preConnectQueue.length > 0) {
+          const wire = this.preConnectQueue.shift()!;
+          s.send(wire, (err) => {
+            if (this.socket === s && err !== null && err !== undefined) {
+              this.pendingError = err as NodeJS.ErrnoException;
+            }
+          });
+        }
+      });
+    } catch (err) {
+      try {
+        s.close();
+      } catch {
+        // Socket never became active.
+      }
+      throw err;
+    }
     return s;
   }
 
@@ -408,30 +442,33 @@ export class SecureUdpTransport implements BeatTransport {
       this.preConnectQueue.push(wire);
       return;
     }
-    this.socket.send(wire, (err) => {
-      if (err !== null && err !== undefined) {
+    const socket = this.socket;
+    socket.send(wire, (err) => {
+      if (this.socket === socket && err !== null && err !== undefined) {
         this.pendingError = err as NodeJS.ErrnoException;
       }
     });
   }
 
   reconnect(): void {
-    try {
-      this.socket.close();
-    } catch {
-      // Already closed.
-    }
-    this.pendingError = null;
-    this.preConnectQueue = [];
     const newSalt = randomBytes(SESSION_SALT_BYTES);
     const newPrefixIndex = 0;
     const newIvPrefix = deriveIvPrefix(newSalt, newPrefixIndex);
     const newSocket = this.openSocket();
+    const old = this.socket;
+    this.socket = newSocket;
+    this.connected = false;
+    this.pendingError = null;
+    this.preConnectQueue = [];
     this.sessionSalt = newSalt;
     this.prefixIndex = newPrefixIndex;
     this.counter = 0;
     this.ivPrefix = newIvPrefix;
-    this.socket = newSocket;
+    try {
+      old.close();
+    } catch {
+      // Already closed.
+    }
   }
 
   close(): void {
