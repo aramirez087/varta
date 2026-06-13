@@ -584,6 +584,16 @@ impl super::PromExporter {
             self.decrypt_failures_total
         );
         self.body_buf.push_str(
+            "# HELP varta_secure_replay_refused_total Total authenticated secure-UDP frames refused as replays: the AEAD tag verified for a known sender but the inner VLP nonce/timestamp did not advance past the recorded high-water mark. Distinct from varta_frame_decrypt_failures_total (crypto failures).\n",
+        );
+        self.body_buf
+            .push_str("# TYPE varta_secure_replay_refused_total counter\n");
+        let _ = writeln!(
+            self.body_buf,
+            "varta_secure_replay_refused_total {}",
+            self.replay_refused_total
+        );
+        self.body_buf.push_str(
             "# HELP varta_truncated_datagrams_total Total datagrams received with wrong size.\n",
         );
         self.body_buf

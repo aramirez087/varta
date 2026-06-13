@@ -277,6 +277,18 @@ pub trait BeatListener: Send + 'static {
         0
     }
 
+    /// Drain and reset the replay-refused counter.
+    ///
+    /// Incremented when an authenticated frame from a *known* sender identity
+    /// is refused because its VLP nonce / timestamp did not advance past the
+    /// recorded replay high-water mark. Distinct from
+    /// [`Self::drain_decrypt_failures`]: the AEAD tag verified, so this is a
+    /// replay refusal, not a crypto failure. Only listeners that maintain
+    /// per-sender replay state override this.
+    fn drain_replay_refused(&mut self) -> u64 {
+        0
+    }
+
     /// Drain and reset the truncated-datagram counter.
     fn drain_truncated(&mut self) -> u64 {
         0

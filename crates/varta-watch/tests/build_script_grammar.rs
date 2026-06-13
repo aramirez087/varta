@@ -215,6 +215,28 @@ recovery_audit_sync_every = 0
 }
 
 #[test]
+fn recovery_timeout_ms_below_minimum_is_rejected() {
+    let bad = "\
+socket = /tmp/x.sock
+threshold_ms = 5000
+recovery_timeout_ms = 0
+";
+    let err = parse_kv(bad).expect_err("recovery_timeout_ms=0 must error");
+    assert!(err.contains("recovery_timeout_ms"), "got: {err}");
+}
+
+#[test]
+fn recovery_audit_max_bytes_below_minimum_is_rejected() {
+    let bad = "\
+socket = /tmp/x.sock
+threshold_ms = 5000
+recovery_audit_max_bytes = 100
+";
+    let err = parse_kv(bad).expect_err("recovery_audit_max_bytes=100 must error");
+    assert!(err.contains("recovery_audit_max_bytes"), "got: {err}");
+}
+
+#[test]
 fn tracker_capacity_zero_is_rejected() {
     let bad = "\
 socket = /tmp/x.sock

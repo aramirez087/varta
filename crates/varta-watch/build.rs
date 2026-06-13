@@ -268,6 +268,39 @@ pub fn parse_kv(input: &str) -> Result<ParsedConfig, String> {
             );
         }
     }
+    if let Some(v) = out.singletons.get("recovery_timeout_ms") {
+        // Keep `100` in sync with config::types::MIN_RECOVERY_TIMEOUT_MS
+        // (build.rs cannot import crate consts). A baked `0` (or any value below
+        // the floor) makes the reap gate kill every still-running recovery child
+        // on the first reap tick, neutering recovery; omit the key for the
+        // never-kill default.
+        let n: u64 = v
+            .parse()
+            .map_err(|_| format!("recovery_timeout_ms: not a valid u64: {v:?}"))?;
+        if n < 100 {
+            return Err(
+                "recovery_timeout_ms must be >= 100 (a lower value kills recovery children on \
+                 the first reap tick; omit the key for the never-kill default)"
+                    .into(),
+            );
+        }
+    }
+    if let Some(v) = out.singletons.get("recovery_audit_max_bytes") {
+        // Keep `4096` in sync with config::types::MIN_RECOVERY_AUDIT_MAX_BYTES
+        // (build.rs cannot import crate consts). A tiny cap arms per-record
+        // rotation that shreds the Class C audit trail with no tamper signal;
+        // omit the key to grow the audit file unbounded.
+        let n: u64 = v
+            .parse()
+            .map_err(|_| format!("recovery_audit_max_bytes: not a valid u64: {v:?}"))?;
+        if n < 4096 {
+            return Err(
+                "recovery_audit_max_bytes must be >= 4096 (a smaller cap shreds the audit trail \
+                 with no tamper signal; omit the key for unbounded growth)"
+                    .into(),
+            );
+        }
+    }
     if let Some(v) = out.singletons.get("eviction_scan_window") {
         let n: usize = v
             .parse()

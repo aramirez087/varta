@@ -1435,6 +1435,14 @@ fn run(cfg: Config) -> std::io::Result<()> {
             }
         }
 
+        let replay_refused = observer.drain_replay_refused();
+        if replay_refused > 0 {
+            #[cfg(feature = "prometheus-exporter")]
+            if let Some(pe) = prom_export.as_mut() {
+                pe.record_replay_refused(replay_refused);
+            }
+        }
+
         let truncated = observer.drain_truncated();
         if truncated > 0 {
             #[cfg(feature = "prometheus-exporter")]

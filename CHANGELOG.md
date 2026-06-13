@@ -30,6 +30,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`--recovery-timeout-ms 0` no longer silently neuters recovery (bug-434).**
+  The flag is the kill-after deadline for a still-running recovery child; the
+  reap gate kills a child once `spawned_at.elapsed() >= recovery_timeout`. A
+  value of `0` made that comparison (`elapsed() < ZERO`) always false, so every
+  still-running child was `kill(2)`'d on the very first reap tick — killing the
+  documented `systemctl restart agent@{pid}` case before it could complete. A
+  new `MIN_RECOVERY_TIMEOUT_MS = 100` floor (`RecoveryTimeoutTooLow`) is enforced
+  across all three config paths (argv parser, Class-A `validate_runtime`, and
+  `build.rs`), mirroring the `MIN_SELF_WATCHDOG_SECS` recipe. The never-kill
+  default is still reached by omitting the flag — `None`, never `0`.
+- **`--recovery-audit-max-bytes` now has a minimum floor (bug-435).** The audit
+  writer arms rotation on `bytes_written >= max` with no implicit floor, so a
+  tiny or zero cap rotated roughly once per record and shredded the IEC 62304
+  Class C audit trail to the last ~5 records while the hash chain stayed linear
+  — i.e. with no tamper-evidence signal that history was discarded. A new
+  `MIN_RECOVERY_AUDIT_MAX_BYTES = 4096` floor (`RecoveryAuditMaxBytesTooLow`) is
+  enforced across the same three config paths. Unbounded growth is still reached
+  by omitting the flag.
+- **Secure-UDP replay refusals are no longer mislabelled as decrypt failures
+  (bug-435).** A replay from a known sender (AEAD tag valid, but the inner VLP
+  nonce/timestamp did not advance past the recorded high-water mark) incremented
+  `varta_frame_decrypt_failures_total`, conflating a replay with an AEAD/tag
+  failure on operator dashboards. Replay refusals now increment a dedicated
+  `varta_secure_replay_refused_total` counter.
+
 - **Secure-UDP PID recycle no longer false-stalls or recovery-kills the
   healthy newcomer.** When the OS handed a recently-vacated PID to a new
   process, its fresh secure session (new IV prefix, VLP nonce restarting at 1)

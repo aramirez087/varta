@@ -431,6 +431,84 @@ fn recovery_timeout_omitted_is_none() {
     assert!(cfg.recovery_timeout.is_none());
 }
 
+/// `--recovery-timeout-ms 0` (and any sub-floor value) must be rejected: a
+/// zero deadline makes the reap gate (`elapsed() < ZERO`) always false, so
+/// every still-running recovery child is killed on the first reap tick,
+/// silently neutering recovery for the documented slow case
+/// (`systemctl restart agent@{pid}`). The never-kill default is reached by
+/// omitting the flag, never by `0`.
+#[test]
+fn recovery_timeout_below_minimum_is_rejected() {
+    match Config::from_args(args(&[
+        "--socket",
+        "/s",
+        "--threshold-ms",
+        "100",
+        "--recovery-timeout-ms",
+        "0",
+    ])) {
+        Err(ConfigError::RecoveryTimeoutTooLow { value, min }) => {
+            assert_eq!(value, 0);
+            assert_eq!(min, super::types::MIN_RECOVERY_TIMEOUT_MS);
+        }
+        other => panic!("expected RecoveryTimeoutTooLow, got {other:?}"),
+    }
+
+    // The floor value itself parses cleanly.
+    let min_s = super::types::MIN_RECOVERY_TIMEOUT_MS.to_string();
+    let cfg = Config::from_args(args(&[
+        "--socket",
+        "/s",
+        "--threshold-ms",
+        "100",
+        "--recovery-timeout-ms",
+        &min_s,
+    ]))
+    .expect("floor value must parse");
+    assert_eq!(
+        cfg.recovery_timeout,
+        Some(Duration::from_millis(super::types::MIN_RECOVERY_TIMEOUT_MS))
+    );
+}
+
+/// `--recovery-audit-max-bytes` below the floor must be rejected: a tiny cap
+/// arms per-record rotation that shreds the IEC 62304 Class C audit trail to
+/// the last few records while the hash chain stays linear — no tamper signal.
+/// Unbounded growth is reached by omitting the flag, never by a tiny value.
+#[test]
+fn recovery_audit_max_bytes_below_minimum_is_rejected() {
+    match Config::from_args(args(&[
+        "--socket",
+        "/s",
+        "--threshold-ms",
+        "100",
+        "--recovery-audit-max-bytes",
+        "100",
+    ])) {
+        Err(ConfigError::RecoveryAuditMaxBytesTooLow { value, min }) => {
+            assert_eq!(value, 100);
+            assert_eq!(min, super::types::MIN_RECOVERY_AUDIT_MAX_BYTES);
+        }
+        other => panic!("expected RecoveryAuditMaxBytesTooLow, got {other:?}"),
+    }
+
+    // The floor value itself parses cleanly.
+    let min_s = super::types::MIN_RECOVERY_AUDIT_MAX_BYTES.to_string();
+    let cfg = Config::from_args(args(&[
+        "--socket",
+        "/s",
+        "--threshold-ms",
+        "100",
+        "--recovery-audit-max-bytes",
+        &min_s,
+    ]))
+    .expect("floor value must parse");
+    assert_eq!(
+        cfg.recovery_audit_max_bytes,
+        Some(super::types::MIN_RECOVERY_AUDIT_MAX_BYTES)
+    );
+}
+
 #[test]
 fn parses_socket_mode_octal() {
     let cfg = Config::from_args(args(&[

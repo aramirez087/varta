@@ -590,9 +590,14 @@ fn replay_from_different_source_port_is_rejected() {
         "replayed ciphertext from a new source port must be consumed and rejected"
     );
     assert_eq!(
-        listener.drain_decrypt_failures(),
+        listener.drain_replay_refused(),
         1,
-        "transport replay rejection must increment decrypt_failures"
+        "transport replay rejection must increment replay_refused, not decrypt_failures"
+    );
+    assert_eq!(
+        listener.drain_decrypt_failures(),
+        0,
+        "a replay refusal (AEAD tag valid) must not be counted as a decrypt failure"
     );
 }
 

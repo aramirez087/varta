@@ -159,8 +159,12 @@ This preserves long-running-recovery semantics (e.g. a restart that
 blocks on health checks).
 
 Operators who want the kill-after behaviour set
-`--recovery-timeout-ms <MS>` explicitly. Sub-100 ms values still work
-but the kill is surfaced no faster than one tick after the deadline.
+`--recovery-timeout-ms <MS>` explicitly. The accepted minimum is 100 ms:
+a value of `0` would make the reap gate kill every still-running child on
+the first reap tick (silently neutering recovery), so `0` and any
+sub-100 ms value are rejected at parse time. The kill is surfaced no
+faster than one tick after the deadline. The never-kill default is reached
+by omitting the flag, never by `0`.
 
 ## Concurrency model
 

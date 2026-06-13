@@ -1097,6 +1097,17 @@ impl Observer {
             .sum()
     }
 
+    /// Drain and reset the replay-refused counter across all listeners.
+    /// Counts authenticated frames from a known sender whose VLP nonce /
+    /// timestamp did not advance past the recorded replay high-water mark —
+    /// replay refusals, distinct from AEAD decrypt failures.
+    pub fn drain_replay_refused(&mut self) -> u64 {
+        self.listeners
+            .iter_mut()
+            .map(|l| l.drain_replay_refused())
+            .sum()
+    }
+
     /// Drain and reset the truncated-datagram counter across all listeners.
     pub fn drain_truncated(&mut self) -> u64 {
         self.listeners.iter_mut().map(|l| l.drain_truncated()).sum()

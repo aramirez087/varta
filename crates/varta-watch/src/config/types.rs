@@ -144,6 +144,21 @@ pub const DEFAULT_SHUTDOWN_GRACE_MS: u64 = 5_000;
 /// round under load, which would orphan every outstanding child to PID 1.
 pub const MIN_SHUTDOWN_GRACE_MS: u64 = 100;
 
+/// Minimum accepted value for `--recovery-timeout-ms`. This flag is the
+/// kill-after deadline for a still-running recovery child: the reap gate in
+/// [`crate::recovery::Recovery`] `kill(2)`s a child once
+/// `spawned_at.elapsed() >= recovery_timeout`. A value of `0` makes that
+/// comparison (`elapsed() < ZERO`) always false, so *every* still-running
+/// child is killed on the very first reap tick after spawn — silently
+/// neutering recovery for the documented slow case
+/// (`systemctl restart agent@{pid}`). Values below this floor likewise kill
+/// realistic recovery commands mid-flight before they can complete. `0` is the
+/// "disable" idiom for the sibling rate flags (`--max-beat-rate 0`, …), so an
+/// operator reaching for it to mean "unlimited" would instead arm a guaranteed
+/// self-defeat; reject it loudly. To run without a kill-after deadline (the
+/// default never-kill semantics), omit the flag — `None`, not `0`.
+pub const MIN_RECOVERY_TIMEOUT_MS: u64 = 100;
+
 /// Default per-child cap for combined stdout+stderr capture when
 /// `--recovery-capture-stdio` is enabled.  4 KiB is enough to fit a typical
 /// systemctl/journalctl output snippet without risking pipe-buffer pressure
@@ -203,6 +218,18 @@ pub const DEFAULT_AUDIT_SYNC_INTERVAL_MS: u32 = 0;
 /// from blocking the poll loop during rotation.
 #[cfg(not(feature = "compile-time-config"))]
 pub const DEFAULT_AUDIT_ROTATION_BUDGET_MS: u32 = 50;
+
+/// Minimum accepted value for `--recovery-audit-max-bytes`. The audit writer
+/// arms rotation when `bytes_written >= max` (see `audit/writer.rs`) with no
+/// implicit floor; a tiny or zero cap rotates roughly once per record, so the
+/// IEC 62304 Class C audit trail is shredded to only the
+/// `AUDIT_ROTATION_GENERATIONS` (5) most recent records while the hash chain
+/// stays linear — i.e. with *no* tamper-evidence signal that history was
+/// silently discarded. The floor keeps at least the file header, the boot
+/// record, and a meaningful run of recovery records before the first rotation.
+/// To let the audit file grow unbounded, omit the flag — `None`, not a tiny
+/// value.
+pub const MIN_RECOVERY_AUDIT_MAX_BYTES: u64 = 4096;
 
 /// Parsed daemon configuration.
 #[derive(Clone, Debug)]
@@ -585,6 +612,27 @@ pub enum ConfigError {
         /// The minimum allowed value.
         min: u64,
     },
+    /// `--recovery-timeout-ms` was below [`MIN_RECOVERY_TIMEOUT_MS`]. A value of
+    /// `0` (and any value below the floor) makes the reap gate kill every
+    /// still-running recovery child on the first reap tick, silently neutering
+    /// recovery; the never-kill default is reached by omitting the flag, never
+    /// by `0`.
+    RecoveryTimeoutTooLow {
+        /// The value that was provided, in milliseconds.
+        value: u64,
+        /// The minimum allowed value, in milliseconds.
+        min: u64,
+    },
+    /// `--recovery-audit-max-bytes` was below [`MIN_RECOVERY_AUDIT_MAX_BYTES`].
+    /// A tiny cap arms per-record rotation that shreds the Class C audit trail
+    /// to the last few records with no tamper-evidence signal; the unbounded
+    /// default is reached by omitting the flag, never by a tiny value.
+    RecoveryAuditMaxBytesTooLow {
+        /// The value that was provided, in bytes.
+        value: u64,
+        /// The minimum allowed value, in bytes.
+        min: u64,
+    },
     /// Shell-mode recovery flags were passed (removed feature).  Use
     /// `--recovery-exec` instead.
     ShellRecoveryNotCompiledIn,
@@ -767,6 +815,18 @@ impl core::fmt::Display for ConfigError {
                 f,
                 "--shutdown-grace-ms: {value} is below the minimum allowed value ({min} ms)"
             ),
+            ConfigError::RecoveryTimeoutTooLow { value, min } => write!(
+                f,
+                "--recovery-timeout-ms: {value} is below the minimum {min} ms \
+                 (0 kills every still-running recovery child on the first reap tick, \
+                 neutering recovery; omit the flag for the never-kill default)"
+            ),
+            ConfigError::RecoveryAuditMaxBytesTooLow { value, min } => write!(
+                f,
+                "--recovery-audit-max-bytes: {value} is below the minimum {min} bytes \
+                 (a tiny cap rotates per record and shreds the audit trail with no \
+                 tamper signal; omit the flag to grow the audit file unbounded)"
+            ),
             ConfigError::RecoveryCaptureBytesTooLarge { value, max } => write!(
                 f,
                 "--recovery-capture-bytes: {value} exceeds the maximum allowed value ({max} bytes)"
@@ -903,6 +963,14 @@ impl core::fmt::Display for ConfigError {
             ConfigError::AuditRotationBudgetTooLarge { value, max } => write!(
                 f,
                 "audit rotation budget out of range: {value} ms exceeds {max} ms ({REF})"
+            ),
+            ConfigError::RecoveryTimeoutTooLow { value, min } => write!(
+                f,
+                "recovery timeout below minimum: {value} ms < {min} ms ({REF})"
+            ),
+            ConfigError::RecoveryAuditMaxBytesTooLow { value, min } => write!(
+                f,
+                "recovery audit max bytes below minimum: {value} < {min} ({REF})"
             ),
             ConfigError::ThresholdTooLow { value, min } => {
                 write!(f, "threshold below minimum: {value} ms < {min} ms ({REF})")

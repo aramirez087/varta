@@ -237,6 +237,13 @@ pub struct SecureUdpListener {
     decrypt_failures: u64,
     truncated_count: u64,
     sender_state_full: u64,
+    /// Total authenticated frames from a *known* sender identity refused
+    /// because their VLP nonce / timestamp did not advance past the recorded
+    /// replay high-water mark. Distinct from [`Self::decrypt_failures`]: the
+    /// AEAD tag verified, so this is a replay refusal, not a decrypt failure.
+    /// Folding it into `decrypt_failures` would mislabel a replay as a crypto
+    /// failure on the operator dashboard.
+    replay_refused: u64,
     /// Total AEAD decryption attempts since the last drain. The receive path
     /// trials *every* loaded key on every frame (no early-exit on success),
     /// so an attacker measuring RTT can no longer count attempts to learn
@@ -300,6 +307,7 @@ impl SecureUdpListener {
             decrypt_failures: 0,
             truncated_count: 0,
             sender_state_full: 0,
+            replay_refused: 0,
             aead_attempts: 0,
             recovery_trust: TransportTrust::Untrusted,
         })
@@ -334,6 +342,7 @@ impl SecureUdpListener {
             decrypt_failures: 0,
             truncated_count: 0,
             sender_state_full: 0,
+            replay_refused: 0,
             aead_attempts: 0,
             recovery_trust: TransportTrust::Untrusted,
         })
@@ -823,7 +832,12 @@ impl BeatListener for SecureUdpListener {
                 frame_timestamp,
             ) {
                 if known_identity {
-                    self.decrypt_failures = self.decrypt_failures.wrapping_add(1);
+                    // The AEAD tag verified for a known sender, but the inner
+                    // VLP nonce / timestamp did not advance past the recorded
+                    // high-water mark: this is a replay refusal, not a decrypt
+                    // failure. Count it on its own metric so operators do not
+                    // read a captured-frame replay as a crypto failure.
+                    self.replay_refused = self.replay_refused.wrapping_add(1);
                 } else {
                     self.sender_state_full = self.sender_state_full.saturating_add(1);
                 }
@@ -851,6 +865,12 @@ impl BeatListener for SecureUdpListener {
     fn drain_decrypt_failures(&mut self) -> u64 {
         let n = self.decrypt_failures;
         self.decrypt_failures = 0;
+        n
+    }
+
+    fn drain_replay_refused(&mut self) -> u64 {
+        let n = self.replay_refused;
+        self.replay_refused = 0;
         n
     }
 

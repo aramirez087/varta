@@ -39,8 +39,8 @@ impl super::types::Config {
         use super::types::{
             max_read_timeout_ms, ConfigError, MAX_AUDIT_ROTATION_BUDGET_MS,
             MAX_ITERATION_BUDGET_MS, MAX_RECOVERY_CAPTURE_BYTES, MAX_SCRAPE_BUDGET_MS,
-            MIN_ITERATION_BUDGET_MS, MIN_SCRAPE_BUDGET_MS, MIN_SELF_WATCHDOG_SECS,
-            MIN_SHUTDOWN_GRACE_MS, MIN_THRESHOLD_MS,
+            MIN_ITERATION_BUDGET_MS, MIN_RECOVERY_AUDIT_MAX_BYTES, MIN_RECOVERY_TIMEOUT_MS,
+            MIN_SCRAPE_BUDGET_MS, MIN_SELF_WATCHDOG_SECS, MIN_SHUTDOWN_GRACE_MS, MIN_THRESHOLD_MS,
         };
 
         if self.threshold < std::time::Duration::from_millis(MIN_THRESHOLD_MS) {
@@ -165,6 +165,30 @@ impl super::types::Config {
                 value: self.audit_rotation_budget_ms as u64,
                 max: MAX_AUDIT_ROTATION_BUDGET_MS as u64,
             });
+        }
+        // A `--recovery-timeout-ms` below the floor (notably `0`) makes the reap
+        // gate kill every still-running recovery child on the first reap tick,
+        // silently neutering recovery. Mirror the argv parser's floor. `None`
+        // means never-kill and is left untouched.
+        if let Some(d) = self.recovery_timeout {
+            let ms = duration_ms_saturating(d);
+            if ms < MIN_RECOVERY_TIMEOUT_MS {
+                return Err(ConfigError::RecoveryTimeoutTooLow {
+                    value: ms,
+                    min: MIN_RECOVERY_TIMEOUT_MS,
+                });
+            }
+        }
+        // A `--recovery-audit-max-bytes` below the floor arms per-record
+        // rotation that shreds the Class C audit trail with no tamper signal.
+        // Mirror the argv parser's floor. `None` means unbounded growth.
+        if let Some(max_bytes) = self.recovery_audit_max_bytes {
+            if max_bytes < MIN_RECOVERY_AUDIT_MAX_BYTES {
+                return Err(ConfigError::RecoveryAuditMaxBytesTooLow {
+                    value: max_bytes,
+                    min: MIN_RECOVERY_AUDIT_MAX_BYTES,
+                });
+            }
         }
 
         let has_udp = self.udp_port.is_some();
@@ -319,6 +343,31 @@ mod tests {
         assert!(matches!(
             cfg.validate_runtime(),
             Err(ConfigError::AuditRotationBudgetTooLarge { .. })
+        ));
+    }
+
+    #[test]
+    fn validate_runtime_rejects_recovery_timeout_too_low() {
+        let mut cfg = valid_config();
+        cfg.recovery_timeout = Some(Duration::from_millis(0));
+
+        assert!(matches!(
+            cfg.validate_runtime(),
+            Err(ConfigError::RecoveryTimeoutTooLow { value: 0, min: 100 })
+        ));
+    }
+
+    #[test]
+    fn validate_runtime_rejects_recovery_audit_max_bytes_too_low() {
+        let mut cfg = valid_config();
+        cfg.recovery_audit_max_bytes = Some(100);
+
+        assert!(matches!(
+            cfg.validate_runtime(),
+            Err(ConfigError::RecoveryAuditMaxBytesTooLow {
+                value: 100,
+                min: 4096
+            })
         ));
     }
 

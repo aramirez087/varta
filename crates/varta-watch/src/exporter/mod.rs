@@ -520,6 +520,12 @@ pub struct PromExporter {
     ctrl_truncated_total: u64,
     capacity_exceeded_total: u64,
     decrypt_failures_total: u64,
+    /// Total authenticated secure-UDP frames refused as replays: the AEAD tag
+    /// verified for a known sender, but the inner VLP nonce / timestamp did not
+    /// advance past the recorded high-water mark. Tracked separately from
+    /// `decrypt_failures_total` so a captured-frame replay is not read as a
+    /// crypto failure.
+    replay_refused_total: u64,
     truncated_total: u64,
     sender_state_full_total: u64,
     /// Total AEAD decryption attempts across the loaded key set. The
@@ -841,6 +847,7 @@ impl PromExporter {
             ctrl_truncated_total: 0,
             capacity_exceeded_total: 0,
             decrypt_failures_total: 0,
+            replay_refused_total: 0,
             truncated_total: 0,
             sender_state_full_total: 0,
             secure_aead_attempts_total: 0,
@@ -935,6 +942,14 @@ impl PromExporter {
     /// Record one or more AEAD decryption (tag verification) failures.
     pub fn record_decrypt_failures(&mut self, count: u64) {
         self.decrypt_failures_total = self.decrypt_failures_total.saturating_add(count);
+    }
+
+    /// Record one or more authenticated secure-UDP frames refused as replays.
+    /// The AEAD tag verified for a known sender, but the inner VLP nonce /
+    /// timestamp did not advance past the recorded high-water mark — a replay,
+    /// not a crypto failure.
+    pub fn record_replay_refused(&mut self, count: u64) {
+        self.replay_refused_total = self.replay_refused_total.saturating_add(count);
     }
 
     /// Record one or more truncated (wrong-size) datagrams received.
