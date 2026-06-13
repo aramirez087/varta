@@ -6,6 +6,15 @@ workspace and follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- Panic/shutdown terminal frames now carry a strictly increasing
+  process-monotonic timestamp instead of a constant zero. The observer uses
+  this timestamp to reject terminal replays, so a second genuine failure from
+  the same JVM PID is no longer discarded. Concurrent handler invocations are
+  also serialized with a non-blocking guard to protect the shared frame and
+  secure-UDP nonce state.
+
 ## [0.1.0] — initial release
 
 - First-class JVM client peer of `crates/varta-client`, published as
