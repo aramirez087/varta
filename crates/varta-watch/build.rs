@@ -193,6 +193,17 @@ pub fn parse_kv(input: &str) -> Result<ParsedConfig, String> {
         let n: u32 = v
             .parse()
             .map_err(|_| format!("recovery_capture_bytes: not a valid u32: {v:?}"))?;
+        // Keep `1` in sync with config::types::MIN_RECOVERY_CAPTURE_BYTES
+        // (build.rs cannot import crate consts). A zero cap makes the capture
+        // drain return immediately, so enabling recovery_capture_stdio would
+        // capture nothing; disable capture by omitting recovery_capture_stdio.
+        if n < 1 {
+            return Err(
+                "recovery_capture_bytes must be >= 1 (0 captures nothing while \
+                 recovery_capture_stdio is enabled; omit recovery_capture_stdio to disable capture)"
+                    .into(),
+            );
+        }
         if n > 1_048_576 {
             return Err(format!(
                 "recovery_capture_bytes: {n} exceeds maximum (1048576)"

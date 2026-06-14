@@ -179,6 +179,15 @@ pub const DEFAULT_RECOVERY_CAPTURE_BYTES: u32 = 4096;
 /// non-blocking pipe drain expensive per tick.
 pub const MAX_RECOVERY_CAPTURE_BYTES: u32 = 1024 * 1024;
 
+/// Minimum accepted `--recovery-capture-bytes`.
+///
+/// `0` makes the capture drain return immediately
+/// ([`crate::recovery::reaper`]), so a deployment that explicitly enables
+/// `--recovery-capture-stdio` would silently capture *nothing* — the recovery
+/// child's stdout/stderr forensic trail vanishes with no error. Capture is
+/// disabled by omitting `--recovery-capture-stdio`, never by a zero byte cap.
+pub const MIN_RECOVERY_CAPTURE_BYTES: u32 = 1;
+
 /// Minimum accepted value for `--iteration-budget-ms`.  Below this the
 /// budget overlaps the noise floor of the work itself — `serve_pending`
 /// alone can spend up to ~200 ms by design — and every iteration would be
@@ -669,6 +678,18 @@ pub enum ConfigError {
         /// The minimum allowed value, in bytes.
         min: u64,
     },
+    /// `--recovery-capture-bytes` was below [`MIN_RECOVERY_CAPTURE_BYTES`].
+    /// A zero cap makes the capture drain return immediately, so a deployment
+    /// that explicitly enabled `--recovery-capture-stdio` captures nothing and
+    /// loses the recovery child's stdout/stderr forensic trail with no error;
+    /// disable capture by omitting `--recovery-capture-stdio`, not with a zero
+    /// byte cap.
+    RecoveryCaptureBytesTooLow {
+        /// The value that was provided, in bytes.
+        value: u32,
+        /// The minimum allowed value, in bytes.
+        min: u32,
+    },
     /// Shell-mode recovery flags were passed (removed feature).  Use
     /// `--recovery-exec` instead.
     ShellRecoveryNotCompiledIn,
@@ -880,6 +901,13 @@ impl core::fmt::Display for ConfigError {
                  on every write, shredding the event stream; omit the flag to grow \
                  the export file unbounded)"
             ),
+            ConfigError::RecoveryCaptureBytesTooLow { value, min } => write!(
+                f,
+                "--recovery-capture-bytes: {value} is below the minimum {min} bytes \
+                 (0 makes the capture drain return immediately, so enabling \
+                 --recovery-capture-stdio would capture nothing and lose the recovery \
+                 child's output; omit --recovery-capture-stdio to disable capture)"
+            ),
             ConfigError::RecoveryCaptureBytesTooLarge { value, max } => write!(
                 f,
                 "--recovery-capture-bytes: {value} exceeds the maximum allowed value ({max} bytes)"
@@ -1038,6 +1066,10 @@ impl core::fmt::Display for ConfigError {
             ConfigError::ExportFileMaxBytesTooLow { value, min } => write!(
                 f,
                 "export file max bytes below minimum: {value} < {min} ({REF})"
+            ),
+            ConfigError::RecoveryCaptureBytesTooLow { value, min } => write!(
+                f,
+                "recovery capture bytes below minimum: {value} < {min} ({REF})"
             ),
             ConfigError::ThresholdTooLow { value, min } => {
                 write!(f, "threshold below minimum: {value} ms < {min} ms ({REF})")

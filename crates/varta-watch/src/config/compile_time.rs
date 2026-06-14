@@ -40,8 +40,8 @@ impl super::types::Config {
             max_read_timeout_ms, ConfigError, MAX_AUDIT_ROTATION_BUDGET_MS,
             MAX_ITERATION_BUDGET_MS, MAX_RECOVERY_CAPTURE_BYTES, MAX_SCRAPE_BUDGET_MS,
             MIN_EXPORT_FILE_MAX_BYTES, MIN_ITERATION_BUDGET_MS, MIN_READ_TIMEOUT_MS,
-            MIN_RECOVERY_AUDIT_MAX_BYTES, MIN_RECOVERY_TIMEOUT_MS, MIN_SCRAPE_BUDGET_MS,
-            MIN_SELF_WATCHDOG_SECS, MIN_SHUTDOWN_GRACE_MS, MIN_THRESHOLD_MS,
+            MIN_RECOVERY_AUDIT_MAX_BYTES, MIN_RECOVERY_CAPTURE_BYTES, MIN_RECOVERY_TIMEOUT_MS,
+            MIN_SCRAPE_BUDGET_MS, MIN_SELF_WATCHDOG_SECS, MIN_SHUTDOWN_GRACE_MS, MIN_THRESHOLD_MS,
         };
 
         if self.threshold < std::time::Duration::from_millis(MIN_THRESHOLD_MS) {
@@ -54,6 +54,12 @@ impl super::types::Config {
             return Err(ConfigError::ShutdownGraceTooLow {
                 value: duration_ms_saturating(self.shutdown_grace),
                 min: MIN_SHUTDOWN_GRACE_MS,
+            });
+        }
+        if self.recovery_capture_bytes < MIN_RECOVERY_CAPTURE_BYTES {
+            return Err(ConfigError::RecoveryCaptureBytesTooLow {
+                value: self.recovery_capture_bytes,
+                min: MIN_RECOVERY_CAPTURE_BYTES,
             });
         }
         if self.recovery_capture_bytes > MAX_RECOVERY_CAPTURE_BYTES {

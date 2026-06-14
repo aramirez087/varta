@@ -32,8 +32,8 @@ use super::types::{
     DEFAULT_RECOVERY_DEBOUNCE_MS, DEFAULT_SHUTDOWN_GRACE_MS, DEFAULT_SOCKET_MODE,
     MAX_AUDIT_ROTATION_BUDGET_MS, MAX_ITERATION_BUDGET_MS, MAX_RECOVERY_CAPTURE_BYTES,
     MAX_SCRAPE_BUDGET_MS, MIN_EXPORT_FILE_MAX_BYTES, MIN_ITERATION_BUDGET_MS, MIN_READ_TIMEOUT_MS,
-    MIN_RECOVERY_AUDIT_MAX_BYTES, MIN_RECOVERY_TIMEOUT_MS, MIN_SCRAPE_BUDGET_MS,
-    MIN_SELF_WATCHDOG_SECS, MIN_SHUTDOWN_GRACE_MS, MIN_THRESHOLD_MS,
+    MIN_RECOVERY_AUDIT_MAX_BYTES, MIN_RECOVERY_CAPTURE_BYTES, MIN_RECOVERY_TIMEOUT_MS,
+    MIN_SCRAPE_BUDGET_MS, MIN_SELF_WATCHDOG_SECS, MIN_SHUTDOWN_GRACE_MS, MIN_THRESHOLD_MS,
 };
 
 #[cfg(not(feature = "compile-time-config"))]
@@ -623,6 +623,12 @@ impl Config {
 
         let recovery_capture_bytes_resolved =
             recovery_capture_bytes.unwrap_or(DEFAULT_RECOVERY_CAPTURE_BYTES);
+        if recovery_capture_bytes_resolved < MIN_RECOVERY_CAPTURE_BYTES {
+            return Err(ConfigError::RecoveryCaptureBytesTooLow {
+                value: recovery_capture_bytes_resolved,
+                min: MIN_RECOVERY_CAPTURE_BYTES,
+            });
+        }
         if recovery_capture_bytes_resolved > MAX_RECOVERY_CAPTURE_BYTES {
             return Err(ConfigError::RecoveryCaptureBytesTooLarge {
                 value: recovery_capture_bytes_resolved,

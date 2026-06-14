@@ -571,6 +571,62 @@ fn export_file_max_bytes_below_minimum_is_rejected() {
     );
 }
 
+/// `--recovery-capture-bytes 0` must be rejected: the capture drain returns
+/// immediately on a zero cap (`recovery::reaper`), so a deployment that
+/// explicitly enables `--recovery-capture-stdio` would capture *nothing* and
+/// lose the recovery child's stdout/stderr forensic trail with no error.
+/// Capture is disabled by omitting `--recovery-capture-stdio`, never by a zero
+/// byte cap.
+#[test]
+fn recovery_capture_bytes_below_minimum_is_rejected() {
+    match Config::from_args(args(&[
+        "--socket",
+        "/s",
+        "--threshold-ms",
+        "100",
+        "--recovery-capture-bytes",
+        "0",
+    ])) {
+        Err(ConfigError::RecoveryCaptureBytesTooLow { value, min }) => {
+            assert_eq!(value, 0);
+            assert_eq!(min, super::types::MIN_RECOVERY_CAPTURE_BYTES);
+        }
+        other => panic!("expected RecoveryCaptureBytesTooLow, got {other:?}"),
+    }
+
+    // The error message names the floor and the disable path.
+    let err = Config::from_args(args(&[
+        "--socket",
+        "/s",
+        "--threshold-ms",
+        "100",
+        "--recovery-capture-bytes",
+        "0",
+    ]))
+    .expect_err("a zero cap must be rejected");
+    let msg = err.to_string();
+    assert!(msg.contains(&super::types::MIN_RECOVERY_CAPTURE_BYTES.to_string()));
+    assert!(msg.contains("--recovery-capture-stdio"));
+
+    // The floor value itself parses cleanly (capture stays enabled with a
+    // non-zero budget; here without --recovery-capture-stdio it is simply the
+    // resolved cap).
+    let min_s = super::types::MIN_RECOVERY_CAPTURE_BYTES.to_string();
+    let cfg = Config::from_args(args(&[
+        "--socket",
+        "/s",
+        "--threshold-ms",
+        "100",
+        "--recovery-capture-bytes",
+        &min_s,
+    ]))
+    .expect("floor value must parse");
+    assert_eq!(
+        cfg.recovery_capture_bytes,
+        super::types::MIN_RECOVERY_CAPTURE_BYTES
+    );
+}
+
 #[test]
 fn read_timeout_ms_zero_is_rejected() {
     // `0` becomes `Duration::ZERO`, which `set_read_timeout` rejects with
