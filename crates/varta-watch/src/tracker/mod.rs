@@ -390,6 +390,15 @@ pub struct Tracker {
     /// can alert on a non-zero value — in correctly-operating code this
     /// counter stays at 0 forever.
     invariant_violations: u64,
+    /// Count of evicted/retired pids dropped because the bounded
+    /// exporter-cleanup queue (`removed_pids`) was full — i.e. the main-loop
+    /// drain fell behind a sustained eviction burst. Each drop leaves a
+    /// permanent orphan per-pid exporter row. UNLIKE [`Self::invariant_violations`]
+    /// this is a load-shed event, not a code bug, so it gets its own counter
+    /// surfaced via [`Tracker::take_removed_pid_drops`] as
+    /// `varta_tracker_removed_pid_drops_total` rather than polluting the
+    /// "non-zero = bug" invariant counter.
+    removed_pid_drops: u64,
 }
 
 impl Default for Tracker {
@@ -438,6 +447,7 @@ impl Tracker {
             namespace_conflicts: 0,
             pid_recycles: 0,
             invariant_violations: 0,
+            removed_pid_drops: 0,
         }
     }
 
@@ -922,6 +932,20 @@ impl Tracker {
     fn remember_removed_pid(&mut self, pid: u32) {
         if self.removed_pids.len() < self.removed_pids.capacity() {
             self.removed_pids.push(pid);
+        } else {
+            // The exporter-cleanup queue is full: the main-loop drain
+            // (REMOVED_PID_DRAIN_MAX_PER_TICK) has fallen behind a sustained
+            // distinct-PID eviction burst. Dropping the pid silently would leak
+            // a permanent orphan per-pid exporter row (a stale
+            // `varta_*{pid=...}` series the drain never removes) and, as
+            // orphans fill the exporter's bounded row table, deny metric
+            // series to genuinely-live agents. We cannot grow this queue
+            // unbounded or raise the drain's file-I/O budget without risking
+            // the Maintenance-stage self-watchdog abort, so the drop stands —
+            // but tick a dedicated load-shed counter so the loss is observable
+            // via `varta_tracker_removed_pid_drops_total` instead of silent.
+            // (NOT `invariant_violations`, whose contract is "non-zero = bug".)
+            self.removed_pid_drops = self.removed_pid_drops.saturating_add(1);
         }
     }
 
@@ -1252,6 +1276,20 @@ impl Tracker {
     pub fn take_invariant_violations(&mut self) -> u64 {
         let count = self.invariant_violations;
         self.invariant_violations = 0;
+        count
+    }
+
+    /// Take and reset the count of evicted/retired pids dropped because the
+    /// bounded exporter-cleanup queue was full.
+    ///
+    /// Surfaced as `varta_tracker_removed_pid_drops_total`. Unlike
+    /// [`Self::take_invariant_violations`] this is a load-shed signal, not a
+    /// code bug: a non-zero value means the main-loop removed-pid drain fell
+    /// behind a sustained eviction burst and one or more stale per-pid
+    /// exporter rows will not be reclaimed (metric blindness for those pids).
+    pub fn take_removed_pid_drops(&mut self) -> u64 {
+        let count = self.removed_pid_drops;
+        self.removed_pid_drops = 0;
         count
     }
 

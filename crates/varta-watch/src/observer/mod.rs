@@ -553,7 +553,16 @@ impl Observer {
         while round < len {
             let i = (start + round) % len;
             round += 1;
-            let result = self.listeners[i].recv();
+            // Read the operator-clock timestamp ONCE, before recv, so the
+            // secure listener's session-restart gate measures the recycle
+            // window in the SAME forward-clamped clock domain the tracker uses
+            // for its matching network-origin recycle reset. A listener-internal
+            // Instant (pauses on suspend) would desync from a boottime/
+            // monotonic-raw tracker across host suspend, reopening the
+            // recycle-kill window (bug-432/447). This same value is reused by
+            // the Authenticated arm below as the slot's beat timestamp.
+            let now_ns = self.now_ns();
+            let result = self.listeners[i].recv(now_ns);
             // Any result other than `WouldBlock` means a datagram was pulled
             // off the socket queue this pass — including the drop paths below
             // that `continue` without yielding an `Event`. Record it so the
@@ -571,7 +580,7 @@ impl Observer {
                     origin,
                     data,
                 } => {
-                    let now_ns = self.now_ns();
+                    // `now_ns` reused from the per-iteration read above.
                     if first_event.is_none() {
                         self.next_listener_start = (i + 1) % len;
                     }
@@ -1082,6 +1091,14 @@ impl Observer {
     /// slot). Exposed as `varta_tracker_invariant_violations_total`.
     pub fn drain_invariant_violations(&mut self) -> u64 {
         self.tracker.take_invariant_violations()
+    }
+
+    /// Drain and reset the tracker removed-pid drop counter. Non-zero values
+    /// surface that the main-loop removed-pid drain fell behind a sustained
+    /// eviction burst, leaving stale per-pid exporter rows unreclaimed.
+    /// Exposed as `varta_tracker_removed_pid_drops_total`.
+    pub fn drain_removed_pid_drops(&mut self) -> u64 {
+        self.tracker.take_removed_pid_drops()
     }
 
     /// Drain and reset the `PidIndex` probe-exhaustion counter — number of

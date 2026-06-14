@@ -175,10 +175,13 @@ impl SecureUdpTransport {
     /// On each beat the PID is sent as a 4-byte plaintext prefix (AAD)
     /// so the observer can derive the same agent key before decrypting.
     ///
-    /// The 8-byte `iv_random` is filled entirely from OS entropy — the PID
-    /// is no longer embedded in it. This gives a 64-bit random birthday
-    /// bound (~2^32 reconnects before collision probability reaches 50%),
-    /// versus the old 32-bit bound of ~2^16 reconnects.
+    /// The 8-byte on-wire `iv_random` is HKDF-SHA256-derived (via
+    /// [`varta_vlp::crypto::kdf::derive_iv_prefix`]) from a 16-byte session
+    /// salt that is read once from OS entropy at connect time — the PID is
+    /// no longer embedded in it. The HKDF output is a uniform 64-bit value,
+    /// so this preserves a 64-bit random birthday bound (~2^32 reconnects
+    /// before collision probability reaches 50%), versus the old 32-bit
+    /// bound of ~2^16 reconnects.
     ///
     /// # Wire format (master-key mode, 64 bytes)
     ///

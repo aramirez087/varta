@@ -413,6 +413,20 @@ impl super::PromExporter {
             "varta_tracker_invariant_violations_total {}",
             self.tracker_invariant_violations_total
         );
+        // Removed-pid drops — evicted/retired pids that could not be queued
+        // for exporter-row cleanup because the bounded queue was full (drain
+        // fell behind a sustained eviction burst). Non-zero = stale per-pid
+        // rows leaking; scale the tracker capacity / investigate churn.
+        self.body_buf.push_str(
+            "# HELP varta_tracker_removed_pid_drops_total Evicted/retired pids dropped because the exporter-cleanup queue was full. Non-zero = orphan per-pid metric rows are leaking (load-shed under churn, not a panic).\n",
+        );
+        self.body_buf
+            .push_str("# TYPE varta_tracker_removed_pid_drops_total counter\n");
+        let _ = writeln!(
+            self.body_buf,
+            "varta_tracker_removed_pid_drops_total {}",
+            self.tracker_removed_pid_drops_total
+        );
         // PidIndex probe-exhaustion — pid lookup / insert walked the full
         // MAX_PROBE budget without resolving. At load factor ≤ 0.5 this is
         // effectively unreachable.

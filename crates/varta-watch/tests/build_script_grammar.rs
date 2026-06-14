@@ -204,6 +204,30 @@ audit_rotation_budget_ms = 251
 }
 
 #[test]
+fn read_timeout_ms_above_max_is_rejected() {
+    // The runtime ceiling (Config::validate_runtime, MAX_READ_TIMEOUT_MS=1000)
+    // rejects this; mirror it at build time so a sealed Class-A image cannot
+    // build successfully and then fail to start.
+    let bad = "\
+socket = /tmp/x.sock
+threshold_ms = 5000
+read_timeout_ms = 1001
+";
+    let err = parse_kv(bad).expect_err("read_timeout_ms=1001 must error");
+    assert!(err.contains("read_timeout_ms"), "got: {err}");
+}
+
+#[test]
+fn read_timeout_ms_at_max_is_accepted() {
+    let cfg = "\
+socket = /tmp/x.sock
+threshold_ms = 5000
+read_timeout_ms = 1000
+";
+    parse_kv(cfg).expect("read_timeout_ms=1000 at the ceiling should parse");
+}
+
+#[test]
 fn recovery_audit_sync_every_zero_is_rejected() {
     let bad = "\
 socket = /tmp/x.sock

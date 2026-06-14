@@ -538,6 +538,77 @@ fn record_evicted_pid_removes_row() {
 }
 
 #[test]
+fn deferred_stall_after_eviction_does_not_recreate_orphan_row() {
+    // A stall queued past the per-tick eval budget can arrive after the slot
+    // was evicted and its exporter row already drained. The Stall arm must
+    // NOT re-create an orphan row for a pid record_evicted_pid will never
+    // remove again — it must count it as a refused row instead.
+    let mut prom = PromExporter::bind("127.0.0.1:0".parse().unwrap(), make_token()).expect("bind");
+    prom.record(&Event::Beat {
+        pid: 42,
+        status: Status::Ok,
+        nonce: 1,
+        payload: 0,
+        observer_ns: 0,
+        origin: crate::peer_cred::BeatOrigin::KernelAttested,
+        pid_ns_inode: None,
+    })
+    .unwrap();
+    prom.record_evicted_pid(42);
+    assert!(!prom.rows.contains_key(&42), "row removed by eviction");
+
+    prom.record(&Event::Stall {
+        pid: 42,
+        last_nonce: 1,
+        last_ns: 0,
+        origin: crate::peer_cred::BeatOrigin::KernelAttested,
+        pid_ns_inode: None,
+        generation: None,
+        observer_ns: 0,
+    })
+    .unwrap();
+    assert!(
+        !prom.rows.contains_key(&42),
+        "deferred stall must not re-create an orphan row for an evicted pid"
+    );
+    assert_eq!(
+        prom.prom_pid_row_refused_total, 1,
+        "missing-row stall is counted as a refused row"
+    );
+}
+
+#[test]
+fn stall_for_live_agent_still_increments_its_existing_row() {
+    // Regression guard: a stall for a pid that has a live row (it beat, then
+    // went silent) must still increment stalls_total and flip last_status.
+    let mut prom = PromExporter::bind("127.0.0.1:0".parse().unwrap(), make_token()).expect("bind");
+    prom.record(&Event::Beat {
+        pid: 7,
+        status: Status::Ok,
+        nonce: 1,
+        payload: 0,
+        observer_ns: 0,
+        origin: crate::peer_cred::BeatOrigin::KernelAttested,
+        pid_ns_inode: None,
+    })
+    .unwrap();
+    prom.record(&Event::Stall {
+        pid: 7,
+        last_nonce: 1,
+        last_ns: 0,
+        origin: crate::peer_cred::BeatOrigin::KernelAttested,
+        pid_ns_inode: None,
+        generation: None,
+        observer_ns: 0,
+    })
+    .unwrap();
+    let row = prom.rows.get(7).expect("live agent keeps its row");
+    assert_eq!(row.stalls_total, 1);
+    assert_eq!(row.last_status, Some(Status::Stall as u8));
+    assert_eq!(prom.prom_pid_row_refused_total, 0);
+}
+
+#[test]
 fn record_evicted_pid_ignores_unknown_pid() {
     let mut prom = PromExporter::bind("127.0.0.1:0".parse().unwrap(), make_token()).expect("bind");
     // Should not panic when called for a pid that was never tracked.

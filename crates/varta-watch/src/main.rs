@@ -1625,6 +1625,17 @@ fn run(cfg: Config) -> std::io::Result<()> {
             }
         }
 
+        // Drained every tick (resets the tracker counter) so a sustained
+        // eviction burst that outruns the removed-pid drain is surfaced as
+        // `varta_tracker_removed_pid_drops_total` rather than lost silently.
+        let tracker_removed_pid_drops = observer.drain_removed_pid_drops();
+        if tracker_removed_pid_drops > 0 {
+            #[cfg(feature = "prometheus-exporter")]
+            if let Some(pe) = prom_export.as_mut() {
+                pe.record_tracker_removed_pid_drops(tracker_removed_pid_drops);
+            }
+        }
+
         let probe_exhausted = observer.drain_pid_index_probe_exhausted();
         if probe_exhausted > 0 {
             #[cfg(feature = "prometheus-exporter")]

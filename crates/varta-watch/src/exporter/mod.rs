@@ -152,6 +152,14 @@ impl PidRowTable {
         self.slab.get(idx)?.as_ref().map(|slot| &slot.row)
     }
 
+    /// Mutable view of an existing row, never inserting. Used by the Stall
+    /// arm so a stall deferred past `record_evicted_pid` cannot re-create an
+    /// orphan row for a pid the tracker has already forgotten.
+    fn get_mut(&mut self, pid: u32) -> Option<&mut GaugeRow> {
+        let idx = self.pid_to_slot.get(pid)?;
+        self.slab.get_mut(idx)?.as_mut().map(|slot| &mut slot.row)
+    }
+
     fn get_mut_or_insert(&mut self, pid: u32) -> Option<&mut GaugeRow> {
         if let Some(idx) = self.pid_to_slot.get(pid) {
             return self.slab.get_mut(idx)?.as_mut().map(|slot| &mut slot.row);
@@ -643,6 +651,11 @@ pub struct PromExporter {
     /// etc.) — the tracker recovered without panicking, but ops should
     /// investigate.
     tracker_invariant_violations_total: u64,
+    /// Evicted/retired pids dropped because the bounded exporter-cleanup queue
+    /// was full (drain fell behind a sustained eviction burst). Surfaced as
+    /// `varta_tracker_removed_pid_drops_total`; non-zero means one or more
+    /// stale per-pid rows below will not be reclaimed (metric blindness).
+    tracker_removed_pid_drops_total: u64,
     /// `PidIndex` lookups / inserts that walked the full `MAX_PROBE` budget
     /// without resolving. Surfaced as
     /// `varta_tracker_pid_index_probe_exhausted_total`.
@@ -873,6 +886,7 @@ impl PromExporter {
             tracker_namespace_conflict_total: 0,
             tracker_pid_recycle_total: 0,
             tracker_invariant_violations_total: 0,
+            tracker_removed_pid_drops_total: 0,
             tracker_pid_index_probe_exhausted_total: 0,
             recovery_outstanding_probe_exhausted_total: 0,
             recovery_reap_truncated_total: 0,
@@ -1150,6 +1164,14 @@ impl PromExporter {
         self.tracker_invariant_violations_total = self
             .tracker_invariant_violations_total
             .saturating_add(count);
+    }
+
+    /// Record one or more evicted/retired pids dropped because the bounded
+    /// exporter-cleanup queue was full. See
+    /// [`crate::tracker::Tracker::take_removed_pid_drops`].
+    pub fn record_tracker_removed_pid_drops(&mut self, count: u64) {
+        self.tracker_removed_pid_drops_total =
+            self.tracker_removed_pid_drops_total.saturating_add(count);
     }
 
     /// Record one or more [`crate::recovery::LastFiredTable`] evictions
@@ -1451,7 +1473,17 @@ impl Exporter for PromExporter {
                 observer_ns: _,
                 ..
             } => {
-                if let Some(row) = self.rows.get_mut_or_insert(*pid) {
+                // Update-only: a Stall is only ever emitted for a pid that
+                // previously beat (it had to be tracked, then go silent), so a
+                // live stalling agent always already has a row from its beats.
+                // If the row is gone, the tracker slot was evicted while this
+                // stall sat queued past RECOVERY_STALL_EVAL_MAX_PER_TICK
+                // (reachable only when --tracker-capacity exceeds that budget).
+                // Re-inserting via get_mut_or_insert would orphan a row for an
+                // untracked pid that record_evicted_pid never removes again —
+                // recovery's stall_freshness gate already skips the kill. Treat
+                // the missing row like a row-refused beat instead.
+                if let Some(row) = self.rows.get_mut(*pid) {
                     row.stalls_total = row.stalls_total.saturating_add(1);
                     row.last_status = Some(Status::Stall as u8);
                 } else {

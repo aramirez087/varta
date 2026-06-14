@@ -60,18 +60,23 @@ fn genuine_rotation_with_newer_nonce_still_accepted() {
 fn recycled_pid_after_session_gap_is_admitted_and_resets_baseline() {
     let mut listener = new_listener();
     let identity = test_identity();
+    // The session-restart gate measures elapsed time in the observer's
+    // operator-clock ns domain (so it stays in lockstep with the tracker's
+    // recycle reset across host suspend). Drive that ns clock directly; the
+    // Instant arg only feeds the eviction sweep, so keep it fixed.
     let t0 = Instant::now();
+    let t0_ns = 1_000_000_000u64;
 
     // A long-lived predecessor climbs to a high regular-nonce high-water mark.
-    assert!(listener.try_record_replay_state_at(t0, identity, test_iv(), 100, 5_000, 5_000));
+    assert!(listener.try_record_replay_state_at(t0, t0_ns, identity, test_iv(), 100, 5_000, 5_000));
     assert_eq!(listener.sender_max_regular_nonce(identity), Some(5_000));
 
     // The OS recycles the PID to a brand-new process: a freshly-derived IV
     // prefix and a monotonic VLP nonce that restarts at 1. WITHIN the session
     // gap the high-water mark still rejects it (replay protection preserved)
     // and committed state is untouched.
-    let within = t0 + SESSION_RESTART_GAP / 2;
-    assert!(!listener.try_record_replay_state_at(within, identity, test_iv2(), 0, 1, 9_999));
+    let within_ns = t0_ns + (SESSION_RESTART_GAP / 2).as_nanos() as u64;
+    assert!(!listener.try_record_replay_state_at(t0, within_ns, identity, test_iv2(), 0, 1, 9_999));
     assert_eq!(
         listener.sender_max_regular_nonce(identity),
         Some(5_000),
@@ -82,8 +87,8 @@ fn recycled_pid_after_session_gap_is_admitted_and_resets_baseline() {
     // Once the predecessor has been silent past SESSION_RESTART_GAP the
     // recycled process is admitted as a fresh session and the baseline resets,
     // bounding the lockout to the gap instead of EVICTION_TTL.
-    let after = t0 + SESSION_RESTART_GAP + Duration::from_secs(1);
-    assert!(listener.try_record_replay_state_at(after, identity, test_iv2(), 0, 1, 9_999));
+    let after_ns = t0_ns + (SESSION_RESTART_GAP + Duration::from_secs(1)).as_nanos() as u64;
+    assert!(listener.try_record_replay_state_at(t0, after_ns, identity, test_iv2(), 0, 1, 9_999));
     assert_eq!(
         listener.sender_max_regular_nonce(identity),
         Some(1),
@@ -95,6 +100,59 @@ fn recycled_pid_after_session_gap_is_admitted_and_resets_baseline() {
         Some([0u8; 8]),
         "a session restart clears the 1-deep prefix history"
     );
+}
+
+#[test]
+fn recycled_pid_admitted_when_operator_clock_advances_through_suspend() {
+    // Regression for the clock-domain desync: the session-restart gate must
+    // use the observer's operator clock (--clock-source), NOT a listener-
+    // internal Instant. Simulate a host suspend: the Instant is FROZEN (it
+    // pauses across suspend) while the operator clock (boottime/monotonic-raw)
+    // ADVANCES past the gap. The recycled-PID session must be admitted. Before
+    // the fix the gate read the frozen Instant, measured ~0 elapsed, and
+    // dropped the healthy newcomer's resume beats as replay — while the tracker
+    // (on the advancing clock) stalled and recovery-killed it.
+    let gap = Duration::from_secs(5);
+    let mut listener = SecureUdpListener::bind("127.0.0.1:0".parse().unwrap(), vec![test_key()])
+        .expect("bind should succeed")
+        .with_session_restart_gap(gap);
+    let identity = test_identity();
+
+    // Predecessor establishes a high-water mark at a frozen Instant.
+    let frozen = Instant::now();
+    let t0_ns = 1_000_000_000u64;
+    assert!(listener.try_record_replay_state_at(
+        frozen,
+        t0_ns,
+        identity,
+        test_iv(),
+        100,
+        5_000,
+        5_000
+    ));
+
+    // Host suspends for an hour: the Instant stays `frozen`, the operator clock
+    // jumps an hour. The recycled-PID resume beat must be admitted.
+    let after_suspend_ns = t0_ns + Duration::from_secs(3600).as_nanos() as u64;
+    assert!(
+        listener.try_record_replay_state_at(
+            frozen,
+            after_suspend_ns,
+            identity,
+            test_iv2(),
+            0,
+            1,
+            9_999
+        ),
+        "a recycled-PID session must be admitted when the operator clock advanced past \
+         the gap, even though the suspend-paused Instant shows no elapsed time"
+    );
+    assert_eq!(
+        listener.sender_max_regular_nonce(identity),
+        Some(1),
+        "admitted session resets the baseline to the newcomer's nonce"
+    );
+    assert_eq!(listener.sender_iv_random(identity), Some(test_iv2()));
 }
 
 #[test]
@@ -118,20 +176,30 @@ fn session_restart_gap_tracks_configured_threshold() {
         .with_session_restart_gap(gap);
     let identity = test_identity();
     let t0 = Instant::now();
+    let t0_ns = 1_000_000_000u64;
 
     // A long-lived predecessor climbs to a high regular-nonce high-water mark.
-    assert!(listener.try_record_replay_state_at(t0, identity, test_iv(), 100, 5_000, 5_000));
+    assert!(listener.try_record_replay_state_at(t0, t0_ns, identity, test_iv(), 100, 5_000, 5_000));
 
     // A recycled-PID fresh session (freshly-derived prefix, monotonic VLP nonce
     // restarting at 1) arrives once silence has passed the configured threshold
     // but is still WITHIN the old 5 s default window.
-    let after_threshold = t0 + gap + Duration::from_millis(1);
+    let after_threshold = gap + Duration::from_millis(1);
     assert!(
-        after_threshold < t0 + SESSION_RESTART_GAP,
+        after_threshold < SESSION_RESTART_GAP,
         "the admit point must fall inside the old 5 s window to prove the regression is closed"
     );
+    let after_threshold_ns = t0_ns + after_threshold.as_nanos() as u64;
     assert!(
-        listener.try_record_replay_state_at(after_threshold, identity, test_iv2(), 0, 1, 9_999),
+        listener.try_record_replay_state_at(
+            t0,
+            after_threshold_ns,
+            identity,
+            test_iv2(),
+            0,
+            1,
+            9_999
+        ),
         "recycled session must be admitted once silence passes the configured threshold"
     );
     assert_eq!(
@@ -153,12 +221,13 @@ fn session_restart_gap_within_configured_threshold_still_rejects() {
         .with_session_restart_gap(gap);
     let identity = test_identity();
     let t0 = Instant::now();
+    let t0_ns = 1_000_000_000u64;
 
-    assert!(listener.try_record_replay_state_at(t0, identity, test_iv(), 100, 5_000, 5_000));
+    assert!(listener.try_record_replay_state_at(t0, t0_ns, identity, test_iv(), 100, 5_000, 5_000));
 
-    let within = t0 + gap / 2;
+    let within_ns = t0_ns + (gap / 2).as_nanos() as u64;
     assert!(
-        !listener.try_record_replay_state_at(within, identity, test_iv2(), 0, 1, 9_999),
+        !listener.try_record_replay_state_at(t0, within_ns, identity, test_iv2(), 0, 1, 9_999),
         "within the configured gap a non-advancing recycle is still rejected as replay"
     );
     assert_eq!(
@@ -479,7 +548,7 @@ fn recv_one(listener: &mut SecureUdpListener) -> RecvResult {
     use std::time::Instant;
     let deadline = Instant::now() + Duration::from_millis(500);
     loop {
-        match listener.recv() {
+        match listener.recv(0) {
             RecvResult::WouldBlock => {
                 if Instant::now() >= deadline {
                     return RecvResult::WouldBlock;
@@ -936,7 +1005,7 @@ fn recv_returns_after_one_decrypt_failure_even_when_valid_frame_is_queued() {
 
     let deadline = Instant::now() + Duration::from_millis(500);
     loop {
-        match listener.recv() {
+        match listener.recv(0) {
             RecvResult::WouldBlock => {
                 if listener.drain_decrypt_failures() == 1 {
                     break;

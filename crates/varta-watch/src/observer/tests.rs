@@ -440,7 +440,7 @@ impl ScriptedListener {
 }
 
 impl BeatListener for ScriptedListener {
-    fn recv(&mut self) -> RecvResult {
+    fn recv(&mut self, _now_ns: u64) -> RecvResult {
         self.results.pop_front().unwrap_or(RecvResult::WouldBlock)
     }
 }

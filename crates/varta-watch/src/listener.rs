@@ -256,7 +256,13 @@ pub trait BeatListener: Send + 'static {
     /// Receive one datagram. Returns the same `RecvResult` as
     /// `peer_cred::recv_authenticated` — callers see `Authenticated`,
     /// `WouldBlock`, `ShortRead`, or `IoError`.
-    fn recv(&mut self) -> RecvResult;
+    ///
+    /// `now_ns` is the observer's operator-clock (`--clock-source`) timestamp
+    /// for this poll iteration. Listeners that keep per-sender session state
+    /// (the secure-UDP listener) measure their recycle/session-restart window
+    /// in this clock domain so it stays in lockstep with the tracker's recycle
+    /// reset across host suspend; stateless listeners ignore it.
+    fn recv(&mut self, now_ns: u64) -> RecvResult;
 
     /// Whether the most recent [`Self::recv`] call dequeued a datagram.
     ///
@@ -495,7 +501,9 @@ impl UdsListener {
 }
 
 impl BeatListener for UdsListener {
-    fn recv(&mut self) -> RecvResult {
+    fn recv(&mut self, _now_ns: u64) -> RecvResult {
+        // UDS carries no per-sender session state; the session-restart clock
+        // is irrelevant here.
         match peer_cred::recv_authenticated(self.sock.as_raw_fd()) {
             RecvResult::ShortRead => {
                 self.truncated_count = self.truncated_count.wrapping_add(1);
@@ -724,7 +732,7 @@ mod tests {
         .expect("bind uds listener");
 
         let start = Instant::now();
-        let result = listener.recv();
+        let result = listener.recv(0);
         let elapsed = start.elapsed();
 
         assert!(
@@ -821,7 +829,7 @@ mod udp_impl {
     }
 
     impl BeatListener for UdpListener {
-        fn recv(&mut self) -> RecvResult {
+        fn recv(&mut self, _now_ns: u64) -> RecvResult {
             let mut buf_with_slack = [0u8; VLP_FRAME_RECV_CAP];
             let origin = match self.recovery_trust {
                 super::TransportTrust::Operator => BeatOrigin::OperatorAttestedTransport,
@@ -893,7 +901,7 @@ mod udp_impl {
 
             let deadline = Instant::now() + Duration::from_millis(500);
             loop {
-                match listener.recv() {
+                match listener.recv(0) {
                     RecvResult::WouldBlock if Instant::now() < deadline => {
                         std::thread::sleep(Duration::from_millis(1));
                     }

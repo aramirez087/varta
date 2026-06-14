@@ -37,6 +37,7 @@
 
 use hkdf::Hkdf;
 use sha2::Sha256;
+use zeroize::Zeroizing;
 
 use super::{KdfError, Key};
 
@@ -61,9 +62,12 @@ pub fn derive_agent_key(master: &Key, agent_id: u32) -> Result<Key, KdfError> {
     let mut info = [0u8; 19];
     info[..15].copy_from_slice(b"varta-agent-v1\0");
     info[15..].copy_from_slice(&agent_id.to_le_bytes());
-    let mut okm = [0u8; 32];
-    hk.expand(&info, &mut okm).map_err(|_| KdfError)?;
-    Ok(Key::from_bytes(okm))
+    // `Zeroizing` wipes the intermediate OKM on scope exit so the derived
+    // key bytes are not left lingering on the stack after the copy into the
+    // `ZeroizeOnDrop` `Key` — preserving the "wiped exactly once" posture.
+    let mut okm = Zeroizing::new([0u8; 32]);
+    hk.expand(&info, okm.as_mut()).map_err(|_| KdfError)?;
+    Ok(Key::from_bytes(*okm))
 }
 
 /// Derive an 8-byte IV prefix from a 16-byte session salt and a `u32` index.
@@ -162,9 +166,12 @@ pub fn derive_epoch_key(agent_key: &Key, epoch: u64) -> Result<Key, KdfError> {
     let mut info = [0u8; 23];
     info[..15].copy_from_slice(b"varta-epoch-v1\0");
     info[15..].copy_from_slice(&epoch.to_le_bytes());
-    let mut okm = [0u8; 32];
-    hk.expand(&info, &mut okm).map_err(|_| KdfError)?;
-    Ok(Key::from_bytes(okm))
+    // `Zeroizing` wipes the intermediate OKM on scope exit so the derived
+    // key bytes are not left lingering on the stack after the copy into the
+    // `ZeroizeOnDrop` `Key` — preserving the "wiped exactly once" posture.
+    let mut okm = Zeroizing::new([0u8; 32]);
+    hk.expand(&info, okm.as_mut()).map_err(|_| KdfError)?;
+    Ok(Key::from_bytes(*okm))
 }
 
 #[cfg(test)]

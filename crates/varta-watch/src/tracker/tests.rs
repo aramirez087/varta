@@ -99,6 +99,47 @@ fn capacity_eviction_queues_removed_pid_for_exporter_cleanup() {
     assert_eq!(t.take_evicted_pid(), None);
 }
 
+/// When the exporter-cleanup queue overflows (the main-loop drain has fallen
+/// behind a sustained eviction burst), the dropped pid must not vanish
+/// silently — it ticks the dedicated `removed_pid_drops` counter (surfaced as
+/// `varta_tracker_removed_pid_drops_total`) so the orphan-row metric-blindness
+/// is observable. It must NOT touch `invariant_violations` (whose contract is
+/// "non-zero = bug").
+#[test]
+fn removed_pid_queue_overflow_is_counted_not_silent() {
+    let mut t = Tracker::new(4, EvictionPolicy::Strict, DEFAULT_EVICTION_SCAN_WINDOW);
+    let cap = t.removed_pids.capacity();
+    // Fill exactly to capacity — these pushes are lossless, no drop.
+    for i in 0..cap {
+        t.remember_removed_pid(1000 + i as u32);
+    }
+    assert_eq!(t.removed_pids.len(), cap, "queue filled to capacity");
+    assert_eq!(
+        t.take_removed_pid_drops(),
+        0,
+        "filling to capacity is lossless"
+    );
+
+    // One more removal overflows: the pid is dropped (the queue stays bounded)
+    // but the loss is surfaced on the dedicated load-shed counter.
+    t.remember_removed_pid(9_999);
+    assert_eq!(
+        t.removed_pids.len(),
+        cap,
+        "overflow must not grow the bounded queue"
+    );
+    assert_eq!(
+        t.take_removed_pid_drops(),
+        1,
+        "a dropped removed-pid must tick removed_pid_drops"
+    );
+    assert_eq!(
+        t.take_invariant_violations(),
+        0,
+        "a load-shed drop must NOT pollute the invariant-violation counter"
+    );
+}
+
 /// A fresh beat on a previously-stalled slot must decrement the counter.
 #[test]
 fn stall_counter_decrements_on_refresh() {

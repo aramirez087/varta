@@ -334,6 +334,21 @@ pub fn parse_kv(input: &str) -> Result<ParsedConfig, String> {
                     .into(),
             );
         }
+        // Keep `1000` in sync with config::types::MAX_READ_TIMEOUT_MS
+        // (= POLL_STAGE_ABORT_MS / 2; build.rs cannot import crate consts). A
+        // baked read_timeout above the ceiling passes the build but is rejected
+        // at startup by Config::validate_runtime (ReadTimeoutTooLarge), so the
+        // sealed Class-A image never starts. This static cap mirrors the most
+        // permissive runtime ceiling; a configured --self-watchdog-secs lowers
+        // it further at runtime (validate_runtime still catches that sub-case).
+        if n > 1000 {
+            return Err(
+                "read_timeout_ms must be <= 1000 (one idle UDS recv must stay below the \
+                 Poll-stage self-watchdog abort; a configured self_watchdog_secs lowers this \
+                 further at runtime; omit the key for the 100 ms default)"
+                    .into(),
+            );
+        }
     }
     if let Some(v) = out.singletons.get("eviction_scan_window") {
         let n: usize = v

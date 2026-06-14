@@ -162,6 +162,14 @@ struct SenderState {
     max_regular_nonce: u64,
     max_terminal_timestamp: Option<u64>,
     last_seen: Instant,
+    /// Operator-clock (`--clock-source`) timestamp of the last accepted beat,
+    /// in observer ns. Drives ONLY the session-restart gate so it measures the
+    /// recycle window in the SAME forward-clamped clock domain the tracker uses
+    /// for its matching network-origin recycle reset. `last_seen` (Instant)
+    /// stays the eviction clock — its pause-on-suspend behaviour is harmless
+    /// for a 10-minute memory bound, but would desync the recycle gate from a
+    /// boottime/monotonic-raw tracker across host suspend (bug-432/447 redux).
+    last_seen_ns: u64,
 }
 
 impl SenderState {
@@ -172,6 +180,7 @@ impl SenderState {
         frame_nonce: u64,
         frame_timestamp: u64,
         now: Instant,
+        now_ns: u64,
     ) -> Self {
         let mut state = SenderState {
             identity,
@@ -182,6 +191,7 @@ impl SenderState {
             max_regular_nonce: 0,
             max_terminal_timestamp: None,
             last_seen: now,
+            last_seen_ns: now_ns,
         };
         state.observe_frame_clock(frame_nonce, frame_timestamp);
         state
@@ -498,6 +508,7 @@ impl SecureUdpListener {
     ) -> bool {
         self.try_record_replay_state_at(
             Instant::now(),
+            0,
             identity,
             iv_random,
             counter,
@@ -508,11 +519,19 @@ impl SecureUdpListener {
 
     /// `now`-injectable core of [`Self::try_record_replay_state`]. Splitting the
     /// clock read out (mirrors [`Self::evict_stale_senders_at`]) lets the recv
-    /// loop share a single per-datagram `Instant` and lets tests drive the
+    /// loop share a single per-datagram clock read and lets tests drive the
     /// [`SESSION_RESTART_GAP`] session-restart logic deterministically.
+    ///
+    /// `now` (Instant) is the eviction clock; `now_ns` is the observer's
+    /// operator-clock (`--clock-source`) timestamp and is the ONLY clock the
+    /// session-restart gate reads, so the gate fires in lockstep with the
+    /// tracker's recycle reset under any clock source, including across a host
+    /// suspend that pauses the Instant but advances a boottime tracker.
+    #[allow(clippy::too_many_arguments)]
     fn try_record_replay_state_at(
         &mut self,
         now: Instant,
+        now_ns: u64,
         identity: ReplayIdentity,
         iv_random: [u8; 8],
         counter: u32,
@@ -536,6 +555,7 @@ impl SecureUdpListener {
                     state.last_counter = counter;
                     state.observe_frame_clock(frame_nonce, frame_timestamp);
                     state.last_seen = now;
+                    state.last_seen_ns = now_ns;
                     return true;
                 }
                 return false;
@@ -546,6 +566,7 @@ impl SecureUdpListener {
                     state.prev_last_counter = counter;
                     state.observe_frame_clock(frame_nonce, frame_timestamp);
                     state.last_seen = now;
+                    state.last_seen_ns = now_ns;
                     return true;
                 }
                 return false;
@@ -566,7 +587,9 @@ impl SecureUdpListener {
                 // but the runtime overrides it to the operator's stall
                 // threshold so this gate fires in lockstep with the tracker's
                 // matching recycle reset (see `session_restart_gap`).
-                if now.saturating_duration_since(state.last_seen) < self.session_restart_gap {
+                if (now_ns.saturating_sub(state.last_seen_ns) as u128)
+                    < self.session_restart_gap.as_nanos()
+                {
                     return false;
                 }
                 *state = SenderState::new(
@@ -576,6 +599,7 @@ impl SecureUdpListener {
                     frame_nonce,
                     frame_timestamp,
                     now,
+                    now_ns,
                 );
                 return true;
             }
@@ -586,6 +610,7 @@ impl SecureUdpListener {
             state.last_counter = counter;
             state.observe_frame_clock(frame_nonce, frame_timestamp);
             state.last_seen = now;
+            state.last_seen_ns = now_ns;
             return true;
         }
 
@@ -596,6 +621,7 @@ impl SecureUdpListener {
             frame_nonce,
             frame_timestamp,
             now,
+            now_ns,
         );
         self.allocate_sender_slot(identity, new_state)
     }
@@ -695,7 +721,7 @@ impl SecureUdpListener {
 }
 
 impl BeatListener for SecureUdpListener {
-    fn recv(&mut self) -> RecvResult {
+    fn recv(&mut self, now_ns: u64) -> RecvResult {
         self.last_recv_consumed = false;
         // Sized for the larger master-key frame; a 60-byte shared-key datagram
         // fills only the first 60 bytes and nread discriminates the path. The
@@ -875,6 +901,7 @@ impl BeatListener for SecureUdpListener {
             // the same clock read as the eviction sweep above.
             if !self.try_record_replay_state_at(
                 now,
+                now_ns,
                 replay_identity,
                 iv_random,
                 iv_counter,
