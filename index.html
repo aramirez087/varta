@@ -7,7 +7,7 @@
   <meta name="color-scheme" content="dark">
   <title>Varta — Zero-overhead health protocol for distributed local agents</title>
   <meta name="description"
-    content="32-byte heartbeats over Unix Domain Sockets and UDP. No dependencies. No allocations. Sub-microsecond.">
+    content="Background daemons die silently. One observer watches thousands of local processes over 32-byte heartbeats, detects stalls, runs recovery, and exports Prometheus — no HTTP server, systemd unit, or pod per process.">
   <meta name="theme-color" content="#09090b">
   <link rel="canonical" href="https://varta.sh/">
   <link rel="alternate" type="application/llms+txt" href="/llms.txt">
@@ -24,7 +24,7 @@
   <meta property="og:url" content="https://varta.sh/">
   <meta property="og:site_name" content="Varta">
   <meta property="og:title" content="Varta — Zero-overhead health protocol for distributed local agents">
-  <meta property="og:description" content="32-byte heartbeats over Unix Domain Sockets and UDP. No dependencies. No allocations. Sub-microsecond.">
+  <meta property="og:description" content="Background daemons die silently. One observer watches thousands of local processes over 32-byte heartbeats, detects stalls, runs recovery, and exports Prometheus — no HTTP server, systemd unit, or pod per process.">
   <meta property="og:image" content="https://varta.sh/assets/og.png">
   <meta property="og:image:width" content="1200">
   <meta property="og:image:height" content="630">
@@ -34,7 +34,7 @@
   <meta name="twitter:card" content="summary_large_image">
   <meta name="twitter:url" content="https://varta.sh/">
   <meta name="twitter:title" content="Varta — Zero-overhead health protocol for distributed local agents">
-  <meta name="twitter:description" content="32-byte heartbeats over Unix Domain Sockets and UDP. No dependencies. No allocations. Sub-microsecond.">
+  <meta name="twitter:description" content="Background daemons die silently. One observer watches thousands of local processes over 32-byte heartbeats, detects stalls, runs recovery, and exports Prometheus — no HTTP server, systemd unit, or pod per process.">
   <meta name="twitter:image" content="https://varta.sh/assets/og.png">
   <meta name="twitter:image:alt" content="Varta — agent sends a 32-byte frame over UDS or UDP to an observer, which exports Prometheus metrics.">
   <link rel="icon" href="/favicon.svg?v=4" type="image/svg+xml">
@@ -1129,10 +1129,11 @@ button, a {
     <a href="/" class="nav-wordmark">VARTA</a>
     <div class="nav-links">
       <div class="nav-menu" id="nav-menu">
+        <a href="#quickstart">Quickstart</a>
         <a href="#how">How it works</a>
+        <a href="#compare">Compare</a>
         <a href="#performance">Performance</a>
-        <a href="#crates">Crates</a>
-        <a href="/book/guides/">Guides</a>
+        <a href="/book/guides/varta-vs-alternatives.html">vs systemd/k8s</a>
         <a href="/book">Documentation</a>
       </div>
       <a href="https://github.com/aramirez087/Varta" target="_blank" rel="noopener" aria-label="GitHub" class="nav-github">
@@ -1152,13 +1153,15 @@ button, a {
     <section class="hero">
       <div class="hero-copy">
         <div class="hero-wordmark" aria-hidden="true">VARTA</div>
-        <h1 class="hero-tagline">Zero-overhead health protocol for distributed local agents and network clusters.</h1>
-        <p class="hero-sub">32-byte heartbeats over Unix Domain Sockets and UDP. No dependencies. No allocations.
-          Built for people who care about their p99s.</p>
+        <h1 class="hero-tagline">Your background workers die silently. Find out before your users do.</h1>
+        <p class="hero-sub">A wedged daemon shows up as a backed-up queue or a customer ticket &mdash; not as
+          anything the process tells you. One <code>varta-watch</code> watches thousands of local processes over a
+          32-byte heartbeat each, restarts the stalled ones, and exports Prometheus metrics &mdash; instead of bolting
+          an HTTP endpoint, a systemd unit, or a pod onto every daemon.</p>
         <div class="hero-audience" aria-label="Who Varta is for">
-          <span class="audience-pill">SRE &amp; platform — stall &rarr; recovery &rarr; Prometheus</span>
-          <span class="audience-pill">Safety-critical — Class-A binary, compile-time config</span>
-          <span class="audience-pill">Polyglot fleets — Rust, Python, Go, Node, .NET, JVM</span>
+          <span class="audience-pill">SRE &amp; platform — agent fleets</span>
+          <span class="audience-pill">Embedded &amp; edge — no_std bare-metal</span>
+          <span class="audience-pill">Polyglot daemons — Rust, Python, Go, Node, .NET, JVM</span>
         </div>
         <div class="hero-proof" aria-label="Published packages">
           <a class="proof-badge" href="https://crates.io/crates/varta-client" target="_blank" rel="noopener">crates.io</a>
@@ -1226,6 +1229,50 @@ button, a {
 
     <hr class="divider">
 
+    <!-- QUICKSTART -->
+    <section class="section" id="quickstart">
+      <p class="section-label">00 &mdash; Quickstart</p>
+      <h2 class="section-title">From nothing to a detected stall in 60 seconds.</h2>
+      <ol class="steps">
+        <li class="step">
+          <span class="step-num">1</span>
+          <div class="step-content">
+            <h3 class="step-title">Run the observer</h3>
+            <p>One process watches every agent on the host and serves Prometheus on <code>:9100</code>.</p>
+            <pre class="code-block"><code>curl -fsSL https://varta.sh/install.sh | sh
+varta-watch --socket /tmp/varta.sock \
+  --prom-addr 127.0.0.1:9100 --threshold-ms 2000</code></pre>
+          </div>
+        </li>
+        <li class="step">
+          <span class="step-num">2</span>
+          <div class="step-content">
+            <h3 class="step-title">Beat from your agent</h3>
+            <p>Connect once, beat every 500&nbsp;ms &mdash; well under the 2&nbsp;s threshold. (<code>pip install varta</code> &middot; <code>npm i @varta-health/client</code> for other languages.)</p>
+            <pre class="code-block"><code>cargo add varta-client</code></pre>
+            <pre class="code-block"><code>use varta_client::{Varta, Status};
+use std::{thread::sleep, time::Duration};
+
+let mut agent = Varta::connect("/tmp/varta.sock")?;
+loop {
+    let _ = agent.beat(Status::Ok, 0);
+    sleep(Duration::from_millis(500));
+}</code></pre>
+          </div>
+        </li>
+        <li class="step">
+          <span class="step-num">3</span>
+          <div class="step-content">
+            <h3 class="step-title">Watch it catch the stall</h3>
+            <p>Kill the agent &mdash; within 2&nbsp;s the observer logs the stall and the counter ticks. Add <code>--recovery-exec 'systemctl restart myagent'</code> to auto-restart it.</p>
+            <pre class="code-block"><code>curl -s 127.0.0.1:9100/metrics | grep varta_stalls_total</code></pre>
+          </div>
+        </li>
+      </ol>
+    </section>
+
+    <hr class="divider">
+
     <!-- PERFORMANCE -->
     <section class="section" id="performance">
       <p class="section-label">01 &mdash; Benchmarks</p>
@@ -1271,13 +1318,14 @@ button, a {
           <div class="step-content">
             <h3 class="step-title">Beat</h3>
             <p><code>agent.beat(Status::Ok, payload)</code> encodes 32 bytes on the stack and calls
-              <code>send(2)</code>. Returns <code>Sent</code>, <code>Dropped</code>, or <code>Failed</code>.
+              <code>send(2)</code>. Returns <code>Sent</code>, <code>Dropped</code>, or <code>Failed</code> &mdash;
+              a missing observer is never an error on your hot path.
             </p>
             <pre class="code-block"><code>use varta_client::{Varta, Status};
 
-let agent = Varta::connect("/tmp/varta.sock")?;
+let mut agent = Varta::connect("/tmp/varta.sock")?;
 loop {
-    agent.beat(Status::Ok, queue_depth)?;
+    let _ = agent.beat(Status::Ok, queue_depth);
     std::thread::sleep(Duration::from_millis(500));
 }</code></pre>
           </div>
@@ -1295,9 +1343,53 @@ loop {
 
     <hr class="divider">
 
+    <!-- COMPARE -->
+    <section class="section" id="compare">
+      <p class="section-label">03 &mdash; Why not just&hellip;</p>
+      <h2 class="section-title">systemd, k8s probes, or a /health endpoint?</h2>
+      <p class="hero-sub" style="max-width: 60ch; margin-bottom: 2.5rem;">For a single 1:1 daemon, systemd&rsquo;s <code>WatchdogSec</code> is the right tool &mdash; use it.
+        Varta earns its place when you have <em>many</em> local processes and a unit file, a pod, or an inbound TCP port
+        per PID is too heavy or simply unavailable.</p>
+      <ol class="steps">
+        <li class="step">
+          <div class="step-content">
+            <h3 class="step-title">systemd <code>WatchdogSec</code></h3>
+            <p>Processes are 1:1 with units and recovery is just <code>Restart=</code>. Already on the host, costs nothing extra.</p>
+          </div>
+        </li>
+        <li class="step">
+          <div class="step-content">
+            <h3 class="step-title">supervisord / monit</h3>
+            <p>One manager for a modest set of children on a non-systemd host, where &ldquo;process is alive&rdquo; is signal enough.</p>
+          </div>
+        </li>
+        <li class="step">
+          <div class="step-content">
+            <h3 class="step-title">k8s liveness probes</h3>
+            <p>You&rsquo;re already on Kubernetes and the kubelet schedules and restarts your containers. Don&rsquo;t add anything.</p>
+          </div>
+        </li>
+        <li class="step">
+          <div class="step-content">
+            <h3 class="step-title">HTTP <code>/health</code></h3>
+            <p>The workload is already an HTTP server and you want rich JSON a human can <code>curl</code>. Note: it signals, it doesn&rsquo;t recover.</p>
+          </div>
+        </li>
+        <li class="step">
+          <div class="step-content">
+            <h3 class="step-title">Varta</h3>
+            <p>Tens to thousands of local processes; embedded / <code>no_std</code> / non-systemd / no orchestrator; polyglot fleets; safety-critical builds with no HTTP server or shell.</p>
+          </div>
+        </li>
+      </ol>
+      <p style="margin-top: 2rem;"><a href="/book/guides/varta-vs-alternatives.html">Full comparison matrix &rarr;</a></p>
+    </section>
+
+    <hr class="divider">
+
     <!-- CRATES -->
     <section class="section" id="crates">
-      <p class="section-label">03 &mdash; Workspace</p>
+      <p class="section-label">04 &mdash; Workspace</p>
       <h2 class="section-title">Three crates. Zero deps.</h2>
       <div class="crate-list">
         <a href="/book/spec/vlp.html" class="crate-row">

@@ -3,13 +3,10 @@
     <pattern id="grid" width="50" height="50" patternUnits="userSpaceOnUse">
       <path d="M 50 0 L 0 0 0 50" fill="none" stroke="#ffffff" stroke-opacity="0.025" stroke-width="1" />
     </pattern>
-    <radialGradient id="glow" cx="50%" cy="40%" r="60%">
-      <stop offset="0%" stop-color="#ff4757" stop-opacity="0.18" />
+    <radialGradient id="glow" cx="32%" cy="36%" r="62%">
+      <stop offset="0%" stop-color="#ff4757" stop-opacity="0.16" />
       <stop offset="100%" stop-color="#ff4757" stop-opacity="0" />
     </radialGradient>
-    <filter id="pulse" x="-50%" y="-50%" width="200%" height="200%">
-      <feGaussianBlur stdDeviation="4" />
-    </filter>
   </defs>
 
   <rect width="1200" height="630" fill="#09090b" />
@@ -22,82 +19,72 @@
   <path d="M 50 580 L 50 600 L 90 600" fill="none" stroke="#27272a" stroke-width="2" stroke-linecap="round" />
   <path d="M 1150 580 L 1150 600 L 1110 600" fill="none" stroke="#27272a" stroke-width="2" stroke-linecap="round" />
 
-  <!-- Left: wordmark + tagline -->
+  <!-- Wordmark -->
   <g font-family="ui-monospace, 'JetBrains Mono', Menlo, monospace">
-    <!-- VARTA wordmark with terminal prompt -->
-    <text x="90" y="200" font-size="42" font-weight="700" fill="#52525b" letter-spacing="2">&gt;</text>
-    <text x="150" y="200" font-size="64" font-weight="800" fill="#f4f4f5" letter-spacing="-1">VARTA</text>
+    <text x="90" y="118" font-size="26" font-weight="700" fill="#52525b">&gt;</text>
+    <text x="124" y="118" font-size="30" font-weight="800" fill="#f4f4f5" letter-spacing="4">VARTA</text>
+    <circle cx="122" cy="102" r="4" fill="#ff4757" />
+  </g>
 
-    <!-- Accent dot -->
-    <circle cx="148" cy="188" r="5" fill="#ff4757" />
-
-    <!-- Tagline (h1) -->
-    <text x="90" y="280" font-size="32" font-weight="700" fill="#f4f4f5">Zero-overhead health protocol</text>
-    <text x="90" y="320" font-size="32" font-weight="700" fill="#f4f4f5">for distributed local agents.</text>
-
+  <!-- Headline (pain-first) -->
+  <g font-family="'Plus Jakarta Sans', Helvetica, system-ui, sans-serif">
+    <text x="88" y="206" font-size="46" font-weight="800" fill="#f4f4f5" letter-spacing="-1">Your background workers</text>
+    <text x="88" y="262" font-size="46" font-weight="800" fill="#ff4757" letter-spacing="-1">die silently.</text>
     <!-- Sub -->
-    <text x="90" y="380" font-size="18" font-weight="500" fill="#a1a1aa">32-byte heartbeats over UDS &amp; UDP.</text>
-    <text x="90" y="406" font-size="18" font-weight="500" fill="#a1a1aa">No dependencies. No allocations.</text>
+    <text x="90" y="312" font-size="24" font-weight="700" fill="#f4f4f5">Find out before your users do.</text>
+    <text x="90" y="350" font-size="21" font-weight="500" fill="#a1a1aa">One observer watches thousands of local processes &#8212;</text>
+    <text x="90" y="378" font-size="21" font-weight="500" fill="#a1a1aa">detects stalls, runs recovery, over a 32-byte beat.</text>
+  </g>
 
-    <!-- Spec chips -->
-    <g transform="translate(90, 460)">
-      <rect width="148" height="36" rx="6" fill="none" stroke="#27272a" stroke-width="1.5" />
-      <text x="74" y="23" text-anchor="middle" font-size="13" font-weight="600" fill="#ff4757" letter-spacing="1">P99 &lt; 1μs</text>
+  <!-- Chips -->
+  <g font-family="ui-monospace, 'JetBrains Mono', Menlo, monospace">
+    <g transform="translate(90, 430)">
+      <rect width="120" height="36" rx="6" fill="none" stroke="#27272a" stroke-width="1.5" />
+      <text x="60" y="23" text-anchor="middle" font-size="13" font-weight="600" fill="#10b981" letter-spacing="1">0 DEPS</text>
     </g>
-    <g transform="translate(252, 460)">
-      <rect width="148" height="36" rx="6" fill="none" stroke="#27272a" stroke-width="1.5" />
-      <text x="74" y="23" text-anchor="middle" font-size="13" font-weight="600" fill="#10b981" letter-spacing="1">0 DEPS</text>
+    <g transform="translate(222, 430)">
+      <rect width="130" height="36" rx="6" fill="none" stroke="#27272a" stroke-width="1.5" />
+      <text x="65" y="23" text-anchor="middle" font-size="13" font-weight="600" fill="#ff4757" letter-spacing="1">P99 &lt; 1&#181;s</text>
     </g>
-    <g transform="translate(414, 460)">
-      <rect width="148" height="36" rx="6" fill="none" stroke="#27272a" stroke-width="1.5" />
-      <text x="74" y="23" text-anchor="middle" font-size="13" font-weight="600" fill="#a1a1aa" letter-spacing="1">RUST 2021</text>
+    <g transform="translate(364, 430)">
+      <rect width="120" height="36" rx="6" fill="none" stroke="#27272a" stroke-width="1.5" />
+      <text x="60" y="23" text-anchor="middle" font-size="13" font-weight="600" fill="#a1a1aa" letter-spacing="1">no_std</text>
+    </g>
+    <g transform="translate(496, 430)">
+      <rect width="150" height="36" rx="6" fill="none" stroke="#27272a" stroke-width="1.5" />
+      <text x="75" y="23" text-anchor="middle" font-size="13" font-weight="600" fill="#a1a1aa" letter-spacing="1">6 LANGUAGES</text>
     </g>
   </g>
 
-  <!-- Right: agent → observer diagram -->
-  <g transform="translate(720, 200)">
-    <!-- Static wire path -->
-    <path d="M 50 100 L 200 100 L 215 50 L 230 160 L 245 70 L 260 100 L 410 100"
-          fill="none" stroke="#27272a" stroke-width="2" stroke-linecap="round" opacity="0.5" />
+  <!-- Terminal card: the stall -> recovery moment -->
+  <g transform="translate(700, 150)">
+    <rect width="448" height="330" rx="12" fill="#161618" stroke="#27272a" stroke-width="1.5" />
+    <!-- title bar -->
+    <rect width="448" height="40" rx="12" fill="#1f1f23" />
+    <rect y="28" width="448" height="12" fill="#1f1f23" />
+    <line x1="0" y1="40" x2="448" y2="40" stroke="#27272a" stroke-width="1" />
+    <circle cx="22" cy="20" r="5.5" fill="#ef4444" />
+    <circle cx="42" cy="20" r="5.5" fill="#eab308" />
+    <circle cx="62" cy="20" r="5.5" fill="#22c55e" />
+    <text x="224" y="24" text-anchor="middle" font-family="ui-monospace, 'JetBrains Mono', Menlo, monospace" font-size="12" fill="#52525b">varta-watch</text>
 
-    <!-- Glowing pulse (static) -->
-    <path d="M 50 100 L 200 100 L 215 50 L 230 160 L 245 70 L 260 100 L 410 100"
-          fill="none" stroke="#ff4757" stroke-width="3" stroke-linecap="round" filter="url(#pulse)" opacity="0.85" />
-
-    <!-- AGENT node -->
-    <circle cx="50" cy="100" r="22" fill="none" stroke="#ff4757" stroke-width="1.5" opacity="0.5" />
-    <circle cx="50" cy="100" r="13" fill="none" stroke="#27272a" stroke-width="2" />
-    <circle cx="50" cy="100" r="6" fill="#ff4757" />
-
-    <text x="50" y="160" text-anchor="middle" font-family="ui-monospace, 'JetBrains Mono', Menlo, monospace" font-size="14" font-weight="700" fill="#f4f4f5" letter-spacing="2">AGENT</text>
-    <text x="50" y="180" text-anchor="middle" font-family="ui-monospace, 'JetBrains Mono', Menlo, monospace" font-size="11" font-weight="500" fill="#a1a1aa">varta-client</text>
-    <text x="50" y="196" text-anchor="middle" font-family="ui-monospace, 'JetBrains Mono', Menlo, monospace" font-size="9.5" fill="#52525b">zero-allocation</text>
-
-    <!-- HUD center label -->
-    <g transform="translate(230, -10)">
-      <path d="M -75 0 L -85 0 L -85 10" fill="none" stroke="#27272a" stroke-width="1.5" />
-      <path d="M -85 24 L -85 34 L -75 34" fill="none" stroke="#27272a" stroke-width="1.5" />
-      <path d="M 75 0 L 85 0 L 85 10" fill="none" stroke="#27272a" stroke-width="1.5" />
-      <path d="M 85 24 L 85 34 L 75 34" fill="none" stroke="#27272a" stroke-width="1.5" />
-      <text x="0" y="14" text-anchor="middle" font-family="ui-monospace, 'JetBrains Mono', Menlo, monospace" font-size="11" font-weight="700" fill="#ff4757" letter-spacing="1.5">32-BYTE FRAME</text>
-      <text x="0" y="30" text-anchor="middle" font-family="ui-monospace, 'JetBrains Mono', Menlo, monospace" font-size="9" fill="#52525b" letter-spacing="1">UDS · UDP</text>
+    <!-- body -->
+    <g font-family="ui-monospace, 'JetBrains Mono', Menlo, monospace" font-size="14.5">
+      <text x="22" y="78"><tspan fill="#52525b">$ </tspan><tspan fill="#f4f4f5" font-weight="700">varta-watch</tspan><tspan fill="#ff2e43"> --threshold-ms</tspan><tspan fill="#a1a1aa"> 2000</tspan></text>
+      <text x="22" y="110" fill="#52525b">&#8226; listening &#183; /metrics on :9100</text>
+      <text x="22" y="146"><tspan fill="#10b981">&#8226;</tspan><tspan fill="#a1a1aa"> pid 4821 &#183; </tspan><tspan fill="#10b981" font-weight="700">Ok</tspan><tspan fill="#52525b"> &#183; 8ms ago</tspan></text>
+      <text x="22" y="174"><tspan fill="#10b981">&#8226;</tspan><tspan fill="#a1a1aa"> pid 4821 &#183; </tspan><tspan fill="#10b981" font-weight="700">Ok</tspan><tspan fill="#52525b"> &#183; 11ms ago</tspan></text>
+      <text x="22" y="210"><tspan fill="#f59e0b" font-weight="700">&#9888; pid 4821 &#183; STALL</tspan><tspan fill="#52525b"> &#183; silent 2104ms</tspan></text>
+      <text x="22" y="244"><tspan fill="#ff4757" font-weight="700">&#8594; recovery:</tspan><tspan fill="#f4f4f5"> systemctl restart agent</tspan></text>
+      <text x="22" y="272"><tspan fill="#10b981" font-weight="700">&#10003; recovered</tspan><tspan fill="#a1a1aa"> &#183; pid 4990 &#183; </tspan><tspan fill="#10b981" font-weight="700">Ok</tspan></text>
+      <text x="22" y="306"><tspan fill="#52525b">varta_stalls_total </tspan><tspan fill="#f4f4f5">1</tspan></text>
     </g>
-
-    <!-- OBSERVER node -->
-    <circle cx="410" cy="100" r="22" fill="none" stroke="#27272a" stroke-width="1.5" stroke-dasharray="4 4" />
-    <circle cx="410" cy="100" r="13" fill="none" stroke="#27272a" stroke-width="2" />
-    <circle cx="410" cy="100" r="6" fill="#10b981" />
-
-    <text x="410" y="160" text-anchor="middle" font-family="ui-monospace, 'JetBrains Mono', Menlo, monospace" font-size="14" font-weight="700" fill="#f4f4f5" letter-spacing="2">OBSERVER</text>
-    <text x="410" y="180" text-anchor="middle" font-family="ui-monospace, 'JetBrains Mono', Menlo, monospace" font-size="11" font-weight="500" fill="#a1a1aa">varta-watch</text>
-    <text x="410" y="196" text-anchor="middle" font-family="ui-monospace, 'JetBrains Mono', Menlo, monospace" font-size="9.5" fill="#52525b">prom-exporter</text>
   </g>
 
-  <!-- Footer: URL + version -->
-  <g font-family="ui-monospace, 'JetBrains Mono', Menlo, monospace" font-size="14" fill="#52525b">
-    <text x="90" y="570" font-weight="500">varta.sh</text>
-    <text x="190" y="570" font-weight="500">·</text>
-    <text x="210" y="570" font-weight="500">MIT / Apache-2.0</text>
-    <text x="1110" y="570" text-anchor="end" font-weight="600" fill="#ff4757">v0.2.0</text>
+  <!-- Footer -->
+  <g font-family="ui-monospace, 'JetBrains Mono', Menlo, monospace" font-size="15" fill="#52525b">
+    <text x="90" y="565" font-weight="600" fill="#a1a1aa">varta.sh</text>
+    <text x="196" y="565" font-weight="500">&#183;  github.com/aramirez087/Varta  &#183;  MIT / Apache-2.0</text>
+    <text x="1110" y="565" text-anchor="end" font-weight="700" fill="#ff4757">v0.2.0</text>
   </g>
 </svg>

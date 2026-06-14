@@ -19,11 +19,62 @@
   <img src="assets/og.svg" alt="Varta — zero-overhead health protocol for distributed local agents" width="100%">
 </p>
 
-**Zero dependencies. Zero allocations. Agents that never go dark.**
+**Your background workers die silently — find out before your users do.**
 
-A 32-byte heartbeat protocol for distributed local agents and networked clusters. Your processes talk; Varta listens.
+A wedged daemon shows up as a backed-up queue or a customer ticket, not as
+anything the process tells you. One `varta-watch` observer watches thousands of
+local processes over a 32-byte heartbeat each, detects stalls, runs recovery, and
+exports Prometheus metrics — instead of bolting an HTTP endpoint, a systemd unit,
+or a pod onto every daemon. Zero dependencies, zero allocations on the beat path.
+
+## 60-second quickstart
+
+```sh
+# 1. Install + run the observer (flags any agent silent >2s, /metrics on :9100)
+curl -fsSL https://varta.sh/install.sh | sh
+varta-watch --socket /tmp/varta.sock --prom-addr 127.0.0.1:9100 --threshold-ms 2000 &
+
+# 2. Add the client to your agent
+cargo add varta-client
+```
+
+```rust
+// ...then beat from your agent, well under the 2s threshold:
+use varta_client::{Varta, Status};
+use std::{thread::sleep, time::Duration};
+
+fn main() -> std::io::Result<()> {
+    let mut agent = Varta::connect("/tmp/varta.sock")?;
+    loop {
+        let _ = agent.beat(Status::Ok, 0);
+        sleep(Duration::from_millis(500));
+    }
+}
+```
+
+```sh
+# 3. Kill the agent — within 2s the observer logs the stall and the counter ticks:
+curl -s 127.0.0.1:9100/metrics | grep varta_stalls_total
+# Add --recovery-exec 'systemctl restart myagent' to varta-watch to auto-restart on stall.
+```
+
+Other languages: `pip install varta` · `npm install @varta-health/client` · [Go/.NET/JVM](#official-clients).
+
+## See it work
+
+![Varta detecting a stalled worker and auto-recovering](docs/marketing/varta-demo.gif)
+
+A worker wedges (PID alive, no longer beating) → the observer detects the stall at
+the 2&nbsp;s threshold → runs recovery → `varta_stalls_total` ticks.
+Replayable [asciinema cast](docs/marketing/varta-demo.cast).
 
 ## Why Varta
+
+> **Why not just systemd `WatchdogSec`, k8s liveness probes, or a `/health` endpoint?**
+> For a single 1:1 daemon, use systemd. Varta is for *many* local processes where a
+> unit/pod/HTTP-port per PID is too heavy or unavailable — see
+> [Varta vs the alternatives](book/src/guides/varta-vs-alternatives.md).
+
 
 - **Zero dependencies.** Production crates carry an empty `[dependencies]`
   section. No `tokio`, no `serde`, no `libc`. Drop in one path dep and get

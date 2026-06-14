@@ -8,6 +8,7 @@
 # Guides
 
 - [Guides overview](guides/index.md)
+- [Varta vs the alternatives](guides/varta-vs-alternatives.md)
 - [Varta vs systemd WatchdogSec](guides/varta-vs-systemd-watchdog.md)
 - [Varta vs HTTP health checks](guides/varta-vs-http-health.md)
 - [Prometheus setup walkthrough](guides/prometheus-setup.md)
