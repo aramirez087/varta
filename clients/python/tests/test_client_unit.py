@@ -28,6 +28,7 @@ from varta._transport import (
     UdsTransport,
 )
 from varta._vlp import decode
+from varta import _fork_epoch
 
 
 # ---------------------------------------------------------------------------
@@ -249,6 +250,81 @@ def test_spoofed_fork_triggers_reconnect_and_increments_counter(
         # Nonce resets to 0 then increments to 1.
         assert agent._nonce == 1
         assert agent._connect_pid == os.getpid()
+
+
+def test_fork_epoch_register_is_idempotent_and_current_is_int() -> None:
+    first = _fork_epoch.register()
+    second = _fork_epoch.register()
+    assert isinstance(first, int)
+    assert first == second
+    assert _fork_epoch.current() == second
+
+
+def test_recycled_pid_with_advanced_fork_epoch_triggers_reconnect(
+    bound_uds_listener: Tuple[socket.socket, Path],
+) -> None:
+    """The PID-recycle case a bare PID comparison misses.
+
+    A forked descendant that inherits this handle and is later reassigned the
+    connect-time PID has ``pid == _connect_pid`` (so the old check skipped
+    reconnect) but a *different* lineage epoch. The beat must still reconnect,
+    re-seeding any session-keyed secure-UDP state before the next frame.
+    """
+    _, path = bound_uds_listener
+    with Varta.connect(path) as agent:
+        agent.beat(Status.OK)
+        agent.beat(Status.OK)
+        assert agent.fork_recoveries() == 0
+        # PID still equals the live PID — the recycled-PID scenario.
+        assert agent._connect_pid == os.getpid()
+        # But the lineage epoch differs: the handle was inherited across a fork.
+        agent._set_connect_fork_epoch_for_test(_fork_epoch.current() - 1)
+
+        outcome = agent.beat(Status.OK)
+
+        assert outcome.is_sent
+        assert agent.fork_recoveries() == 1
+        # Nonce reset to 0 then incremented to 1 (fresh session for the child).
+        assert agent._nonce == 1
+        # Snapshot realigned with the live lineage epoch — no re-trigger.
+        assert agent._connect_fork_epoch == _fork_epoch.current()
+        agent.beat(Status.OK)
+        assert agent.fork_recoveries() == 1
+
+
+def test_explicit_reconnect_refreshes_fork_epoch(
+    bound_uds_listener: Tuple[socket.socket, Path],
+) -> None:
+    _, path = bound_uds_listener
+    with Varta.connect(path) as agent:
+        agent._set_connect_fork_epoch_for_test(_fork_epoch.current() - 5)
+        agent.reconnect()
+        assert agent._connect_fork_epoch == _fork_epoch.current()
+        # A subsequent beat sees an aligned epoch and does not fork-recover.
+        agent.beat(Status.OK)
+        assert agent.fork_recoveries() == 0
+
+
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="requires fork(2)")
+def test_real_fork_advances_lineage_epoch() -> None:
+    """The registered ``os.register_at_fork`` child callback actually fires."""
+    _fork_epoch.register()
+    base = _fork_epoch.current()
+    read_fd, write_fd = os.pipe()
+    pid = os.fork()
+    if pid == 0:  # child
+        os.close(read_fd)
+        try:
+            os.write(write_fd, str(_fork_epoch.current()).encode("ascii"))
+            os.close(write_fd)
+        finally:
+            os._exit(0)
+    os.close(write_fd)
+    _, status = os.waitpid(pid, 0)
+    child_epoch = int(os.read(read_fd, 64))
+    os.close(read_fd)
+    assert os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0
+    assert child_epoch == base + 1
 
 
 def test_clock_regression_counter_increments(

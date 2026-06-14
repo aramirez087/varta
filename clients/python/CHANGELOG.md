@@ -8,6 +8,20 @@ governed independently — see `book/src/spec/vlp.md` in the workspace.
 
 ### Security
 
+- **Beat path: closed an AEAD nonce-reuse hole under fork + PID recycling.**
+  `Varta.beat` detected `fork(2)` by comparing only the live PID to the
+  connect-time PID. A descendant that inherited a secure-UDP session
+  (16-byte salt + IV prefix/counter) and was *later reassigned its ancestor's
+  connect-time PID* through PID recycling passed `pid == connect_pid`, skipped
+  the reconnect, and re-derived an IV prefix its ancestor had already used
+  under the same key — a ChaCha20-Poly1305 `(key, nonce)` collision
+  (keystream + Poly1305 one-time-key recovery → plaintext disclosure and
+  frame forgery). `beat` now also compares a process-lineage epoch
+  (`varta._fork_epoch`, an `os.register_at_fork` child-callback counter) and
+  reconnects when *either* the PID or the epoch changes, so the re-seed fires
+  regardless of how the PID was reassigned. Mirrors the Rust reference
+  (`fork_epoch.rs`, bug-442). Wire-transparent — no observer or spec change.
+
 - **Secure-UDP panic hook: closed an AEAD nonce-reuse hole under PID
   recycling.** The hook detected `fork(2)` by comparing the live PID to the
   install-time PID and only re-randomized its IV salt on a mismatch. A

@@ -19,6 +19,7 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import ClassVar, Optional, Union
 
+from . import _fork_epoch
 from ._errno import (
     EAGAIN,
     ECONNREFUSED,
@@ -230,6 +231,7 @@ class Varta:
         "_last_timestamp",
         "_clock_regressions",
         "_connect_pid",
+        "_connect_fork_epoch",
         "_fork_recoveries",
     )
 
@@ -243,6 +245,10 @@ class Varta:
         self._last_timestamp = 0
         self._clock_regressions = 0
         self._connect_pid = os.getpid()
+        # Snapshot the process-lineage epoch alongside the PID so a forked
+        # descendant that inherits this handle re-seeds its transport even when
+        # PID recycling makes its PID equal this connect-time PID.
+        self._connect_fork_epoch = _fork_epoch.register()
         self._fork_recoveries = 0
 
     # --- constructors ---------------------------------------------------
@@ -278,11 +284,15 @@ class Varta:
     def beat(self, status: StatusLike, payload: int = 0) -> BeatOutcome:
         """Emit one VLP frame and return the outcome.
 
-        Detects ``fork(2)`` by comparing the current PID to the
-        connect-time snapshot. On mismatch, refreshes the transport
-        (re-reading OS entropy for secure-UDP) BEFORE the frame is built.
-        See ``crates/varta-client/src/client.rs:514-593`` for the
-        canonical reference.
+        Detects ``fork(2)`` by comparing both the current PID *and* the
+        process-lineage epoch to the connect-time snapshot. On mismatch,
+        refreshes the transport (re-reading OS entropy for secure-UDP) BEFORE
+        the frame is built. The epoch (see :mod:`varta._fork_epoch`) catches a
+        descendant whose PID was recycled back to this handle's connect-time
+        PID — a case the bare PID comparison misses, which would otherwise
+        re-derive a ChaCha20-Poly1305 nonce its ancestor already used under the
+        same key. Mirrors ``crates/varta-client/src/client.rs`` (``beat`` /
+        ``fork_epoch``).
         """
         try:
             status_value = _coerce_status(status)
@@ -294,12 +304,14 @@ class Varta:
             return _invalid_input_outcome()
 
         pid = os.getpid()
-        if pid != self._connect_pid:
+        current_fork_epoch = _fork_epoch.current()
+        if pid != self._connect_pid or current_fork_epoch != self._connect_fork_epoch:
             try:
                 self._transport.reconnect()
             except OSError as exc:
                 return BeatOutcome.failed(BeatError.from_oserror(exc))
             self._connect_pid = pid
+            self._connect_fork_epoch = _fork_epoch.current()
             self._fork_recoveries = _saturating_add(self._fork_recoveries, 1)
             self._nonce = 0
             self._start_ns = _monotonic_ns()
@@ -371,9 +383,15 @@ class Varta:
         return outcome
 
     def reconnect(self) -> None:
-        """Explicitly rebuild the transport. Use after observer restarts."""
+        """Explicitly rebuild the transport. Use after observer restarts.
+
+        Also refreshes the PID and process-lineage snapshots so an explicit
+        reconnect issued from a forked child cannot leave stale ancestor
+        identity behind that would re-trigger fork recovery on the next beat.
+        """
         self._transport.reconnect()
         self._connect_pid = os.getpid()
+        self._connect_fork_epoch = _fork_epoch.current()
 
     def set_reconnect_after(self, n: Optional[int]) -> None:
         """Auto-reconnect after ``n`` consecutive ``Dropped`` outcomes.
@@ -431,6 +449,9 @@ class Varta:
     # friends). Underscore-prefixed so they do not appear in public dir().
     def _set_connect_pid_for_test(self, pid: int) -> None:
         self._connect_pid = int(pid)
+
+    def _set_connect_fork_epoch_for_test(self, epoch: int) -> None:
+        self._connect_fork_epoch = int(epoch)
 
     def _set_nonce_for_test(self, value: int) -> None:
         self._nonce = int(value)
