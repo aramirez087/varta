@@ -345,8 +345,9 @@ impl UdsListener {
     /// process is already listening at `path`, or if the path is occupied by
     /// a non-socket file, the call fails with `AddrInUse`.
     ///
-    /// The socket is given a read timeout so `recv` cannot block
-    /// indefinitely.
+    /// The socket is bound non-blocking so `recv` never waits on an idle
+    /// queue (returns `WouldBlock` immediately), matching the observer's
+    /// non-blocking round-robin `poll()` contract.
     pub fn bind(
         path: impl AsRef<Path>,
         socket_mode: u32,
@@ -439,6 +440,23 @@ impl UdsListener {
     ) -> io::Result<Self> {
         use std::os::unix::fs::MetadataExt;
 
+        // The observer's round-robin `poll()` is contractually non-blocking:
+        // it pulls at most one datagram per listener per call and must never
+        // wait on an idle socket (`book/.../observer-liveness.md`, p99 ≤ 5 ms).
+        // A blocking-with-timeout UDS socket head-of-line-blocks every other
+        // listener in the same poll loop for up to `read_timeout` (default
+        // 100 ms) whenever it is idle — capping secure-UDP/UDP ingest at
+        // <10 datagrams/s and, inside the recovery ingress pre-drain
+        // (`RECOVERY_PREDRAIN_INGRESS_MAX_PER_TICK` poll() calls in one
+        // DrainPending stage), overrunning the 2 s self-watchdog stage abort
+        // and `process::abort()`-ing a HEALTHY observer. Match the UDP and
+        // secure-UDP listeners: bind non-blocking so `recvmsg` returns EAGAIN
+        // immediately (mapped to `WouldBlock`); idle pacing is the main loop's
+        // 10 ms throttle, gated on `last_poll_consumed()`.
+        sock.set_nonblocking(true)?;
+        // Kept as a defensive no-op (SO_RCVTIMEO is inert on a non-blocking
+        // socket): preserves the validated `--read-timeout-ms` config surface
+        // and its floor/ceiling without changing recv semantics.
         sock.set_read_timeout(Some(read_timeout))?;
         let raw_fd = sock.as_raw_fd();
         peer_cred::enable_credential_passing(raw_fd)?;
@@ -671,6 +689,56 @@ mod tests {
         drop(server);
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_dir(&dir);
+    }
+
+    // Regression: the production UDS listener MUST be non-blocking. A
+    // blocking-with-timeout socket head-of-line-blocks every other listener
+    // in the observer's round-robin poll loop for the full `read_timeout`
+    // whenever it is idle, capping secure-UDP/UDP ingest at <10 datagrams/s
+    // and, inside the recovery pre-drain, overrunning the 2 s DrainPending
+    // self-watchdog stage and aborting a healthy observer. We assert that an
+    // idle `recv()` returns `WouldBlock` essentially immediately even when a
+    // multi-second `read_timeout` is configured.
+    #[test]
+    fn uds_listener_recv_is_nonblocking() {
+        use super::{BeatListener, RecvResult, UdsListener};
+        use std::time::Instant;
+
+        // Bind a short, flat path under temp_dir(): UdsListener::bind enforces
+        // SUN_LEN, so the nested temp_socket_path helper can be too long.
+        let seq = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let mut path = std::env::temp_dir();
+        path.push(format!("vw-nb-{}-{seq}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        // The test runner is multi-threaded; the umask-race probe would fail.
+        let pre_thread = unsafe { super::PreThreadAttestation::new_unchecked() };
+        let mut listener = UdsListener::bind(
+            &path,
+            0o600,
+            // A deliberately huge read timeout: if the socket were still
+            // blocking-with-timeout, this idle recv would stall ~5 s.
+            std::time::Duration::from_secs(5),
+            0,
+            &pre_thread,
+        )
+        .expect("bind uds listener");
+
+        let start = Instant::now();
+        let result = listener.recv();
+        let elapsed = start.elapsed();
+
+        assert!(
+            matches!(result, RecvResult::WouldBlock),
+            "idle recv must return WouldBlock, got a non-WouldBlock result"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_millis(500),
+            "idle recv must return promptly (non-blocking); took {elapsed:?} \
+             — the UDS socket is blocking-with-timeout (head-of-line bug)"
+        );
+
+        drop(listener);
+        let _ = std::fs::remove_file(&path);
     }
 }
 
