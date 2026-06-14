@@ -550,7 +550,13 @@ fn run(cfg: Config) -> std::io::Result<()> {
                 } else {
                     varta_watch::TransportTrust::Untrusted
                 };
-                let secure = secure.with_recovery_trust(trust);
+                // Align the listener's session-restart gate with the tracker's
+                // recycle reset (both gate on the configured stall threshold)
+                // so a recycled-PID agent's resume beats are admitted before
+                // the dead predecessor's slot can stall and fire recovery.
+                let secure = secure
+                    .with_recovery_trust(trust)
+                    .with_session_restart_gap(cfg.threshold);
                 observer.add_listener(Box::new(secure));
                 secure_bound = true;
             }

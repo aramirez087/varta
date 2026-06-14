@@ -30,11 +30,13 @@
 //! legitimate case that is byte-indistinguishable from an aged-out replay: a
 //! brand-new process that the OS handed a recently-vacated PID and that
 //! restarted its monotonic VLP nonce. A wall-clock staleness gate
-//! ([`SESSION_RESTART_GAP`]) separates the two — see that constant — admitting
-//! a genuine recycle as a fresh session while still rejecting replays against
-//! an actively-beating sender. The tracker applies the matching reset for
-//! generation-less network-origin slots so the recycled agent is not
-//! false-stalled or recovery-killed.
+//! ([`SESSION_RESTART_GAP`], overridden at runtime to the operator's
+//! `--threshold-ms`) separates the two — see that constant — admitting a
+//! genuine recycle as a fresh session while still rejecting replays against an
+//! actively-beating sender. The tracker applies the matching reset for
+//! generation-less network-origin slots, keyed on the same `threshold_ns`, so
+//! the two gates fire in lockstep and the recycled agent is not false-stalled
+//! or recovery-killed at any configured threshold.
 
 use std::io;
 use std::net::{SocketAddr, UdpSocket};
@@ -91,6 +93,16 @@ const EVICTION_INTERVAL: Duration = Duration::from_secs(60);
 /// aged-out-replay window) to this interval instead of [`EVICTION_TTL`]. Kept
 /// well above any beat interval and well below the eviction TTL; on the
 /// trusted-local-network transport this is defense-in-depth behind the PSK.
+///
+/// This is the **default** only. The runtime overrides the per-listener gap to
+/// the operator's configured `--threshold-ms` via
+/// [`SecureUdpListener::with_session_restart_gap`] so it equals the silence
+/// window the tracker uses for its matching generation-less network-origin
+/// recycle reset (`threshold_ns`). The historical 5 s value happens to equal
+/// the default `--threshold-ms`; before the override, any `--threshold-ms`
+/// below 5 s left this gate dropping a recycled agent's resume beats for
+/// `[threshold, 5 s)` while the tracker had already stalled and recovery-killed
+/// it.
 const SESSION_RESTART_GAP: Duration = Duration::from_secs(5);
 
 /// Authenticated replay identity.
@@ -253,6 +265,19 @@ pub struct SecureUdpListener {
     /// timing-leak fix is active.
     aead_attempts: u64,
     recovery_trust: TransportTrust,
+    /// Silence after which an aged-out, non-advancing prefix is treated as a
+    /// session restart (recycled PID) rather than a replay — see
+    /// [`SESSION_RESTART_GAP`], the default. The runtime overrides it to the
+    /// operator's configured `--threshold-ms` via
+    /// [`with_session_restart_gap`](Self::with_session_restart_gap) so this
+    /// gate fires in lockstep with the tracker's matching generation-less
+    /// network-origin recycle reset, which keys on `threshold_ns`
+    /// (`tracker::mod::record_with_generation`). If this gate outlasts the
+    /// tracker's, a healthy recycled-PID agent's resume beats are dropped here
+    /// while the tracker stalls the dead predecessor and — under
+    /// [`OperatorAttestedTransport`](BeatOrigin::OperatorAttestedTransport) —
+    /// recovery-kills the healthy newcomer.
+    session_restart_gap: Duration,
 }
 
 /// Build the pre-allocated `(slab, free_list, index)` triple used by both
@@ -310,6 +335,7 @@ impl SecureUdpListener {
             replay_refused: 0,
             aead_attempts: 0,
             recovery_trust: TransportTrust::Untrusted,
+            session_restart_gap: SESSION_RESTART_GAP,
         })
     }
 
@@ -345,6 +371,7 @@ impl SecureUdpListener {
             replay_refused: 0,
             aead_attempts: 0,
             recovery_trust: TransportTrust::Untrusted,
+            session_restart_gap: SESSION_RESTART_GAP,
         })
     }
 
@@ -356,6 +383,26 @@ impl SecureUdpListener {
     /// allows them to fire.
     pub fn with_recovery_trust(mut self, trust: TransportTrust) -> Self {
         self.recovery_trust = trust;
+        self
+    }
+
+    /// Align the session-restart staleness gate with the operator's stall
+    /// threshold.
+    ///
+    /// The default gate ([`SESSION_RESTART_GAP`]) only agrees with the
+    /// tracker's matching generation-less network-origin recycle reset (which
+    /// keys on the configured `--threshold-ms`) at the historical 5 s default.
+    /// For any `--threshold-ms` *below* the default, this listener would
+    /// otherwise keep dropping a recycled-PID agent's resume beats for the
+    /// interval `[threshold, 5 s)` — past the point at which the tracker
+    /// stalls the dead predecessor's slot and fires recovery, killing the
+    /// healthy newcomer (the exact failure the two-layer recycle reset was
+    /// built to eliminate). Plumbing the real threshold collapses that window
+    /// to zero. Values above the default simply make the listener admit a
+    /// recycle no earlier than the tracker would reset it, which is also
+    /// correct.
+    pub fn with_session_restart_gap(mut self, gap: Duration) -> Self {
+        self.session_restart_gap = gap;
         self
     }
 
@@ -515,8 +562,11 @@ impl SecureUdpListener {
                 // only by silence. If the predecessor has been quiet for at
                 // least SESSION_RESTART_GAP, treat this as a new session and
                 // reset the per-sender baseline; otherwise the high-water mark
-                // still rejects it. See [`SESSION_RESTART_GAP`].
-                if now.saturating_duration_since(state.last_seen) < SESSION_RESTART_GAP {
+                // still rejects it. The gap defaults to [`SESSION_RESTART_GAP`]
+                // but the runtime overrides it to the operator's stall
+                // threshold so this gate fires in lockstep with the tracker's
+                // matching recycle reset (see `session_restart_gap`).
+                if now.saturating_duration_since(state.last_seen) < self.session_restart_gap {
                     return false;
                 }
                 *state = SenderState::new(

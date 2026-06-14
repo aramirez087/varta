@@ -98,6 +98,78 @@ fn recycled_pid_after_session_gap_is_admitted_and_resets_baseline() {
 }
 
 #[test]
+fn session_restart_gap_tracks_configured_threshold() {
+    // The runtime plumbs the operator's `--threshold-ms` into the listener via
+    // `with_session_restart_gap` so this gate fires in lockstep with the
+    // tracker's generation-less network-origin recycle reset (which keys on
+    // the same threshold). With a sub-default threshold the gate must admit a
+    // recycled-PID session at the configured threshold, NOT at the historical
+    // 5 s constant. Before the fix the listener kept dropping the newcomer's
+    // resume beats for `[threshold, 5 s)` while the tracker had already stalled
+    // the dead predecessor and (under OperatorAttestedTransport) recovery-
+    // killed the healthy recycled-PID agent.
+    let gap = Duration::from_secs(1);
+    assert!(
+        gap < SESSION_RESTART_GAP,
+        "the test gap must be below the 5 s default to prove the override matters"
+    );
+    let mut listener = SecureUdpListener::bind("127.0.0.1:0".parse().unwrap(), vec![test_key()])
+        .expect("bind should succeed")
+        .with_session_restart_gap(gap);
+    let identity = test_identity();
+    let t0 = Instant::now();
+
+    // A long-lived predecessor climbs to a high regular-nonce high-water mark.
+    assert!(listener.try_record_replay_state_at(t0, identity, test_iv(), 100, 5_000, 5_000));
+
+    // A recycled-PID fresh session (freshly-derived prefix, monotonic VLP nonce
+    // restarting at 1) arrives once silence has passed the configured threshold
+    // but is still WITHIN the old 5 s default window.
+    let after_threshold = t0 + gap + Duration::from_millis(1);
+    assert!(
+        after_threshold < t0 + SESSION_RESTART_GAP,
+        "the admit point must fall inside the old 5 s window to prove the regression is closed"
+    );
+    assert!(
+        listener.try_record_replay_state_at(after_threshold, identity, test_iv2(), 0, 1, 9_999),
+        "recycled session must be admitted once silence passes the configured threshold"
+    );
+    assert_eq!(
+        listener.sender_max_regular_nonce(identity),
+        Some(1),
+        "session restart must reset the high-water mark to the new baseline"
+    );
+    assert_eq!(listener.sender_iv_random(identity), Some(test_iv2()));
+}
+
+#[test]
+fn session_restart_gap_within_configured_threshold_still_rejects() {
+    // Replay protection is preserved, just rescaled to the configured
+    // threshold: inside the gap an aged-out, non-advancing nonce is still
+    // rejected and committed state is untouched.
+    let gap = Duration::from_secs(1);
+    let mut listener = SecureUdpListener::bind("127.0.0.1:0".parse().unwrap(), vec![test_key()])
+        .expect("bind should succeed")
+        .with_session_restart_gap(gap);
+    let identity = test_identity();
+    let t0 = Instant::now();
+
+    assert!(listener.try_record_replay_state_at(t0, identity, test_iv(), 100, 5_000, 5_000));
+
+    let within = t0 + gap / 2;
+    assert!(
+        !listener.try_record_replay_state_at(within, identity, test_iv2(), 0, 1, 9_999),
+        "within the configured gap a non-advancing recycle is still rejected as replay"
+    );
+    assert_eq!(
+        listener.sender_max_regular_nonce(identity),
+        Some(5_000),
+        "a rejected frame must not perturb the high-water mark"
+    );
+    assert_eq!(listener.sender_iv_random(identity), Some(test_iv()));
+}
+
+#[test]
 fn terminal_panic_nonce_does_not_poison_regular_rotation() {
     let mut listener = new_listener();
     let identity = test_identity();
