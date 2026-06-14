@@ -65,6 +65,7 @@
   --text-primary: #f4f4f5;
   --text-secondary: #a1a1aa;
   --text-dim: #52525b;
+  --text-label: #7c7c85; /* WCAG-AA (~4.8:1 on --bg) for small caption/label text */
   --accent: #ff4757;
   --accent-dim: #ff2e43;
   --accent-glow: rgba(255, 71, 87, 0.15);
@@ -607,7 +608,7 @@ button, a {
   font-family: var(--font-mono);
   font-size: 0.75rem;
   font-weight: 500;
-  color: var(--text-dim);
+  color: var(--text-label);
   text-transform: uppercase;
   letter-spacing: 0.15em;
   margin-bottom: 0.6rem;
@@ -680,6 +681,13 @@ button, a {
   color: var(--text-primary);
 }
 
+/* Featured card — the Varta column in the comparison grid */
+.step-featured {
+  border-color: var(--accent-dim);
+  background: linear-gradient(180deg, rgba(255, 71, 87, 0.07), rgba(24, 24, 27, 0.5));
+}
+.step-featured .step-title { color: var(--accent); }
+
 .step-content p {
   color: var(--text-secondary);
   font-size: 0.95rem;
@@ -729,7 +737,7 @@ button, a {
 @media (min-width: 769px) {
   .steps {
     display: grid;
-    grid-template-columns: repeat(3, 1fr);
+    grid-template-columns: repeat(3, minmax(0, 1fr));
     gap: 2rem;
   }
   .step {
@@ -793,7 +801,7 @@ button, a {
   margin-top: 2rem;
   font-family: var(--font-mono);
   font-size: 0.72rem;
-  color: var(--text-dim);
+  color: var(--text-label);
 }
 
 .metrics-footnote code {
@@ -1280,19 +1288,18 @@ loop {
       <div class="metrics">
         <div class="metric">
           <span class="metric-label">P99 Latency</span>
-          <span class="metric-value"><span class="counter" data-target="1166" data-suffix="&nbsp;ns">0&nbsp;ns</span></span>
+          <span class="metric-value"><span class="counter" data-target="1166" data-suffix="&nbsp;ns">1166&nbsp;ns</span></span>
           <span class="metric-sub">sub-microsecond</span>
         </div>
         <div class="metric">
           <span class="metric-label">CPU (50 agents)</span>
           <span class="metric-value"><span class="counter" data-target="0.0535" data-suffix="%"
-              data-decimals="4">0%</span></span>
+              data-decimals="4">0.0535%</span></span>
           <span class="metric-sub">nearly invisible</span>
         </div>
         <div class="metric">
           <span class="metric-label">Binary Overhead</span>
-          <span class="metric-value"><span class="counter" data-target="4.1" data-suffix="&nbsp;KB" data-decimals="1">0
-              KB</span></span>
+          <span class="metric-value"><span class="counter" data-target="4.1" data-suffix="&nbsp;KB" data-decimals="1">4.1&nbsp;KB</span></span>
           <span class="metric-sub">minimal footprint</span>
         </div>
       </div>
@@ -1375,7 +1382,7 @@ loop {
             <p>The workload is already an HTTP server and you want rich JSON a human can <code>curl</code>. Note: it signals, it doesn&rsquo;t recover.</p>
           </div>
         </li>
-        <li class="step">
+        <li class="step step-featured">
           <div class="step-content">
             <h3 class="step-title">Varta</h3>
             <p>Tens to thousands of local processes; embedded / <code>no_std</code> / non-systemd / no orchestrator; polyglot fleets; safety-critical builds with no HTTP server or shell.</p>

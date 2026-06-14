@@ -100,7 +100,18 @@
     requestAnimationFrame(step);
   }
 
-  if ('IntersectionObserver' in window) {
+  function zeroCounter(el) {
+    var suffix = el.getAttribute('data-suffix') || '';
+    var decimals = parseInt(el.getAttribute('data-decimals') || '0', 10);
+    el.textContent = (decimals > 0 ? (0).toFixed(decimals) : '0') + suffix;
+  }
+
+  if ('IntersectionObserver' in window && !prefersReducedMotion) {
+    // Counters carry their real value in the HTML so no-JS / reduced-motion /
+    // crawlers see the truth. We only zero them here — off-screen, before the
+    // count-up animation — so a real visitor never sees a flash.
+    counters.forEach(zeroCounter);
+
     var counterObserver = new IntersectionObserver(
       function (entries) {
         entries.forEach(function (entry) {
