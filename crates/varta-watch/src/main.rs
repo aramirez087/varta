@@ -1435,9 +1435,21 @@ fn run(cfg: Config) -> std::io::Result<()> {
         }
 
         for _ in 0..REMOVED_PID_DRAIN_MAX_PER_TICK {
-            let Some(evicted_pid) = observer.drain_evicted_pid() else {
+            let Some((evicted_pid, evicted_gen)) = observer.drain_evicted_pid() else {
                 break;
             };
+            // bug-458: a queued removal can be stale by the time it is drained.
+            // Under a >REMOVED_PID_DRAIN_MAX_PER_TICK eviction burst (or a
+            // same-tick evict-then-rebeat) the pid may have been re-tracked
+            // before its entry is popped. If the tracker now maps the pid to
+            // the SAME process lineage (matching generation), its exporter row
+            // is LIVE — removing it would reset the agent's counters and lose
+            // any stall that lands before its next beat. Skip the cleanup in
+            // that case. A pid that is gone, or recycled to a DIFFERENT process
+            // (generation mismatch), still has its stale row removed.
+            if observer.tracked_generation(evicted_pid) == Some(evicted_gen) {
+                continue;
+            }
             if let Some(fe) = file_export.as_mut() {
                 if let Err(e) = fe.record_eviction_pid(evicted_pid, observer.now_ns()) {
                     varta_error_rl!(LogKind::FileExportIo, "file export error: {e}");

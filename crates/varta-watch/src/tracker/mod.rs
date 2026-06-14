@@ -342,7 +342,12 @@ pub struct Tracker {
     evictions: u64,
     capacity_exceeded: u64,
     nonce_wraps: u64,
-    removed_pids: Vec<u32>,
+    /// Exporter-cleanup queue of `(pid, generation)` removed from the tracker.
+    /// The generation token is snapshotted at removal so the main-loop drain
+    /// can tell a still-queued entry apart from a *re-tracked* pid: if the pid
+    /// has since been re-inserted by the same process lineage (same
+    /// generation), its exporter row is now LIVE and must not be clobbered.
+    removed_pids: Vec<(u32, Option<u64>)>,
     eviction_policy: EvictionPolicy,
     /// Cached count of slots whose `stall_emitted` flag is currently set.
     ///
@@ -744,7 +749,7 @@ impl Tracker {
                     self.stall_emitted_count = self.stall_emitted_count.saturating_sub(1);
                 }
                 self.evictions = self.evictions.saturating_add(1);
-                self.remember_removed_pid(evicted_slot.pid);
+                self.remember_removed_pid(evicted_slot.pid, evicted_slot.generation);
                 return Update::Inserted;
             }
             self.capacity_exceeded = self.capacity_exceeded.saturating_add(1);
@@ -926,12 +931,12 @@ impl Tracker {
         } else {
             self.eviction_scan_cursor %= self.len;
         }
-        self.remember_removed_pid(removed_pid);
+        self.remember_removed_pid(removed_pid, removed.generation);
     }
 
-    fn remember_removed_pid(&mut self, pid: u32) {
+    fn remember_removed_pid(&mut self, pid: u32, generation: Option<u64>) {
         if self.removed_pids.len() < self.removed_pids.capacity() {
-            self.removed_pids.push(pid);
+            self.removed_pids.push((pid, generation));
         } else {
             // The exporter-cleanup queue is full: the main-loop drain
             // (REMOVED_PID_DRAIN_MAX_PER_TICK) has fallen behind a sustained
@@ -957,12 +962,14 @@ impl Tracker {
         count
     }
 
-    /// Return one pending pid removed from the tracker, if any.
+    /// Return one pending `(pid, generation)` removed from the tracker, if any.
     ///
     /// Covers both capacity evictions and generation-mismatch retirements.
     /// Consumers use this to drop per-pid exporter rows after the slot is no
-    /// longer tracked. Repeated calls drain all pending removals.
-    pub fn take_evicted_pid(&mut self) -> Option<u32> {
+    /// longer tracked. The generation token lets the consumer skip a pid that
+    /// has since been re-tracked by the same process lineage (whose exporter
+    /// row is now live). Repeated calls drain all pending removals.
+    pub fn take_evicted_pid(&mut self) -> Option<(u32, Option<u64>)> {
         self.removed_pids.pop()
     }
 
