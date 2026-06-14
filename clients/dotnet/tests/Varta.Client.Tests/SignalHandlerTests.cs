@@ -72,43 +72,17 @@ public class SignalHandlerTests
             SignalHandler.Run(() => throw new InvalidOperationException("boom")));
     }
 
-    /// Fork-safety: a fork(2) child (PID != install PID) must re-read OS
-    /// entropy for its IV rather than reuse the parent's. Without it, parent
-    /// and child both seal a Critical frame under (key, iv, counter=0) — one
-    /// ChaCha20-Poly1305 nonce — which is keystream + tag reuse.
+    /// The secure panic emitter must DERIVE its 8-byte IV prefix from the
+    /// install-time salt plus the per-fire (pid, timestamp) that are sealed in
+    /// the authenticated plaintext — never a raw stored IV. Decrypting the wire
+    /// recovers (pid, timestamp); re-deriving from (salt, pid, ts, counter=0)
+    /// must reproduce the on-wire prefix exactly. This is the bug-446
+    /// structural fix that brings .NET to parity with the Rust/Go/Python/Node
+    /// clients: a fork(2) child (distinct pid) and a PID-recycled descendant
+    /// (later monotonic timestamp) both get a disjoint nonce by construction,
+    /// with no install-PID probe and no in-hook entropy read.
     [Fact]
-    public void SecureEmitter_OnFork_ReReadsEntropyInsteadOfReusingParentIv()
-    {
-        using var recv = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
-        recv.Bind(new IPEndPoint(IPAddress.Loopback, 0));
-        recv.ReceiveTimeout = 2000;
-        int port = ((IPEndPoint)recv.LocalEndPoint!).Port;
-
-        using var send = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
-        send.Connect(new IPEndPoint(IPAddress.Loopback, port));
-
-        byte[] key = new byte[32];      // valid 32-byte ChaCha key
-        byte[] installIv = new byte[8]; // known all-zero install IV
-
-        // Spoof a fork: current PID differs from the install PID.
-        var emitter = new SignalHandler.SecureEmitter(
-            send, key, (byte[])installIv.Clone(), Environment.ProcessId + 1);
-        emitter.Emit();
-
-        byte[] buf = new byte[AeadCodec.SharedFrameBytes];
-        int n = recv.Receive(buf);
-        Assert.Equal(AeadCodec.SharedFrameBytes, n);
-
-        // wire[0:8] is the iv_random prefix. The fork-recovery branch must have
-        // replaced the all-zero install IV with fresh entropy.
-        Assert.False(buf.Take(8).All(b => b == 0),
-            "fork child must re-read entropy, not reuse the parent IV (nonce reuse)");
-    }
-
-    /// Control: when the PID matches the install PID (no fork), the install-time
-    /// IV is used verbatim — the fork branch does not fire.
-    [Fact]
-    public void SecureEmitter_SamePid_UsesInstallIv()
+    public void SecureEmitter_DerivesIvPrefixFromSaltAndAuthenticatedMeta()
     {
         using var recv = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
         recv.Bind(new IPEndPoint(IPAddress.Loopback, 0));
@@ -119,16 +93,29 @@ public class SignalHandlerTests
         send.Connect(new IPEndPoint(IPAddress.Loopback, port));
 
         byte[] key = new byte[32];
-        byte[] installIv = { 1, 2, 3, 4, 5, 6, 7, 8 };
+        byte[] salt = Enumerable.Range(1, 16).Select(i => (byte)i).ToArray();
 
-        var emitter = new SignalHandler.SecureEmitter(
-            send, key, (byte[])installIv.Clone(), Environment.ProcessId);
+        var emitter = new SignalHandler.SecureEmitter(send, key, (byte[])salt.Clone());
         emitter.Emit();
 
-        byte[] buf = new byte[AeadCodec.SharedFrameBytes];
-        int n = recv.Receive(buf);
+        byte[] wire = new byte[AeadCodec.SharedFrameBytes];
+        int n = recv.Receive(wire);
         Assert.Equal(AeadCodec.SharedFrameBytes, n);
-        Assert.Equal(installIv, buf.Take(8).ToArray());
+
+        // Decrypt with the shared key — succeeds only if the on-wire iv_random
+        // prefix matches the nonce used to seal, recovering (pid, timestamp).
+        byte[] plaintext = new byte[AeadCodec.PlaintextBytes];
+        AeadCodec.DecodeShared(key, wire, plaintext);
+        var frame = Frame.Decode(plaintext);
+        Assert.Equal(Status.Critical, frame.Status);
+        Assert.Equal(Frame.NonceTerminal, frame.Nonce);
+
+        // The transmitted prefix MUST equal HKDF(salt, pid, timestamp, 0) —
+        // proving it is derived from the authenticated meta, not a raw IV.
+        byte[] expectedPrefix = new byte[AeadCodec.IvRandomBytes];
+        Hkdf.DerivePanicIvPrefix(salt, frame.Pid, frame.Timestamp, 0, expectedPrefix);
+        Assert.Equal(expectedPrefix, wire.Take(AeadCodec.IvRandomBytes).ToArray());
+        Assert.NotEqual(salt.Take(8).ToArray(), wire.Take(8).ToArray());
     }
 
     private static object? GetActiveEmitter()

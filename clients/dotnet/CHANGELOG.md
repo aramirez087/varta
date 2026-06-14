@@ -6,6 +6,23 @@ here. Versioning is independent of the Rust workspace and follows
 
 ## [Unreleased]
 
+### Security
+
+- Secure-UDP panic emitter (`SignalHandler.InstallSecureUdp`) now derives its
+  ChaCha20-Poly1305 IV prefix from a 16-byte install-time salt plus the
+  per-fire `(pid, timestamp)` via HKDF-SHA256 (`Hkdf.DerivePanicIvPrefix`),
+  matching the Rust/Go/Python/Node clients byte-for-byte (shared KAT
+  `e2615ed3e4f44375`). The previous build sealed every panic frame with a raw
+  8-byte entropy IV at `ivCounter = 0`, guarded only by an install-PID-equality
+  probe that re-read entropy on a detected fork(2). That probe is defeatable
+  under PID recycling (a descendant reassigned the installer's exact PID reuses
+  the inherited prefix at counter 0) and left cross-process collision at the
+  64-bit birthday bound (~2³² frames under one shared key). Binding the nonce to
+  the authenticated `(salt, pid, monotonic timestamp)` makes reuse structurally
+  impossible across fork(2) and PID recycling and raises the residual
+  cross-process bound to the 128-bit salt. Wire format and on-the-wire
+  compatibility are unchanged.
+
 ### Fixed
 
 - Panic emitters now claim terminal timestamps from a process-wide monotonic

@@ -1,3 +1,4 @@
+using System.Linq;
 using Varta.Internal.VlpSecure;
 using Varta.Tests.Helpers;
 using Xunit;
@@ -101,5 +102,46 @@ public class ConformanceSecureTests
         byte[] actual = new byte[Hkdf.KeyBytes];
         Hkdf.DeriveEpochKey(agentKey, epoch, actual);
         Assert.Equal(expected, actual);
+    }
+
+    private static byte[] PanicIv(byte[] salt, uint pid, ulong ts, uint ctr)
+    {
+        byte[] o = new byte[Hkdf.IvRandomBytes];
+        Hkdf.DerivePanicIvPrefix(salt, pid, ts, ctr, o);
+        return o;
+    }
+
+    /// Shared known-answer test locking the panic-IV KDF byte-for-byte across
+    /// the Rust / Go / Python / Node / .NET clients. salt = 0xA5 x 16,
+    /// pid = 42, ts = 1000, counter = 7 must derive e2615ed3e4f44375, and each
+    /// input must independently change the prefix.
+    [Fact]
+    public void DerivePanicIvPrefix_MatchesCrossClientKat()
+    {
+        byte[] saltA5 = Enumerable.Repeat((byte)0xA5, Hkdf.SessionSaltBytes).ToArray();
+
+        byte[] kat = PanicIv(saltA5, 42, 1000, 7);
+        Assert.Equal("e2615ed3e4f44375", Convert.ToHexString(kat).ToLowerInvariant());
+
+        // Deterministic.
+        Assert.Equal(kat, PanicIv(saltA5, 42, 1000, 7));
+
+        // Each input independently perturbs the output.
+        Assert.NotEqual(kat, PanicIv(saltA5, 43, 1000, 7)); // pid
+        Assert.NotEqual(kat, PanicIv(saltA5, 42, 1001, 7)); // timestamp
+        Assert.NotEqual(kat, PanicIv(saltA5, 42, 1000, 8)); // counter
+    }
+
+    /// A descendant reassigned the installer's exact PID at counter 0 must
+    /// still derive a disjoint prefix, because the monotonic timestamp differs.
+    /// This is the PID-recycle nonce-reuse invariant (bug-446) the .NET client
+    /// previously lacked.
+    [Fact]
+    public void DerivePanicIvPrefix_PidRecycleWithLaterTimestampIsDisjoint()
+    {
+        byte[] salt = Enumerable.Repeat((byte)0x5A, Hkdf.SessionSaltBytes).ToArray();
+        byte[] installer = PanicIv(salt, 4242, 1000, 0);
+        byte[] recycled = PanicIv(salt, 4242, 9_999_000, 0);
+        Assert.NotEqual(installer, recycled);
     }
 }

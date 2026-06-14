@@ -126,12 +126,16 @@ public static class SignalHandler
     }
 
     /// <summary>
-    /// Install a ChaCha20-Poly1305 secure-UDP signal emitter. Reads the
-    /// 8-byte IV from <see cref="RandomNumberGenerator.Fill"/> at
+    /// Install a ChaCha20-Poly1305 secure-UDP signal emitter. Reads a
+    /// 16-byte session salt from <see cref="RandomNumberGenerator.Fill"/> at
     /// install time and fails closed
-    /// (<see cref="PanicInstallErrorKind.EntropyUnavailable"/>) if the
-    /// RNG throws. The emitter snapshots the install-time PID and
-    /// re-reads entropy on a detected fork(2).
+    /// (<see cref="PanicInstallErrorKind.EntropyUnavailable"/>) if the RNG
+    /// throws. Every fire derives its 8-byte IV prefix from that salt plus the
+    /// per-fire <c>(pid, timestamp)</c> via
+    /// <see cref="Hkdf.DerivePanicIvPrefix"/>, so the AEAD nonce is unique
+    /// across <c>fork(2)</c> and PID recycling by construction — no install-PID
+    /// probe and no in-hook entropy read (mirrors the Rust/Go/Python/Node
+    /// clients).
     /// </summary>
     public static IDisposable InstallSecureUdp(string host, int port, ReadOnlySpan<byte> key32)
     {
@@ -146,10 +150,10 @@ public static class SignalHandler
             throw new PlatformNotSupportedException(
                 "ChaCha20-Poly1305 is not available on this platform / .NET runtime.");
         }
-        byte[] iv = new byte[AeadCodec.IvRandomBytes];
+        byte[] salt = new byte[Hkdf.SessionSaltBytes];
         try
         {
-            RandomNumberGenerator.Fill(iv);
+            RandomNumberGenerator.Fill(salt);
         }
         catch (Exception ex)
         {
@@ -166,7 +170,7 @@ public static class SignalHandler
             throw new PanicInstallException(PanicInstallErrorKind.SocketBind,
                 $"failed to bind UDP to {host}:{port}: {ex.Message}", ex);
         }
-        var emitter = new SecureEmitter(sock, key32.ToArray(), iv);
+        var emitter = new SecureEmitter(sock, key32.ToArray(), salt);
         return InstallEmitter(emitter);
     }
 
@@ -247,8 +251,8 @@ public static class SignalHandler
             try
             {
                 Span<byte> buf = stackalloc byte[Frame.Bytes];
-                if (!BuildCriticalFrame(buf)) return;
-                EmitFrame(buf);
+                if (!BuildCriticalFrame(buf, out uint pid, out ulong timestamp)) return;
+                EmitFrame(buf, pid, timestamp);
             }
             catch
             {
@@ -256,20 +260,28 @@ public static class SignalHandler
             }
         }
 
-        protected abstract void EmitFrame(ReadOnlySpan<byte> plaintext32);
+        /// <param name="plaintext32">The 32-byte VLP frame to emit (sealed by
+        /// the secure emitter, sent verbatim by the plaintext emitter).</param>
+        /// <param name="pid">PID written into the authenticated plaintext.</param>
+        /// <param name="timestamp">Terminal timestamp written into the
+        /// authenticated plaintext. The secure emitter MUST feed the same
+        /// <paramref name="pid"/> and <paramref name="timestamp"/> to its
+        /// IV-prefix KDF so the nonce binds to the sealed frame.</param>
+        protected abstract void EmitFrame(ReadOnlySpan<byte> plaintext32, uint pid, ulong timestamp);
 
-        private static bool BuildCriticalFrame(Span<byte> dest)
+        private static bool BuildCriticalFrame(Span<byte> dest, out uint pid, out ulong timestamp)
         {
-            uint pid = (uint)Environment.ProcessId;
+            pid = (uint)Environment.ProcessId;
+            timestamp = 0;
             long elapsedTicks = Stopwatch.GetElapsedTime(s_terminalClockEpoch).Ticks;
             long raw = elapsedTicks > long.MaxValue / 100
                 ? long.MaxValue
                 : Math.Max(1, elapsedTicks * 100);
-            if (!TryClaimTerminalTimestamp(ref s_lastTerminalTimestamp, raw, out ulong ts))
+            if (!TryClaimTerminalTimestamp(ref s_lastTerminalTimestamp, raw, out timestamp))
             {
                 return false;
             }
-            Codec.EncodeInto(dest, Status.Critical, pid, ts, Frame.NonceTerminal, payload: 0);
+            Codec.EncodeInto(dest, Status.Critical, pid, timestamp, Frame.NonceTerminal, payload: 0);
             return true;
         }
 
@@ -305,7 +317,7 @@ public static class SignalHandler
     internal sealed class PlaintextEmitter : Emitter
     {
         public PlaintextEmitter(Socket socket) : base(socket) { }
-        protected override void EmitFrame(ReadOnlySpan<byte> plaintext32)
+        protected override void EmitFrame(ReadOnlySpan<byte> plaintext32, uint pid, ulong timestamp)
         {
             Socket.Send(plaintext32, SocketFlags.None);
         }
@@ -314,53 +326,33 @@ public static class SignalHandler
     internal sealed class SecureEmitter : Emitter
     {
         private readonly byte[] _key;
-        private byte[] _iv;
-        private readonly int _installPid;
+        private readonly byte[] _salt;
 
-        public SecureEmitter(Socket socket, byte[] key32, byte[] iv8) : base(socket)
+        public SecureEmitter(Socket socket, byte[] key32, byte[] salt16) : base(socket)
         {
             _key = key32;
-            _iv = iv8;
-            _installPid = Environment.ProcessId;
+            _salt = salt16;
         }
 
-        // Test seam: spoof the install-time PID so the fork-recovery branch in
-        // EmitFrame can be exercised without an actual fork(2).
-        internal SecureEmitter(Socket socket, byte[] key32, byte[] iv8, int installPidForTest)
-            : base(socket)
+        protected override void EmitFrame(ReadOnlySpan<byte> plaintext32, uint pid, ulong timestamp)
         {
-            _key = key32;
-            _iv = iv8;
-            _installPid = installPidForTest;
-        }
-
-        protected override void EmitFrame(ReadOnlySpan<byte> plaintext32)
-        {
-            // Fork-safety (mirrors the Rust/Go secure panic emitters and this
-            // type's documented contract). Emit() is one-shot per process, so
-            // counter 0 is the only counter ever used in a given process — a
-            // unique IV per process is therefore sufficient. But a fork(2)
-            // child inherits the parent's IV and its own fresh `_fired` flag,
-            // so parent and child could each seal a Critical frame under the
-            // same (key, iv, counter=0) ChaCha20-Poly1305 nonce — catastrophic
-            // keystream + Poly1305 reuse. Detect the fork by PID change and
-            // re-read OS entropy so the child's nonce space is disjoint. Fail
-            // closed if the RNG is unavailable rather than reuse the parent's.
-            if (Environment.ProcessId != _installPid)
-            {
-                byte[] freshIv = new byte[AeadCodec.IvRandomBytes];
-                try
-                {
-                    RandomNumberGenerator.Fill(freshIv);
-                }
-                catch
-                {
-                    return;
-                }
-                _iv = freshIv;
-            }
+            // Fork- and PID-recycle-safe by construction (mirrors the Rust/Go/
+            // Python/Node secure panic emitters). The 8-byte IV prefix is
+            // DERIVED from the install-time salt plus the per-fire (pid,
+            // timestamp) that are also sealed into the authenticated plaintext
+            // above — never a raw stored IV. A fork(2) child inherits the salt
+            // but has a distinct pid; a descendant reassigned the installer's
+            // PID fires later in monotonic time. Either way the derived prefix
+            // differs, so two frames can never share a ChaCha20-Poly1305 nonce
+            // under the same key. There is deliberately no `pid == installPid`
+            // raw-IV fast path: PID equality is unsound under PID recycling
+            // (bug-446). Emit() is one-shot per process, so ivCounter is always
+            // 0 here; the (salt, pid, timestamp) triple carries all uniqueness.
+            const uint ivCounter = 0;
+            Span<byte> ivPrefix = stackalloc byte[AeadCodec.IvRandomBytes];
+            Hkdf.DerivePanicIvPrefix(_salt, pid, timestamp, ivCounter, ivPrefix);
             Span<byte> wire = stackalloc byte[AeadCodec.SharedFrameBytes];
-            AeadCodec.EncodeShared(_key, _iv, ivCounter: 0, plaintext32, wire);
+            AeadCodec.EncodeShared(_key, ivPrefix, ivCounter, plaintext32, wire);
             Socket.Send(wire, SocketFlags.None);
         }
     }
