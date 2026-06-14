@@ -106,6 +106,37 @@ def derive_iv_prefix(session_salt: bytes, prefix_index: int) -> bytes:
     return hkdf_sha256(ikm=session_salt, salt=b"", info=info, length=IV_RANDOM_BYTES)
 
 
+def derive_panic_iv_prefix(
+    session_salt: bytes,
+    panic_pid: int,
+    timestamp: int,
+    iv_counter: int,
+) -> bytes:
+    """HKDF-SHA256 panic-hook IV prefix. Returns 8 bytes.
+
+    Mirrors ``crates/varta-vlp/src/crypto/kdf.rs::derive_panic_iv_prefix``.
+    The secure-panic emitter derives **every** prefix from the install-time
+    ``session_salt`` plus the per-fire ``(panic_pid, timestamp, iv_counter)``
+    — all three are already authenticated in the sealed frame (PID and
+    timestamp inside the VLP plaintext, counter in the AEAD nonce). Mixing
+    the strictly-monotonic ``timestamp`` makes the derived ``(prefix,
+    iv_counter)`` unique across ``fork(2)`` *and* PID recycling without any
+    PID-equality probe or in-hook entropy read: a descendant reassigned the
+    installer's PID still fires later in monotonic time, so its prefix can
+    never collide with the installer's under the same key. See
+    ``book/src/spec/vlp-secure.md`` §6.2.
+    """
+    if len(session_salt) != 16:
+        raise ValueError("session_salt must be 16 bytes")
+    info = (
+        b"varta-panic-iv-v1\x00"
+        + struct.pack("<I", panic_pid & 0xFFFFFFFF)
+        + struct.pack("<Q", timestamp & 0xFFFFFFFFFFFFFFFF)
+        + struct.pack("<I", iv_counter & 0xFFFFFFFF)
+    )
+    return hkdf_sha256(ikm=session_salt, salt=b"", info=info, length=IV_RANDOM_BYTES)
+
+
 def derive_epoch_key(agent_key: bytes, epoch: int) -> bytes:
     """HKDF-SHA256 derive_epoch_key. Returns 32 bytes."""
     if len(agent_key) != KEY_BYTES:

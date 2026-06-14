@@ -79,6 +79,30 @@ func DeriveIVPrefix(sessionSalt [16]byte, prefixIndex uint32) [IVRandomBytes]byt
 	return out
 }
 
+// DerivePanicIVPrefix returns the 8-byte IV prefix for a secure-UDP panic
+// frame, derived from the install-time salt plus the per-fire (panicPid,
+// timestamp, ivCounter). Mirrors
+// crates/varta-vlp/src/crypto/kdf.rs::derive_panic_iv_prefix.
+//
+// All three inputs are authenticated in the sealed frame (PID and timestamp
+// inside the VLP plaintext, counter in the AEAD nonce). Mixing the
+// strictly-monotonic timestamp makes every fire's (prefix, ivCounter) unique
+// across fork(2) and PID recycling without reading entropy in the signal
+// goroutine: a descendant reassigned the installer's PID still fires later in
+// monotonic time, so its prefix can never collide with the installer's under
+// the same key.
+func DerivePanicIVPrefix(sessionSalt [16]byte, panicPid uint32, timestamp uint64, ivCounter uint32) [IVRandomBytes]byte {
+	info := make([]byte, 34)
+	copy(info[:18], []byte("varta-panic-iv-v1\x00"))
+	binary.LittleEndian.PutUint32(info[18:22], panicPid)
+	binary.LittleEndian.PutUint64(info[22:30], timestamp)
+	binary.LittleEndian.PutUint32(info[30:34], ivCounter)
+	okm := HKDFSha256(sessionSalt[:], nil, info, IVRandomBytes)
+	var out [IVRandomBytes]byte
+	copy(out[:], okm)
+	return out
+}
+
 // DeriveEpochKey returns the 32-byte per-epoch key. Reserved for
 // forward compatibility; not used on the wire today but covered by the
 // conformance vectors.

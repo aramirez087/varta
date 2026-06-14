@@ -68,6 +68,26 @@ export function deriveIvPrefix(
   return hkdfSha256(sessionSalt, Buffer.alloc(0), info, IV_RANDOM_BYTES);
 }
 
+export function derivePanicIvPrefix(
+  sessionSalt: Buffer,
+  panicPid: number,
+  timestamp: bigint,
+  ivCounter: number,
+): Buffer {
+  if (sessionSalt.length !== SESSION_SALT_BYTES) {
+    throw new RangeError(`sessionSalt must be ${SESSION_SALT_BYTES} bytes`);
+  }
+  // Mirrors crates/varta-vlp/src/crypto/kdf.rs::derive_panic_iv_prefix.
+  // info = "varta-panic-iv-v1\0" || pid LE32 || timestamp LE64 || counter LE32
+  const label = "varta-panic-iv-v1\x00";
+  const info = Buffer.alloc(label.length + 4 + 8 + 4);
+  info.write(label, 0, "binary");
+  info.writeUInt32LE(panicPid >>> 0, label.length);
+  info.writeBigUInt64LE(timestamp & 0xffffffffffffffffn, label.length + 4);
+  info.writeUInt32LE(ivCounter >>> 0, label.length + 12);
+  return hkdfSha256(sessionSalt, Buffer.alloc(0), info, IV_RANDOM_BYTES);
+}
+
 export function deriveEpochKey(agentKey: Buffer, epoch: bigint): Buffer {
   if (agentKey.length !== KEY_BYTES) {
     throw new RangeError(`agentKey must be ${KEY_BYTES} bytes`);

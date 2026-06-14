@@ -6,6 +6,24 @@ governed independently — see `book/src/spec/vlp.md` in the workspace.
 
 ## [Unreleased]
 
+### Security
+
+- **Secure-UDP panic handler: closed an AEAD nonce-reuse hole under PID
+  recycling.** The handler detected `fork(2)` by comparing the live PID to the
+  install-time PID and only re-randomized its IV salt on a mismatch. A
+  descendant that inherited the install state and was later reassigned the
+  installer's exact PID passed the equality check, re-derived the same
+  `DeriveIVPrefix(salt, 0)` prefix, and sealed its first panic frame under the
+  installer's `(key, nonce)` — a ChaCha20-Poly1305 nonce collision (keystream
+  + Poly1305 one-time-key recovery → plaintext disclosure and forgery of
+  attested panic frames). The handler now derives **every** prefix from
+  `DerivePanicIVPrefix(salt, pid, timestamp, counter)`, mixing the
+  strictly-monotonic terminal timestamp so the nonce is unique across
+  `fork(2)` and PID recycling without any PID-equality probe or in-hook
+  entropy read. Mirrors the Rust reference (`derive_panic_iv_prefix`) and is
+  byte-for-byte identical across the Rust/Python/Node clients (shared
+  known-answer vector). Wire-transparent — no observer or spec change.
+
 ### Fixed
 
 - Panic emitters now claim terminal timestamps from a process-wide monotonic

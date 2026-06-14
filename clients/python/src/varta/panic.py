@@ -32,7 +32,7 @@ from ._vlp import FRAME_BYTES, NONCE_TERMINAL, Status, encode_into
 from ._vlp_secure import (
     CryptographyMissingError,
     KEY_BYTES,
-    derive_iv_prefix,
+    derive_panic_iv_prefix,
     encode_shared,
 )
 
@@ -97,20 +97,34 @@ def _next_terminal_timestamp() -> Optional[int]:
         return candidate
 
 
-def _build_critical_frame(payload: int = 0) -> Optional[bytes]:
+def _build_critical_frame_with_meta(
+    payload: int = 0,
+) -> Optional[Tuple[bytes, int, int]]:
+    """Build a Critical+NONCE_TERMINAL frame, returning ``(frame, pid, ts)``.
+
+    The PID and timestamp baked into the frame are returned so the secure
+    emitter can feed the *same* values into the panic IV-prefix KDF — the
+    nonce and the authenticated plaintext must agree on them.
+    """
     timestamp = _next_terminal_timestamp()
     if timestamp is None:
         return None
+    pid = os.getpid() & 0xFFFFFFFF
     buf = bytearray(FRAME_BYTES)
     encode_into(
         buf,
         Status.CRITICAL,
-        os.getpid() & 0xFFFFFFFF,
+        pid,
         timestamp,
         NONCE_TERMINAL,
         payload & 0xFFFFFFFF,
     )
-    return bytes(buf)
+    return bytes(buf), pid, timestamp
+
+
+def _build_critical_frame(payload: int = 0) -> Optional[bytes]:
+    meta = _build_critical_frame_with_meta(payload)
+    return None if meta is None else meta[0]
 
 
 def _chain_excepthook(emit: Callable[[], None]) -> None:
@@ -197,10 +211,15 @@ def install_excepthook_secure_udp(addr: Address, key: bytes) -> None:
     raises, :class:`EntropyUnavailable` propagates and no hook is
     installed (the original :data:`sys.excepthook` keeps running).
 
-    Detects ``fork(2)`` at hook-call time by comparing the current PID to
-    the snapshot captured at install. On mismatch, re-reads
-    :func:`os.urandom` inside the hook to rotate the IV salt — matches
-    the Rust ``install_panic_handler_secure_udp`` contract.
+    Fork- and PID-recycle-safe by construction: every fire derives its IV
+    prefix from the install-time salt plus the per-fire
+    ``(pid, timestamp, counter)`` via :func:`derive_panic_iv_prefix`. The
+    strictly-monotonic timestamp guarantees a unique nonce across
+    ``fork(2)`` and PID recycling without any PID-equality probe or in-hook
+    entropy read — mirroring the Rust
+    ``install_panic_handler_secure_udp`` contract (a former
+    ``pid != install_pid`` fast path was unsound: a descendant reassigned
+    the installer's PID would reuse the inherited ``(prefix, counter=0)``).
 
     Requires the ``cryptography`` package. Raises
     :class:`varta._vlp_secure.CryptographyMissingError` if missing.
@@ -225,7 +244,7 @@ def install_excepthook_secure_udp(addr: Address, key: bytes) -> None:
     # Verify cryptography is reachable before we register the hook so the
     # failure surfaces at install time rather than during a panic.
     try:
-        derive_iv_prefix(salt, 0)
+        derive_panic_iv_prefix(salt, 0, 0, 0)
         encode_shared(key, b"\x00" * 8, 0, b"\x00" * FRAME_BYTES)
     except CryptographyMissingError:
         sock.close()
@@ -233,26 +252,18 @@ def install_excepthook_secure_udp(addr: Address, key: bytes) -> None:
 
     state = {
         "salt": salt,
-        "pid": os.getpid(),
         "counter": 0,
     }
 
     def emit() -> None:
         try:
-            pid = os.getpid()
-            if pid != state["pid"]:
-                try:
-                    state["salt"] = os.urandom(16)
-                except OSError:
-                    return
-                state["pid"] = pid
-                state["counter"] = 0
-            iv_prefix = derive_iv_prefix(state["salt"], 0)
-            plaintext = _build_critical_frame()
-            if plaintext is None:
+            meta = _build_critical_frame_with_meta()
+            if meta is None:
                 return
+            plaintext, pid, timestamp = meta
             counter = int(state["counter"])
             state["counter"] = counter + 1
+            iv_prefix = derive_panic_iv_prefix(state["salt"], pid, timestamp, counter)
             wire = encode_shared(key, iv_prefix, counter, plaintext)
             sock.send(wire)
         except OSError:

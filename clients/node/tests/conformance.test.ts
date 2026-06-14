@@ -21,6 +21,7 @@ import {
   deriveAgentKey,
   deriveEpochKey,
   deriveIvPrefix,
+  derivePanicIvPrefix,
   encodeMaster,
   encodeShared,
 } from "../src/vlp_secure.js";
@@ -160,6 +161,28 @@ test("KDF derivations match vectors", () => {
       // secure-*-seal vectors handled in the AEAD test below
     }
   }
+});
+
+test("panic IV prefix: cross-impl KAT, per-input variance, recycle distinctness", () => {
+  const saltA5 = Buffer.alloc(16, 0xa5);
+  // Cross-impl known-answer (same KAT pinned in kdf.rs / Python / Go).
+  const kat = derivePanicIvPrefix(saltA5, 42, 1000n, 7);
+  assert.equal(kat.toString("hex"), "e2615ed3e4f44375");
+  assert.deepEqual(kat, derivePanicIvPrefix(saltA5, 42, 1000n, 7)); // deterministic
+  // Every input affects the prefix.
+  assert.notDeepEqual(kat, derivePanicIvPrefix(saltA5, 43, 1000n, 7)); // pid
+  assert.notDeepEqual(kat, derivePanicIvPrefix(saltA5, 42, 1001n, 7)); // timestamp
+  assert.notDeepEqual(kat, derivePanicIvPrefix(saltA5, 42, 1000n, 8)); // counter
+  // Domain separation from the regular session prefix.
+  assert.notDeepEqual(kat, deriveIvPrefix(saltA5, 0));
+  // Security regression: a PID-recycled descendant firing its first panic at
+  // counter 0 must not reuse the installer's (pid, counter=0) prefix. The
+  // strictly-monotonic timestamp is the only thing keeping them apart — the
+  // structural replacement for the former (unsound) PID-equality check.
+  const salt5a = Buffer.alloc(16, 0x5a);
+  const installer = derivePanicIvPrefix(salt5a, 4242, 1000n, 0);
+  const recycled = derivePanicIvPrefix(salt5a, 4242, 9_999_000n, 0);
+  assert.notDeepEqual(installer, recycled);
 });
 
 test("AEAD seal/open vectors", () => {

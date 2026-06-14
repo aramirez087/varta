@@ -84,14 +84,23 @@ func nextTerminalTimestamp() (uint64, bool) {
 	return claimTerminalTimestamp(&lastTerminalTimestamp, raw)
 }
 
-func buildCriticalFrame() ([vlp.FrameBytes]byte, bool) {
-	var out [vlp.FrameBytes]byte
-	ts, ok := nextTerminalTimestamp()
+// buildCriticalFrameWithMeta builds a Critical+NonceTerminal frame and also
+// returns the pid and timestamp baked into it, so the secure emitter can feed
+// the same values into the panic IV-prefix KDF — the AEAD nonce and the
+// authenticated plaintext must agree on them.
+func buildCriticalFrameWithMeta() (frame [vlp.FrameBytes]byte, pid uint32, ts uint64, ok bool) {
+	ts, ok = nextTerminalTimestamp()
 	if !ok {
-		return out, false
+		return frame, 0, 0, false
 	}
-	vlp.EncodeInto(&out, vlp.StatusCritical, uint32(os.Getpid()), ts, vlp.NonceTerminal, 0)
-	return out, true
+	pid = uint32(os.Getpid())
+	vlp.EncodeInto(&frame, vlp.StatusCritical, pid, ts, vlp.NonceTerminal, 0)
+	return frame, pid, ts, true
+}
+
+func buildCriticalFrame() ([vlp.FrameBytes]byte, bool) {
+	frame, _, _, ok := buildCriticalFrameWithMeta()
+	return frame, ok
 }
 
 // installSignals wires the signal goroutine after the emitter has
@@ -215,9 +224,16 @@ func InstallSignalHandlerUDP(host string, port int) error {
 // InstallSignalHandlerSecureUDP installs the handler over secure UDP
 // with a pre-shared 32-byte key. Reads 16 bytes from crypto/rand at
 // install time (fail-closed; returns EntropyUnavailable if the read
-// fails) and snapshots the install-time PID; if the emit closure
-// observes a different PID at signal time, it re-reads entropy before
-// re-deriving the IV prefix.
+// fails).
+//
+// Fork- and PID-recycle-safe by construction: every fire derives its IV
+// prefix from the install-time salt plus the per-fire (pid, timestamp,
+// counter) via vlpsecure.DerivePanicIVPrefix. The strictly-monotonic
+// timestamp guarantees a unique nonce across fork(2) and PID recycling
+// without any PID-equality probe or in-hook entropy read — a former
+// `pid != install_pid` re-randomize path was unsound, since a descendant
+// reassigned the installer's PID would reuse the inherited (prefix,
+// counter=0) under the same key.
 func InstallSignalHandlerSecureUDP(host string, port int, key []byte) error {
 	if len(key) != vlpsecure.KeyBytes {
 		return &PanicInstallError{Kind: "BadKey", Err: errors.New("key must be 32 bytes")}
@@ -236,7 +252,6 @@ func InstallSignalHandlerSecureUDP(host string, port int, key []byte) error {
 
 	state := &secureState{
 		salt:    saltArr,
-		pid:     os.Getpid(),
 		counter: 0,
 	}
 	em := &emitter{
@@ -247,31 +262,23 @@ func InstallSignalHandlerSecureUDP(host string, port int, key []byte) error {
 			// instant a terminating signal arrives. Without the lock both
 			// callers read the same iv counter and seal two distinct frames
 			// under one ChaCha20-Poly1305 nonce: keystream reuse (XOR-recovers
-			// both plaintexts) and Poly1305 forgery. The lock also guards the
-			// salt/pid fork-recovery mutation below. Go delivers signals via a
+			// both plaintexts) and Poly1305 forgery. Go delivers signals via a
 			// normal goroutine (signal.Notify), so a mutex here is safe — there
 			// is no async-signal-safety constraint as in the Rust hook.
 			state.mu.Lock()
 			defer state.mu.Unlock()
-			pid := os.Getpid()
-			if pid != state.pid {
-				if _, rerr := rand.Read(state.salt[:]); rerr != nil {
-					return
-				}
-				state.pid = pid
-				state.counter = 0
-			}
-			ivPrefix := vlpsecure.DeriveIVPrefix(state.salt, 0)
-			plain, ok := buildCriticalFrame()
+			plain, pid, ts, ok := buildCriticalFrameWithMeta()
 			if !ok {
 				return
 			}
-			wire, sealErr := vlpsecure.EncodeShared(keyArr, ivPrefix, state.counter, plain)
+			counter := state.counter
+			// Advance at seal time, not write time: once a counter has sealed a
+			// frame it must never seal another, even if the Write below drops.
+			ivPrefix := vlpsecure.DerivePanicIVPrefix(state.salt, pid, ts, counter)
+			wire, sealErr := vlpsecure.EncodeShared(keyArr, ivPrefix, counter, plain)
 			if sealErr != nil {
 				return
 			}
-			// Advance at seal time, not write time: once a counter has sealed a
-			// frame it must never seal another, even if the Write below drops.
 			state.counter++
 			_, _ = conn.Write(wire[:])
 		},
@@ -286,11 +293,10 @@ func InstallSignalHandlerSecureUDP(host string, port int, key []byte) error {
 //
 // `mu` serializes the emit closure: the signal goroutine and the Run
 // defer/recover wrapper share one emitter and can fire concurrently, so the
-// iv counter (and the fork-recovery salt/pid) must be mutated under a lock to
-// guarantee every sealed frame uses a unique ChaCha20-Poly1305 nonce.
+// iv counter must be mutated under a lock to guarantee every sealed frame uses
+// a unique ChaCha20-Poly1305 nonce.
 type secureState struct {
 	mu      sync.Mutex
 	salt    [16]byte
-	pid     int
 	counter uint32
 }

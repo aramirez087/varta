@@ -279,6 +279,11 @@ mod tests {
         let p1 = derive_panic_iv_prefix(&salt, 42, 1_000, 7).expect("kdf must succeed");
         let p2 = derive_panic_iv_prefix(&salt, 42, 1_000, 7).expect("kdf must succeed");
         assert_eq!(p1, p2);
+        // Known-answer vector. HKDF is deterministic, so the Python, Go, and
+        // Node secure-panic clients — which mirror this exact info layout —
+        // must produce the identical 8 bytes for these inputs. Pinning it here
+        // locks all four implementations together.
+        assert_eq!(p1, [0xe2, 0x61, 0x5e, 0xd3, 0xe4, 0xf4, 0x43, 0x75]);
     }
 
     #[test]

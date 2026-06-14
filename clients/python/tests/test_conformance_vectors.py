@@ -20,6 +20,7 @@ from varta._vlp_secure import (
     derive_agent_key,
     derive_epoch_key,
     derive_iv_prefix,
+    derive_panic_iv_prefix,
     encode_master,
     encode_shared,
 )
@@ -119,6 +120,43 @@ def test_aead_vectors(vectors_path: Path) -> None:
             assert wire.hex() == v["expected_wire_hex"], vid
             pt = decode_master(bytes.fromhex(v["master_key_hex"]), wire)
             assert pt.hex() == v["plaintext_hex"], vid
+
+
+def test_panic_iv_prefix_matches_known_answer() -> None:
+    """Cross-impl known-answer: locks Python to Rust/Go/Node byte-for-byte.
+
+    Same KAT pinned in ``crates/varta-vlp/src/crypto/kdf.rs``
+    (``panic_iv_prefix_is_deterministic``). HKDF is deterministic, so an
+    identical info layout must produce identical bytes across all clients.
+    """
+    salt = bytes([0xA5] * 16)
+    out = derive_panic_iv_prefix(salt, 42, 1_000, 7)
+    assert out == bytes.fromhex("e2615ed3e4f44375")
+    # Deterministic.
+    assert out == derive_panic_iv_prefix(salt, 42, 1_000, 7)
+
+
+def test_panic_iv_prefix_varies_with_every_input() -> None:
+    salt = bytes([0xA5] * 16)
+    baseline = derive_panic_iv_prefix(salt, 42, 1_000, 7)
+    assert baseline != derive_panic_iv_prefix(salt, 43, 1_000, 7)  # pid
+    assert baseline != derive_panic_iv_prefix(salt, 42, 1_001, 7)  # timestamp
+    assert baseline != derive_panic_iv_prefix(salt, 42, 1_000, 8)  # counter
+    # Domain separation from the regular session prefix.
+    assert baseline != derive_iv_prefix(salt, 0)
+
+
+def test_panic_iv_prefix_distinct_for_recycled_pid_at_counter_zero() -> None:
+    """Security regression: a PID-recycled descendant inheriting the install
+    salt and firing its first panic at iv_counter=0 must not reuse the
+    installer's (pid, counter=0) prefix. Distinctness is carried solely by the
+    strictly-monotonic timestamp — the structural replacement for the former
+    (unsound) PID-equality check.
+    """
+    salt = bytes([0x5A] * 16)
+    installer = derive_panic_iv_prefix(salt, 4242, 1_000, 0)
+    recycled = derive_panic_iv_prefix(salt, 4242, 9_999_000, 0)
+    assert installer != recycled
 
 
 def test_cryptography_missing_error_is_actionable() -> None:

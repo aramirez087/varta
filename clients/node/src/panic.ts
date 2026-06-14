@@ -21,7 +21,7 @@ import {
 import {
   encodeShared,
   KEY_BYTES,
-  deriveIvPrefix,
+  derivePanicIvPrefix,
   IV_RANDOM_BYTES,
   SESSION_SALT_BYTES,
 } from "./vlp_secure.js";
@@ -70,19 +70,29 @@ function nextTerminalTimestamp(): bigint | undefined {
   return candidate;
 }
 
-function buildCriticalFrame(payload: number = 0): Buffer | undefined {
+interface CriticalFrameMeta {
+  frame: Buffer;
+  pid: number;
+  timestamp: bigint;
+}
+
+// Build a Critical+NONCE_TERMINAL frame and return the pid and timestamp
+// baked into it, so the secure emitter can feed the same values into the
+// panic IV-prefix KDF — the AEAD nonce and the authenticated plaintext must
+// agree on them.
+function buildCriticalFrameWithMeta(
+  payload: number = 0,
+): CriticalFrameMeta | undefined {
   const timestamp = nextTerminalTimestamp();
   if (timestamp === undefined) return undefined;
+  const pid = process.pid >>> 0;
   const buf = Buffer.alloc(FRAME_BYTES);
-  encodeInto(
-    buf,
-    Status.Critical,
-    process.pid >>> 0,
-    timestamp,
-    NONCE_TERMINAL,
-    payload >>> 0,
-  );
-  return buf;
+  encodeInto(buf, Status.Critical, pid, timestamp, NONCE_TERMINAL, payload >>> 0);
+  return { frame: buf, pid, timestamp };
+}
+
+function buildCriticalFrame(payload: number = 0): Buffer | undefined {
+  return buildCriticalFrameWithMeta(payload)?.frame;
 }
 
 function triggerActive(): void {
@@ -197,6 +207,15 @@ export function installSignalHandlerUds(path: string): void {
 // `crypto.randomBytes(16)` is invoked once at install time; if it
 // throws, `PanicInstallError(kind="EntropyUnavailable")` propagates
 // and no hook is registered.
+//
+// Fork- and PID-recycle-safe by construction: every fire derives its IV
+// prefix from the install-time salt plus the per-fire (pid, timestamp,
+// counter) via `derivePanicIvPrefix`. The strictly-monotonic timestamp
+// guarantees a unique nonce across `fork(2)` and PID recycling without any
+// PID-equality probe or in-hook entropy read — a former
+// `process.pid !== installPid` re-randomize path was unsound, since a
+// descendant reassigned the installer's PID would reuse the inherited
+// (prefix, counter=0) under the same key.
 export function installSignalHandlerSecureUdp(
   host: string,
   port: number,
@@ -222,28 +241,23 @@ export function installSignalHandlerSecureUdp(
 
   const state = {
     salt,
-    installPid: process.pid,
     counter: 0,
   };
 
   const keyCopy = Buffer.from(key);
   installEmitter(() => {
     try {
-      if (process.pid !== state.installPid) {
-        try {
-          state.salt = randomBytes(SESSION_SALT_BYTES);
-        } catch {
-          return;
-        }
-        state.installPid = process.pid;
-        state.counter = 0;
-      }
-      const ivPrefix = deriveIvPrefix(state.salt, 0).subarray(0, IV_RANDOM_BYTES);
+      const meta = buildCriticalFrameWithMeta();
+      if (meta === undefined) return;
       const counter = state.counter;
       state.counter = (state.counter + 1) >>> 0;
-      const plaintext = buildCriticalFrame();
-      if (plaintext === undefined) return;
-      const wire = encodeShared(keyCopy, ivPrefix, counter, plaintext);
+      const ivPrefix = derivePanicIvPrefix(
+        state.salt,
+        meta.pid,
+        meta.timestamp,
+        counter,
+      ).subarray(0, IV_RANDOM_BYTES);
+      const wire = encodeShared(keyCopy, ivPrefix, counter, meta.frame);
       sock.send(wire);
     } catch {
       // Hook must never propagate.

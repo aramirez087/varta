@@ -186,6 +186,45 @@ func TestConformanceKDFVectors(t *testing.T) {
 	}
 }
 
+// TestPanicIVPrefix locks the Go secure-panic IV-prefix derivation to the
+// Rust reference (crates/varta-vlp/src/crypto/kdf.rs) and the Python/Node
+// clients via a shared known-answer, and pins the security property that
+// replaced the former (unsound) PID-equality fork check.
+func TestPanicIVPrefix(t *testing.T) {
+	var saltA5 [16]byte
+	for i := range saltA5 {
+		saltA5[i] = 0xA5
+	}
+	// Cross-impl known-answer (same KAT pinned in kdf.rs).
+	kat := vlpsecure.DerivePanicIVPrefix(saltA5, 42, 1000, 7)
+	if got := hex.EncodeToString(kat[:]); got != "e2615ed3e4f44375" {
+		t.Fatalf("KAT mismatch: got %s want e2615ed3e4f44375", got)
+	}
+	// Every input affects the prefix.
+	diffPid := vlpsecure.DerivePanicIVPrefix(saltA5, 43, 1000, 7)
+	diffTs := vlpsecure.DerivePanicIVPrefix(saltA5, 42, 1001, 7)
+	diffCtr := vlpsecure.DerivePanicIVPrefix(saltA5, 42, 1000, 8)
+	if kat == diffPid || kat == diffTs || kat == diffCtr {
+		t.Fatal("panic IV prefix must vary with pid, timestamp, and counter")
+	}
+	// Domain separation from the regular session prefix.
+	if reg := vlpsecure.DeriveIVPrefix(saltA5, 0); kat == reg {
+		t.Fatal("panic IV prefix must differ from derive_iv_prefix(salt, 0)")
+	}
+	// Security regression: a PID-recycled descendant firing its first panic
+	// at counter 0 must not reuse the installer's (pid, counter=0) prefix —
+	// the strictly-monotonic timestamp is the only thing keeping them apart.
+	var salt5A [16]byte
+	for i := range salt5A {
+		salt5A[i] = 0x5A
+	}
+	installer := vlpsecure.DerivePanicIVPrefix(salt5A, 4242, 1000, 0)
+	recycled := vlpsecure.DerivePanicIVPrefix(salt5A, 4242, 9_999_000, 0)
+	if installer == recycled {
+		t.Fatal("recycled-PID descendant must not reuse installer IV prefix at counter 0")
+	}
+}
+
 func TestConformanceAEADVectors(t *testing.T) {
 	d := loadVectors(t)
 	for _, v := range d.SecureFrameVectors {
