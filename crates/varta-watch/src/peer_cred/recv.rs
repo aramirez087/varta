@@ -614,12 +614,15 @@ mod tests {
     /// ancillary data — and it installs them even on control-buffer overflow.
     /// Before the fix `reclaim_scm_rights` was a no-op on macOS and the buffer
     /// was 16 bytes, so any same-UID process could exhaust the observer's fd
-    /// table by attaching fds to well-formed beats. This sends *multiple* fds
-    /// in one message to also exercise the multi-fd enumeration the 1024-byte
-    /// buffer enables (XNU caps `SCM_RIGHTS` at 253 fds).
+    /// table by attaching fds to well-formed beats. This sends a *maximally
+    /// stuffed* message — exactly `SCM_RIGHTS_MAX_FDS` (XNU's per-message cap)
+    /// fds — so it exercises the truncation boundary: a buffer even one fd short
+    /// (the prior 1024-byte sizing) truncates the last fd and leaks it, failing
+    /// this assertion. Locks `ANCILLARY_BUFFER_SIZE` against the cap.
     ///
     /// Real-syscall test (bind/sendmsg/recvmsg + `/dev/fd`); not available
-    /// under Miri isolation.
+    /// under Miri isolation. Raises `RLIMIT_NOFILE` first because installing the
+    /// full cap of fds transiently exceeds the default soft limit.
     #[cfg(all(target_os = "macos", not(miri)))]
     #[test]
     fn scm_rights_fds_are_reclaimed_not_leaked_macos() {
@@ -628,15 +631,53 @@ mod tests {
         use std::os::unix::io::AsRawFd;
         use std::os::unix::net::UnixDatagram;
 
+        #[repr(C)]
+        struct Rlimit {
+            rlim_cur: u64,
+            rlim_max: u64,
+        }
         extern "C" {
             fn sendmsg(fd: i32, msg: *const plat::Msghdr, flags: i32) -> isize;
             fn dup(fd: i32) -> i32;
             fn close(fd: i32) -> i32;
+            fn getrlimit(resource: i32, rlp: *mut Rlimit) -> i32;
+            fn setrlimit(resource: i32, rlp: *const Rlimit) -> i32;
         }
 
         const SOL_SOCKET: i32 = 0xffff;
         const SCM_RIGHTS: i32 = 0x01;
-        const NFDS: usize = 8;
+        const RLIMIT_NOFILE: i32 = 8; // <sys/resource.h> on macOS/BSD
+
+        // Maximally stuffed: XNU's per-message SCM_RIGHTS cap. A buffer one fd
+        // short truncates the tail and leaks it — this is the boundary value.
+        const NFDS: usize = plat::SCM_RIGHTS_MAX_FDS;
+
+        // Installing NFDS fds, plus the NFDS sender-side dups still open at send
+        // time, transiently needs ~2*NFDS descriptors — well over the default
+        // 256 soft limit. Raise the soft limit toward the hard limit; if the
+        // hard limit itself cannot accommodate the boundary, skip rather than
+        // fail on an under-resourced host.
+        let needed = (NFDS * 2 + 64) as u64;
+        // SAFETY: `getrlimit`/`setrlimit` read/write a fully-initialised
+        // `Rlimit` of the correct size; `RLIMIT_NOFILE` is a valid resource.
+        let mut rl = Rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        unsafe { getrlimit(RLIMIT_NOFILE, &mut rl) };
+        if rl.rlim_max < needed {
+            eprintln!(
+                "skipping: RLIMIT_NOFILE hard limit {} < {needed} needed for the {NFDS}-fd boundary",
+                rl.rlim_max
+            );
+            return;
+        }
+        let target = needed.max(4096).min(rl.rlim_max);
+        let new = Rlimit {
+            rlim_cur: target,
+            rlim_max: rl.rlim_max,
+        };
+        unsafe { setrlimit(RLIMIT_NOFILE, &new) };
 
         fn open_fd_count() -> usize {
             std::fs::read_dir("/dev/fd").expect("read /dev/fd").count()

@@ -89,13 +89,26 @@ extern "C" {
 // control buffer large enough to *enumerate* them, then walk and close every
 // `SCM_RIGHTS` fd (see `reclaim_scm_rights`).
 //
-// XNU caps `SCM_RIGHTS` at 253 fds per message (a 254-fd `sendmsg` is rejected
-// with EMSGSIZE on the sender). 253 fds is exactly `CMSG_ALIGN(sizeof(cmsghdr))
-// + 253 * sizeof(int)` = `12 + 1012` = 1024 bytes on XNU (cmsg alignment is to
-// `sizeof(u32)` = 4). Sizing the buffer to that kernel maximum means a single
-// datagram's unsolicited fds are always fully enumerable and reclaimable — no
-// truncation, no leaked overflow.
-pub(crate) const ANCILLARY_BUFFER_SIZE: usize = 1024;
+// XNU caps `SCM_RIGHTS` at 254 fds per message (a 255-fd `sendmsg` is rejected
+// with EINVAL on the sender; verified empirically on Darwin 25.x — see the
+// `scm_rights_fds_are_reclaimed_not_leaked_macos` boundary test). 254 fds
+// occupy `CMSG_ALIGN(sizeof(cmsghdr) + 254 * sizeof(int))` = `12 + 1016` =
+// 1028 bytes on XNU (cmsg alignment is to `sizeof(u32)` = 4). A 1024-byte
+// buffer is *four bytes short*: `recvmsg` installs all 254 fds but truncates
+// the control data to 1024 and sets `MSG_CTRUNC` — which macOS does not
+// surface (see `ctrl_truncated`), so `reclaim_scm_rights` enumerates only 253
+// and the 254th kernel-installed fd leaks permanently. One leaked fd per
+// maximally-stuffed datagram is the fd-exhaustion DoS this buffer exists to
+// prevent (the macOS twin of the Linux/BSD/illumos leak).
+//
+// Size to the kernel maximum *plus headroom* so a future cap increase cannot
+// silently reopen the leak — the original 1024-byte sizing assumed a 253-fd
+// cap that XNU has since raised, and exact-fitting a moving kernel constant is
+// exactly what regressed it. The buffer is a per-call stack allocation
+// (`recv::AncBuf`), so the slack is free. The compile-time floor below pins the
+// buffer to the documented cap as a regression guard.
+pub(crate) const SCM_RIGHTS_MAX_FDS: usize = 254;
+pub(crate) const ANCILLARY_BUFFER_SIZE: usize = 2048;
 
 /// `SOL_SOCKET` on macOS / XNU (`<sys/socket.h>`) — the cmsg level the kernel
 /// stamps on `SCM_RIGHTS` ancillary data.
@@ -122,10 +135,22 @@ extern "C" {
 /// `sizeof(usize)` (8-byte) alignment the shared `cmsg` walker assumes for the
 /// other platforms — which is why macOS keeps its own small walker here.
 #[inline]
-fn cmsg_align(len: usize) -> usize {
+const fn cmsg_align(len: usize) -> usize {
     let a = core::mem::size_of::<u32>();
     (len + a - 1) & !(a - 1)
 }
+
+// Compile-time floor: the ancillary buffer must hold a maximally-stuffed
+// `SCM_RIGHTS` message in full, or `recvmsg` truncates the tail fds and
+// `reclaim_scm_rights` cannot close them — the fd-exhaustion leak this buffer
+// exists to prevent. Pins `ANCILLARY_BUFFER_SIZE` to the documented kernel cap:
+// shrinking it below the cap's footprint fails the build.
+const _: () = assert!(
+    ANCILLARY_BUFFER_SIZE
+        >= cmsg_align(
+            core::mem::size_of::<Cmsghdr>() + SCM_RIGHTS_MAX_FDS * core::mem::size_of::<i32>()
+        )
+);
 
 /// Reclaim every peer-injected `SCM_RIGHTS` file descriptor XNU installed from
 /// this datagram's ancillary data.
