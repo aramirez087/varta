@@ -14,8 +14,11 @@
 //! - **`monotonic` (default, all platforms)** — `CLOCK_MONOTONIC`.
 //!   - Linux (`clk_id = 1`): pauses while the host is suspended.
 //!     NTP-slewable.
-//!   - BSD (`clk_id = 4`): pauses while the host is suspended.
-//!     Linux-compatible semantics.
+//!   - FreeBSD / DragonFly (`clk_id = 4`): pauses while the host is
+//!     suspended. Linux-compatible semantics.
+//!   - NetBSD / OpenBSD (`clk_id = 3`): pauses while the host is
+//!     suspended. (clk_id 4 is `CLOCK_THREAD_CPUTIME_ID` on OpenBSD and
+//!     unassigned on NetBSD — see the `CLOCK_MONOTONIC` constant below.)
 //!   - macOS / iOS (`clk_id = 6`): backed by `mach_absolute_time`. Pauses
 //!     during sleep on 10.12 (Sierra) and later — the same observable
 //!     semantics as Linux. The underlying tick rate is host-dependent
@@ -69,19 +72,24 @@ use std::io;
 ///
 /// - Linux:    `<bits/time.h>` — `CLOCK_MONOTONIC = 1`
 /// - macOS/iOS: `<sys/_types/_clock_id.h>` — `_CLOCK_MONOTONIC = 6` (10.12+)
-/// - FreeBSD:  `<sys/_clock_id.h>` — `CLOCK_MONOTONIC = 4`
-/// - NetBSD/OpenBSD/DragonFly: same as FreeBSD (4)
+/// - FreeBSD/DragonFly: `<sys/_clock_id.h>` — `CLOCK_MONOTONIC = 4`
+/// - NetBSD `<sys/time.h>` / OpenBSD `<sys/_time.h>` — `CLOCK_MONOTONIC = 3`
+///   (clk_id 4 is `CLOCK_THREAD_CPUTIME_ID` on OpenBSD, unassigned on NetBSD)
 #[cfg(target_os = "linux")]
 const CLOCK_MONOTONIC: i32 = 1;
 #[cfg(any(target_os = "macos", target_os = "ios"))]
 const CLOCK_MONOTONIC: i32 = 6;
-#[cfg(any(
-    target_os = "freebsd",
-    target_os = "netbsd",
-    target_os = "openbsd",
-    target_os = "dragonfly",
-))]
+#[cfg(any(target_os = "freebsd", target_os = "dragonfly"))]
 const CLOCK_MONOTONIC: i32 = 4;
+// NetBSD/OpenBSD number CLOCK_MONOTONIC as 3, NOT 4 like FreeBSD. clk_id 4 is
+// `CLOCK_THREAD_CPUTIME_ID` on OpenBSD (per-thread on-CPU time — it advances
+// only while the single observer poll thread is actually scheduled, so the
+// silence delta `now_ns - last_beat_ns` never reaches `threshold_ns` and
+// stalls are silently never detected) and is unassigned on NetBSD (where
+// `clock_gettime(4)` returns EINVAL, so the observer fails to start). Using 4
+// here is a brick on NetBSD and a silent missed-stall on OpenBSD.
+#[cfg(any(target_os = "netbsd", target_os = "openbsd"))]
+const CLOCK_MONOTONIC: i32 = 3;
 #[cfg(not(any(
     target_os = "linux",
     target_os = "macos",
@@ -475,6 +483,42 @@ mod tests {
         let a = clk.now_ns();
         let b = clk.now_ns();
         assert!(b >= a, "monotonic clock regressed: {a} -> {b}");
+    }
+
+    /// The numeric `clk_id` backing `Monotonic` is platform-specific and is
+    /// NOT caught by `monotonic_forward_only`: a wrong-but-forward clock
+    /// (e.g. OpenBSD's `CLOCK_THREAD_CPUTIME_ID = 4`) passes that test while
+    /// silently mis-clocking stall detection, and NetBSD's missing clk_id 4
+    /// would only fail at `Clock::new`. Pin the integer per platform so the
+    /// constant cannot drift back to a wrong value (the regression guard for
+    /// the FreeBSD-assumed BSD `clk_id`).
+    #[test]
+    fn monotonic_clk_id_matches_platform() {
+        #[cfg(target_os = "linux")]
+        let expected = 1;
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        let expected = 6;
+        #[cfg(any(target_os = "freebsd", target_os = "dragonfly"))]
+        let expected = 4;
+        #[cfg(any(target_os = "netbsd", target_os = "openbsd"))]
+        let expected = 3;
+        #[cfg(not(any(
+            target_os = "linux",
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "freebsd",
+            target_os = "dragonfly",
+            target_os = "netbsd",
+            target_os = "openbsd",
+        )))]
+        let expected = 1; // last-resort default — most kernels follow Linux
+
+        assert_eq!(
+            ClockSource::Monotonic.clk_id(),
+            Some(expected),
+            "Monotonic clk_id drifted from the per-platform CLOCK_MONOTONIC value"
+        );
+        assert_eq!(CLOCK_MONOTONIC, expected);
     }
 
     #[cfg(target_os = "linux")]
