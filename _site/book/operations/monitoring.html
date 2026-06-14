@@ -35,18 +35,11 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-76c5ea20.js";
+            window.path_to_searchindex_js = "../searchindex-76ae65e6.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="../toc-3f8cf947.js"></script>
-    <script defer data-domain="varta.sh" src="https://plausible.io/js/script.js"></script>
-<!-- Privacy-friendly analytics by Plausible -->
-<script async src="https://plausible.io/js/pa-YyA03_Ow6U040l0wzUwht.js"></script>
-<script>
-  window.plausible=window.plausible||function(){(plausible.q=plausible.q||[]).push(arguments)},plausible.init=plausible.init||function(i){plausible.o=i||{}};
-  plausible.init()
-</script>
-</head>
+        <script src="../toc-2d897c67.js"></script>
+    </head>
     <body>
     <div id="mdbook-help-container">
         <div id="mdbook-help-popup">
@@ -188,6 +181,7 @@
                 <div id="mdbook-content" class="content">
                     <main>
                         <h1 id="monitoring--alerting"><a class="header" href="#monitoring--alerting">Monitoring &amp; Alerting</a></h1>
+<p><strong>Quick walkthrough:</strong> <a href="../guides/prometheus-setup.html">Prometheus setup guide</a></p>
 <p><code>varta-watch</code> ships with a turn-key Prometheus + Grafana + Alertmanager
 bundle. The artefacts live under <a href="https://github.com/aramirez087/Varta/tree/main/observability"><code>observability/</code></a>
 in the repo; this chapter is the operator-facing prose tying them
@@ -270,7 +264,7 @@ zero), so <code>by (label)</code> queries and <code>absent()</code> rules are sa
 <tr><td><code>varta_stalls_total</code></td><td>counter</td><td><code>pid</code></td><td>Observer-detected stalls per agent.</td></tr>
 <tr><td><code>varta_status</code></td><td>gauge</td><td><code>pid</code></td><td>Last classification (0=Ok, 1=Degraded, 2=Critical, 3=Stall). Stall is <strong>observer-synthesised</strong> when the silence threshold is crossed — it is never on the wire (see <a href="../spec/vlp.html">VLP — Base Frame</a> §3.7).</td></tr>
 <tr><td><code>varta_nonce_wrap_total</code></td><td>counter</td><td></td><td>Agent exhausted its u64 nonce — must be unreachable in practice.</td></tr>
-<tr><td><code>varta_rate_limited_total</code></td><td>counter</td><td><code>reason</code></td><td>Beats dropped by per-pid or global token bucket.</td></tr>
+<tr><td><code>varta_rate_limited_total</code></td><td>counter</td><td><code>reason</code></td><td>Frames dropped by per-pid or global token bucket.</td></tr>
 </tbody>
 </table>
 </div>
@@ -505,7 +499,7 @@ eviction window.</li>
 <tr><td><code>VartaAuditFlushBudgetPressure</code></td><td><code>fdatasync(2)</code> over budget consistently. Check disk; raise <code>--audit-fsync-budget-ms</code> if disk is healthy.</td></tr>
 <tr><td><code>VartaRecoveryReapTruncated</code></td><td>&gt;64 children completing per tick. Reap is keeping up; queue may grow.</td></tr>
 <tr><td><code>VartaAuditRingWatermarkCritical</code></td><td>Ring crossed 95% fill at least once. Drops are imminent.</td></tr>
-<tr><td><code>VartaRateLimitingActive</code></td><td>Rate-limit dropping beats. Either agent hot-loop or raise <code>--max-beat-rate</code> / <code>--global-beat-rate</code>.</td></tr>
+<tr><td><code>VartaRateLimitingActive</code></td><td>Frames are being shed. Check for agent hot loops or authenticated malformed traffic before tuning limits.</td></tr>
 <tr><td><code>VartaClockJump</code></td><td>Forward wall-clock jump &gt; 5s. VM migration / NTP step. Stall windows may be off.</td></tr>
 </tbody>
 </table>

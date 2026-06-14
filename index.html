@@ -751,6 +751,27 @@ button, a {
     white-space: pre-wrap;
     word-break: break-word;
   }
+
+  #quickstart .steps,
+  #how .steps {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 1.25rem;
+  }
+  #quickstart .step,
+  #how .step {
+    flex-direction: row;
+    align-items: flex-start;
+    gap: 1.5rem;
+    padding: 1.5rem 1.75rem;
+  }
+  #quickstart .step-num,
+  #how .step-num {
+    width: 36px;
+    height: 36px;
+    font-size: 0.95rem;
+  }
+  #quickstart .step-content,
+  #how .step-content { flex: 1; min-width: 0; }
 }
 
 /* --- Metrics --- */

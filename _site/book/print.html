@@ -36,18 +36,11 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-76c5ea20.js";
+            window.path_to_searchindex_js = "searchindex-76ae65e6.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="toc-3f8cf947.js"></script>
-    <script defer data-domain="varta.sh" src="https://plausible.io/js/script.js"></script>
-<!-- Privacy-friendly analytics by Plausible -->
-<script async src="https://plausible.io/js/pa-YyA03_Ow6U040l0wzUwht.js"></script>
-<script>
-  window.plausible=window.plausible||function(){(plausible.q=plausible.q||[]).push(arguments)},plausible.init=plausible.init||function(i){plausible.o=i||{}};
-  plausible.init()
-</script>
-</head>
+        <script src="toc-2d897c67.js"></script>
+    </head>
     <body>
     <div id="mdbook-help-container">
         <div id="mdbook-help-popup">
@@ -424,6 +417,7 @@ against familiar watchdog and observability patterns.</p>
 <tr><th>Guide</th><th>When to read</th></tr>
 </thead>
 <tbody>
+<tr><td><a href="#varta-vs-the-alternatives">Varta vs the alternatives</a></td><td>“I already have systemd / supervisord / k8s probes / an HTTP <code>/health</code> — why add this?” One decision matrix across all of them.</td></tr>
 <tr><td><a href="#varta-vs-systemd-watchdogsec">Varta vs systemd <code>WatchdogSec</code></a></td><td>You already rely on systemd unit watchdogs and want one observer for many agents.</td></tr>
 <tr><td><a href="#varta-vs-http-health-checks">Varta vs HTTP <code>/health</code> checks</a></td><td>Every service exposes an HTTP probe today; you want sub-microsecond beats without a sidecar HTTP stack.</td></tr>
 <tr><td><a href="#prometheus-setup-walkthrough">Prometheus setup walkthrough</a></td><td>You need scrape config, alert rules, and a Grafana dashboard in one sitting.</td></tr>
@@ -432,6 +426,82 @@ against familiar watchdog and observability patterns.</p>
 </div>
 <p>The full operator reference remains in <a href="#monitoring--alerting">Monitoring &amp; Alerting</a>.
 The loadable artefact bundle lives in <a href="https://github.com/aramirez087/Varta/tree/main/observability"><code>observability/</code></a>.</p>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="varta-vs-the-alternatives"><a class="header" href="#varta-vs-the-alternatives">Varta vs the alternatives</a></h1>
+<p>If you run background workers, daemons, or edge agents, you already have <em>some</em>
+liveness story — systemd <code>WatchdogSec</code>, a supervisord/monit config, Kubernetes
+liveness probes, or an HTTP <code>/health</code> route a prober polls. Each is the right
+tool when its assumptions hold: one process per unit, one orchestrator, one HTTP
+server already in the binary. The question this page answers is narrower: when
+you have <em>many</em> local processes and don’t want to add a unit file, a pod, or an
+inbound TCP port to each one, what does adding <code>varta-watch</code> actually buy you —
+and where do the incumbents still win?</p>
+<h2 id="at-a-glance"><a class="header" href="#at-a-glance">At a glance</a></h2>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Capability</th><th>systemd <code>WatchdogSec</code></th><th>supervisord / monit</th><th>k8s liveness probes</th><th>HTTP <code>/health</code> polling</th><th>Varta</th></tr>
+</thead>
+<tbody>
+<tr><td>Watches many processes via one collector</td><td>No — one unit per process</td><td>Partial — one supervisor config, but per-process stanzas</td><td>No — one probe per container</td><td>No — one prober target per endpoint</td><td>Yes — one <code>varta-watch</code> ↔ thousands of agents (bounded table)</td></tr>
+<tr><td>Per-process cost</td><td>One unit file + <code>sd_notify</code></td><td>A config stanza + a managed child</td><td>A probe spec + kubelet exec/HTTP</td><td>A listening TCP port + handler per PID</td><td>One non-blocking UDS/UDP socket; 32-byte <code>send(2)</code>, zero-alloc after connect</td></tr>
+<tr><td>Liveness signal</td><td>App pings the watchdog (push)</td><td>Process-alive + optional check command</td><td>kubelet polls the probe (pull)</td><td>Prober polls the endpoint (pull)</td><td>App pushes 32-byte beats; observer synthesises stall on silence</td></tr>
+<tr><td>Auto-recovery</td><td>Yes — unit <code>Restart=</code></td><td>Yes — restart managed child</td><td>Yes — kubelet restarts container</td><td>No — prober only signals; recovery is external</td><td>Yes — per-PID debounced command (<code>--recovery-exec</code>), refused for unauthenticated origins</td></tr>
+<tr><td>Metrics</td><td>Journal + unit state; no native Prometheus</td><td>Status via socket/CLI; no native Prometheus</td><td>Pod conditions / events; metrics via separate stack</td><td>Whatever the endpoint exposes (often blackbox exporter)</td><td>Native Prometheus exporter, TSV export, structured audit log, uniform labels</td></tr>
+<tr><td>Runs without systemd</td><td>No</td><td>Yes</td><td>Yes</td><td>Yes</td><td>Yes</td></tr>
+<tr><td>Runs without k8s</td><td>Yes</td><td>Yes</td><td>No</td><td>Yes</td><td>Yes</td></tr>
+<tr><td>Cross-language</td><td>C / libsystemd or notify-socket protocol</td><td>Process-level, language-agnostic</td><td>Language-agnostic (exec/HTTP)</td><td>Any language that serves HTTP</td><td>Frozen 32-byte wire format; clients in Rust, Python, Go, Node, .NET, JVM</td></tr>
+<tr><td>Safety-critical profile</td><td>Depends on distro/unit; no built-in profile</td><td>No</td><td>No</td><td>No</td><td>Class-A build removes HTTP server, arg parser, and shell exec (IEC 62304 Class C grade)</td></tr>
+</tbody>
+</table>
+</div>
+<h2 id="which-one-should-you-pick"><a class="header" href="#which-one-should-you-pick">Which one should you pick?</a></h2>
+<p><strong>Pick systemd <code>WatchdogSec</code></strong> if your processes are 1:1 with units, recovery is
+just <code>Restart=on-failure</code>, and you don’t need per-beat payload (queue depth,
+degraded mode) or native Prometheus metrics. It’s already on the host, costs
+nothing extra, and is the simplest correct answer for a handful of long-running
+daemons.</p>
+<p><strong>Pick supervisord / monit</strong> if you want a single process manager to start,
+restart, and check a modest set of children on a non-systemd host, and
+process-alive (plus an occasional check command) is a sufficient liveness
+signal. You get supervision and recovery without per-beat instrumentation or a
+metrics pipeline — and without each child needing to emit anything.</p>
+<p><strong>Pick k8s liveness probes</strong> if you’re already on Kubernetes and your workloads
+are containers the kubelet schedules. The probe + restart loop is built in, no
+extra component to run, and it’s the idiomatic choice — there’s no reason to add
+Varta for liveness of pods the orchestrator already restarts.</p>
+<p><strong>Pick HTTP <code>/health</code> polling</strong> if the workload is already an HTTP server,
+<code>/health</code> is one more route, and your orchestrator or load balancer only speaks
+HTTP. It’s also the right call when you need rich JSON diagnostics a human can
+<code>curl</code>. Note it signals liveness but doesn’t recover anything — recovery stays
+external.</p>
+<p><strong>Pick Varta</strong> when you have many local processes (tens to thousands) and adding
+a unit file, pod, or inbound TCP port per PID is operationally heavy or simply
+unavailable — embedded / <code>no_std</code> / non-systemd / inside a container with no
+orchestrator. It fits high-frequency liveness (100 ms–1 s) where p99 matters,
+polyglot fleets that need uniform metrics and labels, and safety-critical builds
+that must not ship an HTTP server or a shell. It’s niche and local-first by
+design; for a single 1:1 daemon, systemd is the better tool.</p>
+<h2 id="you-dont-have-to-choose-just-one"><a class="header" href="#you-dont-have-to-choose-just-one">You don’t have to choose just one</a></h2>
+<p>These aren’t mutually exclusive, and the common production setup combines them:
+run <code>varta-watch</code> <em>itself</em> as a single <code>Type=notify</code> systemd unit (or one k8s
+sidecar), and let systemd/k8s watch the watcher while Varta watches the fleet.
+systemd or the kubelet restarts the one observer if it stalls; Varta restarts the
+many agents when their beats go silent. You get the incumbent’s battle-tested
+supervision for the single long-lived component, and Varta’s
+one-collector-many-agents model for everything that would otherwise need a unit,
+pod, or HTTP port each. See
+<a href="#varta-vs-systemd-watchdogsec">Varta vs systemd <code>WatchdogSec</code></a> for the hybrid
+systemd recipe and
+<a href="https://github.com/aramirez087/Varta/blob/main/observability/examples/varta-watch.service"><code>observability/examples/varta-watch.service</code></a>
+for the unit file.</p>
+<h2 id="next-steps"><a class="header" href="#next-steps">Next steps</a></h2>
+<ul>
+<li><a href="#install">Install (Quickstart)</a></li>
+<li><a href="#varta-vs-systemd-watchdogsec">Varta vs systemd <code>WatchdogSec</code></a></li>
+<li><a href="#varta-vs-http-health-checks">Varta vs HTTP <code>/health</code> checks</a></li>
+<li><a href="#prometheus-setup-walkthrough">Prometheus setup walkthrough</a></li>
+</ul>
 <div style="break-before: page; page-break-before: always;"></div>
 <h1 id="varta-vs-systemd-watchdogsec"><a class="header" href="#varta-vs-systemd-watchdogsec">Varta vs systemd <code>WatchdogSec</code></a></h1>
 <p>systemd’s per-unit watchdog is excellent when <strong>one service equals one unit</strong>
@@ -479,7 +549,7 @@ the safety binary — use <code>prometheus-exporter</code> only on a non–Class
 and keep application agents as lightweight processes that only call <code>beat()</code>.
 Let systemd restart the <strong>observer</strong> if it stalls; let Varta restart <strong>agents</strong>
 when their beats go silent.</p>
-<h2 id="next-steps"><a class="header" href="#next-steps">Next steps</a></h2>
+<h2 id="next-steps-1"><a class="header" href="#next-steps-1">Next steps</a></h2>
 <ul>
 <li><a href="#install">Install (Quickstart)</a></li>
 <li><a href="#prometheus-setup-walkthrough">Prometheus setup walkthrough</a></li>
@@ -531,7 +601,7 @@ unacceptable attack surface.</li>
 </ol>
 <p>Keep HTTP <code>/health</code> for <strong>external</strong> traffic if customers still need it; use
 Varta for <strong>internal</strong> liveness the platform owns.</p>
-<h2 id="next-steps-1"><a class="header" href="#next-steps-1">Next steps</a></h2>
+<h2 id="next-steps-2"><a class="header" href="#next-steps-2">Next steps</a></h2>
 <ul>
 <li><a href="#bench-harness-results">Benchmark Results</a></li>
 <li><a href="#prometheus-setup-walkthrough">Prometheus setup walkthrough</a></li>
@@ -2318,6 +2388,7 @@ curl -sS -H "Authorization: Bearer $(cat /etc/varta/prom.token)" \
 </code></pre>
 <div style="break-before: page; page-break-before: always;"></div>
 <h1 id="monitoring--alerting"><a class="header" href="#monitoring--alerting">Monitoring &amp; Alerting</a></h1>
+<p><strong>Quick walkthrough:</strong> <a href="#prometheus-setup-walkthrough">Prometheus setup guide</a></p>
 <p><code>varta-watch</code> ships with a turn-key Prometheus + Grafana + Alertmanager
 bundle. The artefacts live under <a href="https://github.com/aramirez087/Varta/tree/main/observability"><code>observability/</code></a>
 in the repo; this chapter is the operator-facing prose tying them
@@ -2400,7 +2471,7 @@ zero), so <code>by (label)</code> queries and <code>absent()</code> rules are sa
 <tr><td><code>varta_stalls_total</code></td><td>counter</td><td><code>pid</code></td><td>Observer-detected stalls per agent.</td></tr>
 <tr><td><code>varta_status</code></td><td>gauge</td><td><code>pid</code></td><td>Last classification (0=Ok, 1=Degraded, 2=Critical, 3=Stall). Stall is <strong>observer-synthesised</strong> when the silence threshold is crossed — it is never on the wire (see <a href="#vlp-v02--base-frame-specification">VLP — Base Frame</a> §3.7).</td></tr>
 <tr><td><code>varta_nonce_wrap_total</code></td><td>counter</td><td></td><td>Agent exhausted its u64 nonce — must be unreachable in practice.</td></tr>
-<tr><td><code>varta_rate_limited_total</code></td><td>counter</td><td><code>reason</code></td><td>Beats dropped by per-pid or global token bucket.</td></tr>
+<tr><td><code>varta_rate_limited_total</code></td><td>counter</td><td><code>reason</code></td><td>Frames dropped by per-pid or global token bucket.</td></tr>
 </tbody>
 </table>
 </div>
@@ -2635,7 +2706,7 @@ eviction window.</li>
 <tr><td><code>VartaAuditFlushBudgetPressure</code></td><td><code>fdatasync(2)</code> over budget consistently. Check disk; raise <code>--audit-fsync-budget-ms</code> if disk is healthy.</td></tr>
 <tr><td><code>VartaRecoveryReapTruncated</code></td><td>&gt;64 children completing per tick. Reap is keeping up; queue may grow.</td></tr>
 <tr><td><code>VartaAuditRingWatermarkCritical</code></td><td>Ring crossed 95% fill at least once. Drops are imminent.</td></tr>
-<tr><td><code>VartaRateLimitingActive</code></td><td>Rate-limit dropping beats. Either agent hot-loop or raise <code>--max-beat-rate</code> / <code>--global-beat-rate</code>.</td></tr>
+<tr><td><code>VartaRateLimitingActive</code></td><td>Frames are being shed. Check for agent hot loops or authenticated malformed traffic before tuning limits.</td></tr>
 <tr><td><code>VartaClockJump</code></td><td>Forward wall-clock jump &gt; 5s. VM migration / NTP step. Stall windows may be off.</td></tr>
 </tbody>
 </table>
@@ -3388,7 +3459,10 @@ varta-watch --socket /tmp/varta.sock --threshold-ms 500 \
 <li>
 <p><strong>UDS</strong>: On Linux, the kernel attests the sender’s PID and UID via
 <code>SCM_CREDENTIALS</code>. The observer rejects frames where <code>frame.pid != peer_pid</code>
-or <code>peer_uid != observer_uid</code>. On macOS pathname datagram sockets,
+or <code>peer_uid != observer_uid</code>. Linux recovery eligibility also requires the
+observer to pin the sender’s <code>/proc/&lt;pid&gt;/stat</code> start-time generation before
+first contact can become <code>KernelAttested</code>; an unpinned first-contact beat is
+tracked as <code>SocketModeOnly</code>. On macOS pathname datagram sockets,
 <code>LOCAL_PEERTOKEN</code> requires a connected local socket and the observer falls
 back to <code>--socket-mode 0600</code>. On other platforms without per-datagram
 credentials, the only defence is <code>--socket-mode</code>.</p>
@@ -3537,10 +3611,12 @@ ChaCha20-Poly1305 nonce its parent has already emitted under the same
 key — a <em>catastrophic</em> confidentiality and integrity failure (Poly1305
 key recovery, plaintext XOR leak).</p>
 <h3 id="how-varta-enforces-fork-safety-structurally"><a class="header" href="#how-varta-enforces-fork-safety-structurally">How <code>Varta</code> enforces fork-safety structurally</a></h3>
-<p><code>Varta::connect</code> snapshots <code>std::process::id()</code> into a private
-<code>connect_pid</code> field. Every <code>Varta::beat</code> reads the current PID and
-compares — on mismatch (i.e. the handle is now in a forked child), the
-wrapper invokes <code>transport.reconnect()</code> <strong>before</strong> building the frame.
+<p><code>Varta::connect</code> snapshots both <code>std::process::id()</code> and a process-lineage
+epoch maintained by a one-time <code>pthread_atfork</code> child callback. Every
+<code>Varta::beat</code> reads the current PID and epoch and compares both — on either
+mismatch, the wrapper invokes <code>transport.reconnect()</code> <strong>before</strong> building the
+frame. The epoch changes on every fork and therefore remains distinct even
+if a later descendant is assigned the original connect-time PID.
 <code>SecureUdpTransport::reconnect()</code> re-reads OS entropy into a fresh
 16-byte session salt, recomputes the IV prefix, and resets the prefix
 index and counter to zero. The child’s first emitted frame therefore
@@ -3561,11 +3637,10 @@ observer transitions its current state into the <code>prev_*</code> slots and ac
 the new prefix as a fresh session — no replay error, no protocol-level
 signal required. Fork-recovery is <em>entirely transparent</em> to the wire format.</p>
 <h3 id="advanced-callers"><a class="header" href="#advanced-callers">Advanced callers</a></h3>
-<p>Callers using <code>SecureUdpTransport</code> directly (without the <code>Varta</code>
-wrapper) do <strong>not</strong> get auto-detection. The <code>BeatTransport</code> trait is
-intentionally low-level; the safety policy lives one layer up.
-Direct-transport users must call <code>SecureUdpTransport::reconnect()</code>
-themselves in the forked child before the first beat.</p>
+<p>Callers using <code>SecureUdpTransport</code> directly receive the same protection.
+The transport snapshots the process-lineage epoch at construction and checks
+it before every seal, reconnecting before inherited AEAD state can be used in
+a child.</p>
 <h3 id="parent-pid-stall-window-transport-agnostic"><a class="header" href="#parent-pid-stall-window-transport-agnostic">Parent-pid stall window (transport-agnostic)</a></h3>
 <p>Auto-recovery handles the <em>child</em>. The <em>parent</em> does not get a free pass:
 if the parent forks and then <code>exit(0)</code>s (the daemonise pattern), its PID
@@ -3845,6 +3920,9 @@ can kick it once per poll iteration.  If the kick stops, the kernel reboots the
 host — even if the OS itself is wedged.</p>
 <pre><code class="language-sh">varta-watch --hw-watchdog /dev/watchdog ...
 </code></pre>
+<p>At startup, <code>varta-watch</code> verifies that the opened descriptor is a character
+device. A regular file, FIFO, or socket is rejected rather than silently
+accepting writes while providing no watchdog protection.</p>
 <p><strong>Magic close:</strong> on a clean shutdown (SIGTERM/SIGINT followed by graceful exit)
 <code>varta-watch</code> writes the magic byte <code>'V'</code> to disarm the watchdog before
 exiting.  A crash or hang leaves the watchdog armed; the kernel reboots after
@@ -3871,7 +3949,10 @@ while :; do
 done
 </code></pre>
 <p>The first field in the heartbeat file is a monotonically increasing loop
-counter.  If it stops advancing, the observer is wedged or dead.</p>
+counter.  If it stops advancing, the observer is wedged or dead. Each update
+uses an exclusively-created mode-<code>0600</code> tempfile plus an atomic same-directory
+rename, so stale files and symlinks are never opened or truncated. The parent
+directory should still be writable only by the observer account.</p>
 <h3 id="prometheus-uptime-scraper"><a class="header" href="#prometheus-uptime-scraper">Prometheus uptime scraper</a></h3>
 <p><code>/metrics</code> exposes <code>varta_watch_uptime_seconds</code>.  A second Prometheus instance
 (or Alertmanager rule) can alert when the gauge stops increasing. The
@@ -4475,8 +4556,12 @@ outstanding children are reaped on completion but <strong>never killed</strong>.
 This preserves long-running-recovery semantics (e.g. a restart that
 blocks on health checks).</p>
 <p>Operators who want the kill-after behaviour set
-<code>--recovery-timeout-ms &lt;MS&gt;</code> explicitly. Sub-100 ms values still work
-but the kill is surfaced no faster than one tick after the deadline.</p>
+<code>--recovery-timeout-ms &lt;MS&gt;</code> explicitly. The accepted minimum is 100 ms:
+a value of <code>0</code> would make the reap gate kill every still-running child on
+the first reap tick (silently neutering recovery), so <code>0</code> and any
+sub-100 ms value are rejected at parse time. The kill is surfaced no
+faster than one tick after the deadline. The never-kill default is reached
+by omitting the flag, never by <code>0</code>.</p>
 <h2 id="concurrency-model"><a class="header" href="#concurrency-model">Concurrency model</a></h2>
 <ul>
 <li>The <code>Recovery</code> struct is owned exclusively by the binary’s poll loop.
@@ -4714,14 +4799,29 @@ refusal.  See <code>book/src/architecture/namespaces.md</code> for the planned g
 <tr><th>Platform</th><th>Mechanism</th><th>Per-datagram?</th><th>Recovery-eligible?</th></tr>
 </thead>
 <tbody>
-<tr><td>Linux</td><td><code>SO_PASSCRED</code> + <code>SCM_CREDENTIALS</code> (<code>struct ucred</code>)</td><td>Yes</td><td>Yes</td></tr>
+<tr><td>Linux</td><td><code>SO_PASSCRED</code> + <code>SCM_CREDENTIALS</code> (<code>struct ucred</code>)</td><td>Yes</td><td>Yes, after <code>/proc/&lt;pid&gt;/stat</code> start-time generation is pinned</td></tr>
 <tr><td>macOS pathname UDS</td><td>socket file permissions only (<code>LOCAL_PEERTOKEN</code> requires a connected local socket)</td><td><strong>No</strong></td><td><strong>No</strong></td></tr>
-<tr><td>FreeBSD / DragonFly / NetBSD</td><td><code>LOCAL_CREDS</code> + <code>SCM_CREDS</code> (<code>struct cmsgcred</code>)</td><td>Yes</td><td>Yes</td></tr>
-<tr><td>illumos / Solaris</td><td><code>SO_RECVUCRED</code> + <code>SCM_UCRED</code> + <code>ucred_t</code> (opaque)</td><td>Yes</td><td>Yes</td></tr>
+<tr><td>FreeBSD / DragonFly / NetBSD</td><td><code>LOCAL_CREDS</code> + <code>SCM_CREDS</code> (<code>struct cmsgcred</code>)</td><td>Yes</td><td>Yes (recycle-unverifiable¹)</td></tr>
+<tr><td>illumos / Solaris</td><td><code>SO_RECVUCRED</code> + <code>SCM_UCRED</code> + <code>ucred_t</code> (opaque)</td><td>Yes</td><td>Yes (recycle-unverifiable¹)</td></tr>
 <tr><td>OpenBSD, AIX, HP-UX, other Unix</td><td>none — <code>--socket-mode 0600</code> only</td><td><strong>No</strong></td><td><strong>No</strong></td></tr>
 </tbody>
 </table>
 </div>
+<blockquote>
+<p>¹ <strong>Recycle-unverifiable recovery.</strong> These platforms attest the sender
+PID per datagram (minting <code>KernelAttested</code>, so recovery is eligible) but
+expose no <code>/proc/&lt;pid&gt;/stat</code>, so <code>read_pid_start_time</code> returns <code>None</code> and
+no start-time <em>generation</em> token can be pinned. A PID recycled inside the
+per-tick spawn-budget deferral window therefore cannot be distinguished
+from the original process. Rather than risk firing <code>kill(2)</code>/restart
+against an innocent recycled PID, the observer’s deferred-stall freshness
+re-check <strong>withholds</strong> recovery for a <code>KernelAttested</code> stall that carries
+no generation, surfacing it as
+<code>varta_recovery_outcomes_total{outcome="skipped_stall_unverifiable"}</code>. The
+immediate (same-tick) recovery path is unaffected — it has no deferral
+window for a recycle to occur in. On Linux a <code>KernelAttested</code> slot always
+carries a generation, so this skip never fires there.</p>
+</blockquote>
 <h3 id="socket-mode-only-fallback"><a class="header" href="#socket-mode-only-fallback">Socket-mode-only fallback</a></h3>
 <p>On platforms that do not provide per-datagram kernel credential passing
 for Varta’s pathname UDS transport (currently: macOS, OpenBSD, and any
@@ -5201,14 +5301,23 @@ namespace inode, and silence timer all re-pinned) and the event is counted as
 <code>varta_tracker_pid_recycle_total</code>. The generation check runs <strong>before</strong> the
 origin / namespace / nonce checks — a recycled process legitimately differs on
 all of them. A <code>None</code> on either side (“generation unknown”: non-Linux, UDP, or
-unreadable <code>/proc</code>) is treated leniently and never triggers a reset, so prior
-PID-only behaviour is preserved exactly. When the slot’s pinned generation is
-<code>None</code> and a later beat carries <code>Some(_)</code> with an <strong>accepted</strong> nonce, the token
-is pinned in place (same rule as the namespace-inode <code>None → Some</code> upgrade) so
-a subsequent recycle can compare <code>(Some(G1), Some(G2))</code> instead of staying
-stuck at <code>None</code>. Out-of-order frames must not pin generation. Replay protection
-is untouched: a low nonce under the <strong>same</strong> generation is still dropped as
-out-of-order.</p>
+unreadable <code>/proc</code>) is treated leniently by the tracker and never triggers a
+reset, so prior PID-only behaviour is preserved exactly for non-recovery
+transports and for already-pinned slots whose peer vanished. When the slot’s
+pinned generation is <code>None</code> and a later beat carries <code>Some(_)</code> with an
+<strong>accepted</strong> nonce, the token is pinned in place (same rule as the
+namespace-inode <code>None → Some</code> upgrade) so a subsequent recycle can compare
+<code>(Some(G1), Some(G2))</code> instead of staying stuck at <code>None</code>. Out-of-order frames
+must not pin generation. Replay protection is untouched: a low nonce under the
+<strong>same</strong> generation is still dropped as out-of-order.</p>
+<p>For Linux UDS first contact, the observer requires that <code>Some(generation)</code>
+before the slot may pin recovery-eligible <code>KernelAttested</code> origin. If the
+sender exits after <code>recvmsg(2)</code> but before the <code>/proc/&lt;pid&gt;/stat</code> start-time
+read, the beat is still observable, but it is recorded as <code>SocketModeOnly</code>.
+A later accepted beat that can read a concrete generation may upgrade the slot
+to <code>KernelAttested</code>. This keeps transient dying-gasp frames from breaking
+monitoring while preventing an unpinned numeric PID from driving <code>{pid}</code>
+recovery after PID recycle.</p>
 <p>The same generation is revalidated when a kernel-attested slot first becomes a
 stall candidate. If <code>/proc/&lt;pid&gt;/stat</code> now returns a concrete <strong>different</strong>
 generation, the old slot is retired and no <code>Event::Stall</code> is emitted. This
@@ -5299,6 +5408,10 @@ exited between <code>recvmsg</code> and <code>readlink</code>, <code>/proc</code
 returns <code>None</code>. The tracker’s <code>None → Some</code> upgrade allows one-shot
 recovery so a transient <code>/proc</code> unavailability does not pin a slot as
 permanently unknown.</li>
+<li><strong><code>/proc/&lt;peer_pid&gt;/stat</code> unreadable on first contact</strong>: the helper returns
+<code>None</code>, so the beat is tracked as <code>SocketModeOnly</code> until a later accepted
+Linux UDS beat can pin <code>Some(generation)</code>. Missing generation remains
+fail-open only after a slot already has recovery-eligible identity pinned.</li>
 <li><strong>Existing <code>frame.pid != peer_pid</code> check fires first</strong> for most real
 cross-namespace traffic (the two namespaces almost always produce different
 numeric pids for the same process). The namespace gate is belt-and-suspenders
@@ -5407,6 +5520,28 @@ startup warning and the build is <strong>not</strong> Class C-conforming. Up to
 <li>After writing the post-rotation <code>boot</code> record.</li>
 <li>In <code>Drop</code> (best-effort; not load-bearing for correctness).</li>
 </ul>
+<h3 id="directory-entry-durability"><a class="header" href="#directory-entry-durability">Directory-entry durability</a></h3>
+<p><code>fsync(2)</code> on the audit file does <strong>not</strong> persist the directory entry that
+names it. The daemon therefore also fsyncs the audit file’s parent
+directory: once at startup in <code>create</code> (a freshly-created file would
+otherwise vanish entirely on power cut — including records whose
+<code>fdatasync</code> had already returned), and once per rotation in a dedicated
+final <code>SyncingDir</code> state-machine stage covering the generation renames,
+the new live file’s <code>create_new</code>, and the <code>EXDEV</code> fallback’s copy/unlink
+pair. The stage runs behind its own budget check so the <code>Finalizing</code> tail
+keeps the exact two-fsync cost its <code>--audit-rotation-budget-ms</code> model is
+sized for. A directory-fsync failure is a soft durability degradation
+latched on the audit error channel, mirroring the UDS-bind posture.</p>
+<h2 id="file-identity-hardening"><a class="header" href="#file-identity-hardening">File identity hardening</a></h2>
+<p>Audit startup opens the live path once with <code>O_NOFOLLOW</code>, verifies the opened
+inode is a regular file owned by the observer UID with exactly one hard link,
+then uses that same descriptor for tail recovery, optional truncation, and all
+later appends. Leaf symlinks and multiply-linked files are rejected before any
+audit bytes are changed.</p>
+<p>Rotation creates every new live generation and EXDEV copy destination
+exclusively with mode 0600. The EXDEV fallback copies from a clone of the
+writer’s already-validated descriptor, not from a second pathname open, and
+keeps the exclusive destination descriptor as the new sink.</p>
 <h2 id="tamper-evidence-the-hash-chain"><a class="header" href="#tamper-evidence-the-hash-chain">Tamper-evidence: the hash chain</a></h2>
 <p>When the daemon is built with <code>--features audit-chain</code>, every record’s
 trailing <code>chain</code> column is the lowercase-hex SHA-256 of:</p>
@@ -5492,7 +5627,7 @@ cat audit.log.5 audit.log.4 audit.log.3 audit.log.2 audit.log.1 audit.log \
 <tr><th>Flag</th><th>Required</th><th>Default</th><th>Meaning</th></tr>
 </thead>
 <tbody>
-<tr><td><code>--recovery-audit-file &lt;PATH&gt;</code></td><td>no</td><td>unset</td><td>Append audit records to PATH. Created mode 0600.</td></tr>
+<tr><td><code>--recovery-audit-file &lt;PATH&gt;</code></td><td>no</td><td>unset</td><td>Append audit records to PATH. Created mode 0600; leaf symlinks and multiply-linked files are rejected.</td></tr>
 <tr><td><code>--recovery-audit-max-bytes &lt;N&gt;</code></td><td>no</td><td>unbounded</td><td>Rotate after a write that pushes the file past N bytes.</td></tr>
 <tr><td><code>--recovery-audit-sync-every &lt;N&gt;</code></td><td>no</td><td>1</td><td>fdatasync cadence. <code>1</code> is the only Class C-conforming value.</td></tr>
 <tr><td><code>--audit-fsync-budget-ms &lt;MS&gt;</code></td><td>no</td><td>50</td><td>Soft per-call budget for one <code>fdatasync(2)</code>. Overruns defer further fsyncs in the <em>current</em> drain to next tick; the poll loop never blocks on more than one slow fsync per tick.</td></tr>

@@ -57,6 +57,7 @@ jobs:
           cp CNAME _site/
           cp -r assets _site/assets
           # Place the compiled book at /book
+          rm -rf _site/book
           cp -r book/book _site/book
 
       - name: inject analytics

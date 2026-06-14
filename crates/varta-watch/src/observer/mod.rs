@@ -977,25 +977,25 @@ impl Observer {
         self.tracker.take_evictions()
     }
 
-    /// Drain one `(pid, generation)` whose tracker slot was removed, if any.
+    /// Drain one pid whose tracker slot was removed, if any.
     ///
-    /// Covers capacity evictions and generation-mismatch retirements. The
-    /// main loop drains this to remove stale per-pid exporter rows; the
-    /// generation token lets it skip a pid that has since been re-tracked by
-    /// the same process lineage (see [`Observer::tracked_generation`]).
-    pub fn drain_evicted_pid(&mut self) -> Option<(u32, Option<u64>)> {
+    /// Covers capacity evictions and generation-mismatch retirements. The main
+    /// loop drains this to remove stale per-pid exporter rows, re-checking
+    /// [`Observer::is_tracked`] first so it never clobbers the live row of a
+    /// pid re-tracked (same lineage or recycled) before its entry is drained.
+    pub fn drain_evicted_pid(&mut self) -> Option<u32> {
         self.tracker.take_evicted_pid()
     }
 
-    /// Return the pinned generation of a currently-tracked pid.
+    /// True iff `pid` currently maps to a live tracker slot.
     ///
-    /// `Some(gen)` when the pid is tracked (`gen` is its start-time token, or
-    /// `None` if generation pinning is unavailable on this platform); `None`
-    /// when the pid is not tracked at all. The main-loop exporter-cleanup
-    /// drain compares this against the queued removal's generation to avoid
-    /// clobbering the live row of a re-tracked pid.
-    pub fn tracked_generation(&self, pid: u32) -> Option<Option<u64>> {
-        self.tracker.generation_of(pid)
+    /// Used by the main-loop exporter-cleanup drain to decide whether a queued
+    /// removal's per-pid row is safe to reap: rows are keyed by bare PID, so a
+    /// re-tracked pid (same lineage OR recycled) owns the live row and must be
+    /// skipped — only a no-longer-tracked pid is reaped. See
+    /// [`crate::tracker::Tracker::is_tracked`].
+    pub fn is_tracked(&self, pid: u32) -> bool {
+        self.tracker.is_tracked(pid)
     }
 
     /// Drain and reset the capacity-exceeded counter.

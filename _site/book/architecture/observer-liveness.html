@@ -35,18 +35,11 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-76c5ea20.js";
+            window.path_to_searchindex_js = "../searchindex-76ae65e6.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="../toc-3f8cf947.js"></script>
-    <script defer data-domain="varta.sh" src="https://plausible.io/js/script.js"></script>
-<!-- Privacy-friendly analytics by Plausible -->
-<script async src="https://plausible.io/js/pa-YyA03_Ow6U040l0wzUwht.js"></script>
-<script>
-  window.plausible=window.plausible||function(){(plausible.q=plausible.q||[]).push(arguments)},plausible.init=plausible.init||function(i){plausible.o=i||{}};
-  plausible.init()
-</script>
-</head>
+        <script src="../toc-2d897c67.js"></script>
+    </head>
     <body>
     <div id="mdbook-help-container">
         <div id="mdbook-help-popup">
@@ -317,6 +310,9 @@ can kick it once per poll iteration.  If the kick stops, the kernel reboots the
 host — even if the OS itself is wedged.</p>
 <pre><code class="language-sh">varta-watch --hw-watchdog /dev/watchdog ...
 </code></pre>
+<p>At startup, <code>varta-watch</code> verifies that the opened descriptor is a character
+device. A regular file, FIFO, or socket is rejected rather than silently
+accepting writes while providing no watchdog protection.</p>
 <p><strong>Magic close:</strong> on a clean shutdown (SIGTERM/SIGINT followed by graceful exit)
 <code>varta-watch</code> writes the magic byte <code>'V'</code> to disarm the watchdog before
 exiting.  A crash or hang leaves the watchdog armed; the kernel reboots after
@@ -343,7 +339,10 @@ while :; do
 done
 </code></pre>
 <p>The first field in the heartbeat file is a monotonically increasing loop
-counter.  If it stops advancing, the observer is wedged or dead.</p>
+counter.  If it stops advancing, the observer is wedged or dead. Each update
+uses an exclusively-created mode-<code>0600</code> tempfile plus an atomic same-directory
+rename, so stale files and symlinks are never opened or truncated. The parent
+directory should still be writable only by the observer account.</p>
 <h3 id="prometheus-uptime-scraper"><a class="header" href="#prometheus-uptime-scraper">Prometheus uptime scraper</a></h3>
 <p><code>/metrics</code> exposes <code>varta_watch_uptime_seconds</code>.  A second Prometheus instance
 (or Alertmanager rule) can alert when the gauge stops increasing. The

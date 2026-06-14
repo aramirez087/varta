@@ -35,18 +35,11 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-76c5ea20.js";
+            window.path_to_searchindex_js = "../searchindex-76ae65e6.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="../toc-3f8cf947.js"></script>
-    <script defer data-domain="varta.sh" src="https://plausible.io/js/script.js"></script>
-<!-- Privacy-friendly analytics by Plausible -->
-<script async src="https://plausible.io/js/pa-YyA03_Ow6U040l0wzUwht.js"></script>
-<script>
-  window.plausible=window.plausible||function(){(plausible.q=plausible.q||[]).push(arguments)},plausible.init=plausible.init||function(i){plausible.o=i||{}};
-  plausible.init()
-</script>
-</head>
+        <script src="../toc-2d897c67.js"></script>
+    </head>
     <body>
     <div id="mdbook-help-container">
         <div id="mdbook-help-popup">
@@ -333,8 +326,12 @@ outstanding children are reaped on completion but <strong>never killed</strong>.
 This preserves long-running-recovery semantics (e.g. a restart that
 blocks on health checks).</p>
 <p>Operators who want the kill-after behaviour set
-<code>--recovery-timeout-ms &lt;MS&gt;</code> explicitly. Sub-100 ms values still work
-but the kill is surfaced no faster than one tick after the deadline.</p>
+<code>--recovery-timeout-ms &lt;MS&gt;</code> explicitly. The accepted minimum is 100 ms:
+a value of <code>0</code> would make the reap gate kill every still-running child on
+the first reap tick (silently neutering recovery), so <code>0</code> and any
+sub-100 ms value are rejected at parse time. The kill is surfaced no
+faster than one tick after the deadline. The never-kill default is reached
+by omitting the flag, never by <code>0</code>.</p>
 <h2 id="concurrency-model"><a class="header" href="#concurrency-model">Concurrency model</a></h2>
 <ul>
 <li>The <code>Recovery</code> struct is owned exclusively by the binary’s poll loop.

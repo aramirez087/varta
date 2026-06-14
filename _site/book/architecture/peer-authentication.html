@@ -35,18 +35,11 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-76c5ea20.js";
+            window.path_to_searchindex_js = "../searchindex-76ae65e6.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="../toc-3f8cf947.js"></script>
-    <script defer data-domain="varta.sh" src="https://plausible.io/js/script.js"></script>
-<!-- Privacy-friendly analytics by Plausible -->
-<script async src="https://plausible.io/js/pa-YyA03_Ow6U040l0wzUwht.js"></script>
-<script>
-  window.plausible=window.plausible||function(){(plausible.q=plausible.q||[]).push(arguments)},plausible.init=plausible.init||function(i){plausible.o=i||{}};
-  plausible.init()
-</script>
-</head>
+        <script src="../toc-2d897c67.js"></script>
+    </head>
     <body>
     <div id="mdbook-help-container">
         <div id="mdbook-help-popup">
@@ -274,14 +267,29 @@ refusal.  See <code>book/src/architecture/namespaces.md</code> for the planned g
 <tr><th>Platform</th><th>Mechanism</th><th>Per-datagram?</th><th>Recovery-eligible?</th></tr>
 </thead>
 <tbody>
-<tr><td>Linux</td><td><code>SO_PASSCRED</code> + <code>SCM_CREDENTIALS</code> (<code>struct ucred</code>)</td><td>Yes</td><td>Yes</td></tr>
+<tr><td>Linux</td><td><code>SO_PASSCRED</code> + <code>SCM_CREDENTIALS</code> (<code>struct ucred</code>)</td><td>Yes</td><td>Yes, after <code>/proc/&lt;pid&gt;/stat</code> start-time generation is pinned</td></tr>
 <tr><td>macOS pathname UDS</td><td>socket file permissions only (<code>LOCAL_PEERTOKEN</code> requires a connected local socket)</td><td><strong>No</strong></td><td><strong>No</strong></td></tr>
-<tr><td>FreeBSD / DragonFly / NetBSD</td><td><code>LOCAL_CREDS</code> + <code>SCM_CREDS</code> (<code>struct cmsgcred</code>)</td><td>Yes</td><td>Yes</td></tr>
-<tr><td>illumos / Solaris</td><td><code>SO_RECVUCRED</code> + <code>SCM_UCRED</code> + <code>ucred_t</code> (opaque)</td><td>Yes</td><td>Yes</td></tr>
+<tr><td>FreeBSD / DragonFly / NetBSD</td><td><code>LOCAL_CREDS</code> + <code>SCM_CREDS</code> (<code>struct cmsgcred</code>)</td><td>Yes</td><td>Yes (recycle-unverifiable¹)</td></tr>
+<tr><td>illumos / Solaris</td><td><code>SO_RECVUCRED</code> + <code>SCM_UCRED</code> + <code>ucred_t</code> (opaque)</td><td>Yes</td><td>Yes (recycle-unverifiable¹)</td></tr>
 <tr><td>OpenBSD, AIX, HP-UX, other Unix</td><td>none — <code>--socket-mode 0600</code> only</td><td><strong>No</strong></td><td><strong>No</strong></td></tr>
 </tbody>
 </table>
 </div>
+<blockquote>
+<p>¹ <strong>Recycle-unverifiable recovery.</strong> These platforms attest the sender
+PID per datagram (minting <code>KernelAttested</code>, so recovery is eligible) but
+expose no <code>/proc/&lt;pid&gt;/stat</code>, so <code>read_pid_start_time</code> returns <code>None</code> and
+no start-time <em>generation</em> token can be pinned. A PID recycled inside the
+per-tick spawn-budget deferral window therefore cannot be distinguished
+from the original process. Rather than risk firing <code>kill(2)</code>/restart
+against an innocent recycled PID, the observer’s deferred-stall freshness
+re-check <strong>withholds</strong> recovery for a <code>KernelAttested</code> stall that carries
+no generation, surfacing it as
+<code>varta_recovery_outcomes_total{outcome="skipped_stall_unverifiable"}</code>. The
+immediate (same-tick) recovery path is unaffected — it has no deferral
+window for a recycle to occur in. On Linux a <code>KernelAttested</code> slot always
+carries a generation, so this skip never fires there.</p>
+</blockquote>
 <h3 id="socket-mode-only-fallback"><a class="header" href="#socket-mode-only-fallback">Socket-mode-only fallback</a></h3>
 <p>On platforms that do not provide per-datagram kernel credential passing
 for Varta’s pathname UDS transport (currently: macOS, OpenBSD, and any

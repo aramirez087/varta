@@ -35,18 +35,11 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-76c5ea20.js";
+            window.path_to_searchindex_js = "../searchindex-76ae65e6.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="../toc-3f8cf947.js"></script>
-    <script defer data-domain="varta.sh" src="https://plausible.io/js/script.js"></script>
-<!-- Privacy-friendly analytics by Plausible -->
-<script async src="https://plausible.io/js/pa-YyA03_Ow6U040l0wzUwht.js"></script>
-<script>
-  window.plausible=window.plausible||function(){(plausible.q=plausible.q||[]).push(arguments)},plausible.init=plausible.init||function(i){plausible.o=i||{}};
-  plausible.init()
-</script>
-</head>
+        <script src="../toc-2d897c67.js"></script>
+    </head>
     <body>
     <div id="mdbook-help-container">
         <div id="mdbook-help-popup">
@@ -326,7 +319,10 @@ varta-watch --socket /tmp/varta.sock --threshold-ms 500 \
 <li>
 <p><strong>UDS</strong>: On Linux, the kernel attests the sender’s PID and UID via
 <code>SCM_CREDENTIALS</code>. The observer rejects frames where <code>frame.pid != peer_pid</code>
-or <code>peer_uid != observer_uid</code>. On macOS pathname datagram sockets,
+or <code>peer_uid != observer_uid</code>. Linux recovery eligibility also requires the
+observer to pin the sender’s <code>/proc/&lt;pid&gt;/stat</code> start-time generation before
+first contact can become <code>KernelAttested</code>; an unpinned first-contact beat is
+tracked as <code>SocketModeOnly</code>. On macOS pathname datagram sockets,
 <code>LOCAL_PEERTOKEN</code> requires a connected local socket and the observer falls
 back to <code>--socket-mode 0600</code>. On other platforms without per-datagram
 credentials, the only defence is <code>--socket-mode</code>.</p>
@@ -475,10 +471,12 @@ ChaCha20-Poly1305 nonce its parent has already emitted under the same
 key — a <em>catastrophic</em> confidentiality and integrity failure (Poly1305
 key recovery, plaintext XOR leak).</p>
 <h3 id="how-varta-enforces-fork-safety-structurally"><a class="header" href="#how-varta-enforces-fork-safety-structurally">How <code>Varta</code> enforces fork-safety structurally</a></h3>
-<p><code>Varta::connect</code> snapshots <code>std::process::id()</code> into a private
-<code>connect_pid</code> field. Every <code>Varta::beat</code> reads the current PID and
-compares — on mismatch (i.e. the handle is now in a forked child), the
-wrapper invokes <code>transport.reconnect()</code> <strong>before</strong> building the frame.
+<p><code>Varta::connect</code> snapshots both <code>std::process::id()</code> and a process-lineage
+epoch maintained by a one-time <code>pthread_atfork</code> child callback. Every
+<code>Varta::beat</code> reads the current PID and epoch and compares both — on either
+mismatch, the wrapper invokes <code>transport.reconnect()</code> <strong>before</strong> building the
+frame. The epoch changes on every fork and therefore remains distinct even
+if a later descendant is assigned the original connect-time PID.
 <code>SecureUdpTransport::reconnect()</code> re-reads OS entropy into a fresh
 16-byte session salt, recomputes the IV prefix, and resets the prefix
 index and counter to zero. The child’s first emitted frame therefore
@@ -499,11 +497,10 @@ observer transitions its current state into the <code>prev_*</code> slots and ac
 the new prefix as a fresh session — no replay error, no protocol-level
 signal required. Fork-recovery is <em>entirely transparent</em> to the wire format.</p>
 <h3 id="advanced-callers"><a class="header" href="#advanced-callers">Advanced callers</a></h3>
-<p>Callers using <code>SecureUdpTransport</code> directly (without the <code>Varta</code>
-wrapper) do <strong>not</strong> get auto-detection. The <code>BeatTransport</code> trait is
-intentionally low-level; the safety policy lives one layer up.
-Direct-transport users must call <code>SecureUdpTransport::reconnect()</code>
-themselves in the forked child before the first beat.</p>
+<p>Callers using <code>SecureUdpTransport</code> directly receive the same protection.
+The transport snapshots the process-lineage epoch at construction and checks
+it before every seal, reconnecting before inherited AEAD state can be used in
+a child.</p>
 <h3 id="parent-pid-stall-window-transport-agnostic"><a class="header" href="#parent-pid-stall-window-transport-agnostic">Parent-pid stall window (transport-agnostic)</a></h3>
 <p>Auto-recovery handles the <em>child</em>. The <em>parent</em> does not get a free pass:
 if the parent forks and then <code>exit(0)</code>s (the daemonise pattern), its PID

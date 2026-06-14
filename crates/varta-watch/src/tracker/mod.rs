@@ -342,12 +342,16 @@ pub struct Tracker {
     evictions: u64,
     capacity_exceeded: u64,
     nonce_wraps: u64,
-    /// Exporter-cleanup queue of `(pid, generation)` removed from the tracker.
-    /// The generation token is snapshotted at removal so the main-loop drain
-    /// can tell a still-queued entry apart from a *re-tracked* pid: if the pid
-    /// has since been re-inserted by the same process lineage (same
-    /// generation), its exporter row is now LIVE and must not be clobbered.
-    removed_pids: Vec<(u32, Option<u64>)>,
+    /// Exporter-cleanup queue of pids removed from the tracker (capacity
+    /// evictions and generation-mismatch retirements). Per-pid exporter rows
+    /// are keyed by bare PID, so the main-loop drain reaps a queued pid's row
+    /// only when the pid is no longer tracked at all (see
+    /// [`Tracker::is_tracked`]). A pid re-tracked between queueing and drain —
+    /// the same process after a spurious eviction, OR a PID recycle to a new
+    /// process — owns that single shared row, so its entry is skipped.
+    /// Lineage is irrelevant here: membership, not generation, decides whether
+    /// the row is live, which is why no generation token is stored.
+    removed_pids: Vec<u32>,
     eviction_policy: EvictionPolicy,
     /// Cached count of slots whose `stall_emitted` flag is currently set.
     ///
@@ -749,7 +753,7 @@ impl Tracker {
                     self.stall_emitted_count = self.stall_emitted_count.saturating_sub(1);
                 }
                 self.evictions = self.evictions.saturating_add(1);
-                self.remember_removed_pid(evicted_slot.pid, evicted_slot.generation);
+                self.remember_removed_pid(evicted_slot.pid);
                 return Update::Inserted;
             }
             self.capacity_exceeded = self.capacity_exceeded.saturating_add(1);
@@ -931,12 +935,12 @@ impl Tracker {
         } else {
             self.eviction_scan_cursor %= self.len;
         }
-        self.remember_removed_pid(removed_pid, removed.generation);
+        self.remember_removed_pid(removed_pid);
     }
 
-    fn remember_removed_pid(&mut self, pid: u32, generation: Option<u64>) {
+    fn remember_removed_pid(&mut self, pid: u32) {
         if self.removed_pids.len() < self.removed_pids.capacity() {
-            self.removed_pids.push((pid, generation));
+            self.removed_pids.push(pid);
         } else {
             // The exporter-cleanup queue is full: the main-loop drain
             // (REMOVED_PID_DRAIN_MAX_PER_TICK) has fallen behind a sustained
@@ -962,14 +966,15 @@ impl Tracker {
         count
     }
 
-    /// Return one pending `(pid, generation)` removed from the tracker, if any.
+    /// Return one pending pid removed from the tracker, if any.
     ///
     /// Covers both capacity evictions and generation-mismatch retirements.
-    /// Consumers use this to drop per-pid exporter rows after the slot is no
-    /// longer tracked. The generation token lets the consumer skip a pid that
-    /// has since been re-tracked by the same process lineage (whose exporter
-    /// row is now live). Repeated calls drain all pending removals.
-    pub fn take_evicted_pid(&mut self) -> Option<(u32, Option<u64>)> {
+    /// Consumers use this to drop the per-pid exporter row once the slot is no
+    /// longer tracked. The consumer must re-check membership via
+    /// [`Tracker::is_tracked`] before removing the row: a pid re-tracked
+    /// between queueing and drain — same lineage OR recycled — owns the live
+    /// bare-pid-keyed row. Repeated calls drain all pending removals.
+    pub fn take_evicted_pid(&mut self) -> Option<u32> {
         self.removed_pids.pop()
     }
 
@@ -1059,6 +1064,18 @@ impl Tracker {
     /// True iff no pids are tracked.
     pub fn is_empty(&self) -> bool {
         self.len == 0
+    }
+
+    /// True iff `pid` currently maps to a live tracker slot.
+    ///
+    /// The membership question the exporter-cleanup drain asks before reaping a
+    /// queued pid's per-pid row: because rows are keyed by bare PID, any live
+    /// slot for `pid` — the original process, a spurious-eviction re-track, or
+    /// a PID recycle to a new process — owns that single row, so its counters
+    /// are live and the row must be kept. Only a pid with no live slot is safe
+    /// to reap. Lineage (generation) is deliberately not consulted here.
+    pub fn is_tracked(&self, pid: u32) -> bool {
+        self.generation_of(pid).is_some()
     }
 
     /// Re-validate a deferred stall immediately before recovery fires.

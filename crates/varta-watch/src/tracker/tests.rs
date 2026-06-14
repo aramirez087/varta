@@ -93,7 +93,7 @@ fn capacity_eviction_queues_removed_pid_for_exporter_cleanup() {
     );
     assert_eq!(
         t.take_evicted_pid(),
-        Some((10, None)),
+        Some(10),
         "the evicted slot pid must be surfaced for exporter cleanup"
     );
     assert_eq!(t.take_evicted_pid(), None);
@@ -111,7 +111,7 @@ fn removed_pid_queue_overflow_is_counted_not_silent() {
     let cap = t.removed_pids.capacity();
     // Fill exactly to capacity — these pushes are lossless, no drop.
     for i in 0..cap {
-        t.remember_removed_pid(1000 + i as u32, None);
+        t.remember_removed_pid(1000 + i as u32);
     }
     assert_eq!(t.removed_pids.len(), cap, "queue filled to capacity");
     assert_eq!(
@@ -122,7 +122,7 @@ fn removed_pid_queue_overflow_is_counted_not_silent() {
 
     // One more removal overflows: the pid is dropped (the queue stays bounded)
     // but the loss is surfaced on the dedicated load-shed counter.
-    t.remember_removed_pid(9_999, None);
+    t.remember_removed_pid(9_999);
     assert_eq!(
         t.removed_pids.len(),
         cap,
@@ -140,11 +140,11 @@ fn removed_pid_queue_overflow_is_counted_not_silent() {
     );
 }
 
-/// bug-458: a capacity eviction must surface the evicted slot's *generation*
-/// alongside its pid, so the main-loop exporter-cleanup drain can tell a stale
-/// queued removal apart from a pid that has since been re-tracked.
+/// bug-459: a capacity eviction queues the evicted slot's pid for exporter-row
+/// cleanup. Rows are keyed by bare PID, so the main-loop drain decides on
+/// membership ([`Tracker::is_tracked`]) — the queue need only carry the pid.
 #[test]
-fn evicted_pid_carries_generation_for_cleanup_gate() {
+fn evicted_pid_is_queued_for_cleanup() {
     let mut t = Tracker::new(2, EvictionPolicy::Strict, DEFAULT_EVICTION_SCAN_WINDOW);
     let threshold_ns = 100;
     // Two kernel-attested slots with distinct pinned generations.
@@ -172,36 +172,38 @@ fn evicted_pid_carries_generation_for_cleanup_gate() {
     );
     assert_eq!(
         t.take_evicted_pid(),
-        Some((10, Some(0xA1))),
-        "the queued removal must carry the evicted slot's generation"
+        Some(10),
+        "the evicted slot's pid must be queued for exporter-row cleanup"
     );
 }
 
-/// bug-458: the exact decision the main-loop drain makes — skip the row
-/// removal iff `tracked_generation(pid) == Some(queued_generation)`. A pid
-/// re-tracked by the SAME lineage is kept (live row); a pid recycled to a
-/// DIFFERENT generation, or one no longer tracked, is removed.
+/// bug-459: the exact decision the main-loop drain makes — skip the row
+/// removal iff the pid is still tracked. Per-pid exporter rows are keyed by
+/// bare PID, so a pid re-tracked by the SAME lineage OR recycled to a
+/// DIFFERENT generation both own the single shared (live) row and must be
+/// kept; only a no-longer-tracked pid is reaped. The earlier
+/// generation-equality gate (the bug-458 fix) wrongly reaped the recycle case.
 #[test]
-fn cleanup_gate_skips_only_same_lineage_retrack() {
+fn cleanup_gate_skips_any_retracked_pid() {
     let mut t = Tracker::new(4, EvictionPolicy::Strict, DEFAULT_EVICTION_SCAN_WINDOW);
     let threshold_ns = 100;
 
-    // (1) Re-tracked, same lineage: a pid tracked at generation 7, with a
-    // queued removal that also carried generation 7. The live generation
-    // matches the queued one → the gate must SKIP (its row is live).
+    // (1) Re-tracked, same lineage: a pid tracked at generation 7. It is
+    // tracked → the gate must SKIP (its row is live).
     assert_eq!(
         t.record_with_generation(&frame(10, 1), 0, threshold_ns, ORIGIN, None, Some(7)),
         Update::Inserted
     );
-    assert_eq!(
-        t.generation_of(10),
-        Some(Some(7)),
-        "same-lineage re-track: gate compares Some(7) == Some(7) → skip removal"
+    assert!(
+        t.is_tracked(10),
+        "same-lineage re-track: pid is tracked → gate skips removal"
     );
 
     // (2) Recycled to a different process: a generation-mismatch beat resets
-    // the slot to generation 9. A removal queued at generation 7 no longer
-    // matches the live generation → the gate must REMOVE the stale row.
+    // the slot to generation 9. The exporter row is still keyed by the SAME
+    // bare pid and now holds the recycled agent's LIVE counters, so the pid is
+    // tracked → the gate must STILL skip. (The generation-equality gate
+    // compared Some(9) != Some(7) and reaped the live row — bug-459.)
     assert_eq!(
         t.record_with_generation(
             &frame(10, 2),
@@ -214,17 +216,15 @@ fn cleanup_gate_skips_only_same_lineage_retrack() {
         Update::Inserted
     );
     assert_eq!(t.take_pid_recycles(), 1, "generation mismatch is a recycle");
-    assert_eq!(
-        t.generation_of(10),
-        Some(Some(9)),
-        "recycle: gate compares Some(9) != Some(7) → remove stale row"
+    assert!(
+        t.is_tracked(10),
+        "recycle: pid still tracked (live recycled row) → gate skips removal"
     );
 
-    // (3) Untracked pid: the gate compares None != Some(_) → remove.
-    assert_eq!(
-        t.generation_of(404),
-        None,
-        "gone pid: gate compares None != Some(_) → remove stale row"
+    // (3) Untracked pid: not tracked → the gate removes the stale row.
+    assert!(
+        !t.is_tracked(404),
+        "gone pid: not tracked → gate removes stale row"
     );
 }
 
@@ -1498,7 +1498,7 @@ fn stall_generation_mismatch_queues_every_retired_pid_for_exporter_cleanup() {
     assert_eq!(t.len(), 0);
     assert_eq!(t.take_pid_recycles(), 3);
     let mut removed = Vec::new();
-    while let Some((pid, _gen)) = t.take_evicted_pid() {
+    while let Some(pid) = t.take_evicted_pid() {
         removed.push(pid);
     }
     removed.sort_unstable();

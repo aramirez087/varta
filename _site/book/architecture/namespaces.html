@@ -35,18 +35,11 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-76c5ea20.js";
+            window.path_to_searchindex_js = "../searchindex-76ae65e6.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="../toc-3f8cf947.js"></script>
-    <script defer data-domain="varta.sh" src="https://plausible.io/js/script.js"></script>
-<!-- Privacy-friendly analytics by Plausible -->
-<script async src="https://plausible.io/js/pa-YyA03_Ow6U040l0wzUwht.js"></script>
-<script>
-  window.plausible=window.plausible||function(){(plausible.q=plausible.q||[]).push(arguments)},plausible.init=plausible.init||function(i){plausible.o=i||{}};
-  plausible.init()
-</script>
-</head>
+        <script src="../toc-2d897c67.js"></script>
+    </head>
     <body>
     <div id="mdbook-help-container">
         <div id="mdbook-help-popup">
@@ -261,14 +254,23 @@ namespace inode, and silence timer all re-pinned) and the event is counted as
 <code>varta_tracker_pid_recycle_total</code>. The generation check runs <strong>before</strong> the
 origin / namespace / nonce checks — a recycled process legitimately differs on
 all of them. A <code>None</code> on either side (“generation unknown”: non-Linux, UDP, or
-unreadable <code>/proc</code>) is treated leniently and never triggers a reset, so prior
-PID-only behaviour is preserved exactly. When the slot’s pinned generation is
-<code>None</code> and a later beat carries <code>Some(_)</code> with an <strong>accepted</strong> nonce, the token
-is pinned in place (same rule as the namespace-inode <code>None → Some</code> upgrade) so
-a subsequent recycle can compare <code>(Some(G1), Some(G2))</code> instead of staying
-stuck at <code>None</code>. Out-of-order frames must not pin generation. Replay protection
-is untouched: a low nonce under the <strong>same</strong> generation is still dropped as
-out-of-order.</p>
+unreadable <code>/proc</code>) is treated leniently by the tracker and never triggers a
+reset, so prior PID-only behaviour is preserved exactly for non-recovery
+transports and for already-pinned slots whose peer vanished. When the slot’s
+pinned generation is <code>None</code> and a later beat carries <code>Some(_)</code> with an
+<strong>accepted</strong> nonce, the token is pinned in place (same rule as the
+namespace-inode <code>None → Some</code> upgrade) so a subsequent recycle can compare
+<code>(Some(G1), Some(G2))</code> instead of staying stuck at <code>None</code>. Out-of-order frames
+must not pin generation. Replay protection is untouched: a low nonce under the
+<strong>same</strong> generation is still dropped as out-of-order.</p>
+<p>For Linux UDS first contact, the observer requires that <code>Some(generation)</code>
+before the slot may pin recovery-eligible <code>KernelAttested</code> origin. If the
+sender exits after <code>recvmsg(2)</code> but before the <code>/proc/&lt;pid&gt;/stat</code> start-time
+read, the beat is still observable, but it is recorded as <code>SocketModeOnly</code>.
+A later accepted beat that can read a concrete generation may upgrade the slot
+to <code>KernelAttested</code>. This keeps transient dying-gasp frames from breaking
+monitoring while preventing an unpinned numeric PID from driving <code>{pid}</code>
+recovery after PID recycle.</p>
 <p>The same generation is revalidated when a kernel-attested slot first becomes a
 stall candidate. If <code>/proc/&lt;pid&gt;/stat</code> now returns a concrete <strong>different</strong>
 generation, the old slot is retired and no <code>Event::Stall</code> is emitted. This
@@ -359,6 +361,10 @@ exited between <code>recvmsg</code> and <code>readlink</code>, <code>/proc</code
 returns <code>None</code>. The tracker’s <code>None → Some</code> upgrade allows one-shot
 recovery so a transient <code>/proc</code> unavailability does not pin a slot as
 permanently unknown.</li>
+<li><strong><code>/proc/&lt;peer_pid&gt;/stat</code> unreadable on first contact</strong>: the helper returns
+<code>None</code>, so the beat is tracked as <code>SocketModeOnly</code> until a later accepted
+Linux UDS beat can pin <code>Some(generation)</code>. Missing generation remains
+fail-open only after a slot already has recovery-eligible identity pinned.</li>
 <li><strong>Existing <code>frame.pid != peer_pid</code> check fires first</strong> for most real
 cross-namespace traffic (the two namespaces almost always produce different
 numeric pids for the same process). The namespace gate is belt-and-suspenders

@@ -35,18 +35,11 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-76c5ea20.js";
+            window.path_to_searchindex_js = "../searchindex-76ae65e6.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="../toc-3f8cf947.js"></script>
-    <script defer data-domain="varta.sh" src="https://plausible.io/js/script.js"></script>
-<!-- Privacy-friendly analytics by Plausible -->
-<script async src="https://plausible.io/js/pa-YyA03_Ow6U040l0wzUwht.js"></script>
-<script>
-  window.plausible=window.plausible||function(){(plausible.q=plausible.q||[]).push(arguments)},plausible.init=plausible.init||function(i){plausible.o=i||{}};
-  plausible.init()
-</script>
-</head>
+        <script src="../toc-2d897c67.js"></script>
+    </head>
     <body>
     <div id="mdbook-help-container">
         <div id="mdbook-help-popup">
@@ -277,6 +270,28 @@ startup warning and the build is <strong>not</strong> Class C-conforming. Up to
 <li>After writing the post-rotation <code>boot</code> record.</li>
 <li>In <code>Drop</code> (best-effort; not load-bearing for correctness).</li>
 </ul>
+<h3 id="directory-entry-durability"><a class="header" href="#directory-entry-durability">Directory-entry durability</a></h3>
+<p><code>fsync(2)</code> on the audit file does <strong>not</strong> persist the directory entry that
+names it. The daemon therefore also fsyncs the audit file’s parent
+directory: once at startup in <code>create</code> (a freshly-created file would
+otherwise vanish entirely on power cut — including records whose
+<code>fdatasync</code> had already returned), and once per rotation in a dedicated
+final <code>SyncingDir</code> state-machine stage covering the generation renames,
+the new live file’s <code>create_new</code>, and the <code>EXDEV</code> fallback’s copy/unlink
+pair. The stage runs behind its own budget check so the <code>Finalizing</code> tail
+keeps the exact two-fsync cost its <code>--audit-rotation-budget-ms</code> model is
+sized for. A directory-fsync failure is a soft durability degradation
+latched on the audit error channel, mirroring the UDS-bind posture.</p>
+<h2 id="file-identity-hardening"><a class="header" href="#file-identity-hardening">File identity hardening</a></h2>
+<p>Audit startup opens the live path once with <code>O_NOFOLLOW</code>, verifies the opened
+inode is a regular file owned by the observer UID with exactly one hard link,
+then uses that same descriptor for tail recovery, optional truncation, and all
+later appends. Leaf symlinks and multiply-linked files are rejected before any
+audit bytes are changed.</p>
+<p>Rotation creates every new live generation and EXDEV copy destination
+exclusively with mode 0600. The EXDEV fallback copies from a clone of the
+writer’s already-validated descriptor, not from a second pathname open, and
+keeps the exclusive destination descriptor as the new sink.</p>
 <h2 id="tamper-evidence-the-hash-chain"><a class="header" href="#tamper-evidence-the-hash-chain">Tamper-evidence: the hash chain</a></h2>
 <p>When the daemon is built with <code>--features audit-chain</code>, every record’s
 trailing <code>chain</code> column is the lowercase-hex SHA-256 of:</p>
@@ -362,7 +377,7 @@ cat audit.log.5 audit.log.4 audit.log.3 audit.log.2 audit.log.1 audit.log \
 <tr><th>Flag</th><th>Required</th><th>Default</th><th>Meaning</th></tr>
 </thead>
 <tbody>
-<tr><td><code>--recovery-audit-file &lt;PATH&gt;</code></td><td>no</td><td>unset</td><td>Append audit records to PATH. Created mode 0600.</td></tr>
+<tr><td><code>--recovery-audit-file &lt;PATH&gt;</code></td><td>no</td><td>unset</td><td>Append audit records to PATH. Created mode 0600; leaf symlinks and multiply-linked files are rejected.</td></tr>
 <tr><td><code>--recovery-audit-max-bytes &lt;N&gt;</code></td><td>no</td><td>unbounded</td><td>Rotate after a write that pushes the file past N bytes.</td></tr>
 <tr><td><code>--recovery-audit-sync-every &lt;N&gt;</code></td><td>no</td><td>1</td><td>fdatasync cadence. <code>1</code> is the only Class C-conforming value.</td></tr>
 <tr><td><code>--audit-fsync-budget-ms &lt;MS&gt;</code></td><td>no</td><td>50</td><td>Soft per-call budget for one <code>fdatasync(2)</code>. Overruns defer further fsyncs in the <em>current</em> drain to next tick; the poll loop never blocks on more than one slow fsync per tick.</td></tr>
