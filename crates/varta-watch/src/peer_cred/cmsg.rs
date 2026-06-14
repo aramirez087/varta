@@ -25,13 +25,22 @@
 // CMSG alignment helpers
 // ---------------------------------------------------------------------------
 
-/// `CMSG_ALIGN(len)` from `<sys/socket.h>` — round `len` up to the platform's
-/// natural alignment (`sizeof(size_t)` on all targets we support).
-pub(super) const fn cmsg_align(len: usize) -> usize {
-    // On all supported 64-bit platforms, sizeof(size_t) == sizeof(long) == 8,
-    // which matches CMSG_ALIGN.  On 32-bit both are 4.
-    let align = core::mem::size_of::<usize>();
+/// Round `len` up to the power-of-two `align`. The primitive behind every
+/// cmsg alignment computation.
+pub(super) const fn align_up(len: usize, align: usize) -> usize {
     (len + align - 1) & !(align - 1)
+}
+
+/// `CMSG_ALIGN(len)` for the platforms (Linux, BSD) whose cmsg data **and**
+/// header alignment are both `sizeof(size_t)` (8 on LP64, 4 on 32-bit).
+///
+/// illumos / Solaris are the exception: their kernel aligns the cmsg payload
+/// on a 4-byte boundary regardless of word size, so they override
+/// [`CmsgPlatform::DATA_ALIGN`] / [`CmsgPlatform::HDR_ALIGN`] instead of using
+/// this helper. Retained here because `platform::{linux,bsd}` still use it for
+/// their compile-time ancillary-buffer-size floor asserts.
+pub(super) const fn cmsg_align(len: usize) -> usize {
+    align_up(len, core::mem::size_of::<usize>())
 }
 
 // ---------------------------------------------------------------------------
@@ -86,6 +95,24 @@ pub(super) unsafe trait CmsgPlatform {
     /// `type` the kernel sets on credential cmsg (e.g. `SCM_CREDENTIALS`).
     const TARGET_TYPE: i32;
 
+    /// Alignment applied to `sizeof(cmsghdr)` to locate the cmsg payload
+    /// (POSIX `CMSG_DATA`) and to size it (`cmsg_len - cmsg_hdr_size`).
+    ///
+    /// Linux and BSD round by `sizeof(size_t)` — the default below. illumos /
+    /// Solaris override to 4 (`_CMSG_DATA_ALIGNMENT == sizeof(int)`, on every
+    /// arch), placing the payload at offset `round4(12) = 12` rather than
+    /// `round8(12) = 16`.
+    const DATA_ALIGN: usize = core::mem::size_of::<usize>();
+
+    /// Alignment applied to `cmsg_len` when stepping to the next cmsg (POSIX
+    /// `CMSG_NXTHDR`).
+    ///
+    /// Linux and BSD round by `sizeof(size_t)` — the default below. illumos /
+    /// Solaris override to `_CMSG_HDR_ALIGNMENT`: 4 on non-sparc64, 8 on
+    /// sparc64. This is a *separate* knob from [`Self::DATA_ALIGN`] because on
+    /// sparc64 the two genuinely differ (data 4, header 8).
+    const HDR_ALIGN: usize = core::mem::size_of::<usize>();
+
     fn cmsg_len(hdr: &Self::Hdr) -> usize;
     fn cmsg_level(hdr: &Self::Hdr) -> i32;
     fn cmsg_type(hdr: &Self::Hdr) -> i32;
@@ -113,7 +140,7 @@ pub(super) unsafe trait CmsgPlatform {
     /// Aligned size of one `cmsghdr` on this platform. Used for bounds
     /// checks and for computing the payload offset within a cmsg.
     fn cmsg_hdr_size() -> usize {
-        cmsg_align(core::mem::size_of::<Self::Hdr>())
+        align_up(core::mem::size_of::<Self::Hdr>(), Self::DATA_ALIGN)
     }
 }
 
@@ -194,10 +221,11 @@ where
         //   and `base` is valid for `controllen` readable bytes per `new`'s
         //   SAFETY contract.
         // - Alignment: the receive path's ancillary buffer is
-        //   `#[repr(align(8))]` (see `recv::AncBuf`) and `cmsg_align` ensures
-        //   `cursor` is on an 8-byte boundary; the platform's `Cmsghdr` has
-        //   an alignment of at most `usize` (covered by layout guards in
-        //   `super::plat`).
+        //   `#[repr(align(8))]` (see `recv::AncBuf`) and the cursor advances by
+        //   multiples of `P::HDR_ALIGN`, which is `>= align_of::<P::Hdr>()` on
+        //   every platform (8 for Linux/BSD; 4 for illumos x86, whose `Cmsghdr`
+        //   is 4-aligned). So every `base + cursor` meets `Hdr`'s alignment.
+        //   (Layout guards in `super::plat` pin each `Cmsghdr`.)
         // - The pointed-to bytes are initialised cmsghdr bytes per `recvmsg(2)`
         //   semantics (or equivalent fuzz/test fabrication).
         let hdr_ptr = unsafe { self.base.add(self.cursor) } as *const P::Hdr;
@@ -216,7 +244,7 @@ where
         // anything smaller than the header itself) cannot stall the walk in
         // an infinite loop. `saturating_add` prevents `usize` overflow from
         // wrapping into a small value that could look in-bounds.
-        let advance = core::cmp::max(cmsg_align(len), P::cmsg_hdr_size());
+        let advance = core::cmp::max(align_up(len, P::HDR_ALIGN), P::cmsg_hdr_size());
         self.cursor = self.cursor.saturating_add(advance);
         Some((hdr, data_ptr))
     }
@@ -656,13 +684,14 @@ mod miri_cmsg_tests {
     /// is provenance-clean for the illumos-shaped layout too.
     #[test]
     fn illumos_shape_buffer_returns_pid_euid() {
-        use super::super::platform::illumos::{Cmsghdr, IllumosCmsg, Msghdr};
-        use core::mem;
+        use super::super::platform::illumos::{IllumosCmsg, Msghdr};
 
-        // illumos Cmsghdr is 12 bytes; cmsg_align(12) = 16 on LP64.
+        // illumos Cmsghdr is 12 bytes; the kernel aligns CMSG_DATA on a 4-byte
+        // boundary (`_CMSG_DATA_ALIGNMENT == sizeof(int)`), so the payload
+        // starts at offset `round4(12) = 12` — NOT `round8(12) = 16`. See
+        // illumos <sys/socket.h> and `platform/illumos.rs` DATA_ALIGN.
         let illumos_hdr_size = <IllumosCmsg as CmsgPlatform>::cmsg_hdr_size();
-        assert_eq!(illumos_hdr_size, cmsg_align(mem::size_of::<Cmsghdr>()));
-        assert_eq!(illumos_hdr_size, 16);
+        assert_eq!(illumos_hdr_size, 12);
 
         // Payload: 4 bytes pid (i32) + 4 bytes uid (u32) = 8 bytes.
         // The shim reads pid at offset 0, uid at offset 4 of the payload.
@@ -707,6 +736,61 @@ mod miri_cmsg_tests {
 
         let result = find_credential::<IllumosCmsg>(&mhdr);
         assert_eq!(result, Some((expected_pid as u32, expected_uid)));
+    }
+
+    /// REGRESSION (illumos/Solaris credential brick): fabricate the ancillary
+    /// buffer exactly as the kernel does — `CMSG_DATA` at the 4-byte-aligned
+    /// offset 12 (`_CMSG_DATA_ALIGN(sizeof(cmsghdr)) = round4(12) = 12`), with
+    /// `cmsg_len = 12 + payload` — using LITERAL offsets, independent of the
+    /// walker's own `cmsg_hdr_size`. Before the `DATA_ALIGN` fix the walker read
+    /// the `ucred_t` at offset 16 and computed `payload_len = cmsg_len - 16`, so
+    /// `find_credential` returned `None` for every datagram — total platform
+    /// denial of stall detection and recovery. It must now decode the
+    /// credentials at the kernel's real offset.
+    #[test]
+    fn illumos_kernel_4byte_data_alignment_offset_12() {
+        use super::super::platform::illumos::{IllumosCmsg, Msghdr};
+
+        // Kernel layout: 12-byte cmsghdr, ucred payload at byte 12.
+        const KERNEL_DATA_OFFSET: usize = 12;
+        let payload_len = 8usize; // Linux shim reads pid@0 (i32) + uid@4 (u32)
+        let cmsg_len = KERNEL_DATA_OFFSET + payload_len; // == CMSG_LEN(8) on illumos
+
+        #[repr(align(8))]
+        struct AlignedBuf([u8; 64]);
+        let mut buf_wrapper = AlignedBuf([0u8; 64]);
+        let buf = &mut buf_wrapper.0[..cmsg_len];
+
+        buf[0..4].copy_from_slice(&(cmsg_len as u32).to_ne_bytes());
+        let sol_socket: i32 = 0xffff;
+        let scm_ucred: i32 = 0x1012;
+        buf[4..8].copy_from_slice(&sol_socket.to_ne_bytes());
+        buf[8..12].copy_from_slice(&scm_ucred.to_ne_bytes());
+
+        let expected_pid: i32 = 7777;
+        let expected_uid: u32 = 1001;
+        buf[KERNEL_DATA_OFFSET..KERNEL_DATA_OFFSET + 4]
+            .copy_from_slice(&expected_pid.to_ne_bytes());
+        buf[KERNEL_DATA_OFFSET + 4..KERNEL_DATA_OFFSET + 8]
+            .copy_from_slice(&expected_uid.to_ne_bytes());
+
+        let mhdr = Msghdr {
+            msg_name: core::ptr::null_mut(),
+            msg_namelen: 0,
+            _pad1: 0,
+            msg_iov: core::ptr::null_mut(),
+            msg_iovlen: 0,
+            _pad2: 0,
+            msg_control: buf.as_mut_ptr() as *mut _,
+            msg_controllen: cmsg_len as u32,
+            msg_flags: 0,
+        };
+
+        assert_eq!(
+            find_credential::<IllumosCmsg>(&mhdr),
+            Some((expected_pid as u32, expected_uid)),
+            "illumos walker must read CMSG_DATA at the kernel's 4-byte-aligned offset 12"
+        );
     }
 
     /// `ucred_getpid` shim returns -1 when the buffer encodes a negative pid
@@ -1021,5 +1105,64 @@ mod miri_cmsg_tests {
         let mut closed = Vec::new();
         reclaim_scm_rights::<IllumosCmsg>(&mhdr, scm_rights, |fd| closed.push(fd));
         assert_eq!(closed, vec![21]);
+    }
+
+    /// REGRESSION (illumos `SCM_RIGHTS` reclaim desync): two cmsgs on the
+    /// kernel's real boundaries — an `SCM_UCRED` (`cmsg_len = 12 + 8 = 20`,
+    /// next header at `round4(20) = 20`) followed by an `SCM_RIGHTS` carrying
+    /// one fd. With the old 8-byte advance the walker stepped to
+    /// `round8(20) = 24`, overshooting the `SCM_RIGHTS` header at offset 20 and
+    /// leaving the peer-injected fd open (fd-exhaustion DoS). The 4-byte
+    /// `HDR_ALIGN` must now land on the `SCM_RIGHTS` cmsg and close the fd.
+    #[test]
+    fn reclaim_scm_rights_illumos_multi_cmsg_4byte_advance() {
+        use super::super::platform::illumos::{IllumosCmsg, Msghdr};
+
+        const SCM_UCRED: i32 = 0x1012;
+        const SCM_RIGHTS: i32 = 0x1010;
+        let sol_socket: i32 = 0xffff;
+
+        #[repr(align(8))]
+        struct AlignedBuf([u8; 128]);
+        let mut buf_wrapper = AlignedBuf([0u8; 128]);
+
+        // cmsg #1 — SCM_UCRED, cmsg_len = 12 + 8 = 20 (deliberately NOT a
+        // multiple of 8, so 4-byte vs 8-byte advance land on different offsets).
+        let ucred_len = 12 + 8usize;
+        // cmsg #2 — SCM_RIGHTS with one fd, at the kernel offset round4(20)=20.
+        let rights_off = align_up(ucred_len, 4); // == 20
+        let rights_len = 12 + core::mem::size_of::<i32>(); // 16
+        let total = rights_off + rights_len;
+        let buf = &mut buf_wrapper.0[..total];
+
+        buf[0..4].copy_from_slice(&(ucred_len as u32).to_ne_bytes());
+        buf[4..8].copy_from_slice(&sol_socket.to_ne_bytes());
+        buf[8..12].copy_from_slice(&SCM_UCRED.to_ne_bytes());
+
+        let passed_fd: i32 = 77;
+        buf[rights_off..rights_off + 4].copy_from_slice(&(rights_len as u32).to_ne_bytes());
+        buf[rights_off + 4..rights_off + 8].copy_from_slice(&sol_socket.to_ne_bytes());
+        buf[rights_off + 8..rights_off + 12].copy_from_slice(&SCM_RIGHTS.to_ne_bytes());
+        buf[rights_off + 12..rights_off + 16].copy_from_slice(&passed_fd.to_ne_bytes());
+
+        let mhdr = Msghdr {
+            msg_name: core::ptr::null_mut(),
+            msg_namelen: 0,
+            _pad1: 0,
+            msg_iov: core::ptr::null_mut(),
+            msg_iovlen: 0,
+            _pad2: 0,
+            msg_control: buf.as_mut_ptr() as *mut _,
+            msg_controllen: total as u32,
+            msg_flags: 0,
+        };
+
+        let mut closed = Vec::new();
+        reclaim_scm_rights::<IllumosCmsg>(&mhdr, SCM_RIGHTS, |fd| closed.push(fd));
+        assert_eq!(
+            closed,
+            vec![passed_fd],
+            "4-byte HDR_ALIGN must step to the SCM_RIGHTS cmsg at offset 20 and reclaim the fd"
+        );
     }
 }

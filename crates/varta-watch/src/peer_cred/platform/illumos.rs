@@ -195,6 +195,19 @@ unsafe impl super::super::cmsg::CmsgPlatform for IllumosCmsg {
     const TARGET_LEVEL: i32 = SOL_SOCKET;
     const TARGET_TYPE: i32 = SCM_UCRED;
 
+    // illumos / Solaris cmsg ABI differs from Linux/BSD: the kernel aligns the
+    // payload (`CMSG_DATA`) on a 4-byte boundary, not `sizeof(size_t)`.
+    // `_CMSG_DATA_ALIGNMENT == sizeof(int) == 4` on every arch, so the opaque
+    // `ucred_t` starts at offset `round4(12) = 12` and `cmsg_len = 12 +
+    // payload`. The shared 8-byte default would read it at offset 16 with a
+    // 4-byte-short payload length — `ucred_getpid` then fails on every datagram
+    // and the whole platform silently loses stall detection and recovery.
+    // `_CMSG_HDR_ALIGNMENT` (the next-cmsg step) is 4 except 8 on sparc64; it is
+    // a separate knob because on sparc64 data (4) and header (8) diverge.
+    // See illumos <sys/socket.h>.
+    const DATA_ALIGN: usize = core::mem::size_of::<i32>();
+    const HDR_ALIGN: usize = if cfg!(target_arch = "sparc64") { 8 } else { 4 };
+
     fn cmsg_len(hdr: &Cmsghdr) -> usize {
         hdr.cmsg_len as usize
     }
