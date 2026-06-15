@@ -84,6 +84,20 @@ pub struct FileExporter {
     /// `writeln!` (beats, stalls, decode errors, IO errors, AuthFailures,
     /// evictions) and is checked at the bottom of `after_write`.
     writes_since_sync: u32,
+    /// Set when a rotation renamed the live file to `.1` but could not recreate
+    /// the live `PATH` (e.g. ENOSPC / EMFILE after the rename already
+    /// succeeded). While set, [`Self::after_write`] retries ONLY the reopen and
+    /// must NOT re-run [`Self::rotate`] — otherwise the stale sink fd (which now
+    /// holds the rotated `.1` inode) would be carried down the generation chain
+    /// on every record and deleted at the oldest generation, silently
+    /// destroying the rotated content. Mirrors the audit log's
+    /// retry-the-open-only rotation posture.
+    rotation_reopen_pending: bool,
+    /// Test-only override: when set, forces the live-file reopen to fail so the
+    /// rename-succeeded-but-create-failed window can be exercised
+    /// deterministically (no portable way to provoke real ENOSPC/EMFILE).
+    #[cfg(test)]
+    reopen_must_fail: bool,
     /// Test-only count of parent-directory fsync *attempts* (initial create
     /// plus each rotation). The durability regression test asserts the
     /// `fsync_parent_dir` sweep actually runs: reverting the fix drops this
@@ -129,6 +143,9 @@ impl FileExporter {
             bytes_written,
             sync_every,
             writes_since_sync: 0,
+            rotation_reopen_pending: false,
+            #[cfg(test)]
+            reopen_must_fail: false,
             #[cfg(test)]
             dir_fsyncs: 0,
         };
@@ -228,6 +245,21 @@ impl FileExporter {
                 None => Ok(()),
             };
         };
+        // A prior rotation rotated the live file to `.1` but could not recreate
+        // the live `PATH` (the sink still holds the `.1` inode and
+        // `bytes_written >= max`). Retry ONLY the reopen — re-running rotate()
+        // would carry the stale fd down `.1`→…→`.5` and delete it at the oldest
+        // generation, silently destroying the rotated records.
+        if self.rotation_reopen_pending {
+            return match self.reopen_live() {
+                Ok(()) => match first_err {
+                    Some(e) => Err(e),
+                    None => Ok(()),
+                },
+                Err(e) => Err(first_err.unwrap_or(e)),
+            };
+        }
+
         self.bytes_written = self.bytes_written.saturating_add(line_len);
         if self.bytes_written < max {
             return match first_err {
@@ -244,24 +276,50 @@ impl FileExporter {
             self.remember_error(&e);
             return Err(first_err.unwrap_or(e));
         }
+        match self.reopen_live() {
+            Ok(()) => match first_err {
+                Some(e) => Err(e),
+                None => Ok(()),
+            },
+            Err(e) => Err(first_err.unwrap_or(e)),
+        }
+    }
+
+    /// (Re)create the live export file and re-point the sink at it.
+    ///
+    /// On success the rotation is complete: the byte/sync counters reset, the
+    /// reopen-pending latch clears, and the parent directory is fsynced. On
+    /// failure the OLD sink is left untouched — it still holds the already-
+    /// rotated `.1` inode — and `rotation_reopen_pending` is SET so the next
+    /// record retries the create WITHOUT re-running [`Self::rotate`]. Re-running
+    /// rotate would migrate the stale fd's inode `.1`→…→`.5` and delete it at
+    /// the oldest generation, silently destroying the rotated records (the bug
+    /// this guard closes).
+    fn reopen_live(&mut self) -> io::Result<()> {
+        #[cfg(test)]
+        if self.reopen_must_fail {
+            let e = io::Error::new(io::ErrorKind::Other, "forced reopen failure (test)");
+            self.remember_error(&e);
+            self.rotation_reopen_pending = true;
+            return Err(e);
+        }
         match create_new_export_file(&self.path) {
             Ok(file) => {
                 self.sink = BufWriter::new(file);
                 self.bytes_written = 0;
                 self.writes_since_sync = 0;
+                self.rotation_reopen_pending = false;
                 // `rotate()` renamed `PATH`→`PATH.1` (or, on EXDEV, copied then
                 // unlinked the live path) and we just created the new live
                 // `PATH`; one parent-dir fsync makes every dirent of this
                 // rotation durable. See [`Self::sync_parent_dir`].
                 self.sync_parent_dir();
-                match first_err {
-                    Some(e) => Err(e),
-                    None => Ok(()),
-                }
+                Ok(())
             }
             Err(e) => {
                 self.remember_error(&e);
-                Err(first_err.unwrap_or(e))
+                self.rotation_reopen_pending = true;
+                Err(e)
             }
         }
     }
@@ -862,6 +920,60 @@ mod tests {
             .flush()
             .expect_err("rotation reopen failure must remain latched");
         assert_eq!(pending.kind(), io::ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn rotation_reopen_failure_does_not_migrate_records_to_deletion() {
+        // Regression (bug-479): when a rotation renames the live file to `.1`
+        // but then cannot recreate `PATH` (ENOSPC/EMFILE *after* the rename
+        // succeeded), the sink still holds the `.1` inode. Re-running rotate()
+        // on every subsequent record carried that stale fd down `.1`→…→`.5` and
+        // deleted it at the oldest generation, silently destroying the rotated
+        // records. The reopen-pending latch must retry ONLY the reopen, leaving
+        // `.1` in place.
+        let (dir, path) = rotation_reopen_fixture("reopen-no-loss");
+        let mut fe = FileExporter::create(&path, Some(1), 0).unwrap();
+
+        // Emulate rename-succeeds-but-create-fails for every reopen.
+        fe.reopen_must_fail = true;
+        // Write well more records than MAX_ROTATION_GENERATIONS, so the buggy
+        // path would migrate the fd off the end of `.5` and delete it.
+        for ns in 200..220u64 {
+            let _ = fe.record(&sample_beat(ns)); // Err during the pending window
+        }
+        // Flush the buffered tail to whatever inode the sink currently holds:
+        // with the fix that is the retained `.1`; with the bug it is the stale
+        // fd's inode, already unlinked after migrating off the end of `.5`.
+        let _ = fe.flush();
+
+        // Every windowed record must survive on disk — not vanish into a stale
+        // fd whose inode was deleted at `.5`. Concatenate every generation.
+        let mut all = String::new();
+        if let Ok(b) = std::fs::read_to_string(&path) {
+            all.push_str(&b);
+        }
+        for g in 1..=MAX_ROTATION_GENERATIONS {
+            if let Ok(b) = std::fs::read_to_string(generation_path(&path, g)) {
+                all.push_str(&b);
+            }
+        }
+        assert!(
+            all.contains("200\t"),
+            "earliest windowed record (200) must survive the reopen-failure window"
+        );
+        assert!(
+            all.contains("219\t"),
+            "latest windowed record (219) must survive — with the bug the stale \
+             fd's inode is deleted at .5 and the tail of the window is lost"
+        );
+
+        // Recovery: once the reopen can succeed, the live PATH is recreated.
+        fe.reopen_must_fail = false;
+        fe.record(&sample_beat(300))
+            .expect("reopen succeeds once create can");
+        assert!(path.exists(), "live PATH recreated once reopen succeeds");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
