@@ -744,10 +744,8 @@ impl Observer {
                             // has opted in via --allow-cross-namespace-agents.
                             let observer_ns_inode =
                                 crate::peer_cred::observer_pid_namespace_inode();
-                            let cross_ns = matches!(
-                                (observer_ns_inode, peer_pid_ns_inode),
-                                (Some(a), Some(b)) if a != b
-                            );
+                            let cross_ns =
+                                cross_namespace_refused(observer_ns_inode, peer_pid_ns_inode);
                             if cross_ns && !self.allow_cross_namespace {
                                 self.cross_namespace_drops =
                                     self.cross_namespace_drops.saturating_add(1);
@@ -1191,6 +1189,46 @@ impl Observer {
     /// `varta_socket_bind_dir_fsync_failed_total`.
     pub fn drain_bind_dir_fsync_failures() -> u64 {
         crate::listener::drain_bind_dir_fsync_failures()
+    }
+}
+
+/// Whether a kernel-attested peer must be refused as cross-namespace.
+///
+/// The gate exists so a `frame.pid` from a different PID namespace can never
+/// be used to target a recovery command: a recycled PID in another namespace
+/// could name an unrelated process, so recovery against it is unsafe. It is
+/// **fail-closed** — a peer that presents a namespace inode is refused whenever
+/// the observer cannot prove the peer shares its own namespace, i.e. both when
+/// the inodes differ AND when the observer's own inode is unknown (`None`).
+///
+/// This matters because [`observer_pid_namespace_inode`] memoizes its result
+/// in a `OnceLock` at the first beat. If that first read raced an unmounted or
+/// unreadable `/proc/self/ns/pid` — late `/proc` mount in the observer's mount
+/// namespace, early boot, or a startup seccomp/permission denial — it caches
+/// `None` for the whole process lifetime. The previous gate
+/// (`matches!((observer, peer), (Some(a), Some(b)) if a != b)`) treated that
+/// `None` observer inode as "accept", silently disabling the gate so a
+/// container agent in a different PID namespace could be tracked — and
+/// recovered against — without the operator's `--allow-cross-namespace-agents`
+/// opt-in.
+///
+/// A peer with **no** inode (`None`: UDP transport, non-Linux, or the peer's
+/// own `/proc` is equally unreadable) is not a cross-namespace conflict —
+/// there is nothing to compare and no PID-targeting beyond what the transport
+/// already implies — so it is accepted, preserving the documented no-op on
+/// those paths.
+///
+/// [`observer_pid_namespace_inode`]: crate::peer_cred::observer_pid_namespace_inode
+fn cross_namespace_refused(observer_ns_inode: Option<u64>, peer_pid_ns_inode: Option<u64>) -> bool {
+    match peer_pid_ns_inode {
+        // The peer presented a PID-namespace inode: refuse unless the observer
+        // knows its own inode AND it matches. `observer_ns_inode != Some(peer)`
+        // is true both when they differ and when the observer's inode is `None`
+        // (fail-closed).
+        Some(peer) => observer_ns_inode != Some(peer),
+        // No peer inode to compare (UDP / non-Linux / unreadable peer `/proc`):
+        // not a cross-namespace conflict.
+        None => false,
     }
 }
 

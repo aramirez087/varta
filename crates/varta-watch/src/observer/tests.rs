@@ -1168,3 +1168,25 @@ fn predrain_loop_observes_all_buffered_resumes_before_deferred_stalls_fire() {
         );
     }
 }
+
+#[test]
+fn cross_namespace_gate_is_fail_closed_when_observer_inode_unknown() {
+    // Same namespace -> accepted (not refused).
+    assert!(!cross_namespace_refused(Some(42), Some(42)));
+    // Different namespace -> refused.
+    assert!(cross_namespace_refused(Some(42), Some(7)));
+    // No peer inode (UDP transport / non-Linux / unreadable peer /proc): there
+    // is nothing to compare, so it is NOT a cross-namespace conflict.
+    assert!(!cross_namespace_refused(Some(42), None));
+    assert!(!cross_namespace_refused(None, None));
+
+    // Regression (bug-483): the observer's own namespace inode is unknown
+    // (`observer_pid_namespace_inode` memoized `None` after a startup
+    // `/proc/self/ns/pid` race) but the peer presents an inode. The gate MUST
+    // fail closed and refuse the cross-namespace peer, not silently accept it
+    // for the rest of the process lifetime. The previous
+    // `matches!((observer, peer), (Some(a), Some(b)) if a != b)` returned
+    // `false` here (accept), disabling the gate without the operator's
+    // `--allow-cross-namespace-agents` opt-in.
+    assert!(cross_namespace_refused(None, Some(7)));
+}
