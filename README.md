@@ -185,20 +185,25 @@ fn main() -> std::io::Result<()> {
 }
 ```
 
-Start the observer in a separate terminal:
+Start the observer in a separate terminal.  `/metrics` has no anonymous
+access, so `--prom-token-file` is mandatory whenever `--prom-addr` is set —
+generate the bearer token first:
 
 ```sh
+openssl rand -hex 32 > /tmp/prom.token
+chmod 0600 /tmp/prom.token
+
 varta-watch \
   --socket /tmp/varta.sock \
-  --udp-port 9000 \
   --threshold-ms 2000 \
-  --prom-addr 127.0.0.1:9100
+  --prom-addr 127.0.0.1:9100 \
+  --prom-token-file /tmp/prom.token
 ```
 
 Then inspect the metrics:
 
 ```sh
-curl -s -H "Authorization: Bearer $(cat /etc/varta/prom.token)" \
+curl -s -H "Authorization: Bearer $(cat /tmp/prom.token)" \
   http://127.0.0.1:9100/metrics
 ```
 
