@@ -64,7 +64,7 @@ No polling. No persistent connection state. No heap allocation after `Connect()`
 
 | Transport | When to use |
 | --------- | ----------- |
-| **UDS** (`Connect`) | Same-host deployment. The observer reads kernel peer credentials (`SCM_CREDENTIALS` on Linux, `LOCAL_PEERTOKEN` on macOS), granting `BeatOrigin::KernelAttested` status. **Only kernel-attested beats are eligible for observer-driven recovery commands.** |
+| **UDS** (`Connect`) | Same-host deployment. On observer platforms with pathname-datagram peer credentials (Linux and supported BSD/illumos/Solaris targets), beats become `BeatOrigin::KernelAttested` and are eligible for observer-driven recovery. macOS pathname UDS is `SocketModeOnly`, so recovery is refused there. |
 | **UDP** (`ConnectUDP`) | Cross-host or same-host when UDS is unavailable. Beats are classified `NetworkUnverified`; recovery is refused by the observer. |
 | **Secure UDP** (`ConnectSecureUDP`) | Same use case as UDP, plus ChaCha20-Poly1305 AEAD encryption for beat confidentiality. Still refused for recovery. |
 
