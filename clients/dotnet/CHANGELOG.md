@@ -6,6 +6,18 @@ here. Versioning is independent of the Rust workspace and follows
 
 ## [Unreleased]
 
+### Fixed
+
+- **Regular beat: the wire timestamp now saturates instead of overflowing.**
+  `Varta.Beat` computed the timestamp as `(ulong)(elapsedTicks * 100L)` in
+  signed-`long` arithmetic with no clamp. After a multi-century single-handle
+  uptime that overflows `long` into a negative value whose `(ulong)` cast lands
+  near the reserved `u64::MAX` `BadTimestamp` sentinel — which the observer
+  drops. Conversion now saturates (`SaturatingNanosFromTicks`), matching the
+  panic path (`SignalHandler.BuildCriticalFrame`) and the Rust client
+  (`elapsed().as_nanos().min(u64::MAX as u128) as u64`). The regular beat was
+  the lone unguarded converter.
+
 ### Security
 
 - Secure-UDP panic emitter (`SignalHandler.InstallSecureUdp`) now derives its

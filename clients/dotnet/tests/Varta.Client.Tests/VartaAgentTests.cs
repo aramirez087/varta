@@ -240,6 +240,30 @@ public class VartaAgentTests
     }
 
     [Fact]
+    public void SaturatingNanosFromTicks_SaturatesInsteadOfOverflowingIntoSentinel()
+    {
+        // Regression (bug-474): the wire timestamp is `ticks * 100` (100-ns
+        // Stopwatch ticks -> ns) in signed-long arithmetic. After a multi-century
+        // single-handle uptime that overflows `long` negative, and the (ulong)
+        // cast lands near the reserved u64::MAX BadTimestamp sentinel (which the
+        // observer drops). The converter must saturate instead — matching the
+        // panic path (SignalHandler.BuildCriticalFrame) and the Rust client.
+        Assert.Equal(100_000UL, global::Varta.Varta.SaturatingNanosFromTicks(1000));
+        // At/over the overflow threshold it saturates to long.MaxValue ns, NOT a
+        // wrapped value near u64::MAX (without the guard this returns
+        // 18446744073709551516, failing this assertion).
+        Assert.Equal(
+            (ulong)long.MaxValue,
+            global::Varta.Varta.SaturatingNanosFromTicks(long.MaxValue));
+        Assert.Equal(
+            (ulong)long.MaxValue,
+            global::Varta.Varta.SaturatingNanosFromTicks(long.MaxValue / 100 + 1));
+        // Saturated value is below the BadTimestamp sentinel, so a saturated
+        // agent's beats are never rejected as the reserved u64::MAX.
+        Assert.True(global::Varta.Varta.SaturatingNanosFromTicks(long.MaxValue) < ulong.MaxValue);
+    }
+
+    [Fact]
     public void ReconnectRetry_CommitsNonceOnlyOnSuccessfulRetry()
     {
         var transport = new DropThenSend(2);

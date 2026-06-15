@@ -145,7 +145,7 @@ public sealed class Varta : IDisposable
             //
             // Monotonic ns since this Varta was constructed. Stopwatch.GetElapsedTime
             // is unaffected by NTP adjustments. TimeSpan.Ticks = 100 ns.
-            ulong nowNs = (ulong)(Stopwatch.GetElapsedTime(_startTimestamp).Ticks * 100L);
+            ulong nowNs = SaturatingNanosFromTicks(Stopwatch.GetElapsedTime(_startTimestamp).Ticks);
             if (nowNs < _lastTimestamp)
             {
                 _clockRegressions = SaturatingIncrement(_clockRegressions);
@@ -298,4 +298,15 @@ public sealed class Varta : IDisposable
     private static uint SaturatingIncrementU32(uint v) => v == uint.MaxValue ? v : v + 1;
     private static bool IsAgentStatus(Status status) =>
         status == Status.Ok || status == Status.Degraded || status == Status.Critical;
+
+    // Convert 100-ns Stopwatch ticks to nanoseconds, saturating instead of
+    // overflowing. `ticks * 100` is signed-long arithmetic; after a
+    // multi-century single-handle uptime it would overflow `long` into a
+    // negative value whose `(ulong)` cast lands near the reserved BadTimestamp
+    // sentinel (u64::MAX), which the observer drops. Mirrors the panic path
+    // (SignalHandler.BuildCriticalFrame) and the Rust client's
+    // `self.start.elapsed().as_nanos().min(u64::MAX as u128) as u64`.
+    // internal for the regression test (InternalsVisibleTo Varta.Client.Tests).
+    internal static ulong SaturatingNanosFromTicks(long ticks) =>
+        ticks > long.MaxValue / 100 ? (ulong)long.MaxValue : (ulong)(ticks * 100L);
 }
