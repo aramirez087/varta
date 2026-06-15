@@ -18,7 +18,7 @@ with the `audit-chain` feature.
 
 ## File format
 
-Two file-level header lines, then one record per line. Fields are
+One file-level header line, then one record per line. Fields are
 tab-separated. Every record kind carries a leading `seq` column and a
 trailing `chain` column. Free-form fields (program paths, refusal
 reasons) have their `\t`, `\n`, and `\r` bytes replaced with a single
