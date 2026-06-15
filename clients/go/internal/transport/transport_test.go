@@ -190,3 +190,44 @@ func TestUnitSecureUDPFailedReconnectPreservesSession(t *testing.T) {
 		t.Fatal("failed Reconnect partially replaced secure session state")
 	}
 }
+
+func TestUnitSecureUDPFailedSendAtWrapDoesNotRotatePrefix(t *testing.T) {
+	// Regression: a Dropped send at the nonce-wrap boundary must NOT rotate the
+	// IV prefix or reset the counter. Prefix index, IV prefix, and counter may
+	// only advance after a successful Write (commit-on-success); otherwise a
+	// failed send burns a prefix index off the wire and runs HKDF on the hot
+	// path, violating the cross-client invariant (cf. Rust NonceAdvance, Java
+	// bug-478). The prior code called rotatePrefix() eagerly before the Write.
+	transport, err := NewSecureUDPShared("127.0.0.1", 9, make([]byte, 32))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer transport.Close()
+
+	// Park the counter at the wrap boundary and snapshot the pre-send state.
+	transport.SetCounterForTest(aeadCounterLimit)
+	oldPrefixIndex := transport.prefixIndex
+	oldCounter := transport.counter
+	oldPrefix := transport.ivPrefix
+
+	// Force the Write to fail deterministically by closing the socket first.
+	if err := transport.conn.Close(); err != nil {
+		t.Fatalf("closing the conn to force a Write failure: %v", err)
+	}
+
+	if _, err := transport.Send(make([]byte, 32)); err == nil {
+		t.Fatal("Send on a closed socket must fail")
+	}
+
+	if transport.prefixIndex != oldPrefixIndex {
+		t.Fatalf("failed wrap-boundary send rotated prefixIndex: got %d, want %d (commit-on-success violated)",
+			transport.prefixIndex, oldPrefixIndex)
+	}
+	if transport.counter != oldCounter {
+		t.Fatalf("failed wrap-boundary send advanced counter: got %d, want %d",
+			transport.counter, oldCounter)
+	}
+	if transport.ivPrefix != oldPrefix {
+		t.Fatal("failed wrap-boundary send re-derived the IV prefix")
+	}
+}

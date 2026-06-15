@@ -106,12 +106,6 @@ func prepareSecureUDPSession(
 	return conn, sessionSalt, ivPrefix, nil
 }
 
-func (t *SecureUDPTransport) rotatePrefix() {
-	t.prefixIndex++
-	t.counter = 0
-	t.ivPrefix = vlpsecure.DeriveIVPrefix(t.sessionSalt, t.prefixIndex)
-}
-
 // Send AEAD-wraps the 32-byte plaintext into a 60- or 64-byte wire
 // frame and transmits it. The IV counter advances only after a
 // successful Write (commit-on-success), so a Dropped beat does not
@@ -120,12 +114,21 @@ func (t *SecureUDPTransport) Send(buf []byte) (int, error) {
 	if len(buf) != 32 {
 		return 0, errors.New("secure-udp: plaintext must be exactly 32 bytes")
 	}
-	if t.counter >= aeadCounterLimit {
-		t.rotatePrefix()
+	// Compute the nonce-wrap into locals; transport state is mutated only after
+	// a successful Write (commit-on-success), so a Dropped send never burns a
+	// prefix index or resets the counter. Mirrors the Rust NonceAdvance pattern
+	// and the Java fix (bug-478); the prior code called rotatePrefix() eagerly
+	// here, leaving prefixIndex/counter/ivPrefix rotated when the Write failed.
+	prefixIndex := t.prefixIndex
+	counter := t.counter
+	ivPrefix := t.ivPrefix
+	if counter >= aeadCounterLimit {
+		prefixIndex++
+		counter = 0
+		ivPrefix = vlpsecure.DeriveIVPrefix(t.sessionSalt, prefixIndex)
 	}
 	var pt [32]byte
 	copy(pt[:], buf)
-	counter := t.counter
 
 	var (
 		wire []byte
@@ -134,14 +137,14 @@ func (t *SecureUDPTransport) Send(buf []byte) (int, error) {
 	)
 	switch t.kind {
 	case SecureUDPKindShared:
-		w, sealErr := vlpsecure.EncodeShared(t.key, t.ivPrefix, counter, pt)
+		w, sealErr := vlpsecure.EncodeShared(t.key, ivPrefix, counter, pt)
 		if sealErr != nil {
 			return 0, sealErr
 		}
 		wire = w[:]
 	case SecureUDPKindMaster:
 		agentPID := uint32(os.Getpid())
-		w, _, sealErr := vlpsecure.EncodeMaster(t.masterKey, agentPID, t.ivPrefix, counter, pt)
+		w, _, sealErr := vlpsecure.EncodeMaster(t.masterKey, agentPID, ivPrefix, counter, pt)
 		if sealErr != nil {
 			return 0, sealErr
 		}
@@ -151,10 +154,12 @@ func (t *SecureUDPTransport) Send(buf []byte) (int, error) {
 	}
 	n, err = t.conn.Write(wire)
 	if err != nil {
-		// Commit-on-success — leave counter untouched so we never burn
-		// a nonce on a Dropped send.
+		// Commit-on-success — leave the prefix index, IV prefix, and counter
+		// untouched so a Dropped send never burns a nonce or a prefix.
 		return n, err
 	}
+	t.prefixIndex = prefixIndex
+	t.ivPrefix = ivPrefix
 	t.counter = counter + 1
 	return n, nil
 }

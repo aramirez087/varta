@@ -26,6 +26,20 @@ governed independently — see `book/src/spec/vlp.md` in the workspace.
 
 ### Fixed
 
+- **Secure-UDP nonce-wrap rotation now honours commit-on-success.** At the
+  32-bit IV-counter boundary, `SecureUDPTransport.Send` called `rotatePrefix()`
+  — which advances `prefixIndex`, resets `counter` to 0, and re-derives the IV
+  prefix — *before* the `Write`. A Dropped send (`EWOULDBLOCK`/`ENOBUFS` under
+  backpressure, or any transient socket error) at that boundary therefore left
+  the transport's prefix index and counter rotated even though no frame reached
+  the wire, contradicting the documented contract ("the transport rotates the
+  prefix when the counter is about to wrap so a Dropped send never advances past
+  the boundary") and the cross-client invariant that no send-path state mutates
+  on a Dropped send. The wrap is now computed into locals and committed only
+  after a successful `Write`, mirroring the Rust `NonceAdvance` pattern and the
+  Java client fix. The regular-counter path was already correct; only the wrap
+  rotation was eager. Wire format unchanged.
+
 - Panic emitters now claim terminal timestamps from a process-wide monotonic
   high-water mark. Clock rollback, equal samples, and handler replacement can
   no longer make a later genuine panic look like a replay.
