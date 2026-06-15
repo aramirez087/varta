@@ -43,7 +43,10 @@ use varta_watch::__test_signal_abi::varta_signal_restorer;
     not(feature = "libc-signal-mode"),
     feature = "test-hooks"
 ))]
-use varta_watch::__test_signal_abi::{rt_sigaction_raw, KernelSigAction, SA_RESTART, SA_RESTORER};
+use varta_watch::__test_signal_abi::{
+    rt_sigaction_raw, rt_sigprocmask_raw, verify_live_delivery, KernelSigAction, SA_RESTART,
+    SA_RESTORER,
+};
 
 static GOT_SIGNAL: AtomicBool = AtomicBool::new(false);
 
@@ -372,4 +375,61 @@ fn linux_riscv64_direct_syscall_roundtrips() {
     unsafe {
         rt_sigaction_raw(SIGUSR2, &old, std::ptr::null_mut());
     }
+}
+
+/// Regression (bug-476): the live-delivery smoke test must NOT brick startup
+/// when SIGUSR1 is in the inherited process blocked-signal mask. `sigprocmask`
+/// masks survive `execve`, so a parent (supervisor / sandbox / container-init)
+/// that blocked SIGUSR1 leaves it blocked in varta-watch; a blocked SIGUSR1
+/// stays *pending* and never reaches `smoke_handler`, so before the fix
+/// `verify_live_delivery()` timed out and aborted startup even though the real
+/// SIGINT/SIGTERM handlers (the only ones the daemon needs) installed fine.
+///
+/// The bug only manifests single-threaded: a process-directed `kill(getpid,
+/// SIGUSR1)` is delivered to *any* thread with SIGUSR1 unblocked, so in the
+/// multithreaded cargo runner a sibling test thread would mask it. We therefore
+/// `fork` a single-threaded child that blocks SIGUSR1 and runs the smoke test,
+/// reproducing real single-threaded daemon startup.
+#[cfg(all(
+    target_os = "linux",
+    not(feature = "libc-signal-mode"),
+    feature = "test-hooks"
+))]
+#[test]
+fn smoke_test_survives_inherited_blocked_sigusr1() {
+    extern "C" {
+        fn fork() -> i32;
+        fn waitpid(pid: i32, status: *mut i32, options: i32) -> i32;
+        fn _exit(code: i32) -> !;
+    }
+
+    const SIGUSR1: i32 = 10;
+    const SIG_BLOCK: i32 = 0;
+    let usr1: u64 = 1u64 << (SIGUSR1 - 1);
+
+    // SAFETY: fork(2). The child only calls async-signal-safe syscalls plus the
+    // smoke test, then _exit(2); glibc/musl keep malloc fork-safe via atfork.
+    let pid = unsafe { fork() };
+    assert!(pid >= 0, "fork failed");
+    if pid == 0 {
+        // Child: single-threaded. Block SIGUSR1 (the inherited-blocked-mask
+        // scenario), then run the smoke test. Exit 0 iff it succeeds despite
+        // the block — i.e. iff it unblocks SIGUSR1 itself.
+        let mut saved: u64 = 0;
+        let _ = unsafe { rt_sigprocmask_raw(SIG_BLOCK, &usr1, &mut saved) };
+        let ok = unsafe { verify_live_delivery() }.is_ok();
+        unsafe { _exit(i32::from(!ok)) };
+    }
+
+    let mut status: i32 = 0;
+    let w = unsafe { waitpid(pid, &mut status, 0) };
+    assert_eq!(w, pid, "waitpid failed");
+    let exited_normally = (status & 0x7f) == 0;
+    let exit_code = (status >> 8) & 0xff;
+    assert!(
+        exited_normally && exit_code == 0,
+        "smoke test aborted under an inherited-blocked SIGUSR1 \
+         (status={status:#x}, code={exit_code}); it must unblock SIGUSR1 for \
+         its own delivery window instead of false-failing startup",
+    );
 }

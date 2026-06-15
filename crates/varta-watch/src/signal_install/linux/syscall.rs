@@ -134,3 +134,99 @@ pub unsafe fn rt_sigaction_raw(
     }
     ret
 }
+
+// ---------------------------------------------------------------------------
+// rt_sigprocmask(2) — examine/change the process blocked-signal mask.
+// ---------------------------------------------------------------------------
+//
+// `how` is SIG_BLOCK(0) / SIG_UNBLOCK(1) / SIG_SETMASK(2). `set`/`oldset` point
+// at a kernel sigset — a single 64-bit word covering signals 1..=64 (bit N-1
+// for signal N); `sigsetsize` = 8. `__NR_rt_sigprocmask` = 14 (x86_64), 135
+// (aarch64/riscv64 generic ABI). Used at startup to temporarily unblock SIGUSR1
+// for the live-delivery smoke test, since blocked masks survive execve.
+
+/// Invoke the Linux `rt_sigprocmask(2)` syscall directly.
+///
+/// Returns `0` on success or a negative `-errno` value on failure.
+///
+/// # Safety
+/// - `set` must be a valid pointer to an initialised `u64` sigset, or null.
+/// - `oldset` must be a valid writable pointer to a `u64` slot, or null.
+#[cfg(target_arch = "x86_64")]
+#[inline]
+pub unsafe fn rt_sigprocmask_raw(how: i32, set: *const u64, oldset: *mut u64) -> i64 {
+    const SYS_RT_SIGPROCMASK: i64 = 14;
+    const SIGSETSIZE: i64 = core::mem::size_of::<u64>() as i64; // 8
+    let ret: i64;
+    // SAFETY: see function-level comment.
+    unsafe {
+        core::arch::asm!(
+            "syscall",
+            inlateout("rax") SYS_RT_SIGPROCMASK => ret,
+            in("rdi") how as i64,
+            in("rsi") set,
+            in("rdx") oldset,
+            in("r10") SIGSETSIZE,
+            lateout("rcx") _,   // clobbered: saved RIP
+            lateout("r11") _,   // clobbered: saved RFLAGS
+            options(nostack),
+        );
+    }
+    ret
+}
+
+/// Invoke the Linux `rt_sigprocmask(2)` syscall directly.
+///
+/// Returns `0` on success or a negative `-errno` value on failure.
+///
+/// # Safety
+/// - `set` must be a valid pointer to an initialised `u64` sigset, or null.
+/// - `oldset` must be a valid writable pointer to a `u64` slot, or null.
+#[cfg(target_arch = "aarch64")]
+#[inline]
+pub unsafe fn rt_sigprocmask_raw(how: i32, set: *const u64, oldset: *mut u64) -> i64 {
+    const SYS_RT_SIGPROCMASK: i64 = 135;
+    const SIGSETSIZE: i64 = core::mem::size_of::<u64>() as i64; // 8
+    let ret: i64;
+    // SAFETY: see function-level comment.
+    unsafe {
+        core::arch::asm!(
+            "svc #0",
+            in("x8") SYS_RT_SIGPROCMASK,
+            inlateout("x0") how as i64 => ret,
+            in("x1") set,
+            in("x2") oldset,
+            in("x3") SIGSETSIZE,
+            options(nostack),
+        );
+    }
+    ret
+}
+
+/// Invoke the Linux `rt_sigprocmask(2)` syscall directly.
+///
+/// Returns `0` on success or a negative `-errno` value on failure.
+///
+/// # Safety
+/// - `set` must be a valid pointer to an initialised `u64` sigset, or null.
+/// - `oldset` must be a valid writable pointer to a `u64` slot, or null.
+#[cfg(target_arch = "riscv64")]
+#[inline]
+pub unsafe fn rt_sigprocmask_raw(how: i32, set: *const u64, oldset: *mut u64) -> i64 {
+    const SYS_RT_SIGPROCMASK: i64 = 135;
+    const SIGSETSIZE: i64 = core::mem::size_of::<u64>() as i64; // 8
+    let ret: i64;
+    // SAFETY: see function-level comment.
+    unsafe {
+        core::arch::asm!(
+            "ecall",
+            in("a7") SYS_RT_SIGPROCMASK,
+            inlateout("a0") how as i64 => ret,
+            in("a1") set,
+            in("a2") oldset,
+            in("a3") SIGSETSIZE,
+            options(nostack),
+        );
+    }
+    ret
+}

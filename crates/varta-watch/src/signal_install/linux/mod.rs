@@ -40,7 +40,7 @@ use kernel_abi::KernelSigAction;
 #[cfg(not(feature = "libc-signal-mode"))]
 use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(not(feature = "libc-signal-mode"))]
-use syscall::rt_sigaction_raw;
+use syscall::{rt_sigaction_raw, rt_sigprocmask_raw};
 
 /// `SA_RESTART`: restart syscalls interrupted by this signal (no `EINTR`).
 /// Verified against `<asm-generic/signal-defs.h>`.
@@ -132,8 +132,20 @@ extern "C" {
     fn kill(pid: i32, sig: i32) -> i32;
 }
 
+/// Prove the just-installed direct-syscall signal path actually delivers and
+/// returns through the trampoline: install a transient `SIGUSR1` handler, send
+/// `SIGUSR1` to this process, and confirm the handler ran within 50 ms.
+///
+/// Temporarily unblocks `SIGUSR1` (restoring the inherited mask afterward) so an
+/// inherited-blocked `SIGUSR1` cannot make the test time out and false-fail
+/// startup. Exposed via `__test_signal_abi` for the regression test; not part of
+/// the stable public API.
+///
+/// # Safety
+/// Must run single-threaded at startup, before other threads exist, with no
+/// concurrent install of `SIGUSR1`.
 #[cfg(not(feature = "libc-signal-mode"))]
-unsafe fn verify_live_delivery() -> io::Result<()> {
+pub unsafe fn verify_live_delivery() -> io::Result<()> {
     SMOKE_TEST_FIRED.store(false, Ordering::SeqCst);
 
     let mut old = std::mem::MaybeUninit::<KernelSigAction>::zeroed();
@@ -142,6 +154,24 @@ unsafe fn verify_live_delivery() -> io::Result<()> {
     // saving the previous disposition into `old`.
     // SAFETY: zeroed MaybeUninit; old_out is a valid mutable pointer.
     unsafe { direct::install_one_direct(SIGUSR1, smoke_handler, old.as_mut_ptr()) }?;
+
+    // SIGUSR1 may be in the process blocked-signal mask varta-watch inherited:
+    // `sigprocmask` masks survive `execve` (unlike caught dispositions, which
+    // `execve` resets to default). A blocked SIGUSR1 stays *pending* and never
+    // reaches `smoke_handler`, so the test would time out and falsely abort
+    // startup despite a healthy trampoline and correctly-installed SIGINT/
+    // SIGTERM handlers. Temporarily unblock SIGUSR1 for the delivery window and
+    // restore the inherited mask on every exit path below.
+    const SIG_UNBLOCK: i32 = 1;
+    const SIG_SETMASK: i32 = 2;
+    let usr1_mask: u64 = 1u64 << (SIGUSR1 - 1);
+    let mut saved_mask: u64 = 0;
+    // SAFETY: `usr1_mask` / `saved_mask` are valid stack `u64` sigsets; the
+    // wrapper passes sigsetsize = 8.
+    let unblock_rc = unsafe { rt_sigprocmask_raw(SIG_UNBLOCK, &usr1_mask, &mut saved_mask) };
+    // If the unblock failed, fall through — SIGUSR1 was likely already
+    // deliverable and the 50 ms deadline still bounds the wait. Only restore
+    // the mask when we successfully captured the previous one.
 
     // Deliver SIGUSR1 to this process. On Linux, kill(getpid(), sig) marks
     // the signal pending; it is delivered at the next return from kernel mode
@@ -162,6 +192,10 @@ unsafe fn verify_live_delivery() -> io::Result<()> {
             // SAFETY: old.as_mut_ptr() was fully initialised by install_one_direct.
             let old_init = unsafe { old.assume_init() };
             unsafe { rt_sigaction_raw(SIGUSR1, &old_init, std::ptr::null_mut()) };
+            if unblock_rc == 0 {
+                // SAFETY: `saved_mask` is the valid stack sigset captured above.
+                unsafe { rt_sigprocmask_raw(SIG_SETMASK, &saved_mask, std::ptr::null_mut()) };
+            }
             return Err(io::Error::new(
                 io::ErrorKind::Other,
                 "signal smoke test: SIGUSR1 not delivered within 50 ms — \
@@ -175,6 +209,12 @@ unsafe fn verify_live_delivery() -> io::Result<()> {
     // SAFETY: old was fully initialised by the install_one_direct call above.
     let old_init = unsafe { old.assume_init() };
     let rc = unsafe { rt_sigaction_raw(SIGUSR1, &old_init, std::ptr::null_mut()) };
+    // Restore the inherited blocked-signal mask regardless of the disposition
+    // restore's result, so a parent that blocked SIGUSR1 sees it blocked again.
+    if unblock_rc == 0 {
+        // SAFETY: `saved_mask` is the valid stack sigset captured above.
+        unsafe { rt_sigprocmask_raw(SIG_SETMASK, &saved_mask, std::ptr::null_mut()) };
+    }
     if rc < 0 {
         return Err(io::Error::from_raw_os_error(-rc as i32));
     }
@@ -197,8 +237,9 @@ unsafe fn verify_live_delivery() -> io::Result<()> {
 #[cfg(all(any(test, feature = "test-hooks"), not(feature = "libc-signal-mode")))]
 pub(crate) mod test_abi {
     pub use super::kernel_abi::KernelSigAction;
-    pub use super::syscall::rt_sigaction_raw;
+    pub use super::syscall::{rt_sigaction_raw, rt_sigprocmask_raw};
     #[cfg(target_arch = "x86_64")]
     pub use super::trampoline::varta_signal_restorer;
+    pub use super::verify_live_delivery;
     pub use super::{SA_RESTART, SA_RESTORER};
 }
