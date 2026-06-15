@@ -293,6 +293,28 @@ struct Timespec {
     tv_nsec: i64,
 }
 
+// The `i64`/`i64` layout above is ABI-correct only where both `time_t` and
+// `long` are 64-bit — i.e. every 64-bit Linux target (x86_64, aarch64, riscv64,
+// …; all Linux 64-bit ABIs are LP64). On a 32-bit Linux target `long`
+// (`tv_nsec`) is 32-bit, and `time_t` (`tv_sec`) is either 32-bit (legacy) or
+// 64-bit (time64) depending on how the libc this binary links against was
+// built. Because the clock is read through `extern "C" clock_gettime` (libc's,
+// not a raw syscall), the kernel/libc writes through whichever `struct timespec`
+// that libc defines — a size that a single fixed `#[repr(C)]` declaration cannot
+// match across both 32-bit variants without a libc dependency. Reading the
+// wrong layout would yield a garbage nanosecond value and silently mis-clock
+// stall detection (the observer's core function). Fail the build loudly instead,
+// mirroring the `O_NOFOLLOW` ABI tripwire in `file_security.rs`; a 32-bit Linux
+// port must add a verified, time_t-variant-correct `Timespec` here first.
+#[cfg(all(target_os = "linux", not(target_pointer_width = "64")))]
+compile_error!(
+    "varta-watch's raw clock_gettime FFI Timespec is ABI-verified only for \
+     64-bit Linux (time_t and long both 64-bit). On 32-bit Linux tv_nsec is a \
+     32-bit `long` and time_t is libc-build-dependent (legacy vs time64), so the \
+     fixed i64/i64 layout would mis-read nanoseconds and break stall detection. \
+     Add a verified per-variant Timespec before building for 32-bit Linux."
+);
+
 #[cfg(any(target_os = "macos", target_os = "ios"))]
 #[repr(C)]
 struct Timespec {
