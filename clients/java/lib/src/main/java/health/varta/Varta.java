@@ -133,7 +133,19 @@ public final class Varta implements AutoCloseable {
                     consecutiveDropped = 0;
                     forkRecoveries = saturatingInc(forkRecoveries);
                 } catch (IOException e) {
-                    return ErrnoClassifier.classify(e);
+                    // Fork-recovery reconnect failed: the fork invalidated the
+                    // old socket and a new one could not be established, so the
+                    // beat path is broken. This is a terminal error, NOT a
+                    // transient drop — return Failed unconditionally, matching
+                    // the Rust reference (BeatOutcome::Failed(BeatError::from_io))
+                    // and every other client (Go "ReconnectFailed", Python/Node
+                    // from_oserror/fromNodeError, .NET). Routing it through
+                    // ErrnoClassifier would misclassify e.g. "connection refused"
+                    // as Dropped(NO_OBSERVER), telling the caller the beat path
+                    // is still operational when fork recovery has actually
+                    // failed — so it would keep retrying a dead beat loop instead
+                    // of surfacing the hard failure.
+                    return BeatOutcome.failed(new BeatError(0, "ReconnectFailed"));
                 }
             }
 

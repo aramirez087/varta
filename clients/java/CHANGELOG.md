@@ -8,6 +8,21 @@ workspace and follows [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **A failed fork-recovery reconnect now surfaces as `Failed`, not `Dropped`.**
+  When `beat()` detects a `fork(2)` (the cached connect PID no longer matches)
+  it reconnects the transport before emitting. If that `reconnect()` threw, the
+  exception was routed through `ErrnoClassifier.classify(e)`, which maps
+  recognised conditions — e.g. a "Connection refused" `SocketException` — to
+  `Dropped(NO_OBSERVER)`. A fork-recovery reconnect failure is a *terminal*
+  error (the fork invalidated the old socket and a new one could not be
+  established), so reporting `Dropped` told the caller the beat path was still
+  operational and invited an indefinite retry loop instead of escalating the
+  hard failure. The fork-recovery path now returns
+  `BeatOutcome.failed(new BeatError(0, "ReconnectFailed"))` unconditionally,
+  matching the Rust reference (`BeatOutcome::Failed`) and the Go, Python, Node,
+  and .NET clients. The regular auto-reconnect path (a send that keeps dropping)
+  still uses `ErrnoClassifier` and is unaffected.
+
 - **Secure-UDP: the IV-prefix rotation at the counter-wrap boundary is now
   commit-on-success.** `SecureUdpTransport.send` rotated the committed prefix
   index, re-derived the IV prefix (an HKDF on the hot beat path), and reset the
