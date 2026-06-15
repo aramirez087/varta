@@ -6,6 +6,19 @@ governed independently — see `book/src/spec/vlp.md` in the workspace.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Solaris / illumos: corrected the `ENOBUFS` errno value (111 → 132).**
+  `_errno.py` hard-coded the solarish `ENOBUFS` as `111`, but the real
+  `<sys/errno.h>` value is `132` (`111` is Linux's `ECONNREFUSED` and is
+  undefined on solarish). On Solaris/illumos a genuine send-buffer `ENOBUFS`
+  therefore never matched `classify_send_error`'s `code == ENOBUFS` branch and
+  was misclassified as a hard `BeatOutcome.failed` instead of
+  `Dropped(KERNEL_QUEUE_FULL)`, breaking the dropped-beat taxonomy and the
+  `set_reconnect_after` auto-recovery (which counts only `Dropped`). Matches the
+  Rust reference and the Node client; this is the Python sibling of Rust
+  bug-470.
+
 ### Security
 
 - **Beat path: closed an AEAD nonce-reuse hole under fork + PID recycling.**

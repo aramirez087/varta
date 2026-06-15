@@ -63,6 +63,22 @@ def test_classify_send_error_enobufs_is_kernel_queue_full() -> None:
     assert outcome.reason is DropReason.KERNEL_QUEUE_FULL
 
 
+def test_solarish_enobufs_value_is_132(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Regression (bug-473, the Python sibling of Rust bug-470): the solarish
+    # ENOBUFS value is 132 (rust-libc ``src/unix/solarish/mod.rs``), NOT 111 —
+    # 111 is Linux's ECONNREFUSED and undefined on solarish, so a real
+    # send-buffer ENOBUFS (132) would miss the ``code == ENOBUFS`` branch and be
+    # misclassified as ``failed`` instead of ``Dropped(KERNEL_QUEUE_FULL)``.
+    # Pins the literal (host-independent; the test above is host-relative) so a
+    # transcription cannot recur, and exercises the platform selection.
+    import varta._errno as e
+
+    assert e._SOLARIS_ENOBUFS == 132
+    for plat in ("sunos5", "solaris", "illumos"):
+        monkeypatch.setattr(e.sys, "platform", plat)
+        assert e._select_enobufs() == 132
+
+
 def test_classify_send_error_blocking_io_error() -> None:
     outcome = classify_send_error(BlockingIOError())
     assert outcome.is_dropped

@@ -35,7 +35,12 @@ class UnsupportedPlatformError(RuntimeError):
 
 _LINUX_ENOBUFS = 105
 _BSD_ENOBUFS = 55  # macOS / iOS / FreeBSD / NetBSD / OpenBSD / DragonFly
-_SOLARIS_ENOBUFS = 111  # Solaris / illumos
+# Solaris / illumos ENOBUFS = 132 (confirmed against rust-libc
+# ``src/unix/solarish/mod.rs``; matches the Rust client and the Node client).
+# NOT 111 — that is Linux's ECONNREFUSED and is undefined on solarish, so the
+# old value silently routed real send-buffer backpressure to ``failed`` instead
+# of ``Dropped(KERNEL_QUEUE_FULL)`` (this is the Python sibling of Rust bug-470).
+_SOLARIS_ENOBUFS = 132  # Solaris / illumos
 
 
 def _select_enobufs() -> int:
