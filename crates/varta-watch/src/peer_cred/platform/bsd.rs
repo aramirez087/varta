@@ -1,9 +1,10 @@
 //! FreeBSD / DragonFly / NetBSD FFI surface — `LOCAL_CREDS` / `SCM_CREDS` /
-//! `struct cmsgcred`.
+//! BSD credential ancillary payloads.
 //!
 //! On the BSD family the observer enables `LOCAL_CREDS` on its receive
-//! socket; the kernel then attaches `SCM_CREDS` ancillary data containing a
-//! `struct cmsgcred` (pid, uid, euid, gid, groups) to every datagram.
+//! socket; the kernel then attaches `SCM_CREDS` ancillary data to every
+//! datagram. FreeBSD / DragonFly deliver `struct cmsgcred`; NetBSD delivers
+//! `struct sockcred` and uses different `LOCAL_CREDS` / `SCM_CREDS` constants.
 //! Extraction is done by walking the ancillary buffer with the shared
 //! `super::super::cmsg_*` helpers.
 //!
@@ -48,7 +49,7 @@ pub(crate) struct Cmsghdr {
     pub cmsg_type: i32,
 }
 
-/// `struct cmsgcred` — FreeBSD/NetBSD peer credentials ancillary message.
+/// `struct cmsgcred` — FreeBSD / DragonFly peer credentials ancillary message.
 ///
 /// Attached by the kernel to every recvmsg(2) datagram when `LOCAL_CREDS`
 /// is enabled on the socket. Contains the sending process's PID, real and
@@ -77,6 +78,35 @@ pub(crate) struct Cmsgcred {
     pub cmcred_groups: [u32; 16],
 }
 
+/// `struct sockcred` — NetBSD peer credentials ancillary message.
+///
+/// NetBSD's `LOCAL_CREDS` option does **not** deliver FreeBSD's
+/// `struct cmsgcred`. It delivers `struct sockcred`, whose effective UID is
+/// at offset 8. The trailing group array is variable-sized in C; the
+/// one-element Rust representation matches libc's ABI surface and is enough
+/// for Varta, which reads only `sc_pid` and `sc_euid`.
+///
+/// Layout (64-bit NetBSD, `<sys/socket.h>`):
+///   offset  0: sc_pid      (pid_t = i32, 4 bytes)
+///   offset  4: sc_uid      (uid_t = u32, 4 bytes)
+///   offset  8: sc_euid     (uid_t = u32, 4 bytes)
+///   offset 12: sc_gid      (gid_t = u32, 4 bytes)
+///   offset 16: sc_egid     (gid_t = u32, 4 bytes)
+///   offset 20: sc_ngroups  (int = i32, 4 bytes)
+///   offset 24: sc_groups   (gid_t[1], variable tail)
+///   total minimum: 28 bytes
+#[cfg(any(test, target_os = "netbsd"))]
+#[repr(C)]
+pub(crate) struct Sockcred {
+    pub sc_pid: i32,
+    pub sc_uid: u32,
+    pub sc_euid: u32,
+    pub sc_gid: u32,
+    pub sc_egid: u32,
+    pub sc_ngroups: i32,
+    pub sc_groups: [u32; 1],
+}
+
 // --- constants ------------------------------------------------------------
 
 /// `SOL_SOCKET` on FreeBSD / XNU derivatives = `0xffff` (`<sys/socket.h>`).
@@ -94,13 +124,24 @@ pub(crate) const SOL_SOCKET: i32 = 0xffff;
 pub(crate) const SOL_LOCAL: i32 = 0;
 /// `LOCAL_CREDS` enables SCM_CREDS ancillary data on received datagrams.
 /// Value: 0x0002 on FreeBSD/DragonFly (`<sys/un.h>`),
-///        0x0001 on NetBSD.
-#[cfg(any(target_os = "freebsd", target_os = "dragonfly"))]
-pub(crate) const LOCAL_CREDS: i32 = 0x0002;
+///        0x0004 on NetBSD.
+#[cfg(any(test, not(target_os = "netbsd")))]
+pub(crate) const FREEBSD_DRAGONFLY_LOCAL_CREDS: i32 = 0x0002;
+#[cfg(any(test, target_os = "netbsd"))]
+pub(crate) const NETBSD_LOCAL_CREDS: i32 = 0x0004;
+#[cfg(not(target_os = "netbsd"))]
+pub(crate) const LOCAL_CREDS: i32 = FREEBSD_DRAGONFLY_LOCAL_CREDS;
 #[cfg(target_os = "netbsd")]
-pub(crate) const LOCAL_CREDS: i32 = 0x0001;
-/// `SCM_CREDS` — the CMSG type for cmsgcred ancillary data.
-pub(crate) const SCM_CREDS: i32 = 0x03;
+pub(crate) const LOCAL_CREDS: i32 = NETBSD_LOCAL_CREDS;
+/// `SCM_CREDS` — the CMSG type for BSD credential ancillary data.
+#[cfg(any(test, not(target_os = "netbsd")))]
+pub(crate) const FREEBSD_DRAGONFLY_SCM_CREDS: i32 = 0x03;
+#[cfg(any(test, target_os = "netbsd"))]
+pub(crate) const NETBSD_SCM_CREDS: i32 = 0x10;
+#[cfg(not(target_os = "netbsd"))]
+pub(crate) const SCM_CREDS: i32 = FREEBSD_DRAGONFLY_SCM_CREDS;
+#[cfg(target_os = "netbsd")]
+pub(crate) const SCM_CREDS: i32 = NETBSD_SCM_CREDS;
 
 // --- FFI ------------------------------------------------------------------
 //
@@ -152,11 +193,14 @@ pub(crate) fn reclaim_scm_rights(mhdr: &Msghdr) {
 
 // --- ancillary buffer sizing ----------------------------------------------
 
-// CMSG_SPACE(sizeof(struct cmsgcred)) on 64-bit BSD:
+// CMSG_SPACE(sizeof(struct cmsgcred)) on 64-bit FreeBSD / DragonFly:
 //   cmsg_align(sizeof(Cmsghdr)) + cmsg_align(sizeof(Cmsgcred))
 //   = cmsg_align(12)           + cmsg_align(84)
 //   = 16                       + 88
 //   = 104 bytes
+//
+// NetBSD's minimum sockcred cmsg is smaller:
+//   cmsg_align(12) + cmsg_align(28) = 16 + 32 = 48 bytes.
 //
 // 256 bytes provides generous headroom for kernel ancillary-data
 // extensions (e.g. future security labels) — same sizing as Linux.
@@ -167,26 +211,52 @@ const _: () = assert!(
         >= super::super::cmsg::cmsg_align(core::mem::size_of::<Cmsghdr>())
             + core::mem::size_of::<Cmsgcred>()
 );
+#[cfg(any(test, target_os = "netbsd"))]
+const _: () = assert!(
+    ANCILLARY_BUFFER_SIZE
+        >= super::super::cmsg::cmsg_align(core::mem::size_of::<Cmsghdr>())
+            + core::mem::size_of::<Sockcred>()
+);
 
-/// Zero-sized marker type that selects the BSD-family cmsg-walking parameters.
-pub(crate) struct BsdCmsg;
+#[cfg(target_os = "netbsd")]
+const _: () = assert!(LOCAL_CREDS == NETBSD_LOCAL_CREDS && SCM_CREDS == NETBSD_SCM_CREDS);
+#[cfg(any(target_os = "freebsd", target_os = "dragonfly"))]
+const _: () = assert!(
+    LOCAL_CREDS == FREEBSD_DRAGONFLY_LOCAL_CREDS && SCM_CREDS == FREEBSD_DRAGONFLY_SCM_CREDS
+);
+
+/// Zero-sized marker for FreeBSD / DragonFly cmsg-walking parameters.
+#[cfg(not(target_os = "netbsd"))]
+pub(crate) struct FreeBsdCmsg;
+
+/// Zero-sized marker for NetBSD cmsg-walking parameters.
+#[cfg(any(all(test, target_os = "linux"), target_os = "netbsd"))]
+pub(crate) struct NetBsdCmsg;
+
+/// Active BSD-family marker for the current target.
+#[cfg(not(target_os = "netbsd"))]
+pub(crate) type BsdCmsg = FreeBsdCmsg;
+#[cfg(target_os = "netbsd")]
+pub(crate) type BsdCmsg = NetBsdCmsg;
 
 // SAFETY: All required layouts are verified at compile time elsewhere in
 // this file:
 // - `Cmsghdr`: cmsg_len@0 (u32), cmsg_level@4 (i32), cmsg_type@8 (i32),
 //   total size 12.
-// - `Cmsgcred`: cmcred_pid@0 (i32), cmcred_uid@4 (u32), cmcred_euid@8 (u32),
-//   cmcred_gid@12, cmcred_ngroups@16, cmcred_groups@20 — total size 84.
+// - `Cmsgcred` (FreeBSD / DragonFly): cmcred_pid@0 (i32), cmcred_uid@4 (u32),
+//   cmcred_euid@8 (u32), cmcred_gid@12, cmcred_ngroups@16,
+//   cmcred_groups@20 — total size 84.
 // - `Msghdr`: msg_control@32 (*c_void), msg_controllen@40 (u32), total
 //   size 48.
 // `SOL_SOCKET` and `SCM_CREDS` are the kernel-defined `(level, type)` pair
-// for `LOCAL_CREDS` credential ancillary data on the BSD family.
-unsafe impl super::super::cmsg::CmsgPlatform for BsdCmsg {
+// for `LOCAL_CREDS` credential ancillary data on FreeBSD / DragonFly.
+#[cfg(not(target_os = "netbsd"))]
+unsafe impl super::super::cmsg::CmsgPlatform for FreeBsdCmsg {
     type Hdr = Cmsghdr;
     type Cred = Cmsgcred;
     type Msghdr = Msghdr;
     const TARGET_LEVEL: i32 = SOL_SOCKET;
-    const TARGET_TYPE: i32 = SCM_CREDS;
+    const TARGET_TYPE: i32 = FREEBSD_DRAGONFLY_SCM_CREDS;
 
     fn cmsg_len(hdr: &Cmsghdr) -> usize {
         hdr.cmsg_len as usize
@@ -210,6 +280,43 @@ unsafe impl super::super::cmsg::CmsgPlatform for BsdCmsg {
         // contract that `data` points to initialised kernel-supplied bytes.
         let cred = unsafe { &*(data as *const Cmsgcred) };
         Some((cred.cmcred_pid as u32, cred.cmcred_euid))
+    }
+}
+
+// SAFETY: Same cmsg header / msghdr guarantees as the FreeBSD / DragonFly
+// implementation above. NetBSD differs in the credential payload and cmsg
+// type: `LOCAL_CREDS` delivers `SCM_CREDS` type 0x10 containing `sockcred`,
+// with `sc_pid@0` and `sc_euid@8` (layout guarded below).
+#[cfg(any(all(test, target_os = "linux"), target_os = "netbsd"))]
+unsafe impl super::super::cmsg::CmsgPlatform for NetBsdCmsg {
+    type Hdr = Cmsghdr;
+    type Cred = Sockcred;
+    type Msghdr = Msghdr;
+    const TARGET_LEVEL: i32 = SOL_SOCKET;
+    const TARGET_TYPE: i32 = NETBSD_SCM_CREDS;
+
+    fn cmsg_len(hdr: &Cmsghdr) -> usize {
+        hdr.cmsg_len as usize
+    }
+    fn cmsg_level(hdr: &Cmsghdr) -> i32 {
+        hdr.cmsg_level
+    }
+    fn cmsg_type(hdr: &Cmsghdr) -> i32 {
+        hdr.cmsg_type
+    }
+    fn msg_control(mhdr: &Msghdr) -> *const u8 {
+        mhdr.msg_control as *const u8
+    }
+    fn msg_controllen(mhdr: &Msghdr) -> usize {
+        mhdr.msg_controllen as usize
+    }
+    unsafe fn extract_pid_uid(data: *const u8, len: usize) -> Option<(u32, u32)> {
+        // find_credential guarantees len >= size_of::<Sockcred>().
+        debug_assert!(len >= core::mem::size_of::<Sockcred>());
+        // SAFETY: guaranteed by find_credential's pre-check and the caller's
+        // contract that `data` points to initialised kernel-supplied bytes.
+        let cred = unsafe { &*(data as *const Sockcred) };
+        Some((cred.sc_pid as u32, cred.sc_euid))
     }
 }
 
@@ -248,11 +355,13 @@ pub(crate) fn ctrl_truncated(_mhdr: &Msghdr) -> bool {
 
 const _: () = assert!(mem::size_of::<Msghdr>() == 48);
 const _: () = assert!(mem::size_of::<Cmsgcred>() == 84);
+#[cfg(any(test, target_os = "netbsd"))]
+const _: () = assert!(mem::size_of::<Sockcred>() == 28);
 const _: () = assert!(mem::size_of::<Iovec>() == 16);
 
 #[cfg(test)]
 mod layout_tests {
-    use super::{Cmsgcred, Cmsghdr, Iovec, Msghdr};
+    use super::{Cmsgcred, Cmsghdr, Iovec, Msghdr, Sockcred};
 
     #[test]
     fn recvmsg_layout_offsets_match_bsd_abi() {
@@ -277,6 +386,14 @@ mod layout_tests {
         assert_field_offset!(Cmsgcred, cmcred_gid, 12);
         assert_field_offset!(Cmsgcred, cmcred_ngroups, 16);
         assert_field_offset!(Cmsgcred, cmcred_groups, 20);
+
+        assert_field_offset!(Sockcred, sc_pid, 0);
+        assert_field_offset!(Sockcred, sc_uid, 4);
+        assert_field_offset!(Sockcred, sc_euid, 8);
+        assert_field_offset!(Sockcred, sc_gid, 12);
+        assert_field_offset!(Sockcred, sc_egid, 16);
+        assert_field_offset!(Sockcred, sc_ngroups, 20);
+        assert_field_offset!(Sockcred, sc_groups, 24);
     }
 
     #[test]
@@ -293,5 +410,22 @@ mod layout_tests {
         // BSD host; reverting the const to `SOL_SOCKET` turns this red.
         assert_eq!(super::SOL_LOCAL, 0);
         assert_ne!(super::SOL_LOCAL, super::SOL_SOCKET);
+    }
+
+    #[test]
+    fn netbsd_credential_constants_are_not_freebsd_constants() {
+        // NetBSD's modern `LOCAL_CREDS` option is 0x0004 and delivers cmsg
+        // type 0x10 with a `sockcred` payload. The legacy 0x0001 option is
+        // `LOCAL_OCREDS`, and FreeBSD's cmsg type 0x03 does not match NetBSD's
+        // delivered credentials. Pin the literal values here because Linux CI
+        // compiles this module for cmsg-walker tests even without a NetBSD host.
+        assert_eq!(super::NETBSD_LOCAL_CREDS, 0x0004);
+        assert_ne!(super::NETBSD_LOCAL_CREDS, 0x0001);
+        assert_ne!(
+            super::NETBSD_LOCAL_CREDS,
+            super::FREEBSD_DRAGONFLY_LOCAL_CREDS
+        );
+        assert_eq!(super::NETBSD_SCM_CREDS, 0x10);
+        assert_ne!(super::NETBSD_SCM_CREDS, super::FREEBSD_DRAGONFLY_SCM_CREDS);
     }
 }

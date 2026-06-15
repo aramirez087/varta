@@ -611,12 +611,12 @@ mod miri_cmsg_tests {
     /// provenance-clean for the BSD-shaped layout too.
     #[test]
     fn bsd_shape_buffer_returns_pid_euid() {
-        use super::super::platform::bsd::{BsdCmsg, Cmsgcred, Cmsghdr, Msghdr};
+        use super::super::platform::bsd::{Cmsgcred, Cmsghdr, FreeBsdCmsg, Msghdr};
         use core::mem;
 
         // BSD: cmsg_align uses sizeof(usize) on 64-bit, same as Linux.
         // BSD Cmsghdr is 12 bytes; cmsg_align(12) = 16.
-        let bsd_hdr_size = <BsdCmsg as CmsgPlatform>::cmsg_hdr_size();
+        let bsd_hdr_size = <FreeBsdCmsg as CmsgPlatform>::cmsg_hdr_size();
         assert_eq!(bsd_hdr_size, cmsg_align(mem::size_of::<Cmsghdr>()));
         assert_eq!(bsd_hdr_size, 16);
 
@@ -666,8 +666,63 @@ mod miri_cmsg_tests {
             msg_flags: 0,
         };
 
-        let result = find_credential::<BsdCmsg>(&mhdr);
+        let result = find_credential::<FreeBsdCmsg>(&mhdr);
         assert_eq!(result, Some((expected_pid as u32, expected_euid)));
+    }
+
+    /// Regression: NetBSD does not use FreeBSD's `SCM_CREDS = 0x03` +
+    /// `struct cmsgcred` payload. Modern NetBSD `LOCAL_CREDS = 0x0004`
+    /// delivers `SCM_CREDS = 0x10` containing `struct sockcred`.
+    #[test]
+    fn netbsd_shape_buffer_returns_pid_euid() {
+        use super::super::platform::bsd::{
+            Cmsghdr, Msghdr, NetBsdCmsg, Sockcred, NETBSD_SCM_CREDS, SOL_SOCKET,
+        };
+        use core::mem;
+
+        let bsd_hdr_size = <NetBsdCmsg as CmsgPlatform>::cmsg_hdr_size();
+        assert_eq!(bsd_hdr_size, cmsg_align(mem::size_of::<Cmsghdr>()));
+        assert_eq!(bsd_hdr_size, 16);
+
+        let total = bsd_hdr_size + mem::size_of::<Sockcred>();
+        let aligned_total = cmsg_align(total);
+        #[repr(align(8))]
+        struct AlignedBuf([u8; 256]);
+        let mut buf_wrapper = AlignedBuf([0u8; 256]);
+        let buf = &mut buf_wrapper.0[..aligned_total];
+
+        let cmsg_len: u32 = total as u32;
+        buf[0..4].copy_from_slice(&cmsg_len.to_ne_bytes());
+        buf[4..8].copy_from_slice(&SOL_SOCKET.to_ne_bytes());
+        buf[8..12].copy_from_slice(&NETBSD_SCM_CREDS.to_ne_bytes());
+
+        let expected_pid: i32 = 4242;
+        let expected_uid: u32 = 501;
+        let expected_euid: u32 = 1501;
+        let cred_off = bsd_hdr_size;
+        buf[cred_off..cred_off + 4].copy_from_slice(&expected_pid.to_ne_bytes());
+        buf[cred_off + 4..cred_off + 8].copy_from_slice(&expected_uid.to_ne_bytes());
+        buf[cred_off + 8..cred_off + 12].copy_from_slice(&expected_euid.to_ne_bytes());
+
+        let mhdr = Msghdr {
+            msg_name: core::ptr::null_mut(),
+            msg_namelen: 0,
+            _pad1: 0,
+            msg_iov: core::ptr::null_mut(),
+            msg_iovlen: 0,
+            _pad2: 0,
+            msg_control: buf.as_mut_ptr() as *mut _,
+            msg_controllen: aligned_total as u32,
+            msg_flags: 0,
+        };
+
+        let result = find_credential::<NetBsdCmsg>(&mhdr);
+        assert_eq!(result, Some((expected_pid as u32, expected_euid)));
+
+        // FreeBSD's cmsg type must not be accepted by the NetBSD walker.
+        let freebsd_scm_creds: i32 = 0x03;
+        buf[8..12].copy_from_slice(&freebsd_scm_creds.to_ne_bytes());
+        assert_eq!(find_credential::<NetBsdCmsg>(&mhdr), None);
     }
 
     /// Drives the unified walker through the illumos/Solaris arm
