@@ -299,9 +299,7 @@ impl FileExporter {
         #[cfg(test)]
         if self.reopen_must_fail {
             let e = io::Error::new(io::ErrorKind::Other, "forced reopen failure (test)");
-            self.remember_error(&e);
-            self.rotation_reopen_pending = true;
-            return Err(e);
+            return self.reopen_failed(e);
         }
         match create_new_export_file(&self.path) {
             Ok(file) => {
@@ -316,12 +314,32 @@ impl FileExporter {
                 self.sync_parent_dir();
                 Ok(())
             }
-            Err(e) => {
-                self.remember_error(&e);
-                self.rotation_reopen_pending = true;
-                Err(e)
-            }
+            Err(e) => self.reopen_failed(e),
         }
+    }
+
+    /// Handle a failed live-file recreate after [`Self::rotate`] has already
+    /// committed its directory-entry mutation (`rename PATH`→`PATH.1`, or the
+    /// `EXDEV` copy-then-unlink). The recreate is deferred to the next write via
+    /// `rotation_reopen_pending`, but the rotation's dirent change has ALREADY
+    /// happened — so fsync the parent directory now to make it durable. Without
+    /// this, a power cut in the deferred-reopen window can orphan the
+    /// freshly-rotated `PATH.1` (its data was `fdatasync`'d in `rotate` /
+    /// `copy_live_to_first`, but the dirent naming it was not) and silently lose
+    /// those records; the prior code returned here without any parent-dir fsync,
+    /// leaving the rotation durable only once the *next* reopen happened to
+    /// succeed. The next successful `reopen_live` fsyncs again for the new live
+    /// dirent. `sync_parent_dir` is a soft latch (best-effort, never returns),
+    /// so a platform that rejects directory fsync degrades gracefully; the
+    /// recreate error `e` is remembered LAST so it stays the surfaced failure
+    /// (`remember_error` is last-write-wins). Single chokepoint shared by the
+    /// real create-failure arm and the `reopen_must_fail` test seam so the two
+    /// cannot drift.
+    fn reopen_failed(&mut self, e: io::Error) -> io::Result<()> {
+        self.sync_parent_dir();
+        self.remember_error(&e);
+        self.rotation_reopen_pending = true;
+        Err(e)
     }
 
     /// Rotate `path`: shift `path` → `path.1`, `path.1` → `path.2`, …
@@ -972,6 +990,46 @@ mod tests {
         fe.record(&sample_beat(300))
             .expect("reopen succeeds once create can");
         assert!(path.exists(), "live PATH recreated once reopen succeeds");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reopen_failure_fsyncs_parent_dir_to_persist_the_rotation() {
+        // Regression (bug-482): a reopen failure *after* a committed rotation
+        // must still fsync the parent directory. `rotate()` renames
+        // `PATH`→`PATH.1` (or, on EXDEV, copies then unlinks the live path)
+        // BEFORE `reopen_live` recreates `PATH`. When that recreate fails
+        // (ENOSPC/EMFILE) the live recreate is deferred via
+        // `rotation_reopen_pending` — but the rename's dirent mutation has
+        // already happened, and the prior code returned without an `fsync(2)`
+        // of the parent. A power cut in the deferred window could then orphan
+        // the freshly-rotated `.1` (its data was `fdatasync`'d in `rotate`, but
+        // the dirent naming it was not) and silently lose those records. The
+        // `dir_fsyncs` counter makes this red->green: without the fix it does
+        // NOT advance on a reopen failure.
+        let (dir, path) = rotation_reopen_fixture("reopen-fail-fsync");
+        // max_bytes = 1 => the first record rotates; the reopen then fails.
+        let mut fe = FileExporter::create(&path, Some(1), 0).unwrap();
+        let before = fe.dir_fsyncs;
+
+        fe.reopen_must_fail = true;
+        let err = fe
+            .record(&sample_beat(200))
+            .expect_err("rotation reopen failure must be returned");
+        assert_eq!(err.kind(), io::ErrorKind::Other);
+
+        assert!(
+            fe.rotation_reopen_pending,
+            "reopen failure must set the reopen-pending latch"
+        );
+        assert_eq!(
+            fe.dir_fsyncs,
+            before + 1,
+            "reopen failure must fsync the parent dir once to persist the \
+             committed rotation (rename PATH->.1), not leave it non-durable \
+             until the next successful reopen"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
