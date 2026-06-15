@@ -320,16 +320,26 @@ Observers MUST maintain per-sender state to reject replayed frames.
 > (H5)"](../architecture/vlp-transports.md#secure-udp--session-restart-replay-window-h5)
 > for the exact window, bound, and root cause.
 
+Replay state MUST be keyed by the **AEAD-authenticated sender identity**, never
+by the UDP source address. A source address is neither stable — a legitimate
+reconnect changes the source port — nor authenticated — a replay attacker can
+resend a captured ciphertext from any port. A source-keyed scheme therefore
+both drops legitimate reconnects and admits a replayed frame from a fresh port.
+The sender identity below is bound by the Poly1305 tag, so it is the only
+identity an observer can trust.
+
 ### 7.1 Shared-key mode
 
-Per `(source_address, iv_random)` pair: track `last_seen_counter`.
-Accept a new frame only if `iv_counter > last_seen_counter`; reject equal
-or lesser counters.
+Key by the **VLP frame PID** read from the decrypted plaintext; within that
+sender, track `last_seen_counter` per `iv_random` prefix. Accept a new frame
+only if `iv_counter > last_seen_counter` for its prefix; reject equal or lesser
+counters.
 
 ### 7.2 Master-key mode
 
-Per `(source_address, agent_pid, iv_random)` triple: same monotonicity
-rule.
+Key by the on-wire `agent_pid` (which is also bound as the AEAD AAD), tracking
+the same per-prefix counter monotonicity rule. The UDP source address is not
+part of the key in either mode.
 
 ### 7.3 Bounded state
 
