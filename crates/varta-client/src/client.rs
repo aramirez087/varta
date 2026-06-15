@@ -39,10 +39,13 @@ const ENOBUFS: i32 = 105;
 ))]
 const ENOBUFS: i32 = 55;
 
-/// Solaris / illumos value of `ENOBUFS` from `<sys/errno.h>`. Hard-coded
-/// for the same reason.
+/// Solaris / illumos value of `ENOBUFS` from `<sys/errno.h>` (= 132; confirmed
+/// against rust-libc `src/unix/solarish/mod.rs`). Hard-coded for the same
+/// reason. NOTE: the value is NOT 111 — that is Linux's `ECONNREFUSED`; on
+/// solarish 111 is undefined, so a wrong-platform transcription silently routed
+/// real `ENOBUFS` backpressure to `Failed` instead of `Dropped`.
 #[cfg(any(target_os = "solaris", target_os = "illumos"))]
-const ENOBUFS: i32 = 111;
+const ENOBUFS: i32 = 132;
 
 /// POSIX `ENOSPC` ("No space left on device"). The value is stable across the
 /// Unix targets Varta supports; hard-coded to preserve the zero-dependency

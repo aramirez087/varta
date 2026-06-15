@@ -23,8 +23,11 @@ const ENOBUFS_FOR_THIS_OS: i32 = 105;
 ))]
 const ENOBUFS_FOR_THIS_OS: i32 = 55;
 
+// solarish ENOBUFS is 132 (rust-libc `src/unix/solarish/mod.rs`); 111 was a
+// Linux-value transcription. `hardcoded_errno_values_match_system_header` reads
+// the real `<sys/errno.h>` and would catch this — but only when run ON solarish.
 #[cfg(any(target_os = "solaris", target_os = "illumos"))]
-const ENOBUFS_FOR_THIS_OS: i32 = 111;
+const ENOBUFS_FOR_THIS_OS: i32 = 132;
 
 const ENOSPC_FOR_THIS_OS: i32 = 28;
 
