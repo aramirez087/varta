@@ -64,7 +64,35 @@ extern "C" {
 // Adding a new target_os requires verifying these two constants against the
 // platform's headers and extending the cfg-any lists below. The `compile_error!`
 // fallback prevents silent drift to wrong values on an untested platform.
-#[cfg(target_os = "linux")]
+// Linux SOL_SOCKET/SO_RCVBUF are architecture-specific: mips/sparc use the
+// BSD-style 0xffff / 0x1002, generic arches use 1 / 8 (rust-libc arch tables;
+// same split as peer_cred/platform/linux.rs). A flat generic value on mips/sparc
+// makes the SO_RCVBUF setsockopt fail (wrong level + wrong optname), so the UDS
+// receive buffer is never enlarged from the small kernel default — dropping
+// datagrams under burst on the core liveness path.
+#[cfg(all(
+    target_os = "linux",
+    any(
+        target_arch = "mips",
+        target_arch = "mips32r6",
+        target_arch = "mips64",
+        target_arch = "mips64r6",
+        target_arch = "sparc",
+        target_arch = "sparc64",
+    )
+))]
+const SOL_SOCKET: i32 = 0xffff_u32 as i32;
+#[cfg(all(
+    target_os = "linux",
+    not(any(
+        target_arch = "mips",
+        target_arch = "mips32r6",
+        target_arch = "mips64",
+        target_arch = "mips64r6",
+        target_arch = "sparc",
+        target_arch = "sparc64",
+    ))
+))]
 const SOL_SOCKET: i32 = 1;
 #[cfg(any(
     target_os = "macos",
@@ -78,7 +106,29 @@ const SOL_SOCKET: i32 = 1;
 ))]
 const SOL_SOCKET: i32 = 0xffff_u32 as i32;
 
-#[cfg(target_os = "linux")]
+#[cfg(all(
+    target_os = "linux",
+    any(
+        target_arch = "mips",
+        target_arch = "mips32r6",
+        target_arch = "mips64",
+        target_arch = "mips64r6",
+        target_arch = "sparc",
+        target_arch = "sparc64",
+    )
+))]
+const SO_RCVBUF: i32 = 0x1002;
+#[cfg(all(
+    target_os = "linux",
+    not(any(
+        target_arch = "mips",
+        target_arch = "mips32r6",
+        target_arch = "mips64",
+        target_arch = "mips64r6",
+        target_arch = "sparc",
+        target_arch = "sparc64",
+    ))
+))]
 const SO_RCVBUF: i32 = 8;
 #[cfg(any(
     target_os = "macos",

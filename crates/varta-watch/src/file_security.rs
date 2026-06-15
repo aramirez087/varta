@@ -99,7 +99,36 @@ const O_NOFOLLOW: i32 = 0x20000;
 )))]
 compile_error!("O_NOFOLLOW value is unknown for this target - add it to the cfg gates above");
 
-#[cfg(target_os = "linux")]
+// Linux ELOOP is architecture-specific (rust-libc per-arch tables): mips = 90,
+// sparc = 62, generic = 40. A flat 40 on mips/sparc makes the leaf-symlink
+// rejection in open_nofollow fail to normalize to the clean InvalidInput error
+// (the raw_os_error match misses), leaking a raw ELOOP to the operator.
+#[cfg(all(
+    target_os = "linux",
+    any(
+        target_arch = "mips",
+        target_arch = "mips32r6",
+        target_arch = "mips64",
+        target_arch = "mips64r6",
+    )
+))]
+const ELOOP: i32 = 90;
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "sparc", target_arch = "sparc64")
+))]
+const ELOOP: i32 = 62;
+#[cfg(all(
+    target_os = "linux",
+    not(any(
+        target_arch = "mips",
+        target_arch = "mips32r6",
+        target_arch = "mips64",
+        target_arch = "mips64r6",
+        target_arch = "sparc",
+        target_arch = "sparc64",
+    ))
+))]
 const ELOOP: i32 = 40;
 #[cfg(any(
     target_os = "macos",

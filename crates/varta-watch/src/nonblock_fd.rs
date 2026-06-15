@@ -138,7 +138,38 @@ compile_error!(
 // O_NONBLOCK — pinned per-platform from each <fcntl.h>.
 // ---------------------------------------------------------------------------
 
-#[cfg(target_os = "linux")]
+// Linux O_NONBLOCK is architecture-specific (rust-libc per-arch tables): mips
+// family = 0x80, sparc family = 0x4000, generic (x86/x86_64/arm/aarch64/riscv/
+// powerpc/s390x/…) = 0x800. A flat 0x800 is WRONG on mips, where 0x800 is
+// O_NOCTTY (an open-time flag F_SETFL silently ignores), so O_NONBLOCK is never
+// set and recovery child stdio pipes stay BLOCKING — a drain read with no
+// pending data then stalls the single-threaded observer poll loop.
+#[cfg(all(
+    target_os = "linux",
+    any(
+        target_arch = "mips",
+        target_arch = "mips32r6",
+        target_arch = "mips64",
+        target_arch = "mips64r6",
+    )
+))]
+const O_NONBLOCK_FCNTL: i32 = 0x80;
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "sparc", target_arch = "sparc64")
+))]
+const O_NONBLOCK_FCNTL: i32 = 0x4000;
+#[cfg(all(
+    target_os = "linux",
+    not(any(
+        target_arch = "mips",
+        target_arch = "mips32r6",
+        target_arch = "mips64",
+        target_arch = "mips64r6",
+        target_arch = "sparc",
+        target_arch = "sparc64",
+    ))
+))]
 const O_NONBLOCK_FCNTL: i32 = 0x800;
 
 #[cfg(any(
