@@ -48,10 +48,94 @@ pub(crate) struct Ucred {
 
 // --- constants ------------------------------------------------------------
 
-pub(crate) const SOL_SOCKET: i32 = 1;
-pub(crate) const SO_PASSCRED: i32 = 16;
-/// `SO_PASSPIDFD` asks Linux 6.5+ to attach an `SCM_PIDFD` cmsg per datagram.
-pub(crate) const SO_PASSPIDFD: i32 = 76;
+// `SOL_SOCKET`, `SO_PASSCRED`, and `SO_PASSPIDFD` are kernel-UAPI socket-option
+// numbers that DIFFER by architecture (`asm/socket.h`), pinned here against
+// rust-libc's per-arch tables. A wrong-arch value is a SILENT fault: on powerpc
+// optname 16 is `SO_RCVLOWAT`, and on mips/sparc `SOL_SOCKET` is `0xffff` (not
+// 1) — so a generic-table value makes `setsockopt` either succeed-but-no-op or
+// target the wrong level; the kernel then attaches no `SCM_CREDENTIALS`, every
+// beat becomes `RecvResult::IoError -> Event::Io`, and stall detection +
+// recovery are silently dead while the observer looks alive. `SOL_SOCKET` is
+// also `LinuxCmsg::TARGET_LEVEL`, so the value governs both the setsockopt level
+// and the received-cmsg match. Same per-arch discipline as the `O_NOFOLLOW`
+// table in `file_security.rs`. Big-endian arches (sparc, BE mips/powerpc) are
+// excluded upstream by the varta-vlp little-endian `compile_error!`, but are
+// listed so the table is complete and the generic arm is a true default.
+#[cfg(any(target_arch = "powerpc", target_arch = "powerpc64"))]
+pub(crate) use arch_socket::*;
+#[cfg(any(target_arch = "powerpc", target_arch = "powerpc64"))]
+mod arch_socket {
+    // powerpc/powerpc64 (incl. powerpc64le): generic level, but SO_PASSCRED=20.
+    pub(crate) const SOL_SOCKET: i32 = 1;
+    pub(crate) const SO_PASSCRED: i32 = 20;
+    pub(crate) const SO_PASSPIDFD: i32 = 76;
+    // Tripwire: powerpc must NOT carry the generic SO_PASSCRED (16 = SO_RCVLOWAT).
+    const _: () = assert!(SO_PASSCRED != 16);
+}
+
+#[cfg(any(
+    target_arch = "mips",
+    target_arch = "mips32r6",
+    target_arch = "mips64",
+    target_arch = "mips64r6",
+))]
+pub(crate) use arch_socket::*;
+#[cfg(any(
+    target_arch = "mips",
+    target_arch = "mips32r6",
+    target_arch = "mips64",
+    target_arch = "mips64r6",
+))]
+mod arch_socket {
+    // mips family: socket level is 0xffff, SO_PASSCRED=17.
+    pub(crate) const SOL_SOCKET: i32 = 0xffff;
+    pub(crate) const SO_PASSCRED: i32 = 17;
+    pub(crate) const SO_PASSPIDFD: i32 = 76;
+    // Tripwire: mips must NOT carry the generic socket level or optname.
+    const _: () = assert!(SOL_SOCKET != 1 && SO_PASSCRED != 16);
+}
+
+#[cfg(any(target_arch = "sparc", target_arch = "sparc64"))]
+pub(crate) use arch_socket::*;
+#[cfg(any(target_arch = "sparc", target_arch = "sparc64"))]
+mod arch_socket {
+    // sparc/sparc64: socket level is 0xffff, SO_PASSCRED=0x2, SO_PASSPIDFD=0x55.
+    // (Big-endian — excluded by the varta-vlp guard; present for completeness.)
+    pub(crate) const SOL_SOCKET: i32 = 0xffff;
+    pub(crate) const SO_PASSCRED: i32 = 0x0002;
+    pub(crate) const SO_PASSPIDFD: i32 = 0x0055;
+    const _: () = assert!(SOL_SOCKET != 1 && SO_PASSCRED != 16);
+}
+
+#[cfg(not(any(
+    target_arch = "powerpc",
+    target_arch = "powerpc64",
+    target_arch = "mips",
+    target_arch = "mips32r6",
+    target_arch = "mips64",
+    target_arch = "mips64r6",
+    target_arch = "sparc",
+    target_arch = "sparc64",
+)))]
+pub(crate) use arch_socket::*;
+#[cfg(not(any(
+    target_arch = "powerpc",
+    target_arch = "powerpc64",
+    target_arch = "mips",
+    target_arch = "mips32r6",
+    target_arch = "mips64",
+    target_arch = "mips64r6",
+    target_arch = "sparc",
+    target_arch = "sparc64",
+)))]
+mod arch_socket {
+    // Generic libc arch table (x86, x86_64, aarch64, arm, riscv32/64, s390x,
+    // loongarch, m68k, csky, hexagon, …): SOL_SOCKET=1, SO_PASSCRED=16.
+    pub(crate) const SOL_SOCKET: i32 = 1;
+    pub(crate) const SO_PASSCRED: i32 = 16;
+    /// `SO_PASSPIDFD` asks Linux 6.5+ to attach an `SCM_PIDFD` cmsg per datagram.
+    pub(crate) const SO_PASSPIDFD: i32 = 76;
+}
 pub(crate) const SCM_CREDENTIALS: i32 = 2;
 /// `SCM_PIDFD` ancillary type carrying one pidfd (`int`).
 pub(crate) const SCM_PIDFD: i32 = 0x04;
@@ -344,5 +428,59 @@ mod layout_tests {
         assert_field_offset!(Ucred, pid, 0);
         assert_field_offset!(Ucred, uid, 4);
         assert_field_offset!(Ucred, gid, 8);
+    }
+}
+
+#[cfg(test)]
+mod socket_optname_tests {
+    use super::{SOL_SOCKET, SO_PASSCRED, SO_PASSPIDFD};
+
+    /// Regression (bug-469): `SOL_SOCKET` / `SO_PASSCRED` / `SO_PASSPIDFD` are
+    /// architecture-specific Linux socket-option numbers, but were hardcoded to
+    /// the generic-table values (1 / 16 / 76) on every arch. On powerpc 16 is
+    /// `SO_RCVLOWAT` and on mips/sparc `SOL_SOCKET` is `0xffff`, so the kernel
+    /// attached no `SCM_CREDENTIALS` and every beat was dropped (stall detection
+    /// and recovery silently dead). This pins the values for the build arch, so
+    /// on a powerpc/mips host or CI cross-build the wrong constant turns it red.
+    #[test]
+    fn socket_optnames_match_kernel_uapi_for_this_arch() {
+        #[cfg(any(target_arch = "powerpc", target_arch = "powerpc64"))]
+        {
+            assert_eq!(SOL_SOCKET, 1);
+            assert_eq!(SO_PASSCRED, 20);
+            assert_eq!(SO_PASSPIDFD, 76);
+        }
+        #[cfg(any(
+            target_arch = "mips",
+            target_arch = "mips32r6",
+            target_arch = "mips64",
+            target_arch = "mips64r6",
+        ))]
+        {
+            assert_eq!(SOL_SOCKET, 0xffff);
+            assert_eq!(SO_PASSCRED, 17);
+            assert_eq!(SO_PASSPIDFD, 76);
+        }
+        #[cfg(any(target_arch = "sparc", target_arch = "sparc64"))]
+        {
+            assert_eq!(SOL_SOCKET, 0xffff);
+            assert_eq!(SO_PASSCRED, 0x0002);
+            assert_eq!(SO_PASSPIDFD, 0x0055);
+        }
+        #[cfg(not(any(
+            target_arch = "powerpc",
+            target_arch = "powerpc64",
+            target_arch = "mips",
+            target_arch = "mips32r6",
+            target_arch = "mips64",
+            target_arch = "mips64r6",
+            target_arch = "sparc",
+            target_arch = "sparc64",
+        )))]
+        {
+            assert_eq!(SOL_SOCKET, 1);
+            assert_eq!(SO_PASSCRED, 16);
+            assert_eq!(SO_PASSPIDFD, 76);
+        }
     }
 }
