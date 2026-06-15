@@ -309,6 +309,17 @@ and the literal NUL):
 
 Observers MUST maintain per-sender state to reject replayed frames.
 
+> **Known limitation (reference implementation).** Per-sender replay state is
+> reset when a PID is recycled and its session restarts after a silence gap,
+> which opens a **bounded** window in which a captured frame of the *dead*
+> session can be replayed — forging one liveness beat for the recycled PID
+> (recovery commands remain gated and are not triggerable by the replay). A
+> full fix needs a wire-level session/epoch identifier, deferred to a future
+> VLP version. See
+> [`vlp-transports.md` — "Secure UDP — session-restart replay window
+> (H5)"](../architecture/vlp-transports.md#secure-udp--session-restart-replay-window-h5)
+> for the exact window, bound, and root cause.
+
 ### 7.1 Shared-key mode
 
 Per `(source_address, iv_random)` pair: track `last_seen_counter`.

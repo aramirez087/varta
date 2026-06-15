@@ -293,6 +293,52 @@ separate
 `--secure-udp-i-accept-recovery-on-unauthenticated-transport`
 acknowledgement.
 
+## Secure UDP — session-restart replay window (H5)
+
+`SecureUdpListener` resets a sender's per-PID replay high-water when a
+recycled PID legitimately restarts its session. A process that dies and has
+its PID reused by a fresh agent reconnects with a **new** session salt, so its
+IV prefixes and VLP nonce sequence restart from the beginning; after
+`SESSION_RESTART_GAP` (= `--threshold-ms`) of silence the listener treats the
+first frame on an aged-out prefix as a session restart and resets the
+per-sender `max_regular_nonce` so the new low-nonce session is admitted.
+
+That reset opens a **bounded replay window**. An on-path attacker who captured
+a frame from the *dead* session — one whose nonce is higher than the recycled
+session's reset baseline; no key is needed to resend a captured ciphertext —
+can replay it in the window after the reset. Because the captured nonce
+exceeds the reset baseline it is accepted, forging a single liveness beat
+attributed to the recycled PID (and advancing the high-water to the replayed
+value).
+
+**Bounded by.** The attack requires all of: (a) a captured dead-session frame,
+(b) the PID to be recycled, (c) `SESSION_RESTART_GAP` of silence, and (d) the
+replay to land before the recycled agent's own nonce climbs past the captured
+value. The forged beat carries a `NetworkUnverified` origin (or, under the
+explicit opt-in, `OperatorAttestedTransport`): recovery commands remain gated
+behind `--secure-udp-i-accept-recovery-on-unauthenticated-transport` and are
+**not** triggerable by a replayed beat alone. The residual impact is therefore
+forged *liveness* (a recycled PID briefly appearing alive) plus a poisoned
+nonce high-water — not arbitrary command execution.
+
+**Root cause.** Nonce-based replay protection cannot distinguish a recycled
+agent's fresh-but-low-nonce session from a replayed high-nonce frame of the
+dead session, because the recycled agent derives a **new session salt** (and
+thus new IV prefixes) that the observer cannot bind to: VLP v0.2 carries no
+wire-level session/epoch identifier. Closing the window fully requires a
+protocol change — a per-session epoch in the frame that the observer binds
+into replay state — so it is deferred to a future VLP version rather than
+patched in the listener. Any listener-only heuristic either re-opens the
+window or rejects a legitimately fast-beating recycled agent (its nonce can
+outpace any fixed post-reset jump bound), so no clean implementation-only fix
+exists.
+
+**Mitigation.** The loopback-default binding (H4) and the recovery-origin gate
+already constrain who can reach the port and what a replayed beat can do.
+Operators who require strict cross-session replay rejection should keep
+secure-UDP loopback-only or front it with an authenticated tunnel; a shorter
+`--threshold-ms` narrows (but does not eliminate) the window.
+
 ## Fork-safety on secure-UDP
 
 After `fork(2)`, a child process inherits its parent's
