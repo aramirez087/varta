@@ -156,9 +156,18 @@ fn evicted_pid_is_queued_for_cleanup() {
         t.record_with_generation(&frame(20, 1), 0, threshold_ns, ORIGIN, None, Some(0xB2)),
         Update::Inserted
     );
-    // Stall both, then a third pid evicts the oldest (pid 10).
+    // Stall both, then a third pid evicts the oldest (pid 10). Use the
+    // injectable recycle seam (never-recycled) so the verdict is deterministic
+    // and miri-safe: the public `drain_stalled_slots` reads real `/proc` for
+    // these low pids, which exist on Linux CI and would flip the eviction
+    // victim (and miri forbids the `/proc` open outright).
     let now_ns = threshold_ns * 20;
-    t.drain_stalled_slots(now_ns, threshold_ns, |_, _, _, _, _, _| {});
+    t.drain_stalled_slots_with_generation_check(
+        now_ns,
+        threshold_ns,
+        |_, _| false,
+        |_, _, _, _, _, _| {},
+    );
     assert_eq!(
         t.record_with_generation(
             &frame(30, 1),
