@@ -32,7 +32,10 @@ or a pod onto every daemon. Zero dependencies, zero allocations on the beat path
 ```sh
 # 1. Install + run the observer (flags any agent silent >2s, /metrics on :9100)
 curl -fsSL https://varta.sh/install.sh | sh
-varta-watch --socket /tmp/varta.sock --prom-addr 127.0.0.1:9100 --threshold-ms 2000 &
+# /metrics is bearer-token protected — generate a token first:
+openssl rand -hex 32 > /tmp/prom.token
+varta-watch --socket /tmp/varta.sock --prom-addr 127.0.0.1:9100 \
+  --prom-token-file /tmp/prom.token --threshold-ms 2000 &
 
 # 2. Add the client to your agent
 cargo add varta-client
@@ -54,7 +57,8 @@ fn main() -> std::io::Result<()> {
 
 ```sh
 # 3. Kill the agent — within 2s the observer logs the stall and the counter ticks:
-curl -s 127.0.0.1:9100/metrics | grep varta_stalls_total
+curl -s -H "Authorization: Bearer $(cat /tmp/prom.token)" \
+  127.0.0.1:9100/metrics | grep varta_stalls_total
 # Add --recovery-exec 'systemctl restart myagent' to varta-watch to auto-restart on stall.
 ```
 
@@ -172,9 +176,9 @@ fn main() -> std::io::Result<()> {
     loop {
         // Zero allocation: encodes on the stack, hands to send(2).
         match agent.beat(Status::Ok, 0) {
-            BeatOutcome::Sent    => {}
-            BeatOutcome::Dropped => { /* observer absent — safe to continue */ }
-            BeatOutcome::Failed(e) => eprintln!("beat: {e}"),
+            BeatOutcome::Sent       => {}
+            BeatOutcome::Dropped(_) => { /* observer absent — safe to continue */ }
+            BeatOutcome::Failed(e)  => eprintln!("beat: {e}"),
         }
         std::thread::sleep(std::time::Duration::from_millis(500));
     }
