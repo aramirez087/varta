@@ -469,6 +469,14 @@ jobs:
           digest=$(awk -F': ' '/Digest:/{print $2}' push.out)
           echo "CHART_DIGEST=$digest" >> "$GITHUB_ENV"
 
+      # `helm registry login` authenticates helm's own credential store, not
+      # the docker/cosign one — cosign needs its own GHCR login to push the
+      # signature, else: UNAUTHORIZED: User cannot be authenticated.
+      - name: ghcr login (cosign)
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" | \
+            cosign login ghcr.io -u ${{ github.actor }} --password-stdin
+
       - name: cosign sign chart
         env:
           CHART_REF: ${{ env.CHART_REGISTRY }}/varta-watch@${{ env.CHART_DIGEST }}
