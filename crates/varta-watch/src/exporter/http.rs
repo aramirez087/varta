@@ -161,7 +161,7 @@ impl super::PromExporter {
                         drop(stream);
                         continue;
                     }
-                    match self.serve_one(stream, render_fresh)? {
+                    match self.serve_one(stream, render_fresh) {
                         ServeOutcome::ServedFresh => served_fresh = true,
                         ServeOutcome::ServedCached => {
                             self.scrape_skipped_total = self.scrape_skipped_total.saturating_add(1);
@@ -210,13 +210,20 @@ impl super::PromExporter {
         result
     }
 
-    fn serve_one(&mut self, mut stream: TcpStream, render_fresh: bool) -> io::Result<ServeOutcome> {
+    fn serve_one(&mut self, mut stream: TcpStream, render_fresh: bool) -> ServeOutcome {
         // Linux accept4(2) with SOCK_CLOEXEC does *not* propagate O_NONBLOCK
         // to the accepted socket — the man page is explicit on this.  Set it
         // unconditionally so the deadline loops below are the actual latency
         // bounds, not a kernel blocking wait.  Do *not* use set_read_timeout /
         // set_write_timeout: those silently re-enable blocking mode.
-        stream.set_nonblocking(true)?;
+        // A per-connection failure must NEVER abort the serve loop: that would
+        // skip the freshness commit and the anti-flood drain phase, letting a
+        // single hostile reset-per-tick starve every queued legitimate scraper.
+        // `serve_one` is therefore infallible — any setup/read failure is
+        // contained as a rejected connection so the loop proceeds to the next.
+        if stream.set_nonblocking(true).is_err() {
+            return ServeOutcome::Rejected;
+        }
         let deadline = Instant::now() + PROM_READ_DEADLINE;
         // PROM_REQUEST_CAP bytes covers the widest real-world request: a
         // Prometheus request line + Authorization header + verbose user-agent /
@@ -257,7 +264,12 @@ impl super::PromExporter {
                     std::thread::yield_now();
                     continue;
                 }
-                Err(e) => return Err(e),
+                // A peer-side read failure (ECONNRESET / BrokenPipe / any
+                // non-WouldBlock) means no usable request arrived. Stop reading
+                // and fall through to the request-too-short branch (405 +
+                // Rejected) — mirroring `drain_read_to_would_block`'s graceful
+                // `Err(_) => break`. It must NOT abort the serve loop.
+                Err(_) => break,
             }
         }
 
@@ -267,7 +279,7 @@ impl super::PromExporter {
             let _ = write_all_nonblocking(&mut stream, response, cleanup_deadline);
             drain_read_to_would_block(&mut stream, cleanup_deadline);
             let _ = stream.shutdown(Shutdown::Write);
-            return Ok(ServeOutcome::Rejected);
+            return ServeOutcome::Rejected;
         }
 
         // Bearer-token auth.  Header parsing skips the request line and
@@ -287,7 +299,7 @@ impl super::PromExporter {
             let _ = write_all_nonblocking(&mut stream, response, cleanup_deadline);
             drain_read_to_would_block(&mut stream, cleanup_deadline);
             let _ = stream.shutdown(Shutdown::Write);
-            return Ok(ServeOutcome::Rejected);
+            return ServeOutcome::Rejected;
         }
 
         if render_fresh {
@@ -304,11 +316,11 @@ impl super::PromExporter {
         // An authorized client was served. `render_fresh` decides whether the
         // body it received was freshly rendered (advances `last_scrape`) or
         // came from the cache (counts as a skipped scrape).
-        Ok(if render_fresh {
+        if render_fresh {
             ServeOutcome::ServedFresh
         } else {
             ServeOutcome::ServedCached
-        })
+        }
     }
 }
 

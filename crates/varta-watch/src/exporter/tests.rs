@@ -1102,3 +1102,97 @@ fn stage_histogram_records_observation_in_correct_bucket() {
         "drain_pending count must remain 0; body:\n{body}"
     );
 }
+
+/// Regression (bug-477): a single peer that resets its connection must NOT
+/// abort the whole `/metrics` serve loop for the tick. Before the fix, an
+/// `ECONNRESET` on a freshly-accepted socket made `serve_one` return `Err`,
+/// whose `?` aborted `serve_pending` — skipping the freshness commit and the
+/// anti-flood drain and abandoning every connection queued behind the hostile
+/// one, so a reset-per-tick attacker could starve legitimate scrapers.
+///
+/// `serve_one` is now infallible: a reset connection becomes
+/// `ServeOutcome::Rejected` and the loop proceeds. This queues a hostile
+/// (RST-on-close) connection AHEAD of a legitimate authorized one and asserts
+/// the legitimate one is still served within a SINGLE `serve_pending` call.
+#[cfg(unix)]
+#[test]
+fn reset_connection_does_not_abort_serve_loop() {
+    use std::os::unix::io::AsRawFd;
+
+    #[repr(C)]
+    struct Linger {
+        l_onoff: i32,
+        l_linger: i32,
+    }
+    // SO_LINGER {l_onoff=1, l_linger=0}: close(2) sends RST immediately.
+    #[cfg(target_os = "linux")]
+    const SOL_SOCKET: i32 = 1;
+    #[cfg(target_os = "linux")]
+    const SO_LINGER: i32 = 13;
+    #[cfg(not(target_os = "linux"))]
+    const SOL_SOCKET: i32 = 0xffff;
+    #[cfg(not(target_os = "linux"))]
+    const SO_LINGER: i32 = 0x0080;
+    extern "C" {
+        fn setsockopt(
+            fd: i32,
+            level: i32,
+            optname: i32,
+            optval: *const core::ffi::c_void,
+            optlen: u32,
+        ) -> i32;
+    }
+
+    let mut prom = PromExporter::bind("127.0.0.1:0".parse().unwrap(), make_token()).expect("bind");
+    let addr = prom.local_addr().expect("local_addr");
+
+    // Hostile connection A: arm RST-on-close, then write an unread byte so the
+    // server's read of the reset socket reliably returns ECONNRESET.
+    let mut hostile = TcpStream::connect(addr).expect("connect hostile");
+    let lin = Linger {
+        l_onoff: 1,
+        l_linger: 0,
+    };
+    let rc = unsafe {
+        setsockopt(
+            hostile.as_raw_fd(),
+            SOL_SOCKET,
+            SO_LINGER,
+            core::ptr::addr_of!(lin) as *const core::ffi::c_void,
+            core::mem::size_of::<Linger>() as u32,
+        )
+    };
+    assert_eq!(rc, 0, "SO_LINGER setsockopt failed");
+    hostile.write_all(b"X").expect("write hostile byte");
+
+    // Legit connection B: valid authorized GET, queued behind A, kept open.
+    let mut legit = TcpStream::connect(addr).expect("connect legit");
+    legit
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .expect("read timeout");
+    legit
+        .write_all(
+            format!(
+                "GET /metrics HTTP/1.0\r\nAuthorization: Bearer {TEST_TOKEN_HEX}\r\nConnection: close\r\n\r\n"
+            )
+            .as_bytes(),
+        )
+        .expect("write legit");
+
+    // Let both reach the listen backlog, then RST A.
+    std::thread::sleep(Duration::from_millis(150));
+    drop(hostile);
+    std::thread::sleep(Duration::from_millis(30));
+
+    // A SINGLE serve loop: with the bug, A's ECONNRESET aborts it before B is
+    // served; with the fix, A is Rejected and B is served in the same call.
+    let _ = prom.serve_pending();
+
+    let mut response = String::new();
+    let _ = legit.read_to_string(&mut response);
+    assert!(
+        response.starts_with("HTTP/1.0 200"),
+        "a legit scraper queued behind a reset connection must still be served \
+         in the same serve loop; got: {response:?}"
+    );
+}
