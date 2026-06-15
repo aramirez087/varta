@@ -672,7 +672,36 @@ fn classify_tail(buf: &[u8], scan_start: u64, data_start: u64) -> (TailProbe, bo
                     true,
                 );
             }
+            // The look-back was a real whole record (a true boundary, or the
+            // full data region) that ALSO failed to parse — two or more
+            // consecutive complete-but-unparseable drift records. This result
+            // is USED (not re-widened) on the full-region rescan, so step `seq`
+            // PAST the last drift record's own leading sequence: that record is
+            // RETAINED on disk (`truncate_to: None`), and resetting to 0 would
+            // reuse its seq and false-trip the gap/loss detector — the same
+            // strict-monotonic-seq break the look-back branch above guards
+            // (bug-475, this is its consecutive-drift sibling). `last_line` is a
+            // complete record (clean-tail branch), so its leading seq column is
+            // safe to read even when a later column is corrupt; fall back to 0
+            // only if even the seq column is unreadable. The chain cannot be
+            // recovered across consecutive corrupt records, so it re-anchors at
+            // genesis — appropriate, since the corrupt span is a genuine break.
+            return (
+                TailProbe {
+                    last_seq: parse_leading_seq(last_line).unwrap_or(0),
+                    last_chain: [0u8; 32],
+                    reason: BootReason::SchemaDrift,
+                    truncate_to: None,
+                    has_v2_header: true,
+                },
+                false,
+            );
         }
+        // Untrusted windowed look-back: `prev_start == 0` in a read that began
+        // AFTER the data region, so offset 0 is the window's cut, not a record
+        // boundary, and nothing here is trusted. Reset to seq 0 / genesis with
+        // `recovered = false` so the caller widens to the full data region —
+        // where offset 0 IS a boundary and the branch above recovers the seq.
         return (
             TailProbe {
                 last_seq: 0,
@@ -1233,6 +1262,43 @@ mod tests {
         assert_eq!(
             probe.truncate_to, None,
             "a clean migrated file must not truncate"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Regression (bug-491, sibling of bug-475): when a file ends with TWO or
+    /// more consecutive complete-but-unparseable (drift) records, the clean-tail
+    /// look-back fails (the predecessor is also unparseable) and falls through.
+    /// That fallthrough returned `last_seq = 0`, so `next_seq` reset to 1 and
+    /// reused the retained drift records' sequence numbers — a
+    /// strict-monotonic-seq break an offline verifier reads as tampering. The
+    /// fallthrough must step past the last drift record's own leading seq.
+    #[test]
+    fn probe_tail_steps_past_consecutive_unparseable_drift_records() {
+        let dir = tmpdir("consec-drift");
+        let path = dir.join("audit.log");
+        let chain: String = if crate::audit::chain_enabled() {
+            "a".repeat(64)
+        } else {
+            "-".to_string()
+        };
+        // Two valid v2 records (seq 1, 2), then two complete-but-unparseable
+        // drift records (seq 99, 100) whose trailing chain column is malformed
+        // (neither "-" nor 64 hex), so `parse_record` rejects them while their
+        // leading seq column is still a plain u64.
+        let body = format!(
+            "# varta-watch recovery audit v2\n\
+             1\t1\t1\tboot\t1234\t-\tlegacy_v1\t{chain}\n\
+             2\t2\t2\tspawn\t7\t9001\texec\t/bin/x\tinline\t1\t{chain}\n\
+             99\t99\t99\tspawn\t7\t9001\texec\t/bin/x\tinline\t1\tBADCHAIN\n\
+             100\t100\t100\tspawn\t7\t9001\texec\t/bin/x\tinline\t1\tBADCHAIN\n",
+        );
+        std::fs::write(&path, &body).expect("write consecutive-drift file");
+
+        let probe = RecoveryAuditLog::probe_tail(&path).expect("probe");
+        assert_eq!(
+            probe.last_seq, 100,
+            "must step past the retained drift records' seq, not reset to 0"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
