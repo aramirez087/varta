@@ -630,17 +630,30 @@ fn classify_tail(buf: &[u8], scan_start: u64, data_start: u64) -> (TailProbe, bo
             .rposition(|&b| b == b'\n')
             .map(|p| p + 1)
             .unwrap_or(0);
-        if let Some((seq, chain)) = parse_record(&prior[prev_start..]) {
-            return (
-                TailProbe {
-                    last_seq: seq,
-                    last_chain: chain,
-                    reason: BootReason::SchemaDrift,
-                    truncate_to: None,
-                    has_v2_header: true,
-                },
-                true,
-            );
+        // `prev_start == 0` is a true line boundary only when the buffer starts
+        // at the data region (`scan_start == data_start`). In a windowed read
+        // that began *after* the data region, offset 0 is wherever the
+        // `TAIL_SCAN_BYTES` window happened to cut — possibly mid-record — so
+        // `&prior[0..]` is a leading fragment, not a whole prior record. On the
+        // default build (chain column `-`) `parse_record` accepts that fragment
+        // with a WRONG `seq` and would falsely report `recovered = true`,
+        // suppressing the caller's widen-rescan and resuming the log at a bogus
+        // sequence (seq reuse / hash-chain break). Trust the look-back only at a
+        // genuine boundary; otherwise fall through to the reset so the caller
+        // widens to the full data region, where offset 0 *is* a real boundary.
+        if prev_start != 0 || scan_start <= data_start {
+            if let Some((seq, chain)) = parse_record(&prior[prev_start..]) {
+                return (
+                    TailProbe {
+                        last_seq: seq,
+                        last_chain: chain,
+                        reason: BootReason::SchemaDrift,
+                        truncate_to: None,
+                        has_v2_header: true,
+                    },
+                    true,
+                );
+            }
         }
         return (
             TailProbe {
@@ -668,17 +681,24 @@ fn classify_tail(buf: &[u8], scan_start: u64, data_start: u64) -> (TailProbe, bo
             .map(|p| p + 1)
             .unwrap_or(0);
         let prev_line = &view[prev_start..];
-        if let Some((seq, chain)) = parse_record(prev_line) {
-            return (
-                TailProbe {
-                    last_seq: seq,
-                    last_chain: chain,
-                    reason: BootReason::CorruptTail,
-                    truncate_to,
-                    has_v2_header: true,
-                },
-                true,
-            );
+        // Same windowed-fragment guard as the clean branch above: when
+        // `prev_start == 0` and the scan began after the data region, this
+        // "prior record" is the leading fragment of a record the window cut
+        // through, not a real prior record — trusting it would resume at a
+        // wrong `seq`. Fall through to the reset so the caller widens.
+        if prev_start != 0 || scan_start <= data_start {
+            if let Some((seq, chain)) = parse_record(prev_line) {
+                return (
+                    TailProbe {
+                        last_seq: seq,
+                        last_chain: chain,
+                        reason: BootReason::CorruptTail,
+                        truncate_to,
+                        has_v2_header: true,
+                    },
+                    true,
+                );
+            }
         }
     }
 
@@ -1670,6 +1690,76 @@ mod tests {
         assert!(!body.contains("99999"), "the torn fragment must be removed");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `classify_tail`'s look-back must not trust a record that abuts the buffer
+    /// start of a *windowed* read (`scan_start > data_start`): offset 0 is then
+    /// wherever the `TAIL_SCAN_BYTES` window cut, so `&buf[0..]` is the leading
+    /// fragment of a record the window sliced through, not a real prior record.
+    /// On the default build (chain column `-`) `parse_record` accepts such a
+    /// fragment with a WRONG `seq`; the unfixed look-back returned
+    /// `recovered = true`, suppressing `probe_tail`'s widen-rescan and resuming
+    /// the log at a bogus sequence (seq reuse / hash-chain break a Class-C
+    /// verifier reads as tampering). The fix forces `recovered = false` so the
+    /// caller widens to the full data region, where offset 0 *is* a boundary.
+    #[test]
+    fn windowed_fragment_at_buffer_start_is_not_trusted_as_a_prior_record() {
+        let data_start = AUDIT_HEADER_V2.len() as u64;
+        // Simulate a 4096-window that began mid-record: the buffer starts at an
+        // absolute offset well past the data region. `frag` is the tail of a
+        // record the window sliced — it parses (first token a u64, last `-`)
+        // but is NOT a whole record. The window holds exactly one newline, so
+        // `prev_start` falls back to 0.
+        let frag = b"200\tcol\t-";
+
+        // CLEAN branch: a complete-but-unparseable final line after the fragment.
+        let mut clean = Vec::new();
+        clean.extend_from_slice(frag);
+        clean.push(b'\n');
+        clean.extend_from_slice(b"7\tbogus\tnot-a-valid-chain\n");
+
+        // Windowed read (scan_start > data_start): the fragment must be rejected.
+        let (probe, recovered) = classify_tail(&clean, data_start + 100, data_start);
+        assert!(
+            !recovered,
+            "clean branch: a fragment at a windowed-read boundary must not be trusted"
+        );
+        assert_eq!(probe.last_seq, 0, "untrusted look-back resets to seq 0");
+
+        // Whole-region read (scan_start == data_start): offset 0 IS a real
+        // boundary, so the legitimate bug-401 look-back is preserved.
+        let (probe, recovered) = classify_tail(&clean, data_start, data_start);
+        assert!(
+            recovered,
+            "whole-region read: a record at the true data-region start must be trusted"
+        );
+        assert_eq!(
+            probe.last_seq, 200,
+            "look-back resumes from the real prior record"
+        );
+
+        // TORN branch: an unterminated fragment after the fragment+newline.
+        let mut torn = Vec::new();
+        torn.extend_from_slice(frag);
+        torn.push(b'\n');
+        torn.extend_from_slice(b"99999");
+
+        let (probe, recovered) = classify_tail(&torn, data_start + 100, data_start);
+        assert!(
+            !recovered,
+            "torn branch: a fragment at a windowed-read boundary must not be trusted"
+        );
+        assert_eq!(probe.last_seq, 0, "untrusted look-back resets to seq 0");
+
+        let (probe, recovered) = classify_tail(&torn, data_start, data_start);
+        assert!(
+            recovered,
+            "whole-region read: torn look-back from the true data-region start is trusted"
+        );
+        assert_eq!(
+            probe.last_seq, 200,
+            "look-back resumes from the real prior record"
+        );
     }
 
     /// Records emitted DURING a multi-tick rotation (on_stall / try_reap) are
