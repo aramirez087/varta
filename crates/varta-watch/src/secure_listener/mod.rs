@@ -587,8 +587,22 @@ impl SecureUdpListener {
                 // but the runtime overrides it to the operator's stall
                 // threshold so this gate fires in lockstep with the tracker's
                 // matching recycle reset (see `session_restart_gap`).
-                if (now_ns.saturating_sub(state.last_seen_ns) as u128)
-                    < self.session_restart_gap.as_nanos()
+                //
+                // A `NONCE_TERMINAL` panic frame is NEVER a session restart: a
+                // recycled process always resumes with a regular monotonic
+                // nonce, and a genuinely later panic advances its authenticated
+                // timestamp (so `accepts_aged_out_prefix` already admitted it
+                // above). Excluding it here stops a replayed terminal frame
+                // from reaching the reset below and wiping `max_regular_nonce`
+                // to 0 — which would disarm the cross-prefix replay high-water
+                // (layer 3) and let every captured regular beat be replayed.
+                // This mirrors the tracker's network-recycle gate, which
+                // excludes terminals with `frame.nonce != NONCE_TERMINAL`, so a
+                // replayed terminal is rejected in lockstep and bounded solely
+                // by the terminal-timestamp high-water in `accepts_aged_out_prefix`.
+                if frame_nonce == NONCE_TERMINAL
+                    || (now_ns.saturating_sub(state.last_seen_ns) as u128)
+                        < self.session_restart_gap.as_nanos()
                 {
                     return false;
                 }

@@ -284,6 +284,79 @@ fn aged_out_terminal_panic_replay_is_rejected_by_timestamp() {
     assert!(listener.try_record_replay_state(identity, newer_panic_iv, 1, NONCE_TERMINAL, 5_000));
 }
 
+#[test]
+fn aged_out_terminal_replay_after_session_gap_does_not_reset_baseline() {
+    // Regression: the session-restart recycle gate must NOT fire for a
+    // NONCE_TERMINAL panic frame. A captured terminal frame replayed on an
+    // aged-out IV prefix after SESSION_RESTART_GAP of silence would otherwise
+    // pass the silence gate, hit `*state = SenderState::new(...)`, and wipe
+    // `max_regular_nonce` to 0 — disarming the cross-prefix replay high-water
+    // (layer 3) so every previously-captured regular beat becomes replayable.
+    // The tracker's matching network-recycle gate already excludes
+    // NONCE_TERMINAL, so the two gates must reject terminal replays in
+    // lockstep; terminal frames are bounded solely by their authenticated
+    // timestamp high-water, never by the session-restart reset.
+    //
+    // Unlike `aged_out_terminal_panic_replay_is_rejected_by_timestamp` (which
+    // replays at the same instant, so the silence gate rejects it before the
+    // reset is ever reached), this drives the operator-clock past the gap to
+    // exercise the session-restart path directly.
+    let mut listener = new_listener();
+    let identity = test_identity();
+    let t0 = Instant::now();
+    let t0_ns = 1_000_000_000u64;
+
+    // A long-lived agent climbs to a high regular-nonce high-water on prefix A.
+    assert!(listener.try_record_replay_state_at(t0, t0_ns, identity, test_iv(), 100, 5_002, 5_002));
+    assert_eq!(listener.sender_max_regular_nonce(identity), Some(5_002));
+
+    // The agent panics: the first terminal frame advances the terminal-timestamp
+    // high-water (and, being newer, is admitted by `accepts_aged_out_prefix`).
+    assert!(listener.try_record_replay_state_at(
+        t0,
+        t0_ns,
+        identity,
+        test_iv2(),
+        1,
+        NONCE_TERMINAL,
+        6_000
+    ));
+    assert_eq!(
+        listener.sender_max_regular_nonce(identity),
+        Some(5_002),
+        "a terminal frame must not advance the regular high-water"
+    );
+
+    // Two later regular rotations push the panic prefix (test_iv2) out of the
+    // 1-deep IV history (current = test_iv4, previous = test_iv3).
+    assert!(listener.try_record_replay_state_at(t0, t0_ns, identity, test_iv3(), 1, 5_003, 6_500));
+    assert!(listener.try_record_replay_state_at(t0, t0_ns, identity, test_iv4(), 1, 5_004, 7_000));
+    assert_eq!(listener.sender_max_regular_nonce(identity), Some(5_004));
+
+    // The agent dies. After SESSION_RESTART_GAP of silence an on-path attacker
+    // replays the captured terminal frame on its aged-out prefix, with its
+    // original (non-advancing) timestamp == the terminal high-water. It must be
+    // rejected and must NOT reset the per-sender baseline.
+    let after_ns = t0_ns + (SESSION_RESTART_GAP + Duration::from_secs(1)).as_nanos() as u64;
+    assert!(
+        !listener.try_record_replay_state_at(
+            t0,
+            after_ns,
+            identity,
+            test_iv2(),
+            1,
+            NONCE_TERMINAL,
+            6_000
+        ),
+        "a replayed terminal frame must be rejected, never treated as a session restart"
+    );
+    assert_eq!(
+        listener.sender_max_regular_nonce(identity),
+        Some(5_004),
+        "a replayed terminal frame must not wipe the cross-prefix regular-nonce high-water"
+    );
+}
+
 fn test_key() -> Key {
     Key::from_bytes([0xabu8; 32])
 }
