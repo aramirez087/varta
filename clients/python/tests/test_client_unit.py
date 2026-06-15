@@ -22,6 +22,7 @@ from varta import (
     classify_send_error,
 )
 from varta._transport import (
+    _AEAD_COUNTER_LIMIT,
     BeatTransport,
     SecureUdpTransport,
     UdpTransport,
@@ -199,6 +200,48 @@ def test_udp_failed_reconnect_preserves_socket() -> None:
         assert transport._sock is old_sock
         assert old_sock is not None
         assert old_sock.fileno() >= 0
+    finally:
+        transport.close()
+
+
+def test_secure_udp_failed_send_at_wrap_does_not_rotate_prefix() -> None:
+    # Regression: a Dropped send (BlockingIOError) at the nonce-wrap boundary
+    # must NOT rotate the IV prefix or reset the counter. Prefix index, IV
+    # prefix, and counter may only advance after the kernel accepts the
+    # datagram (commit-on-success); otherwise a failed send burns a prefix
+    # index off the wire and runs HKDF on the hot path, violating the
+    # cross-client invariant (cf. Rust, Go bug-484). The prior code called
+    # _rotate_prefix() before the syscall.
+    transport = SecureUdpTransport(("127.0.0.1", 9), key=bytes(32))
+    try:
+        # Park the counter at the wrap boundary and snapshot pre-send state.
+        transport._set_iv_counter_for_test(_AEAD_COUNTER_LIMIT)
+        old_prefix_index = transport._iv_prefix_index
+        old_counter = transport._iv_counter
+        old_prefix = transport._iv_prefix
+
+        class _FailingSock:
+            def send(self, _wire: bytes) -> int:
+                raise BlockingIOError(errno.EWOULDBLOCK, "simulated backpressure")
+
+            def close(self) -> None:
+                pass
+
+        # Swap in a socket that always drops; close the real one so its fd
+        # does not leak for the rest of the test session.
+        real = transport._sock
+        transport._sock = _FailingSock()  # type: ignore[assignment]
+        if real is not None:
+            real.close()
+
+        with pytest.raises(BlockingIOError):
+            transport.send(bytes(32))
+
+        assert transport._iv_prefix_index == old_prefix_index, (
+            "a Dropped send at the wrap boundary must not rotate the prefix index"
+        )
+        assert transport._iv_counter == old_counter
+        assert transport._iv_prefix == old_prefix
     finally:
         transport.close()
 

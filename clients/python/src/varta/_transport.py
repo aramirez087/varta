@@ -256,33 +256,38 @@ class SecureUdpTransport(BeatTransport):
             raise
         return sock, session_salt, iv_prefix
 
-    def _rotate_prefix(self) -> None:
-        self._iv_prefix_index += 1
-        self._iv_counter = 0
-        self._iv_prefix = derive_iv_prefix(self._session_salt, self._iv_prefix_index)
-
     def send(self, buf: bytes) -> int:
         assert self._sock is not None
         if len(buf) != FRAME_BYTES:
             raise ValueError("secure-UDP transport expects a 32-byte plaintext frame")
-        if self._iv_counter >= _AEAD_COUNTER_LIMIT:
-            # Cold path: rotate the prefix BEFORE the syscall so a Dropped
-            # send does not advance the counter past its wrap boundary.
-            self._rotate_prefix()
+        # Compute the nonce-wrap into locals; transport state is mutated only
+        # after the kernel accepts the datagram (commit-on-success), so a
+        # Dropped send never advances the prefix index or resets the counter.
+        # The prior code rotated the prefix BEFORE the syscall, leaving the
+        # prefix rotated when a non-blocking send raised BlockingIOError at the
+        # wrap boundary (the Python sibling of the Go fix).
+        prefix_index = self._iv_prefix_index
         counter = self._iv_counter
+        iv_prefix = self._iv_prefix
+        if counter >= _AEAD_COUNTER_LIMIT:
+            prefix_index += 1
+            counter = 0
+            iv_prefix = derive_iv_prefix(self._session_salt, prefix_index)
         if self._master_key is not None:
             agent_pid = os.getpid() & 0xFFFFFFFF
             wire = encode_master(
-                self._master_key, agent_pid, self._iv_prefix, counter, buf
+                self._master_key, agent_pid, iv_prefix, counter, buf
             )
             assert len(wire) == SECURE_MASTER_BYTES
         else:
             assert self._key is not None
-            wire = encode_shared(self._key, self._iv_prefix, counter, buf)
+            wire = encode_shared(self._key, iv_prefix, counter, buf)
             assert len(wire) == SECURE_SHARED_BYTES
         sent = self._sock.send(wire)
-        # Commit-on-success: only advance the counter after the kernel
-        # accepts the datagram. A Dropped send must not consume a nonce.
+        # Commit-on-success: only advance state after the kernel accepts the
+        # datagram. A Dropped send must not consume a nonce or burn a prefix.
+        self._iv_prefix_index = prefix_index
+        self._iv_prefix = iv_prefix
         self._iv_counter = counter + 1
         return sent
 
