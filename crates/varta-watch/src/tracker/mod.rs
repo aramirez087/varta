@@ -884,7 +884,17 @@ impl Tracker {
                 self.invariant_violations = self.invariant_violations.saturating_add(1);
                 continue;
             };
-            let stale = now_ns.saturating_sub(slot.last_ns) > evict_threshold;
+            // `>=`, not `>`: a slot silent for *at least* `evict_threshold` is
+            // a valid victim. This matches the rest of the tracker's silence
+            // gates — stall detection (a slot is newly stalled at silence
+            // `>= threshold_ns`) and the nonce-recycle gate — which all treat
+            // "silent for the threshold" as reached, not strictly exceeded.
+            // With strict `>` a slot whose silence landed exactly on the
+            // boundary was skipped, and because `scan_window` advances the
+            // cursor past the window on a miss it could then be stranded behind
+            // the cursor for a full ring traversal, yielding a spurious
+            // `CapacityExceeded` while a genuine victim existed.
+            let stale = now_ns.saturating_sub(slot.last_ns) >= evict_threshold;
             let qualifies = stale && (!require_stall || slot.stall_emitted);
             if qualifies {
                 self.eviction_scan_cursor = (idx + 1) % n;

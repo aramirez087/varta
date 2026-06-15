@@ -1,6 +1,7 @@
 use super::pid_index::{PidIndex, ProbeExhausted};
 use super::{
-    EvictionPolicy, StallFreshness, Tracker, Update, DEFAULT_EVICTION_SCAN_WINDOW, MAX_CAPACITY,
+    EvictionPolicy, StallFreshness, Tracker, Update, DEFAULT_EVICTION_SCAN_WINDOW,
+    EVICTION_MULTIPLIER, MAX_CAPACITY,
 };
 use crate::peer_cred::BeatOrigin;
 use varta_vlp::{Frame, Status, NONCE_TERMINAL};
@@ -512,6 +513,35 @@ fn find_evictable_slot_scan_is_bounded_to_window() {
     assert!(
         advanced <= window,
         "cursor advanced by {advanced}, expected ≤ {window}"
+    );
+}
+
+/// Regression: the eviction silence gate must treat a slot whose silence is
+/// EXACTLY `threshold * EVICTION_MULTIPLIER` as a valid victim. The gate used
+/// strict `>`, but stall detection and the nonce-recycle gate both use `>=`
+/// ("silent for at least the threshold"). With `>`, a stall-emitted slot
+/// sitting exactly on the boundary was skipped — and `scan_window` advancing
+/// the cursor past the window could then strand it for a full ring traversal,
+/// yielding a spurious CapacityExceeded while a genuine victim existed.
+#[test]
+fn find_evictable_slot_evicts_slot_at_exactly_the_eviction_threshold() {
+    let threshold_ns = 100u64;
+    let mut t = Tracker::new(2, EvictionPolicy::Strict, DEFAULT_EVICTION_SCAN_WINDOW);
+    assert_eq!(
+        t.record(&frame(1, 1), 0, threshold_ns, ORIGIN, None),
+        Update::Inserted
+    );
+    // Mark the slot stall-emitted; drain does not reset last_ns, so the beat
+    // clock stays at 0.
+    t.drain_stalled_slots(threshold_ns * 2, threshold_ns, |_, _, _, _, _, _| {});
+    assert_eq!(t.stall_emitted_count, 1);
+
+    // Silence is EXACTLY threshold * EVICTION_MULTIPLIER.
+    let evict_threshold = threshold_ns * EVICTION_MULTIPLIER as u64;
+    assert!(
+        t.find_evictable_slot(evict_threshold, threshold_ns)
+            .is_some(),
+        "a stall-emitted slot at exactly the eviction threshold must be evictable",
     );
 }
 
