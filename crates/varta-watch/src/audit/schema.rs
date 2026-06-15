@@ -170,6 +170,20 @@ pub(super) fn parse_record(line: &[u8]) -> Option<(u64, [u8; 32])> {
     Some((seq, raw))
 }
 
+/// Parse only the leading `seq` column of an audit line as a `u64`, ignoring
+/// every later column. Used for a record that [`parse_record`] rejects (a
+/// corrupt or newer-schema later column) but that is RETAINED on disk: the
+/// resumed `seq` cursor must still step past its sequence number to preserve
+/// strict monotonicity. Returns `None` for a comment line or a non-numeric
+/// leading column.
+pub(super) fn parse_leading_seq(line: &[u8]) -> Option<u64> {
+    let s = core::str::from_utf8(line).ok()?;
+    if s.starts_with('#') {
+        return None;
+    }
+    s.split('\t').next()?.parse::<u64>().ok()
+}
+
 /// Replace tab/newline bytes in a free-form audit field with a literal space
 /// so a maliciously-chosen file path or argv[0] can never inject a fake column.
 pub(super) fn sanitize(s: &str) -> String {

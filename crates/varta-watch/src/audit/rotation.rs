@@ -5,7 +5,9 @@ use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use super::schema::{parse_record, BootReason, AUDIT_HEADER_V1_PREFIX, AUDIT_HEADER_V2};
+use super::schema::{
+    parse_leading_seq, parse_record, BootReason, AUDIT_HEADER_V1_PREFIX, AUDIT_HEADER_V2,
+};
 use super::RecoveryAuditLog;
 
 /// Number of rotated file generations kept.
@@ -643,9 +645,25 @@ fn classify_tail(buf: &[u8], scan_start: u64, data_start: u64) -> (TailProbe, bo
         // widens to the full data region, where offset 0 *is* a real boundary.
         if prev_start != 0 || scan_start <= data_start {
             if let Some((seq, chain)) = parse_record(&prior[prev_start..]) {
+                // The unparseable drift record (`last_line`) is RETAINED on disk
+                // (`truncate_to: None` — it may be newer-schema durable data), so
+                // the resumed `seq` cursor must step PAST *its* seq, not just the
+                // parseable predecessor's. Otherwise `next_seq = predecessor_seq
+                // + 1` reuses the drift record's seq and two records share one
+                // seq, false-tripping the gap/loss detector
+                // (book/src/architecture/audit-log.md). The drift record's
+                // leading seq column is a plain `u64` even when a later column is
+                // corrupt; fall back to the predecessor's seq if it does not
+                // parse. The hash chain still resumes from the parseable
+                // predecessor (`last_chain`), which the verifier links across the
+                // skipped drift line.
+                let last_seq = match parse_leading_seq(last_line) {
+                    Some(drift_seq) => seq.max(drift_seq),
+                    None => seq,
+                };
                 return (
                     TailProbe {
-                        last_seq: seq,
+                        last_seq,
                         last_chain: chain,
                         reason: BootReason::SchemaDrift,
                         truncate_to: None,
@@ -1286,6 +1304,78 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Regression (bug-475): when `classify_tail`'s clean-unparseable branch
+    /// RETAINS the drift record on disk (`truncate_to: None`) and recovers
+    /// `last_seq` from the parseable predecessor, the resumed cursor must step
+    /// PAST the retained record's own seq. Otherwise the post-drift boot reuses
+    /// the drift record's seq (on-disk seqs `[1, 2, 3, 3]`), breaking the
+    /// strict-monotonic-seq invariant the gap/loss detector relies on.
+    #[test]
+    fn clean_unparseable_drift_resume_does_not_reuse_retained_seq() {
+        let dir = tmpdir("drift-seq");
+        let path = dir.join("audit.log");
+
+        // boot = seq 1, one spawn = seq 2.
+        let (mut log, _) = RecoveryAuditLog::create(&path, cfg(None, 1)).expect("create");
+        log.record_spawn(&crate::audit::SpawnRecord {
+            wallclock_ms: 1,
+            observer_ns: 1,
+            agent_pid: 1,
+            child_pid: 100,
+            mode: "exec",
+            program: "/bin/agent",
+            source: "inline",
+            template_len: 1,
+        });
+        log.flush_pending(Duration::from_secs(5));
+        drop(log);
+
+        // Append a newline-terminated record with a valid leading seq
+        // (3 = last_good + 1) but a trailing column the v2 parser rejects — the
+        // newer-schema / trailing-bit-rot "drift" case the clean branch keeps.
+        {
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .expect("open for append");
+            f.write_all(b"3\t1\t1\tspawn\t/bin/future\tnope\n")
+                .expect("append drift");
+            f.flush().expect("flush drift");
+        }
+
+        // Resume: SchemaDrift, retains the drift record, emits a post-drift boot.
+        let (log2, w) = RecoveryAuditLog::create(&path, cfg(None, 1)).expect("re-create");
+        assert!(w.schema_drift);
+        drop(log2);
+
+        let body = std::fs::read_to_string(&path).expect("read");
+        let seqs: Vec<u64> = body
+            .lines()
+            .filter(|l| !l.starts_with('#') && !l.is_empty())
+            .filter_map(|l| l.split('\t').next()?.parse::<u64>().ok())
+            .collect();
+
+        let mut unique = seqs.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(
+            unique.len(),
+            seqs.len(),
+            "duplicate seq after clean-unparseable drift resume: {seqs:?}"
+        );
+        assert!(
+            seqs.contains(&3),
+            "the retained drift record (seq 3) must survive: {seqs:?}"
+        );
+        assert_eq!(
+            seqs.iter().max(),
+            Some(&4),
+            "post-drift boot must resume at seq 4, never reuse 3: {seqs:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// On the `EXDEV` rotation fallback, `copy`+`unlink` makes `.1` a fresh
     /// inode distinct from the one `self.sink`'s fd holds. The fallback must
     /// re-point the sink at `.1`; otherwise every record drained during
@@ -1590,9 +1680,17 @@ mod tests {
             "a complete unparseable tail is drift, got {:?}",
             probe.reason
         );
+        // bug-475: the drift record (seq_good + 1) is RETAINED on disk, so the
+        // resumed cursor must step PAST it — `last_seq` is `seq_good + 1`, NOT
+        // `seq_good`. Resuming at `seq_good` (as this assertion originally
+        // demanded) makes the next boot reuse `seq_good + 1` and two records
+        // share one seq. Still no reset to 0; the chain still resumes from the
+        // parseable predecessor below.
         assert_eq!(
-            probe.last_seq, seq_good,
-            "seq must resume from the last good record, not reset to 0"
+            probe.last_seq,
+            seq_good + 1,
+            "seq must step past the retained drift record (seq_good+1), not \
+             reuse seq_good (collision) and not reset to 0"
         );
         assert_eq!(
             probe.truncate_to, None,
