@@ -84,6 +84,13 @@ pub struct FileExporter {
     /// `writeln!` (beats, stalls, decode errors, IO errors, AuthFailures,
     /// evictions) and is checked at the bottom of `after_write`.
     writes_since_sync: u32,
+    /// Test-only count of parent-directory fsync *attempts* (initial create
+    /// plus each rotation). The durability regression test asserts the
+    /// `fsync_parent_dir` sweep actually runs: reverting the fix drops this
+    /// to zero and the test goes red. Mirrors the audit log exposing
+    /// `fsync_durations` for the same purpose; absent from production builds.
+    #[cfg(test)]
+    dir_fsyncs: u32,
 }
 
 /// Number of rotated file generations kept.
@@ -114,7 +121,7 @@ impl FileExporter {
     ) -> io::Result<Self> {
         let file = open_or_create_export_file(path.as_ref())?;
         let bytes_written = file.metadata()?.len();
-        Ok(FileExporter {
+        let mut exporter = FileExporter {
             sink: BufWriter::new(file),
             pending_err: None,
             path: path.as_ref().to_path_buf(),
@@ -122,7 +129,36 @@ impl FileExporter {
             bytes_written,
             sync_every,
             writes_since_sync: 0,
-        })
+            #[cfg(test)]
+            dir_fsyncs: 0,
+        };
+        // A freshly-created export file's directory entry is not durable until
+        // the parent directory is fsynced (`open_or_create` may have created
+        // it). See [`Self::sync_parent_dir`].
+        exporter.sync_parent_dir();
+        Ok(exporter)
+    }
+
+    /// Make the export file's *directory entries* durable after a dirent
+    /// mutation (initial create, or a rotation rename/create/unlink). Per
+    /// `fsync(2)`, fsyncing the file *data* does not persist the entry that
+    /// names it — only an explicit parent-directory fsync does. Without this,
+    /// a power cut can lose a rotated generation (`PATH.1`), resurrect an
+    /// unlinked live inode, or orphan the live file, even when the operator
+    /// opted into durability via `--export-file-sync-every`. Failure is a soft
+    /// degradation (some platforms reject directory fsync), latched into
+    /// `pending_err` for the caller to surface — mirroring the audit log's
+    /// create() and `SyncingDir` rotation stages (`audit/mod.rs`,
+    /// `audit/rotation.rs`) and the UDS-bind posture. A single call covers
+    /// every dirent change since the previous one (they share one directory).
+    fn sync_parent_dir(&mut self) {
+        #[cfg(test)]
+        {
+            self.dir_fsyncs = self.dir_fsyncs.saturating_add(1);
+        }
+        if let Err(e) = crate::file_security::fsync_parent_dir(&self.path) {
+            self.remember_error(&e);
+        }
     }
 
     /// Flush the `BufWriter` to the kernel and then `fdatasync(2)` the
@@ -213,6 +249,11 @@ impl FileExporter {
                 self.sink = BufWriter::new(file);
                 self.bytes_written = 0;
                 self.writes_since_sync = 0;
+                // `rotate()` renamed `PATH`→`PATH.1` (or, on EXDEV, copied then
+                // unlinked the live path) and we just created the new live
+                // `PATH`; one parent-dir fsync makes every dirent of this
+                // rotation durable. See [`Self::sync_parent_dir`].
+                self.sync_parent_dir();
                 match first_err {
                     Some(e) => Err(e),
                     None => Ok(()),
@@ -867,5 +908,67 @@ mod tests {
             .record_eviction_pid(42, 123)
             .expect_err("eviction rotation reopen failure must be returned");
         assert_eq!(err.kind(), io::ErrorKind::NotFound);
+    }
+
+    /// Rotation must make its directory-entry mutations durable. A rotation
+    /// renames `PATH`→`PATH.1` (or, on EXDEV, copies then unlinks the live
+    /// path) and creates a fresh `PATH`; the per-record `fdatasync` only
+    /// persists file *data*, never the directory entries, so the parent
+    /// directory needs an explicit fsync (`fsync(2)`). This pins the
+    /// `fsync_parent_dir` sweep added to `create()` and the rotation reopen
+    /// (mirroring the audit log, bug-403): the call must run on the happy path
+    /// without breaking rotation or spuriously latching an error. The
+    /// `dir_fsyncs` counter makes it red->green — reverting the fix leaves it
+    /// at 0. True durability across a power cut can only be shown by fault
+    /// injection; this guards the fix's behavior on a healthy filesystem.
+    #[test]
+    fn rotation_under_sync_every_preserves_generation_without_latching_error() {
+        let (dir, path) = rotation_reopen_fixture("rotation-dir-fsync");
+        // sync_every = 1 => durability opt-in; max_bytes = 1 => every record
+        // rotates. create() already fsynced the parent for the live dirent.
+        let mut fe = FileExporter::create(&path, Some(1), 1).expect("create exporter");
+        assert_eq!(
+            fe.dir_fsyncs, 1,
+            "create() must fsync the parent dir once for the live dirent"
+        );
+        assert!(
+            fe.pending_err.is_none(),
+            "create() parent-dir fsync must not latch an error on a healthy dir"
+        );
+
+        fe.record(&sample_beat(123))
+            .expect("first record + rotation");
+        assert_eq!(
+            fe.dir_fsyncs, 2,
+            "rotation must fsync the parent dir to make the rename/create durable"
+        );
+
+        let first_gen = generation_path(&path, 1);
+        let rotated = std::fs::read_to_string(&first_gen).expect("rotated generation exists");
+        assert!(
+            rotated.contains("\tbeat\t42\t"),
+            "rotated PATH.1 must hold the pre-rotation beat, got: {rotated:?}"
+        );
+        assert_eq!(
+            std::fs::metadata(&path).expect("live path reopened").len(),
+            0,
+            "post-rotation live PATH must be freshly created (empty)"
+        );
+        assert!(
+            fe.pending_err.is_none(),
+            "rotation parent-dir fsync must succeed on a healthy dir, not latch"
+        );
+
+        // The reopened live file is writable and a further rotation still works.
+        fe.record(&sample_beat(124))
+            .expect("second record + rotation");
+        assert_eq!(
+            fe.dir_fsyncs, 3,
+            "the second rotation fsyncs the parent again"
+        );
+        fe.flush()
+            .expect("flush after rotations leaves no latched error");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
