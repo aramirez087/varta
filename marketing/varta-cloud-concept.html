@@ -1,0 +1,435 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Varta Cloud — SaaS Concept &amp; Go-to-Market</title>
+<style>
+  :root{
+    --bg:#0b0e14; --bg2:#11151f; --card:#151a25; --line:#222a39;
+    --ink:#e7ecf3; --muted:#94a3b8; --dim:#647089;
+    --brand:#ff7a45; --brand2:#ffb088; --ok:#34d399; --warn:#fbbf24; --bad:#f87171;
+    --accent:#5b9dff;
+    --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+    --sans:-apple-system,BlinkMacSystemFont,"Segoe UI",Inter,Roboto,Helvetica,Arial,sans-serif;
+  }
+  *{box-sizing:border-box}
+  html{scroll-behavior:smooth}
+  body{margin:0;background:radial-gradient(1200px 600px at 70% -10%,#1a2030 0,var(--bg) 55%);color:var(--ink);font-family:var(--sans);line-height:1.6;-webkit-font-smoothing:antialiased}
+  a{color:var(--brand2);text-decoration:none}
+  a:hover{text-decoration:underline}
+  .wrap{max-width:1080px;margin:0 auto;padding:0 24px}
+  header.top{position:sticky;top:0;z-index:10;backdrop-filter:blur(10px);background:rgba(11,14,20,.72);border-bottom:1px solid var(--line)}
+  header.top .wrap{display:flex;align-items:center;justify-content:space-between;height:58px}
+  .logo{font-weight:800;letter-spacing:.4px;font-size:18px}
+  .logo b{color:var(--brand)}
+  nav a{color:var(--muted);font-size:13px;margin-left:18px}
+  nav a:hover{color:var(--ink);text-decoration:none}
+  .hero{padding:84px 0 56px}
+  .pill{display:inline-block;font-family:var(--mono);font-size:12px;color:var(--brand2);border:1px solid var(--line);background:var(--bg2);padding:5px 12px;border-radius:999px;margin-bottom:22px}
+  h1{font-size:clamp(34px,6vw,60px);line-height:1.04;margin:0 0 18px;letter-spacing:-1.2px;font-weight:820}
+  h1 .g{background:linear-gradient(100deg,var(--brand),var(--brand2));-webkit-background-clip:text;background-clip:text;color:transparent}
+  .lede{font-size:clamp(17px,2.4vw,21px);color:var(--muted);max-width:760px}
+  .cta{margin-top:30px;display:flex;gap:12px;flex-wrap:wrap}
+  .btn{font-weight:600;font-size:14px;padding:11px 18px;border-radius:10px;border:1px solid var(--line);background:var(--card);color:var(--ink)}
+  .btn.p{background:linear-gradient(100deg,var(--brand),#ff9466);border-color:transparent;color:#1a0e08}
+  section{padding:54px 0;border-top:1px solid var(--line)}
+  h2{font-size:clamp(24px,3.4vw,34px);letter-spacing:-.5px;margin:0 0 10px;font-weight:760}
+  h2 .num{font-family:var(--mono);color:var(--brand);font-size:.6em;margin-right:10px;vertical-align:middle}
+  .sub{color:var(--muted);max-width:760px;margin:0 0 28px}
+  h3{font-size:18px;margin:0 0 8px}
+  .grid{display:grid;gap:16px}
+  .g2{grid-template-columns:1fr 1fr}
+  .g3{grid-template-columns:repeat(3,1fr)}
+  .g4{grid-template-columns:repeat(4,1fr)}
+  @media(max-width:860px){.g2,.g3,.g4{grid-template-columns:1fr}nav{display:none}}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:20px}
+  .card .ic{font-size:22px;margin-bottom:8px}
+  .card p{color:var(--muted);margin:6px 0 0;font-size:14px}
+  .muted{color:var(--muted)}
+  .dim{color:var(--dim)}
+  ul.clean{list-style:none;padding:0;margin:0}
+  ul.clean li{padding:7px 0 7px 26px;position:relative;color:var(--muted);font-size:14.5px;border-bottom:1px solid var(--line)}
+  ul.clean li:last-child{border-bottom:0}
+  ul.clean li::before{content:"▸";position:absolute;left:4px;color:var(--brand)}
+  table{width:100%;border-collapse:collapse;font-size:13.5px}
+  th,td{text-align:left;padding:11px 12px;border-bottom:1px solid var(--line);vertical-align:top}
+  th{color:var(--dim);font-weight:600;font-size:12px;text-transform:uppercase;letter-spacing:.5px}
+  td.y{color:var(--ok)}
+  td.n{color:var(--bad)}
+  td.p{color:var(--warn)}
+  .tbl-wrap{overflow-x:auto;border:1px solid var(--line);border-radius:14px;background:var(--card)}
+  .tag{font-family:var(--mono);font-size:11px;padding:2px 8px;border-radius:6px;border:1px solid var(--line);color:var(--muted)}
+  .price{display:grid;grid-template-columns:repeat(4,1fr);gap:14px}
+  @media(max-width:860px){.price{grid-template-columns:1fr}}
+  .tier{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:22px;display:flex;flex-direction:column}
+  .tier.hi{border-color:var(--brand);box-shadow:0 0 0 1px var(--brand),0 18px 50px -20px rgba(255,122,69,.45)}
+  .tier h3{font-size:15px;color:var(--brand2);text-transform:uppercase;letter-spacing:.6px;font-weight:700}
+  .tier .amt{font-size:30px;font-weight:800;margin:6px 0 2px}
+  .tier .amt small{font-size:13px;color:var(--dim);font-weight:500}
+  .tier .who{color:var(--dim);font-size:12.5px;margin-bottom:14px;min-height:34px}
+  .tier ul{list-style:none;padding:0;margin:0 0 6px;font-size:13px;color:var(--muted)}
+  .tier ul li{padding:5px 0 5px 20px;position:relative}
+  .tier ul li::before{content:"✓";position:absolute;left:0;color:var(--ok)}
+  .flow{display:flex;align-items:stretch;gap:0;flex-wrap:wrap}
+  .step{flex:1;min-width:150px;background:var(--card);border:1px solid var(--line);padding:16px;position:relative}
+  .step:first-child{border-radius:12px 0 0 12px}
+  .step:last-child{border-radius:0 12px 12px 0}
+  .step .k{font-family:var(--mono);color:var(--brand);font-size:12px}
+  .step h4{margin:6px 0 4px;font-size:15px}
+  .step p{color:var(--dim);font-size:12.5px;margin:0}
+  @media(max-width:860px){.step{border-radius:12px!important;min-width:100%}}
+  .kpi{display:grid;grid-template-columns:repeat(4,1fr);gap:14px}
+  @media(max-width:860px){.kpi{grid-template-columns:1fr 1fr}}
+  .kpi .b{background:var(--bg2);border:1px solid var(--line);border-radius:12px;padding:16px;text-align:center}
+  .kpi .b .v{font-size:26px;font-weight:800;color:var(--brand2)}
+  .kpi .b .l{font-size:12px;color:var(--dim);margin-top:2px}
+  .note{background:linear-gradient(180deg,#161b27,#12161f);border:1px solid var(--line);border-left:3px solid var(--brand);border-radius:10px;padding:16px 18px;color:var(--muted);font-size:14px}
+  .two{display:grid;grid-template-columns:1fr 1fr;gap:24px}
+  @media(max-width:860px){.two{grid-template-columns:1fr}}
+  code{font-family:var(--mono);background:var(--bg2);border:1px solid var(--line);padding:1px 6px;border-radius:5px;font-size:.88em;color:var(--brand2)}
+  .road li b{color:var(--ink)}
+  footer{padding:40px 0 70px;color:var(--dim);font-size:12.5px;border-top:1px solid var(--line)}
+  footer a{color:var(--muted)}
+  .src{font-size:12.5px;color:var(--dim)}
+  .src a{color:var(--muted)}
+  .badge-row{display:flex;gap:8px;flex-wrap:wrap;margin-top:14px}
+</style>
+</head>
+<body>
+
+<header class="top"><div class="wrap">
+  <div class="logo"><b>Varta</b> Cloud</div>
+  <nav>
+    <a href="#gap">The gap</a>
+    <a href="#product">Product</a>
+    <a href="#icp">Who buys</a>
+    <a href="#land">Competitors</a>
+    <a href="#price">Pricing</a>
+    <a href="#model">Model</a>
+    <a href="#road">Next steps</a>
+  </nav>
+</div></header>
+
+<div class="wrap">
+
+<section class="hero" style="border-top:0">
+  <span class="pill">SaaS concept · open-core · v0 strategy memo</span>
+  <h1>The control plane for fleets of<br><span class="g">long-running local agents.</span></h1>
+  <p class="lede">
+    Varta is already an open-source health protocol: one observer watches thousands of local
+    processes over a 32-byte heartbeat, detects stalls, and auto-recovers them — zero deps,
+    sub-microsecond beat path. <b>Varta Cloud</b> is the managed control plane on top:
+    fleet dashboards, on-call alerting, recovery audit trails, and compliance evidence for
+    teams running agents they can't afford to have die silently.
+  </p>
+  <div class="cta">
+    <a class="btn p" href="#product">See the product →</a>
+    <a class="btn" href="#road">90-day plan to first revenue</a>
+  </div>
+  <div class="badge-row">
+    <span class="tag">OSS keeps driving adoption</span>
+    <span class="tag">Cloud captures the value</span>
+    <span class="tag">Enterprise sells compliance</span>
+  </div>
+</section>
+
+<!-- ============ THE GAP ============ -->
+<section id="gap">
+  <h2><span class="num">01</span>The market gap Varta sits in</h2>
+  <p class="sub">
+    Two crowded markets bracket the problem — and neither solves it. Varta owns the seam between them:
+    <b>process liveness + auto-recovery for fleets of long-running local agents</b>.
+  </p>
+
+  <div class="grid g3">
+    <div class="card">
+      <div class="ic">⏰</div>
+      <h3>Cron / heartbeat monitors</h3>
+      <p><i>healthchecks.io, Cronitor, Dead Man's Snitch, Better Stack.</i> Built for "did this job
+      check in over HTTP." Coarse (per-minute pings), one URL per check, no recovery, no
+      sub-second detection, nothing for thousands of co-located PIDs.</p>
+    </div>
+    <div class="card" style="border-color:var(--brand)">
+      <div class="ic">🐺</div>
+      <h3 style="color:var(--brand2)">Varta — the missing layer</h3>
+      <p>Sub-µs heartbeats, one observer per host watching thousands of agents, stall detection
+      at the <code>ms</code>, <b>automatic recovery</b>, cryptographic attestation, and
+      safety-critical build profiles. The "is my agent actually alive — and fix it if not" layer.</p>
+    </div>
+    <div class="card">
+      <div class="ic">🧠</div>
+      <h3>AI agent observability</h3>
+      <p><i>Langfuse, AgentOps, Braintrust, Arize.</i> Built for LLM traces, evals, and token cost
+      — the <i>quality</i> of an agent's reasoning. They assume the process is up. None of them tell
+      you the agent <b>wedged</b> and stopped beating.</p>
+    </div>
+  </div>
+
+  <div class="note" style="margin-top:18px">
+    <b>The timing thesis.</b> AI agents are turning into <i>long-running background processes</i>, not
+    request/response calls. As autonomous agents, robots, and edge devices proliferate, "my agent
+    silently hung and I found out from a customer ticket" becomes a top-tier failure mode — and the
+    trace/eval tools are blind to it. Varta already speaks that language: <i>"Your background workers
+    die silently — find out before your users do."</i>
+  </div>
+</section>
+
+<!-- ============ PRODUCT ============ -->
+<section id="product">
+  <h2><span class="num">02</span>The product: open-core</h2>
+  <p class="sub">Keep the protocol and observer 100% open — that's the adoption engine. Sell the
+    cloud control plane that a growing fleet eventually needs.</p>
+
+  <div class="two">
+    <div class="card">
+      <h3>🟢 Open source &nbsp;<span class="tag">free forever</span></h3>
+      <ul class="clean">
+        <li><b>VLP protocol</b> + 6 language clients (Rust, Py, Go, Node, .NET, JVM)</li>
+        <li><b>varta-watch</b> observer — stall detection, recovery, Prometheus <code>/metrics</code></li>
+        <li>Self-hosted, unlimited agents, zero telemetry leaves the box</li>
+        <li>Drives bottom-up developer adoption + credibility</li>
+      </ul>
+    </div>
+    <div class="card" style="border-color:var(--brand)">
+      <h3>🟠 Varta Cloud &nbsp;<span class="tag" style="color:var(--brand2);border-color:var(--brand)">paid</span></h3>
+      <ul class="clean">
+        <li>Observers stream telemetry up via a lightweight, outbound-only agent</li>
+        <li><b>Multi-fleet dashboards</b> — every host, every agent, one pane</li>
+        <li><b>On-call</b> — PagerDuty / Opsgenie / Slack / webhook routing + escalation</li>
+        <li><b>Recovery audit trail</b> — who/what/when restarted, tamper-evident</li>
+        <li><b>Anomaly detection</b> + historical analytics + SLA / uptime reports</li>
+        <li><b>RBAC / SSO / SAML</b>, retention tiers, multi-tenant org management</li>
+      </ul>
+    </div>
+  </div>
+
+  <h3 style="margin:28px 0 10px">How the value flows</h3>
+  <div class="flow">
+    <div class="step"><div class="k">agent</div><h4>beat()</h4><p>32-byte heartbeat, zero-alloc, sub-µs.</p></div>
+    <div class="step"><div class="k">host</div><h4>observer</h4><p>Detects stalls, runs recovery locally — works offline.</p></div>
+    <div class="step"><div class="k">edge→cloud</div><h4>secure uplink</h4><p>Outbound-only, attested, batched telemetry.</p></div>
+    <div class="step"><div class="k">cloud</div><h4>control plane</h4><p>Dashboards, alerting, audit, analytics, SLA.</p></div>
+  </div>
+  <p class="dim" style="font-size:13px;margin-top:10px">Recovery never depends on the cloud — the
+    observer is autonomous. The cloud adds visibility, coordination, and evidence. That's the trust story.</p>
+</section>
+
+<!-- ============ ICP ============ -->
+<section id="icp">
+  <h2><span class="num">03</span>Who buys this</h2>
+  <p class="sub">Rank by willingness-to-pay = (cost of a silent stall) × (number of agents). The
+    safety-critical segments are already coded into Varta's <b>Class-A</b> build profiles — a moat.</p>
+  <div class="grid g3">
+    <div class="card"><h3>🤖 AI agent platforms</h3><p>Teams running long-lived autonomous agents / workers. A hung agent = stuck workflows, burned spend, silent SLA breach. Fast-growing, well-funded, OSS-native buyers.</p></div>
+    <div class="card"><h3>🦾 Robotics &amp; autonomous systems</h3><p>Drones, AMRs, self-driving rigs. Many co-located daemons per machine; a wedged process is a safety event. Sub-µs + recovery is non-negotiable.</p></div>
+    <div class="card"><h3>🩺 Medical / clinical edge</h3><p>Varta already ships Class-A safety profiles &amp; STRIDE threat model. IEC 62304 / FDA evidence is a budget line, not a nice-to-have.</p></div>
+    <div class="card"><h3>🏭 Industrial IoT &amp; edge fleets</h3><p>Thousands of gateways running data-collection daemons in the field; remote, intermittent connectivity. Outbound-only uplink fits.</p></div>
+    <div class="card"><h3>📈 Fintech / trading infra</h3><p>Low-latency market-data and execution daemons where a stalled process is measured in lost dollars per second.</p></div>
+    <div class="card"><h3>🧩 Platform / infra teams</h3><p>Anyone running a fleet of background workers who's outgrown "a cron monitor and hope," but doesn't want a pod + HTTP port per PID.</p></div>
+  </div>
+</section>
+
+<!-- ============ COMPETITIVE LANDSCAPE ============ -->
+<section id="land">
+  <h2><span class="num">04</span>Competitive landscape</h2>
+  <p class="sub">Varta is not a feature of any of these — it's the layer underneath them. Most users
+    will run Varta <i>and</i> a trace tool.</p>
+  <div class="tbl-wrap">
+  <table>
+    <thead><tr>
+      <th>Capability</th>
+      <th>Cron monitors<br><span class="dim">healthchecks / Cronitor / DMS</span></th>
+      <th>Agent observability<br><span class="dim">Langfuse / AgentOps / Arize</span></th>
+      <th style="color:var(--brand2)">Varta Cloud</th>
+    </tr></thead>
+    <tbody>
+      <tr><td>Sub-second stall detection</td><td class="n">✗ (minute-grain)</td><td class="n">✗</td><td class="y">✓ ms-grain</td></tr>
+      <tr><td>Thousands of agents / host</td><td class="n">✗ one URL per check</td><td class="p">~ per-trace</td><td class="y">✓ one observer</td></tr>
+      <tr><td>Automatic recovery / restart</td><td class="n">✗ alert only</td><td class="n">✗</td><td class="y">✓ debounced exec</td></tr>
+      <tr><td>Zero-dep, zero-alloc client</td><td class="n">✗ HTTP</td><td class="n">✗ SDK + deps</td><td class="y">✓ 32-byte UDS</td></tr>
+      <tr><td>Cryptographic attestation</td><td class="n">✗</td><td class="n">✗</td><td class="y">✓ AEAD + kernel-attested</td></tr>
+      <tr><td>Safety-critical (Class-A) build</td><td class="n">✗</td><td class="n">✗</td><td class="y">✓ structurally excised</td></tr>
+      <tr><td>Offline / air-gapped operation</td><td class="n">✗ needs inbound ping</td><td class="p">~</td><td class="y">✓ observer autonomous</td></tr>
+      <tr><td>LLM trace / eval / token cost</td><td class="n">✗</td><td class="y">✓ their core</td><td class="n">✗ out of scope</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p class="dim" style="font-size:12.5px;margin-top:12px">Pricing anchors observed (2026): healthchecks.io free→paid · Cronitor ~$12/mo·50 checks · Dead Man's Snitch from $5/mo · AgentOps free→$40/mo · Langfuse Core $29 / Pro $199 / Ent $2,499. Varta Cloud should price <i>between</i> a cron monitor and an observability platform. Sources at bottom.</p>
+</section>
+
+<!-- ============ PRICING ============ -->
+<section id="price">
+  <h2><span class="num">05</span>Pricing concept</h2>
+  <p class="sub">Land on agents-monitored as the value metric (simple, scales with the customer's
+    fleet, not their headcount). Compliance is the enterprise upsell.</p>
+  <div class="price">
+    <div class="tier">
+      <h3>OSS</h3>
+      <div class="amt">$0</div>
+      <div class="who">Self-host everything. Unlimited agents.</div>
+      <ul>
+        <li>Protocol + all clients</li>
+        <li>varta-watch observer</li>
+        <li>Local recovery + Prometheus</li>
+        <li>Community support</li>
+      </ul>
+    </div>
+    <div class="tier hi">
+      <h3>Pro</h3>
+      <div class="amt">$49<small>/mo</small></div>
+      <div class="who">Indie / small team running one fleet.</div>
+      <ul>
+        <li>Cloud dashboard, 1 fleet</li>
+        <li>Up to ~50 agents</li>
+        <li>Slack + email alerts</li>
+        <li>30-day retention + recovery log</li>
+      </ul>
+    </div>
+    <div class="tier">
+      <h3>Team</h3>
+      <div class="amt">$299<small>/mo</small></div>
+      <div class="who">Scaling fleets that need on-call + RBAC.</div>
+      <ul>
+        <li>Multi-fleet, ~500 agents</li>
+        <li>PagerDuty / Opsgenie</li>
+        <li>SSO, RBAC, 1-yr retention</li>
+        <li>Anomaly detection + SLA reports</li>
+        <li>+ usage: $X / extra agent</li>
+      </ul>
+    </div>
+    <div class="tier">
+      <h3>Enterprise</h3>
+      <div class="amt">Custom</div>
+      <div class="who">Safety-critical &amp; regulated fleets.</div>
+      <ul>
+        <li>Compliance evidence pack<br><span class="dim">(Class-A audit, IEC 62304 / DO-178C / SOC 2)</span></li>
+        <li>On-prem / VPC control plane</li>
+        <li>SAML, unlimited agents</li>
+        <li>Support SLA + roadmap input</li>
+      </ul>
+    </div>
+  </div>
+  <p class="dim" style="font-size:12.5px;margin-top:12px">Numbers are starting hypotheses to validate
+    with design-partner calls — not committed prices. Keep per-seat out of it (Langfuse's edge); charge for fleet size + retention + compliance.</p>
+</section>
+
+<!-- ============ BUSINESS MODEL ============ -->
+<section id="model">
+  <h2><span class="num">06</span>Business model &amp; GTM</h2>
+  <div class="two">
+    <div>
+      <h3>The open-core motion</h3>
+      <ul class="clean">
+        <li><b>Top of funnel:</b> OSS install (`curl | sh`, crates.io, PyPI, npm). Devs adopt for free, in their own infra.</li>
+        <li><b>Activation:</b> fleet grows past 1 host → "I need one dashboard for all of these" → Cloud signup.</li>
+        <li><b>Expansion:</b> more agents, more fleets, longer retention → tier upgrades (usage-based).</li>
+        <li><b>Enterprise:</b> regulated buyer needs the compliance/audit pack + on-prem → sales-assisted.</li>
+      </ul>
+    </div>
+    <div>
+      <h3>Why this is defensible</h3>
+      <ul class="clean">
+        <li><b>Protocol lock-in via openness</b> — VLP becomes the standard; clients in 6 languages already.</li>
+        <li><b>Engineering moat</b> — zero-dep, no_std, sub-µs, AEAD, Class-A profiles are <i>hard</i> to copy.</li>
+        <li><b>Compliance moat</b> — threat model + safety profiles are years of work a competitor can't bolt on.</li>
+        <li><b>Wedge position</b> — neither cron-monitors nor trace tools want to rebuild low-level liveness.</li>
+      </ul>
+    </div>
+  </div>
+
+  <h3 style="margin:28px 0 12px">Illustrative early traction targets</h3>
+  <div class="kpi">
+    <div class="b"><div class="v">2k</div><div class="l">OSS installs (yr 1)</div></div>
+    <div class="b"><div class="v">2–4%</div><div class="l">OSS → Cloud conversion</div></div>
+    <div class="b"><div class="v">~$150</div><div class="l">blended ACV / mo</div></div>
+    <div class="b"><div class="v">$70k+</div><div class="l">ARR exit run-rate (yr 1)</div></div>
+  </div>
+  <p class="dim" style="font-size:12.5px;margin-top:10px">Open-core conversion is famously low (1–5%) — the
+    model lives or dies on OSS install volume and on enterprise compliance deals (few, large) carrying ARR. Validate both early.</p>
+</section>
+
+<!-- ============ ROADMAP ============ -->
+<section id="road">
+  <h2><span class="num">07</span>What to do next — 90 days to first paying user</h2>
+  <p class="sub">You already have the hard part (the OSS protocol + observer + clients). The SaaS is a
+    thin, trustworthy cloud on top. Sequence it for the fastest validated dollar.</p>
+
+  <div class="grid g3">
+    <div class="card">
+      <h3>Weeks 1–3 · Validate</h3>
+      <ul class="clean road">
+        <li>Interview <b>10 target users</b> (AI-agent + robotics + edge teams) running fleets today.</li>
+        <li>Confirm the pain &amp; willingness-to-pay; pick <b>3 design partners</b>.</li>
+        <li>Add a one-line <b>"Varta Cloud — join waitlist"</b> CTA to varta.sh + README.</li>
+        <li>Instrument OSS install telemetry (opt-in) to size the funnel.</li>
+      </ul>
+    </div>
+    <div class="card">
+      <h3>Weeks 4–9 · Thin cloud MVP</h3>
+      <ul class="clean road">
+        <li>Build the <b>outbound uplink</b> in varta-watch (batched, attested, opt-in).</li>
+        <li>Ship the smallest valuable cloud: <b>multi-host dashboard + Slack/PagerDuty alert</b>.</li>
+        <li>Stripe billing, single Pro tier, manual onboarding for the 3 partners.</li>
+        <li>Recovery audit log (you already have tamper-evident audit primitives).</li>
+      </ul>
+    </div>
+    <div class="card">
+      <h3>Weeks 10–13 · Monetize</h3>
+      <ul class="clean road">
+        <li>Convert ≥1 design partner to <b>paid</b>; write the case study.</li>
+        <li>Open public self-serve signup; turn on Team tier.</li>
+        <li>Scope the <b>Enterprise compliance pack</b> (Class-A evidence) for first regulated lead.</li>
+        <li>Decide: bootstrap on OSS goodwill vs. raise on the agent-infra thesis.</li>
+      </ul>
+    </div>
+  </div>
+
+  <div class="note" style="margin-top:22px">
+    <b>Cheapest possible first test (this week):</b> publish this page (or a landing variant) at
+    <code>varta.sh/cloud</code> with a waitlist form. If your existing OSS audience signs up, you've
+    validated demand before writing a line of cloud code. The OSS repo is your distribution — use it.
+  </div>
+
+  <h3 style="margin:30px 0 10px">Key risks to retire early</h3>
+  <div class="grid g2">
+    <div class="card"><p><b>Low conversion.</b> Open-core converts at 1–5%. Mitigate: make the cloud genuinely painful-to-rebuild (alerting, multi-fleet, compliance), not a thin wrapper over <code>/metrics</code>.</p></div>
+    <div class="card"><p><b>"Just use Prometheus + Grafana."</b> You already ship that bundle free. The cloud must sell time-saved + on-call + audit + compliance, not dashboards alone.</p></div>
+    <div class="card"><p><b>Trust / data residency.</b> Edge &amp; medical buyers fear telemetry leaving the box. Lead with outbound-only, opt-in, on-prem option, and "recovery never needs the cloud."</p></div>
+    <div class="card"><p><b>Solo maintainer bandwidth.</b> A SaaS needs uptime + support. Consider a managed-Postgres + serverless stack to keep ops near-zero; or partner/raise before committing.</p></div>
+  </div>
+</section>
+
+<!-- ============ SOURCES ============ -->
+<section>
+  <h2><span class="num">08</span>Research sources</h2>
+  <p class="src">Competitor &amp; market scan, June 2026:</p>
+  <p class="src">
+    AI-agent observability landscape —
+    <a href="https://www.getmaxim.ai/articles/top-5-ai-agent-observability-platforms-in-2026/">Maxim</a> ·
+    <a href="https://arize.com/blog/best-ai-observability-tools-for-autonomous-agents-in-2026/">Arize</a> ·
+    <a href="https://aimultiple.com/agentic-monitoring">AIMultiple (AgentOps/Langfuse)</a> ·
+    <a href="https://www.braintrust.dev/articles/best-ai-agent-observability-tools-2026">Braintrust</a> ·
+    <a href="https://latitude.so/blog/best-ai-agent-observability-tools-2026-comparison">Latitude</a><br>
+    Pricing —
+    <a href="https://checkthat.ai/brands/langfuse/pricing">Langfuse pricing</a> ·
+    <a href="https://aidevdayindia.org/blogs/ai-agent-observability-agentops-playbook/ai-agent-observability-agentops-playbook.html">AgentOps</a><br>
+    Heartbeat / cron monitors —
+    <a href="https://betterstack.com/community/comparisons/cronjob-monitoring-tools/">Better Stack: 10 cron monitoring tools</a> ·
+    <a href="https://cronping.com/alternatives/healthchecks-io">healthchecks.io alternatives</a> ·
+    <a href="https://cronping.com/alternatives/dead-mans-snitch">Dead Man's Snitch alternatives</a> ·
+    <a href="https://www.saashub.com/compare-cronitor-vs-healthchecks-io">Cronitor vs healthchecks.io</a> ·
+    <a href="https://www.ilert.com/blog/monitoring-iot-devices-with-heartbeats">ilert: IoT heartbeat monitoring</a>
+  </p>
+</section>
+
+</div>
+
+<footer><div class="wrap">
+  <b style="color:var(--ink)">Varta Cloud</b> — internal strategy concept · generated June 2026 ·
+  source-of-truth for the OSS project: <a href="https://varta.sh">varta.sh</a> ·
+  <span class="dim">Pricing &amp; projections are hypotheses to validate with design partners, not commitments.</span>
+</div></footer>
+
+</body>
+</html>
