@@ -8,6 +8,20 @@ workspace and follows [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **Secure-UDP `reconnect()` is now transactional and never throws an unchecked
+  exception.** It reconnected the inner socket first and only then called
+  `rotateSession()` to refresh the IV state (entropy read + KDF). If that
+  refresh failed — `SecureRandom`/KDF unavailable, entropy exhausted, seccomp
+  restriction — it threw an unchecked `IllegalStateException`, which is NOT
+  caught by `beat()`'s fork-recovery `catch (IOException)` and so escaped
+  `beat()` entirely, crashing the caller's beat loop (a never-throws-contract
+  violation); and it left the transport with a freshly-reconnected socket paired
+  with stale IV state. `reconnect()` now prepares all fallible session material
+  (entropy + IV prefix) into locals first, surfacing any failure as a checked
+  `IOException` (so `beat()` returns `Failed`), and only then reconnects the
+  socket and commits — so a failure leaves the transport entirely unchanged.
+  Mirrors the Rust and .NET prepare-then-commit reconnect.
+
 - **POSIX signal panic handler no longer clobbers the host's own signal
   handler.** `SignalHandler.installSignalHandler*` installed a
   `sun.misc.Signal` handler that, on `SIGTERM`/`SIGINT`/`SIGQUIT`/`SIGHUP`,

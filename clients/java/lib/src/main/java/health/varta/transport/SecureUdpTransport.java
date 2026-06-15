@@ -40,6 +40,44 @@ public final class SecureUdpTransport implements BeatTransport {
     private int counter = 0;
     private int agentPid = (int) ProcessHandle.current().pid();
 
+    /** The fallible entropy + IV-derivation step of a session rotation,
+     *  isolated so a failure can be (a) surfaced as a checked {@link IOException}
+     *  rather than an unchecked exception that would escape {@code beat()}'s
+     *  fork-recovery {@code catch (IOException)}, and (b) injected in tests. */
+    @FunctionalInterface
+    interface SessionMaterialSource {
+        /** @return {@code {sessionSalt, ivPrefix}} for a fresh session. */
+        byte[][] get() throws IOException;
+    }
+
+    private SessionMaterialSource sessionMaterialSource =
+        SecureUdpTransport::readFreshSessionMaterial;
+
+    /** Package-private: tests override the entropy/KDF source to force a
+     *  session-prep failure during {@link #reconnect()}. */
+    void __setSessionMaterialSourceForTest(SessionMaterialSource source) {
+        this.sessionMaterialSource = source;
+    }
+
+    private static byte[][] readFreshSessionMaterial() throws IOException {
+        try {
+            // NativePRNGNonBlocking maps to getrandom(2) on Linux without
+            // blocking on first-boot pool init; falls back elsewhere.
+            SecureRandom rng;
+            try {
+                rng = SecureRandom.getInstance("NativePRNGNonBlocking");
+            } catch (NoSuchAlgorithmException ignored) {
+                rng = new SecureRandom();
+            }
+            byte[] salt = new byte[Hkdf.SESSION_SALT_BYTES];
+            rng.nextBytes(salt);
+            byte[] prefix = Hkdf.deriveIvPrefix(salt, 0);
+            return new byte[][] {salt, prefix};
+        } catch (Exception e) {
+            throw new IOException("could not read secure-session entropy", e);
+        }
+    }
+
     private SecureUdpTransport(Mode mode, InetSocketAddress addr, byte[] key32) throws IOException {
         this.mode = mode;
         this.addr = addr;
@@ -79,21 +117,18 @@ public final class SecureUdpTransport implements BeatTransport {
     }
 
     private void rotateSession() {
+        // Construction-time rotation: an entropy/KDF failure here is a fatal
+        // startup error, so it is fine to surface it as an unchecked exception
+        // (the factory methods already declare {@code throws IOException} for
+        // the socket bind). {@link #reconnect()} must NOT use this path — there
+        // a failure must stay an IOException so {@code beat()} can return Failed.
         try {
-            // NativePRNGNonBlocking on Linux maps to getrandom(2) without
-            // blocking on first-boot pool init. Falls back to the default
-            // strong instance on other platforms.
-            SecureRandom rng;
-            try {
-                rng = SecureRandom.getInstance("NativePRNGNonBlocking");
-            } catch (NoSuchAlgorithmException ignored) {
-                rng = new SecureRandom();
-            }
-            rng.nextBytes(sessionSalt);
+            byte[][] material = sessionMaterialSource.get();
+            System.arraycopy(material[0], 0, sessionSalt, 0, sessionSalt.length);
+            ivPrefix = material[1];
             prefixIndex = 0;
             counter = 0;
-            ivPrefix = Hkdf.deriveIvPrefix(sessionSalt, prefixIndex);
-        } catch (Exception e) {
+        } catch (IOException e) {
             throw new IllegalStateException("could not initialise secure session", e);
         }
     }
@@ -145,10 +180,27 @@ public final class SecureUdpTransport implements BeatTransport {
 
     @Override
     public void reconnect() throws IOException {
+        // Prepare ALL fallible session material (entropy + KDF) into locals
+        // FIRST, surfacing any failure as the declared, caught IOException — so
+        // beat()'s fork-recovery path returns Failed instead of letting an
+        // unchecked exception escape (the never-throws contract), and so a
+        // failure leaves the transport entirely unchanged. Only after the
+        // material is in hand do we reconnect the socket and commit; the commit
+        // cannot fail. Mirrors the Rust/.NET prepare-then-commit reconnect.
+        //
+        // The prior order (inner.reconnect() then rotateSession()) both threw an
+        // unchecked IllegalStateException on entropy failure — which escaped the
+        // fork-recovery catch and crashed the caller's beat loop — AND left a
+        // freshly-reconnected socket paired with stale IV state when entropy
+        // failed after the socket was already swapped.
+        int newAgentPid = (int) ProcessHandle.current().pid();
+        byte[][] material = sessionMaterialSource.get();
         inner.reconnect();
-        // Re-read entropy; this guards against fork() reusing parent's IV.
-        agentPid = (int) ProcessHandle.current().pid();
-        rotateSession();
+        System.arraycopy(material[0], 0, sessionSalt, 0, sessionSalt.length);
+        ivPrefix = material[1];
+        prefixIndex = 0;
+        counter = 0;
+        agentPid = newAgentPid;
     }
 
     @Override

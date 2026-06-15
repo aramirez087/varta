@@ -3,6 +3,7 @@ package health.varta.transport;
 import health.varta.Key;
 import org.junit.jupiter.api.Test;
 
+import java.io.IOException;
 import java.lang.reflect.Method;
 import java.net.DatagramPacket;
 import java.net.DatagramSocket;
@@ -12,6 +13,7 @@ import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 class SecureUdpTransportTest {
 
@@ -141,6 +143,57 @@ class SecureUdpTransportTest {
         assertThat(tx.__getPrefixIndexForTest()).isEqualTo(prefixBefore + 1);
         assertThat(tx.__getIvPrefixForTest()).isNotEqualTo(ivBefore);
         assertThat(tx.__getCounterForTest()).isEqualTo(1);
+    }
+
+    /** Inner transport that records how many times reconnect() was called. */
+    private static final class RecordingInner implements BeatTransport {
+        int reconnects = 0;
+
+        @Override
+        public int send(ByteBuffer frame) {
+            return frame.remaining();
+        }
+
+        @Override
+        public void reconnect() {
+            reconnects++;
+        }
+
+        @Override
+        public void close() {
+        }
+    }
+
+    @Test
+    void reconnect_entropy_failure_surfaces_ioexception_and_is_transactional() {
+        // Regression: a session-prep (entropy/KDF) failure during reconnect()
+        // must surface as a checked IOException — so beat()'s fork-recovery
+        // catch (IOException) returns Failed instead of an unchecked exception
+        // escaping and crashing the caller's beat loop — AND must leave the
+        // transport entirely unchanged: the inner socket is NOT reconnected
+        // until the fresh session material is in hand. The prior code ran
+        // inner.reconnect() first and then threw IllegalStateException from
+        // rotateSession() on entropy failure, leaving a new socket with stale IV.
+        RecordingInner inner = new RecordingInner();
+        SecureUdpTransport tx =
+            new SecureUdpTransport(SecureUdpTransport.Mode.SHARED, inner, KEY32);
+
+        int prefixBefore = tx.__getPrefixIndexForTest();
+        byte[] ivBefore = tx.__getIvPrefixForTest();
+
+        tx.__setSessionMaterialSourceForTest(() -> {
+            throw new IOException("simulated entropy failure");
+        });
+
+        assertThatThrownBy(tx::reconnect)
+            .as("a session-prep failure must surface as IOException, not an unchecked exception")
+            .isInstanceOf(IOException.class);
+
+        // Transactional: the inner socket was never reconnected (prepare failed
+        // first), and the IV state is unchanged.
+        assertThat(inner.reconnects).isZero();
+        assertThat(tx.__getPrefixIndexForTest()).isEqualTo(prefixBefore);
+        assertThat(tx.__getIvPrefixForTest()).isEqualTo(ivBefore);
     }
 
     private static int invokeIntHook(Object target, String name) throws Exception {
