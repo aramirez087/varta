@@ -8,6 +8,14 @@ here. Versioning is independent of the Rust workspace and follows
 
 ### Fixed
 
+- **`Beat()` no longer throws when a fork-recovery reconnect fails.** The
+  fork-detection branch called `_transport.Reconnect()` unguarded, so if the
+  forked child could not re-establish the socket the `SocketException`
+  propagated straight out of `Beat()` and crashed the caller's beat loop —
+  violating the documented never-throws contract. A failed fork reconnect is
+  now caught and surfaced as `BeatOutcome.Failed`, matching the Rust reference
+  and the Go/Python/Node clients; the connect PID is left unchanged so the next
+  beat retries the reconnect.
 - **Regular beat: the wire timestamp now saturates instead of overflowing.**
   `Varta.Beat` computed the timestamp as `(ulong)(elapsedTicks * 100L)` in
   signed-`long` arithmetic with no clamp. After a multi-century single-handle

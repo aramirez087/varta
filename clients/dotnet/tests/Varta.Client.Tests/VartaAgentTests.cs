@@ -90,6 +90,28 @@ public class VartaAgentTests
         Assert.Equal(2, transport.Reconnects);
     }
 
+    [Fact]
+    public void Beat_ForkReconnectFailure_ReturnsFailed_NeverThrows()
+    {
+        // Regression (bug-480): Beat()'s fork-recovery branch called
+        // _transport.Reconnect() unguarded; a failed reconnect (the forked
+        // child cannot re-establish the socket) let a SocketException escape
+        // Beat(), violating the documented never-throws contract that every
+        // peer client (Rust/Go/Python/Node) honours by returning Failed.
+        var transport = new DropAndFailReconnect();
+        using var agent = global::Varta.Varta.FromTransportForTest(transport);
+
+        // Spoof the connect PID so the next Beat() takes the fork-recovery
+        // branch, whose Reconnect() throws a SocketException.
+        agent.SetConnectPidForTest(Environment.ProcessId + 1);
+
+        var outcome = agent.Beat(Status.Ok);
+        Assert.True(
+            outcome.IsFailed,
+            "a failed fork reconnect must surface as Failed, not throw");
+        Assert.Equal(1, transport.Reconnects);
+    }
+
     [SkipOnWindowsFact]
     public void Beat_OnUds_SendsValidFrame()
     {

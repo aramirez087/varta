@@ -128,7 +128,20 @@ public sealed class Varta : IDisposable
             int currentPid = Environment.ProcessId;
             if (currentPid != _connectPid)
             {
-                _transport.Reconnect();
+                try
+                {
+                    _transport.Reconnect();
+                }
+                catch (SocketException ex)
+                {
+                    // Beat() must never throw (the documented contract). A failed
+                    // fork-recovery reconnect is surfaced as Failed — matching the
+                    // Rust reference (client.rs: `Err(e) => BeatOutcome::Failed`)
+                    // and the Go/Python/Node clients. _connectPid is left
+                    // unchanged so the next beat retries the reconnect.
+                    return BeatOutcome.Failed(
+                        new BeatError(ex.NativeErrorCode, ex.SocketErrorCode.ToString()));
+                }
                 _connectPid = currentPid;
                 _nonce = 1;
                 _lastTimestamp = 0;
