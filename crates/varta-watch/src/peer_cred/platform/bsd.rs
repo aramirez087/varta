@@ -81,6 +81,17 @@ pub(crate) struct Cmsgcred {
 
 /// `SOL_SOCKET` on FreeBSD / XNU derivatives = `0xffff` (`<sys/socket.h>`).
 pub(crate) const SOL_SOCKET: i32 = 0xffff;
+/// `SOL_LOCAL` on the BSD family = `0` (`<sys/un.h>`) — the protocol level for
+/// the PF_LOCAL `LOCAL_*` option family. `LOCAL_CREDS` MUST be enabled via
+/// `setsockopt(2)` at this level: the FreeBSD/DragonFly/NetBSD kernels route
+/// `LOCAL_*` options through the protocol's `ctloutput` and reject any level
+/// other than `SOL_LOCAL`. This is the SAME level macOS uses for its
+/// `LOCAL_PEER*` options (`macos.rs`: `SOL_LOCAL = 0`).
+///
+/// Distinct from [`SOL_SOCKET`] above, which is the level the kernel STAMPS on
+/// the *delivered* `SCM_CREDS` cmsg ([`BsdCmsg::TARGET_LEVEL`]); that stays
+/// `SOL_SOCKET` and is unrelated to the enabling level.
+pub(crate) const SOL_LOCAL: i32 = 0;
 /// `LOCAL_CREDS` enables SCM_CREDS ancillary data on received datagrams.
 /// Value: 0x0002 on FreeBSD/DragonFly (`<sys/un.h>`),
 ///        0x0001 on NetBSD.
@@ -266,5 +277,21 @@ mod layout_tests {
         assert_field_offset!(Cmsgcred, cmcred_gid, 12);
         assert_field_offset!(Cmsgcred, cmcred_ngroups, 16);
         assert_field_offset!(Cmsgcred, cmcred_groups, 20);
+    }
+
+    #[test]
+    fn local_creds_enabled_at_sol_local_not_sol_socket() {
+        // Regression (bug-467): `LOCAL_CREDS` is a `<sys/un.h>` PF_LOCAL-level
+        // option. `enable_credential_passing` MUST set it via `setsockopt` at
+        // `SOL_LOCAL` (0), the protocol level — NOT `SOL_SOCKET` (0xffff). At
+        // `SOL_SOCKET` the optname aliases an unrelated `SO_*` option:
+        // `SO_ACCEPTCONN` on FreeBSD/DragonFly (get-only -> `setsockopt`
+        // ENOPROTOOPT -> observer never starts) or `SO_DEBUG` on NetBSD (silent
+        // no-op -> no `SCM_CREDS` -> every beat dropped). The macOS `LOCAL_*`
+        // family already uses `SOL_LOCAL = 0`. `mod bsd` compiles on Linux CI,
+        // so this guards the constant the BSD receive path depends on without a
+        // BSD host; reverting the const to `SOL_SOCKET` turns this red.
+        assert_eq!(super::SOL_LOCAL, 0);
+        assert_ne!(super::SOL_LOCAL, super::SOL_SOCKET);
     }
 }

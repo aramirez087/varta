@@ -110,17 +110,30 @@ pub(crate) fn enable_credential_passing(fd: i32) -> io::Result<()> {
 
     #[cfg(any(target_os = "freebsd", target_os = "dragonfly", target_os = "netbsd"))]
     {
-        let (level, optname) = (plat::SOL_SOCKET, plat::LOCAL_CREDS);
+        // `LOCAL_CREDS` is a `<sys/un.h>` PF_LOCAL-level option: it MUST be set
+        // at `SOL_LOCAL` (0), the protocol level — NOT at `SOL_SOCKET` (0xffff).
+        // At `SOL_SOCKET` the optname aliases an unrelated `SO_*` option: on
+        // FreeBSD/DragonFly `0x0002` is the get-only `SO_ACCEPTCONN`, so
+        // `setsockopt` fails `ENOPROTOOPT` and the observer never starts; on
+        // NetBSD `0x0001` is `SO_DEBUG`, which succeeds silently but never
+        // enables `SCM_CREDS`, so every datagram is dropped as un-credentialed.
+        // The macOS `LOCAL_*` family (`macos.rs`) already sets at `SOL_LOCAL`.
+        const LEVEL: i32 = plat::SOL_LOCAL;
+        const OPTNAME: i32 = plat::LOCAL_CREDS;
+        // Regression guard: pin the enabling level to `SOL_LOCAL` at compile
+        // time so a future edit cannot silently restore the `SOL_SOCKET` brick.
+        const _: () = assert!(LEVEL == plat::SOL_LOCAL && LEVEL != plat::SOL_SOCKET);
         let one: i32 = 1;
-        // SAFETY: `setsockopt(2)` with `LOCAL_CREDS` (see `unix(4)`) reads
-        // `optlen` bytes from `optval`. Same invariants as the Linux branch
-        // above: `fd` is the freshly bound UDS receive socket, `addr_of!`
-        // yields a valid pointer to a stack-local i32, `optlen` matches.
+        // SAFETY: `setsockopt(2)` with `LOCAL_CREDS` at level `SOL_LOCAL` (see
+        // `unix(4)`) reads `optlen` bytes from `optval`. Same invariants as the
+        // Linux branch above: `fd` is the freshly bound UDS receive socket,
+        // `addr_of!` yields a valid pointer to a stack-local i32, `optlen`
+        // matches.
         let ret = unsafe {
             plat::setsockopt(
                 fd,
-                level,
-                optname,
+                LEVEL,
+                OPTNAME,
                 core::ptr::addr_of!(one) as *const core::ffi::c_void,
                 core::mem::size_of::<i32>() as u32,
             )
