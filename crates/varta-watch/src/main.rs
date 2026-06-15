@@ -227,6 +227,24 @@ fn watchdog_expired(now_ns: u64, last_ns: u64, deadline_ns: u64) -> bool {
     last_ns != 0 && now_ns.saturating_sub(last_ns) > deadline_ns
 }
 
+/// Returns `true` when the watchdog thread may emit `WATCHDOG=1` to systemd.
+///
+/// The pet must reflect *main-loop* liveness, not merely the watchdog thread's
+/// own liveness. `last_ns == 0` means the poll loop has not completed a single
+/// iteration yet (it stamps [`LAST_TICK_NS`] only at the foot of the loop), so
+/// petting systemd here would feed its `WatchdogSec` timer while the loop is
+/// wedged in its very first pass — e.g. a hung fsync or an NFS audit dir that
+/// blocks the first maintenance write before any tick. That masks the wedge
+/// from systemd exactly as `watchdog_expired`'s `last == 0` skip masks it from
+/// the in-process abort, defeating *both* liveness layers (on the default build
+/// Check 2 is `prometheus-exporter`-gated, so Check 1 is the only in-process
+/// guard). Withholding the pet until the first real tick lets systemd's timer
+/// fire instead. Once the loop has ticked at least once the pet resumes and
+/// still detects watchdog-thread death (no pet → systemd trips).
+fn watchdog_should_pet_systemd(last_ns: u64) -> bool {
+    last_ns != 0
+}
+
 struct HeartbeatTempPath {
     path: PathBuf,
     armed: bool,
@@ -1000,11 +1018,19 @@ fn run(cfg: Config) -> std::io::Result<()> {
                     }
                 }
 
-                // Main loop is still ticking — emit WATCHDOG=1 to keep
-                // systemd informed of *our* liveness (not just the main
-                // thread's).  No-op when WATCHDOG_USEC is unset.
-                if let Some(n) = wdt_notifier.as_mut() {
-                    n.tick();
+                // Emit WATCHDOG=1 to keep systemd informed of *our* liveness
+                // (not just the main thread's) — but only once the main loop
+                // has completed at least one iteration. Before the first tick
+                // (`last == 0`) the loop may be wedged in its very first pass;
+                // petting here would mask that wedge from systemd's WatchdogSec
+                // backstop just as Check 1's `last == 0` skip masks it from the
+                // in-process abort. After the first tick the pet resumes and
+                // still detects watchdog-thread death. No-op when WATCHDOG_USEC
+                // is unset.
+                if watchdog_should_pet_systemd(last) {
+                    if let Some(n) = wdt_notifier.as_mut() {
+                        n.tick();
+                    }
                 }
             })?;
         wdt_handle = Some(handle);
@@ -2003,6 +2029,24 @@ mod tests {
         let last = 1_000_000u64; // very old
         let deadline = 5_000_000_000u64; // 5 s
         assert!(watchdog_expired(now, last, deadline));
+    }
+
+    #[test]
+    fn watchdog_does_not_pet_systemd_before_first_tick() {
+        // last == 0: the poll loop has not completed an iteration, so the
+        // watchdog thread must NOT emit WATCHDOG=1. A first-iteration wedge then
+        // lets systemd's WatchdogSec timer fire instead of being silently
+        // masked — the symmetric companion to `watchdog_expired`'s last==0 skip.
+        assert!(!watchdog_should_pet_systemd(0));
+    }
+
+    #[test]
+    fn watchdog_pets_systemd_after_first_tick() {
+        // Any non-zero LAST_TICK_NS means the loop has ticked at least once;
+        // the pet resumes (and still detects watchdog-thread death via the
+        // absence of a tick).
+        assert!(watchdog_should_pet_systemd(1));
+        assert!(watchdog_should_pet_systemd(u64::MAX));
     }
 
     #[test]
