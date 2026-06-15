@@ -33,7 +33,7 @@ public final class SecureUdpTransport implements BeatTransport {
     private final InetSocketAddress addr;
     private final byte[] key32; // shared or master, retained for reconnect
 
-    private UdpTransport inner;
+    private BeatTransport inner;
     private final byte[] sessionSalt = new byte[Hkdf.SESSION_SALT_BYTES];
     private byte[] ivPrefix = new byte[Hkdf.IV_RANDOM_BYTES];
     private int prefixIndex = 0;
@@ -45,6 +45,18 @@ public final class SecureUdpTransport implements BeatTransport {
         this.addr = addr;
         this.key32 = key32.clone();
         this.inner = UdpTransport.create(addr);
+        rotateSession();
+    }
+
+    /** Package-private test constructor: inject a controllable inner transport
+     *  (e.g. one that returns 0 to simulate a WouldBlock/ENOBUFS failed send)
+     *  so the commit-on-success behaviour at the counter-wrap boundary can be
+     *  exercised without a real socket. */
+    SecureUdpTransport(Mode mode, BeatTransport inner, byte[] key32) {
+        this.mode = mode;
+        this.addr = null;
+        this.key32 = key32.clone();
+        this.inner = inner;
         rotateSession();
     }
 
@@ -98,21 +110,35 @@ public final class SecureUdpTransport implements BeatTransport {
         plaintextFrame.duplicate().get(plaintext);
         plaintextFrame.position(basePos);
 
-        // Rotate IV prefix when counter wraps.
-        if (counter == Integer.MAX_VALUE) {
-            prefixIndex++;
-            counter = 0;
-            ivPrefix = Hkdf.deriveIvPrefix(sessionSalt, prefixIndex);
+        // Compute the IV state for THIS send into locals, mutating no committed
+        // field until the datagram actually escapes the process (commit-on-
+        // success). At the counter-wrap boundary this rotates the prefix into
+        // locals only: a failed send (WouldBlock / ENOBUFS) must NOT burn the
+        // prefix index, re-derive the prefix (an HKDF on the hot beat path), or
+        // advance the counter — a retry must re-send the SAME (prefix, counter).
+        // Mirrors the Rust reference (secure_transport: NonceAdvance computed
+        // into locals, committed only inside `if result.is_ok()`).
+        int sendPrefixIndex = prefixIndex;
+        int sendCounter = counter;
+        byte[] sendPrefix = ivPrefix;
+        if (sendCounter == Integer.MAX_VALUE) {
+            sendPrefixIndex = prefixIndex + 1;
+            sendCounter = 0;
+            sendPrefix = Hkdf.deriveIvPrefix(sessionSalt, sendPrefixIndex);
         }
 
         byte[] wire = (mode == Mode.SHARED)
-            ? AeadCodec.encodeShared(key32, ivPrefix, counter, plaintext)
-            : AeadCodec.encodeMaster(key32, agentPid, ivPrefix, counter, plaintext);
+            ? AeadCodec.encodeShared(key32, sendPrefix, sendCounter, plaintext)
+            : AeadCodec.encodeMaster(key32, agentPid, sendPrefix, sendCounter, plaintext);
 
         ByteBuffer wireBuf = ByteBuffer.wrap(wire).order(ByteOrder.LITTLE_ENDIAN);
         int written = inner.send(wireBuf);
         if (written > 0) {
-            counter++; // commit-on-success
+            // commit-on-success: the wrap rotation and the counter advance land
+            // only now that the frame was actually transmitted.
+            prefixIndex = sendPrefixIndex;
+            ivPrefix = sendPrefix;
+            counter = sendCounter + 1;
         }
         return written == wire.length ? 32 /* report logical plaintext bytes */ : written;
     }
@@ -134,4 +160,6 @@ public final class SecureUdpTransport implements BeatTransport {
     // Test hooks
     int __getCounterForTest() { return counter; }
     int __getPrefixIndexForTest() { return prefixIndex; }
+    void __setCounterForTest(int c) { this.counter = c; }
+    byte[] __getIvPrefixForTest() { return ivPrefix.clone(); }
 }

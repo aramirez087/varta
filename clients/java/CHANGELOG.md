@@ -8,6 +8,17 @@ workspace and follows [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **Secure-UDP: the IV-prefix rotation at the counter-wrap boundary is now
+  commit-on-success.** `SecureUdpTransport.send` rotated the committed prefix
+  index, re-derived the IV prefix (an HKDF on the hot beat path), and reset the
+  counter *unconditionally before* the datagram was sent; only the post-send
+  `counter++` was gated on success. A failed send (`WouldBlock`/`ENOBUFS`) at
+  the single beat where `counter == Integer.MAX_VALUE` therefore burned a prefix
+  index and left the committed IV state inconsistent with what was transmitted.
+  The wrap is now computed into locals and committed only after a successful
+  send, so a retry re-sends the same `(prefix, counter)` — matching the Rust
+  reference's commit-on-success contract. (No nonce reuse was reachable; this is
+  a state-machine / contract fix.)
 - Panic/shutdown terminal frames now carry a strictly increasing
   process-monotonic timestamp instead of a constant zero. The observer uses
   this timestamp to reject terminal replays, so a second genuine failure from

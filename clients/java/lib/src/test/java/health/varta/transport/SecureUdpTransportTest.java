@@ -93,6 +93,56 @@ class SecureUdpTransportTest {
         }
     }
 
+    /** Controllable inner transport: returns 0 (WouldBlock/ENOBUFS) until
+     *  {@code succeed} is set, then echoes the wire length (success). */
+    private static final class FakeInner implements BeatTransport {
+        boolean succeed = false;
+
+        @Override
+        public int send(ByteBuffer frame) {
+            return succeed ? frame.remaining() : 0;
+        }
+
+        @Override
+        public void reconnect() {}
+
+        @Override
+        public void close() {}
+    }
+
+    @Test
+    void wrap_at_counter_boundary_is_commit_on_success() throws Exception {
+        // Regression (bug-478): at the counter-wrap boundary the IV-prefix
+        // rotation must be commit-on-success — a failed send must NOT burn the
+        // prefix index, re-derive the prefix, or advance the counter. The old
+        // code mutated prefixIndex/ivPrefix/counter unconditionally before send.
+        FakeInner inner = new FakeInner();
+        SecureUdpTransport tx =
+            new SecureUdpTransport(SecureUdpTransport.Mode.SHARED, inner, KEY32);
+
+        // Fast-forward the counter to the wrap boundary.
+        tx.__setCounterForTest(Integer.MAX_VALUE);
+        int prefixBefore = tx.__getPrefixIndexForTest();
+        byte[] ivBefore = tx.__getIvPrefixForTest();
+
+        // (1) A FAILED send at the wrap boundary leaves all IV state untouched.
+        inner.succeed = false;
+        int written = tx.send(ByteBuffer.wrap(new byte[32]).order(ByteOrder.LITTLE_ENDIAN));
+        assertThat(written).isZero();
+        assertThat(tx.__getPrefixIndexForTest()).isEqualTo(prefixBefore);
+        assertThat(tx.__getIvPrefixForTest()).isEqualTo(ivBefore);
+        assertThat(tx.__getCounterForTest()).isEqualTo(Integer.MAX_VALUE);
+
+        // (2) A SUCCESSFUL send rotates the prefix and resets the counter,
+        //     committed only now that the frame actually went out.
+        inner.succeed = true;
+        int sent = tx.send(ByteBuffer.wrap(new byte[32]).order(ByteOrder.LITTLE_ENDIAN));
+        assertThat(sent).isEqualTo(32);
+        assertThat(tx.__getPrefixIndexForTest()).isEqualTo(prefixBefore + 1);
+        assertThat(tx.__getIvPrefixForTest()).isNotEqualTo(ivBefore);
+        assertThat(tx.__getCounterForTest()).isEqualTo(1);
+    }
+
     private static int invokeIntHook(Object target, String name) throws Exception {
         Method m = target.getClass().getDeclaredMethod(name);
         m.setAccessible(true);
