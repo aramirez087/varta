@@ -209,8 +209,9 @@ pub enum Event {
         last_ns: u64,
         /// Transport origin pinned by the slot's first beat. Recovery
         /// refuses to spawn for `NetworkUnverified` unless the operator has
-        /// explicitly opted in via
-        /// `--i-accept-recovery-on-unauthenticated-transport`.
+        /// opted in via the listener's transport-qualified
+        /// `--{secure,plaintext}-udp-i-accept-recovery-on-unauthenticated-transport`
+        /// accept flag (which re-stamps the beat `OperatorAttestedTransport`).
         origin: BeatOrigin,
         /// PID-namespace inode pinned by the slot's first beat (Linux only).
         /// Used by main.rs to construct the recovery `StallSource`: a

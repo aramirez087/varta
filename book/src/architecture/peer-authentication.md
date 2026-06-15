@@ -230,21 +230,27 @@ kernel-attested agent can prove liveness.
 1. **Startup hard-error.**  If any `--recovery-exec` / `--recovery-exec-file`
    is configured *and* `--udp-port`
    is set, the daemon refuses to start with
-   `ConfigError::RecoveryRequiresAuthenticatedTransport`.  Operators must
-   pass `--i-accept-recovery-on-unauthenticated-transport` to proceed.
-   The flag is verbose by design (matches the `--i-accept-<risk>`
-   convention) and shows up in `cargo tree` / startup banners.
+   `ConfigError::RecoveryRequiresAuthenticatedTransport`.  To proceed the
+   operator must pass the transport-qualified accept flag for the listener
+   in play — `--secure-udp-i-accept-recovery-on-unauthenticated-transport`
+   for a secure-UDP listener, or
+   `--plaintext-udp-i-accept-recovery-on-unauthenticated-transport` for a
+   plaintext one.  The flag is verbose by design (matches the
+   `--i-accept-<risk>` convention) and shows up in `cargo tree` / startup
+   banners.
 
-2. **Runtime origin gate.**  Even with the accept flag, `Recovery::on_stall`
-   refuses to spawn the recovery command when the stalled slot's pinned
-   origin is `NetworkUnverified`.  The refusal returns the typed
+2. **Runtime origin gate.**  `Recovery::on_stall` spawns the recovery
+   command only when the stalled slot's pinned origin is `KernelAttested`
+   or `OperatorAttestedTransport`; `NetworkUnverified` and `SocketModeOnly`
+   origins are always refused.  The transport-qualified accept flag from
+   step 1 is exactly what stamps the listener's beats as
+   `OperatorAttestedTransport` — so the single flag that clears the startup
+   hard-error is also what makes the runtime gate pass; there is no separate
+   runtime opt-in.  A refused UDP stall returns the typed
    `RecoveryOutcome::RefusedUnauthenticatedSource { pid }`, increments
    `varta_recovery_refused_total{reason="unauthenticated_transport"}`, and
    emits a structured `refused` record into the recovery audit log
-   (`--recovery-audit-file`).  To enable UDP-origin recovery the operator
-   must construct the `Recovery` with
-   `with_allow_unauthenticated_source(true)` — a second, conscious choice
-   on top of the startup flag.
+   (`--recovery-audit-file`).
 
 ### Why secure-UDP isn't enough
 
@@ -263,9 +269,13 @@ layer:
 
 Kernel attestation has no such failure mode: the kernel knows which
 process owns the socket fd, and that knowledge cannot be forged by any
-amount of key material.  This is why Varta classifies all UDP variants
-(plain and secure) as `NetworkUnverified` for the recovery-eligibility
-decision.
+amount of key material.  This is why Varta never grants UDP variants
+(plain or secure) recovery eligibility on its own: UDP beats default to
+`NetworkUnverified` (recovery refused), and the only way to make them
+recovery-eligible is for the operator to explicitly vouch for the
+transport with the accept flag, which stamps the beats
+`OperatorAttestedTransport` — an *operator* attestation, never a *kernel*
+one.
 
 ## Recovery command authentication boundary
 

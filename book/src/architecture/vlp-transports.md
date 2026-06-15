@@ -82,11 +82,16 @@ a `UdpListener` is added alongside the UDS listener.
 
 > **Recovery-on-UDP is structurally rejected by default.** Combining any
 > recovery flag (`--recovery-exec` / `--recovery-exec-file`) with
-> `--udp-port` is a startup hard-error unless the operator passes
-> `--i-accept-recovery-on-unauthenticated-transport`.  Even with the flag,
-> the runtime origin gate still refuses to fire recovery for UDP-origin
-> stalls — flipping `Recovery::with_allow_unauthenticated_source(true)` is
-> a separate, conscious choice.  See
+> `--udp-port` is a startup hard-error unless the operator passes the
+> transport-qualified accept flag for that listener —
+> `--secure-udp-i-accept-recovery-on-unauthenticated-transport` for a
+> secure-UDP listener, or
+> `--plaintext-udp-i-accept-recovery-on-unauthenticated-transport` for a
+> plaintext one.  That flag stamps the listener's beats
+> `OperatorAttestedTransport`, which the runtime origin gate
+> (`Recovery::on_stall`) accepts; without it, UDP beats stay
+> `NetworkUnverified` and recovery is refused.  It is the single switch —
+> there is no separate runtime opt-in.  See
 > `book/src/architecture/peer-authentication.md` for the full threat model.
 
 ## CLI additions

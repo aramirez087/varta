@@ -175,8 +175,9 @@ pub enum RecoveryOutcome {
     ReapFailed(std::io::Error),
     /// Recovery was structurally declined because the stalled pid's beat
     /// lifetime included a non-kernel-attested transport (any UDP variant),
-    /// and the operator did not pass
-    /// `--i-accept-recovery-on-unauthenticated-transport`. No child was
+    /// and the operator did not pass the listener's transport-qualified
+    /// `--{secure,plaintext}-udp-i-accept-recovery-on-unauthenticated-transport`
+    /// accept flag. No child was
     /// spawned. The refusal is logged to the audit sink and counted in
     /// Prometheus so operators can detect both legitimate misconfiguration
     /// and active spoofing attempts.

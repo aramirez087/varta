@@ -1297,10 +1297,12 @@ fn run(cfg: Config) -> std::io::Result<()> {
                             #[cfg(not(feature = "compile-time-config"))]
                             varta_warn!(
                                 "recovery for pid {pid} REFUSED: stalled beat lifetime \
-                                 includes a non-kernel-attested transport (UDP). Pass \
-                                 --i-accept-recovery-on-unauthenticated-transport AND \
-                                 enable Recovery's allow_unauthenticated_source to \
-                                 override at your own risk."
+                                 includes a non-kernel-attested transport (UDP). To allow \
+                                 recovery for this listener, restart with \
+                                 --secure-udp-i-accept-recovery-on-unauthenticated-transport \
+                                 (secure UDP) or \
+                                 --plaintext-udp-i-accept-recovery-on-unauthenticated-transport \
+                                 (plaintext UDP), which stamps its beats operator-attested."
                             );
                             #[cfg(feature = "compile-time-config")]
                             varta_warn!(
