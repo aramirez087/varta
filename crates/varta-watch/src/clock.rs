@@ -67,6 +67,26 @@
 
 use std::io;
 
+// Darwin defines clockid_t as unsigned int, DragonFly as unsigned long, and
+// Linux plus the other supported BSDs as int. Keep the exact C type at the FFI
+// boundary even where the native calling convention passes the same value.
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+type ClockId = std::os::raw::c_uint;
+#[cfg(target_os = "dragonfly")]
+type ClockId = std::os::raw::c_ulong;
+#[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "dragonfly",)))]
+type ClockId = std::os::raw::c_int;
+
+#[cfg(any(target_os = "macos", target_os = "ios", target_os = "dragonfly"))]
+fn clock_id_for_ffi(clk_id: i32) -> ClockId {
+    clk_id as ClockId
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "dragonfly",)))]
+fn clock_id_for_ffi(clk_id: i32) -> ClockId {
+    clk_id
+}
+
 /// `CLOCK_MONOTONIC` is NOT a POSIX-mandated numeric constant — values
 /// differ across kernels. Source-of-truth per platform:
 ///
@@ -353,7 +373,7 @@ struct Timespec {
 }
 
 extern "C" {
-    fn clock_gettime(clk_id: i32, tp: *mut Timespec) -> i32;
+    fn clock_gettime(clk_id: ClockId, tp: *mut Timespec) -> i32;
 }
 
 /// Read the requested kernel clock and return nanoseconds since its
@@ -371,7 +391,7 @@ pub fn clock_gettime_raw(clk_id: i32) -> io::Result<u64> {
     // scope for the duration of the call. `clock_gettime` writes to `tp`
     // only on success; the caller has exclusive `&mut` access through the
     // raw pointer here.
-    let rc = unsafe { clock_gettime(clk_id, &mut tp as *mut Timespec) };
+    let rc = unsafe { clock_gettime(clock_id_for_ffi(clk_id), &mut tp as *mut Timespec) };
     if rc != 0 {
         return Err(io::Error::last_os_error());
     }
@@ -505,6 +525,22 @@ mod tests {
         let a = clk.now_ns();
         let b = clk.now_ns();
         assert!(b >= a, "monotonic clock regressed: {a} -> {b}");
+    }
+
+    #[test]
+    fn clock_id_type_matches_platform_abi() {
+        let clk_id = clock_id_for_ffi(
+            ClockSource::Monotonic
+                .clk_id()
+                .expect("CLOCK_MONOTONIC must be supported"),
+        );
+
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        let _: std::os::raw::c_uint = clk_id;
+        #[cfg(target_os = "dragonfly")]
+        let _: std::os::raw::c_ulong = clk_id;
+        #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "dragonfly",)))]
+        let _: std::os::raw::c_int = clk_id;
     }
 
     /// The numeric `clk_id` backing `Monotonic` is platform-specific and is
