@@ -137,11 +137,17 @@ function installEmitter(emit: () => void): void {
   process.on("unhandledRejection", onUnhandledRejection);
 
   for (const sig of FATAL_SIGNALS) {
-    process.on(sig, () => {
+    const onSig = (): void => {
       triggerActive();
-      process.removeAllListeners(sig);
-      process.kill(process.pid, sig);
-    });
+      // Remove ONLY our own listener — never `removeAllListeners(sig)`, which
+      // would also strip the host application's graceful-shutdown handlers
+      // (connection drains, flush-to-disk, …) and skip them entirely. Re-raise
+      // so the app's remaining handlers, or the default disposition, still run.
+      // Mirrors the targeted `removeListener` on the uncaughtException path.
+      process.removeListener(sig, onSig);
+      setImmediate(() => process.kill(process.pid, sig));
+    };
+    process.on(sig, onSig);
   }
 }
 

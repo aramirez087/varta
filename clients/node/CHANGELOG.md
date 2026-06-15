@@ -26,6 +26,18 @@ governed independently — see `book/src/spec/vlp.md` in the workspace.
 
 ### Fixed
 
+- **Signal panic handler no longer destroys the host application's own
+  `SIGTERM`/`SIGINT`/`SIGQUIT`/`SIGHUP` handlers.** The installed handler called
+  `process.removeAllListeners(sig)` before re-raising, which stripped every
+  listener for that signal — including the application's graceful-shutdown
+  handlers (connection drains, flush-to-disk, in-flight-request completion) —
+  so they were silently skipped and the process took the default disposition
+  instead. The handler now removes **only its own** listener
+  (`process.removeListener(sig, onSig)`) and re-raises on `setImmediate`, so the
+  application's remaining handlers (or the default disposition) still run.
+  Mirrors the targeted `removeListener` already used on the
+  `uncaughtException` path.
+
 - Panic emitters now claim terminal timestamps from a process-wide monotonic
   high-water mark. Equal clock samples and handler replacement can no longer
   make a later genuine panic look like a replay.

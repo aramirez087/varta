@@ -230,3 +230,59 @@ test("uncaughtException over secure UDP wraps a NONCE_TERMINAL critical beat", a
     await listener.close();
   }
 });
+
+test("signal handler removes only its own listener, preserving the app's", async () => {
+  // Regression (bug-481): the signal handler called `process.removeAllListeners(sig)`,
+  // which stripped the host application's own SIGTERM/SIGINT handlers (graceful
+  // shutdown, connection drains, …) before re-raising — so they never ran. It
+  // must remove ONLY its own listener. Here the child registers an app SIGTERM
+  // handler whose presence keeps the process alive: with the bug it is stripped
+  // and the re-raise default-terminates the child; with the fix it survives.
+  const listener = await bindUdpRecorder();
+  let child: ReturnType<typeof spawn> | undefined;
+  try {
+    const script = `
+      import("${join(repoRoot(), "clients", "node", "src", "panic.ts").replace(/\\\\/g, "\\\\\\\\")}")
+        .then(({ installSignalHandlerUdp }) => {
+          installSignalHandlerUdp("${listener.host}", ${listener.port});
+          // Host application's own SIGTERM handler (placeholder graceful shutdown).
+          process.on("SIGTERM", () => {});
+          setInterval(() => {}, 1000); // keep the event loop alive
+          setTimeout(() => process.kill(process.pid, "SIGTERM"), 50);
+        });
+    `;
+    child = spawn(process.execPath, ["--import", "tsx", "-e", script], {
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    child.stderr.resume();
+    child.stdout.resume();
+    let exited = false;
+    let signalCode: NodeJS.Signals | null = null;
+    child.once("exit", (_code, sig) => {
+      exited = true;
+      signalCode = sig;
+    });
+
+    await listener.wait(1, 5000); // Varta's handler fired and emitted the beat
+    await new Promise((resolve) => setTimeout(resolve, 500));
+
+    assert.equal(
+      exited,
+      false,
+      `the app's SIGTERM handler must survive Varta's handler; the child was default-terminated (signal=${signalCode})`,
+    );
+
+    const frame = decode(listener.received[0]!);
+    assert.equal(frame.status, Status.Critical, "panic beat is Critical");
+    assert.equal(frame.nonce, NONCE_TERMINAL, "panic beat carries NONCE_TERMINAL");
+  } finally {
+    if (child) {
+      try {
+        child.kill("SIGKILL");
+      } catch {
+        // already dead
+      }
+    }
+    await listener.close();
+  }
+});
