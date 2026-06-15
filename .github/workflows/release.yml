@@ -281,6 +281,14 @@ jobs:
         with:
           cosign-release: v2.4.1
 
+      # cosign pushes the signature + attestation to GHCR — authenticate the
+      # registry client first, else: UNAUTHORIZED: User cannot be
+      # authenticated with the token provided.
+      - name: ghcr login (cosign)
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" | \
+            cosign login ghcr.io -u ${{ github.actor }} --password-stdin
+
       - name: cosign sign — image
         env:
           IMAGE_REF: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ needs.build-image.outputs.image-digest }}
@@ -347,6 +355,15 @@ jobs:
     if: ${{ !inputs.dry_run }}
     runs-on: ubuntu-latest
     steps:
+      # push-to-registry writes the attestation manifest to GHCR — needs
+      # registry auth, else: Error: No credentials found for registry ghcr.io
+      - name: ghcr login
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
       - name: attest provenance
         uses: actions/attest-build-provenance@v2
         with:
