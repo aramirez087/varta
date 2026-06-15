@@ -18,6 +18,7 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.Consumer;
 
 /**
  * Install a panic-equivalent handler that emits a {@code CRITICAL} +
@@ -105,10 +106,11 @@ public final class SignalHandler {
         for (String name : POSIX_SIGNALS) {
             try {
                 sun.misc.Signal sig = new sun.misc.Signal(name);
-                sun.misc.SignalHandler prev = sun.misc.Signal.handle(sig, signal -> {
-                    emitter.emitBestEffort();
-                    System.exit(128 + signalNumber(name));
-                });
+                // The lambda looks up `previous.get(name)` at FIRE time (by then
+                // the map is fully populated), so it can chain to the handler
+                // that was installed before ours.
+                sun.misc.SignalHandler prev = sun.misc.Signal.handle(sig, signal ->
+                    onTerminatingSignal(signal, previous.get(name), emitter, SignalHandler::reRaiseSignal));
                 previous.put(name, prev);
             } catch (IllegalArgumentException ignored) {
                 // signal not supported on this OS — skip silently
@@ -125,14 +127,38 @@ public final class SignalHandler {
         };
     }
 
-    private static int signalNumber(String name) {
-        return switch (name) {
-            case "HUP" -> 1;
-            case "INT" -> 2;
-            case "QUIT" -> 3;
-            case "TERM" -> 15;
-            default -> 1;
-        };
+    /**
+     * Signal-fire action: emit the terminal beat, then restore the handler that
+     * was installed before ours and re-raise the signal so it — the host's
+     * graceful-shutdown handler, or the JVM default that runs shutdown hooks —
+     * still runs. A plain {@code System.exit(128 + sig)} here (the prior
+     * behaviour) skipped the previously-installed {@code sun.misc.Signal}
+     * handler entirely, silently clobbering host teardown. Mirrors the
+     * cross-client contract: Node removes its own listener and re-raises
+     * (bug-481), Go uses {@code signal.Reset} + re-raise, and the Rust/Python
+     * hooks chain to the previous hook. Re-raising the signal also yields the
+     * conventional {@code 128 + signum} exit status without hard-coding it.
+     *
+     * <p>The re-raise is injected so the restore-and-chain can be unit-tested
+     * without delivering a real signal to the test JVM.</p>
+     */
+    static void onTerminatingSignal(
+            sun.misc.Signal sig,
+            sun.misc.SignalHandler previousHandler,
+            Emitter emitter,
+            Consumer<sun.misc.Signal> reRaise) {
+        emitter.emitBestEffort();
+        // Restore the prior handler (or the default disposition if somehow
+        // none) BEFORE re-raising, so the re-raised signal runs that handler
+        // rather than re-entering THIS one in an infinite loop.
+        sun.misc.SignalHandler prev =
+            previousHandler != null ? previousHandler : sun.misc.SignalHandler.SIG_DFL;
+        sun.misc.Signal.handle(sig, prev);
+        reRaise.accept(sig);
+    }
+
+    private static void reRaiseSignal(sun.misc.Signal sig) {
+        sun.misc.Signal.raise(sig);
     }
 
     private static BeatTransport openOrFail(TransportOpener opener) {

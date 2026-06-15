@@ -8,6 +8,21 @@ workspace and follows [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **POSIX signal panic handler no longer clobbers the host's own signal
+  handler.** `SignalHandler.installSignalHandler*` installed a
+  `sun.misc.Signal` handler that, on `SIGTERM`/`SIGINT`/`SIGQUIT`/`SIGHUP`,
+  emitted the terminal beat and then called `System.exit(128 + signum)`. That
+  captured the previously-installed handler but never invoked it — a host that
+  had registered its own `sun.misc.Signal` handler (custom teardown, a JNI
+  library) had it silently bypassed, the JVM sibling of the Node
+  `removeAllListeners` clobber. The handler now emits, **restores the previously
+  installed handler, and re-raises** the signal, so that handler (or the JVM
+  default disposition, which still runs shutdown hooks) runs and the process
+  exits with the conventional `128 + signum` status. Mirrors the cross-client
+  contract — Node re-raises after removing its own listener, Go uses
+  `signal.Reset` + re-raise, and the Rust/Python hooks chain to the previous
+  hook. The `installShutdownHook*` installers are unaffected.
+
 - **A failed fork-recovery reconnect now surfaces as `Failed`, not `Dropped`.**
   When `beat()` detects a `fork(2)` (the cached connect PID no longer matches)
   it reconnects the transport before emitting. If that `reconnect()` threw, the
