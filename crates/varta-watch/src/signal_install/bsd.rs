@@ -33,10 +33,27 @@ const _: () = assert!(core::mem::size_of::<SigAction>() == 16);
 #[cfg(target_os = "freebsd")]
 const _: () = assert!(core::mem::size_of::<SigAction>() == 32);
 
-#[cfg(target_os = "macos")]
+// `SA_RESTART` (0x0002) and `SA_SIGINFO` (0x0040) are identical across the
+// 4.4BSD-derived `<sys/signal.h>` on macOS/XNU and FreeBSD — rust-libc defines
+// them once for the whole BSD/Darwin family in `src/unix/bsd/mod.rs`. They are
+// unconditional here on purpose: a per-`cfg` split is exactly what let the
+// FreeBSD value drift to `0x0040` (= `SA_SIGINFO`) while macOS stayed at the
+// correct `0x0002`.
+//
+// `SA_RESTART` makes interrupted syscalls auto-restart, upholding the
+// `recvmsg(2)`-never-returns-`EINTR` invariant documented at `main.rs`.
+// `SA_SIGINFO` selects the 3-argument `sa_sigaction` calling convention and
+// MUST stay clear: `install` registers a 1-argument `extern "C" fn(i32)`.
 const SA_RESTART: i32 = 0x0002;
-#[cfg(target_os = "freebsd")]
-const SA_RESTART: i32 = 0x0040;
+const SA_SIGINFO: i32 = 0x0040;
+
+/// Flags written to `sa_flags`: `SA_RESTART` only, `SA_SIGINFO` deliberately
+/// absent (the handler takes one argument).
+const SA_FLAGS: i32 = SA_RESTART;
+// Regression guard: a 1-argument handler requires `SA_SIGINFO` to stay clear.
+// The original bug set `SA_RESTART = 0x0040` (= `SA_SIGINFO`); this trips that
+// at compile time on every target the module builds for.
+const _: () = assert!(SA_FLAGS & SA_SIGINFO == 0);
 
 extern "C" {
     fn sigaction(signum: i32, act: *const SigAction, oldact: *mut SigAction) -> i32;
@@ -50,7 +67,7 @@ pub(super) unsafe fn install(handler: extern "C" fn(i32)) -> io::Result<()> {
     let mut act = std::mem::MaybeUninit::<SigAction>::zeroed();
     unsafe {
         (*act.as_mut_ptr()).sa_handler = handler as *const ();
-        (*act.as_mut_ptr()).sa_flags = SA_RESTART;
+        (*act.as_mut_ptr()).sa_flags = SA_FLAGS;
     }
     let act = unsafe { act.assume_init() };
 
@@ -67,6 +84,21 @@ pub(super) unsafe fn install(handler: extern "C" fn(i32)) -> io::Result<()> {
 #[cfg(test)]
 mod layout_tests {
     use super::SigAction;
+
+    #[test]
+    fn sa_flags_request_restart_without_siginfo() {
+        // Regression (bug-468): the FreeBSD `SA_RESTART` was mistyped as
+        // `0x0040`, which is `SA_SIGINFO` — so SIGINT/SIGTERM were installed
+        // WITHOUT auto-restart and WITH the 3-argument `sa_sigaction`
+        // convention, while only a 1-argument `extern "C" fn(i32)` handler
+        // exists. The flag values are identical across the BSD/Darwin family,
+        // so this runs on the macOS CI host and guards both arms; reverting
+        // `SA_RESTART` to `0x0040` turns it (and the compile-time guard) red.
+        assert_eq!(super::SA_RESTART, 0x0002);
+        assert_eq!(super::SA_SIGINFO, 0x0040);
+        assert_eq!(super::SA_FLAGS & super::SA_SIGINFO, 0);
+        assert_eq!(super::SA_FLAGS & super::SA_RESTART, super::SA_RESTART);
+    }
 
     #[cfg(target_os = "macos")]
     #[test]
