@@ -130,14 +130,30 @@ impl LogRateLimiter {
 /// are already I/O-bound when they fire) and on Prometheus scrapes.
 pub static LOG_RATE_LIMITER: Mutex<LogRateLimiter> = Mutex::new(LogRateLimiter::new());
 
-/// Return the current wall-clock time in nanoseconds for rate-limit checks.
-/// Uses `UNIX_EPOCH.elapsed()` — monotonicity is not strictly required; the
-/// 1-second cooldown granularity tolerates occasional clock jitter.
+/// Return the current monotonic time in nanoseconds for rate-limit checks.
+///
+/// `should_emit` gates on `now_ns.saturating_sub(last_emit_ns) >= COOLDOWN_NS`.
+/// A wall-clock source (`UNIX_EPOCH.elapsed()`) is **not** safe here: a single
+/// discrete backward step (NTP step-back after a bad RTC, an admin `date` set,
+/// VM live-migration / guest time-sync on resume) drives `now_ns` below the
+/// stored `last_emit_ns`, so `saturating_sub` collapses to `0`, the gate stays
+/// frozen-closed, and EVERY rate-limited operator diagnostic of that kind is
+/// suppressed for the FULL magnitude of the step (hours, not one 1-second
+/// window) — exactly when a clock anomaly may co-occur with the underlying
+/// fault. The suppression is invisible in the human-readable stderr/JSON
+/// stream while `varta_log_suppressed_total{kind}` keeps climbing.
+///
+/// `CLOCK_MONOTONIC` never steps backward, so the gate can no longer be driven
+/// to `0` by a realtime adjustment. We read it via the same raw FFI as the
+/// stall-detection clock (`clock.rs`); `Monotonic.clk_id()` is `Some` on every
+/// supported platform, and the `unwrap_or(0)` arm degrades to "always emit"
+/// (fail-open for diagnostics) on the unreachable error path. The 1-second
+/// cooldown granularity is unchanged.
 #[inline]
 pub fn rl_now_ns() -> u64 {
-    std::time::UNIX_EPOCH
-        .elapsed()
-        .map(|d| d.as_nanos().min(u64::MAX as u128) as u64)
+    crate::clock::ClockSource::Monotonic
+        .clk_id()
+        .and_then(|id| crate::clock::clock_gettime_raw(id).ok())
         .unwrap_or(0)
 }
 
@@ -257,5 +273,70 @@ mod tests {
         assert!(rl.should_emit(LogKind::FileExportIo, 2_000).is_none());
         // AuditIo second emit is also suppressed
         assert!(rl.should_emit(LogKind::AuditIo, 2_000).is_none());
+    }
+
+    /// Documents the harm the time source must avoid: a backward step in
+    /// `now_ns` after a first emit freezes the gate closed for the FULL
+    /// magnitude of the step, not one cooldown window. With the old
+    /// wall-clock source (`UNIX_EPOCH.elapsed()`) an NTP step-back / admin
+    /// `date` set / VM resume time-sync produced exactly this `now_ns`
+    /// sequence and silently suppressed every diagnostic of that kind for
+    /// hours. The fix is to feed `should_emit` a monotonic source (see
+    /// [`rl_now_now_is_monotonic`]); this test pins the failure semantics so
+    /// the regression cannot be reintroduced by reverting the source.
+    #[test]
+    fn backward_now_freezes_gate_for_the_full_step() {
+        let mut rl = fresh_limiter();
+        // First error at a large "wall-clock" stamp emits and stores it.
+        let t0: u64 = 1_750_000_000_000_000_000; // ~ realtime ns
+        assert!(rl.should_emit(LogKind::FileExportIo, t0).is_some());
+
+        // Clock steps back 2 hours. Every subsequent call of this kind sees
+        // now < last_emit -> saturating_sub == 0 -> 0 >= 1e9 is false ->
+        // suppressed, for the WHOLE window, even though > COOLDOWN_NS of the
+        // stepped-back timeline elapses between samples.
+        let two_hours_ns: u64 = 2 * 3_600 * 1_000_000_000;
+        let stepped = t0 - two_hours_ns;
+        for k in 0..10 {
+            // advance well past COOLDOWN_NS each iteration on the new timeline
+            let now = stepped + k * 5 * LogRateLimiter::cooldown_ns_for_test();
+            assert!(
+                rl.should_emit(LogKind::FileExportIo, now).is_none(),
+                "a non-monotonic backward step must suppress until the clock \
+                 re-passes last_emit_ns; never feed should_emit a wall clock"
+            );
+        }
+        // The suppression counter keeps climbing while stderr goes dark.
+        assert_eq!(rl.snapshot_totals()[LogKind::FileExportIo.index()], 10);
+    }
+
+    /// Green half of the fix: `rl_now_ns` — the ONLY time source the macros
+    /// feed into `should_emit` — must be monotonic, so the freeze trace above
+    /// is structurally unreachable in production. The old wall-clock source
+    /// could regress here on a backward realtime adjustment; `CLOCK_MONOTONIC`
+    /// cannot.
+    #[test]
+    fn rl_now_now_is_monotonic() {
+        let a = rl_now_ns();
+        let b = rl_now_ns();
+        let c = rl_now_ns();
+        assert!(
+            b >= a && c >= b,
+            "rl_now_ns must be monotonic (got {a} -> {b} -> {c}); a wall-clock \
+             source here re-opens the diagnostic-suppression bug"
+        );
+        // Sanity: a real monotonic clock returns a nonzero reading (the
+        // fail-open `unwrap_or(0)` arm is only the unreachable error path).
+        assert!(
+            a > 0,
+            "monotonic clock returned 0 — clk_id resolution failed"
+        );
+    }
+
+    impl LogRateLimiter {
+        /// Test accessor for the private cooldown constant.
+        fn cooldown_ns_for_test() -> u64 {
+            Self::COOLDOWN_NS
+        }
     }
 }
