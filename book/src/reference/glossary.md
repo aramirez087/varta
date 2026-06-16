@@ -106,7 +106,7 @@ recovery children, keyed by stalled pid. Statically sized to
 ### Peer-cred / `SO_PASSCRED`
 The Linux mechanism for the receiver of a UDS datagram to learn the
 sender's UID + PID, attested by the kernel rather than claimed by the
-sender. BSDs use `SCM_CREDS`; macOS pathname datagram sockets do not
+sender. BSDs use `SCM_CREDS` / `SCM_CREDS2`; macOS pathname datagram sockets do not
 provide equivalent per-datagram attestation for Varta's UDS transport.
 Varta relies on peer credentials for `KernelAttested` BeatOrigin. See [Peer
 Authentication](../architecture/peer-authentication.md).

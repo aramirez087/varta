@@ -2,7 +2,7 @@
 //!
 //! Each `mod {linux,macos,bsd}` defines the platform's `Iovec`, `Msghdr`,
 //! `Cmsghdr` / `AuditToken` / `Xucred` / `Cmsgcred`, the relevant constants
-//! (`SOL_SOCKET`, `SO_PASSCRED` / `LOCAL_PEERTOKEN` / `LOCAL_CREDS`, ...),
+//! (`SOL_SOCKET`, `SO_PASSCRED` / `LOCAL_PEERTOKEN` / BSD credential options, ...),
 //! the inline `extern "C"` declarations for `setsockopt` / `recvmsg` /
 //! `getsockopt`, the `ANCILLARY_BUFFER_SIZE` constant, the
 //! `peer_pid_after_recv` extractor, and the layout guards that catch ABI drift
@@ -22,16 +22,18 @@ mod macos;
 #[cfg(target_os = "macos")]
 pub(super) use macos::*;
 
-// The BSD module is compiled on the actual BSD targets *and* on Linux. On
-// Linux it provides pure-data types and the `unsafe impl CmsgPlatform for
-// BsdCmsg` body so the cmsg miri tests can drive the BSD walker arm on a
-// Linux CI host. The `extern "C"` FFI, `LOCAL_CREDS`, and `peer_pid_after_recv`
-// stay gated to actual BSD targets via inner `#[cfg]` attributes.
+// The BSD module is compiled on the actual BSD targets and on Linux / macOS
+// test hosts. There it provides pure-data types and `unsafe impl CmsgPlatform`
+// bodies so fabricated-buffer tests can drive the BSD walker arm without a BSD
+// runtime. The `extern "C"` FFI, credential-option constants used by the
+// receive path, and `peer_pid_after_recv` stay gated to actual BSD targets via
+// inner `#[cfg]` attributes.
 #[cfg(any(
     target_os = "linux",
     target_os = "freebsd",
     target_os = "dragonfly",
     target_os = "netbsd",
+    all(test, target_os = "macos"),
 ))]
 pub(super) mod bsd;
 #[cfg(any(target_os = "freebsd", target_os = "dragonfly", target_os = "netbsd"))]
