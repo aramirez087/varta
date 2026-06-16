@@ -124,7 +124,7 @@ impl Drop for PeerPidFd {
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
 pub enum BeatOrigin {
     /// Beat arrived on a Unix Domain Socket with kernel credential passing
-    /// enabled (`SO_PASSCRED` / `SCM_CREDS`). The kernel
+    /// enabled (`SO_PASSCRED` / BSD credential cmsgs / `SO_RECVUCRED`). The kernel
     /// attests the sender's PID and UID per-datagram; the observer has
     /// already verified `frame.pid == peer_pid`.
     KernelAttested,
@@ -146,7 +146,7 @@ pub enum BeatOrigin {
     /// Beat arrived on a Unix Domain Socket on a platform that does not
     /// provide per-datagram kernel credential passing for Varta's pathname
     /// UDS transport (macOS, OpenBSD, AIX, HP-UX, and any other Unix without
-    /// `SO_PASSCRED` / `LOCAL_CREDS` / `SO_RECVUCRED`).
+    /// `SO_PASSCRED` / BSD credential options / `SO_RECVUCRED`).
     ///
     /// Trust derives from filesystem permissions only (`--socket-mode 0600`
     /// restricts access to the owning UID). Recovery commands MUST NOT fire
@@ -182,7 +182,8 @@ pub enum RecvResult {
     /// A full 32-byte frame was received along with credentials. `peer_pid`
     /// is the PID the kernel attributes the datagram to and `peer_uid` is
     /// the effective UID. On Linux this is derived from SCM_CREDENTIALS
-    /// (SO_PASSCRED); on BSD-family targets it is extracted from SCM_CREDS.
+    /// (SO_PASSCRED); on BSD-family targets it is extracted from their
+    /// target-specific credential cmsg.
     ///
     /// `origin` is the transport-class classification: kernel-attested for
     /// UDS, network-unverified for any UDP variant. Plumbed end-to-end to

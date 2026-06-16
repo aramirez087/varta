@@ -318,11 +318,12 @@ jobs:
         env: { MIRIFLAGS: "-Zmiri-strict-provenance" }
 
   cross-compile-checks:
-    name: cross-compile-checks (illumos + OpenBSD + riscv64 + musl)
+    name: cross-compile-checks (illumos + OpenBSD + NetBSD + riscv64 + musl)
     # Verify that varta-watch compiles cleanly on Tier-2/Tier-3 targets:
     # illumos (per-datagram SO_RECVUCRED attestation), OpenBSD (SocketModeOnly
-    # fallback), riscv64 (signal-install architecture support), and musl libc
-    # (different struct sigaction layout, SCM_CREDENTIALS encoding).
+    # fallback), NetBSD (per-datagram SCM_CREDS + struct sockcred attestation),
+    # riscv64 (signal-install architecture support), and musl libc (different
+    # struct sigaction layout, SCM_CREDENTIALS encoding).
     # Type-check only — no linking, no test execution — because we have no
     # runners for those platforms.
     runs-on: ubuntu-latest
@@ -375,6 +376,16 @@ jobs:
         run: |
           cargo +nightly check --locked -p varta-watch \
             --target x86_64-unknown-openbsd \
+            -Zbuild-std=std,panic_abort
+
+      - name: cargo check — x86_64-unknown-netbsd (SCM_CREDS sockcred attestation)
+        # NetBSD uses LOCAL_CREDS=0x0004 and delivers SCM_CREDS=0x10 with
+        # struct sockcred, not FreeBSD/DragonFly's 0x0002 / 0x03 / cmsgcred
+        # ABI. This compiles the target_os="netbsd" cfg arm and its layout
+        # guards; no NetBSD runner is available for live recvmsg testing.
+        run: |
+          cargo +nightly check --locked -p varta-watch \
+            --target x86_64-unknown-netbsd \
             -Zbuild-std=std,panic_abort
 
   safety-profiles:

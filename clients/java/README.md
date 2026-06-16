@@ -82,7 +82,7 @@ descriptor.
 
 | Transport | When to use |
 | --- | --- |
-| **UDS** (`Varta.connect(path)`) | Same-host deployment. The observer reads kernel peer credentials (`SCM_CREDENTIALS` on Linux, `LOCAL_PEERTOKEN` on macOS), granting `BeatOrigin::KernelAttested` status. **Only kernel-attested beats are eligible for observer-driven recovery commands.** |
+| **UDS** (`Varta.connect(path)`) | Same-host deployment. On observer platforms with pathname-datagram peer credentials (Linux and supported BSD/illumos/Solaris targets), beats become `BeatOrigin::KernelAttested` and are eligible for observer-driven recovery. macOS pathname UDS is `SocketModeOnly`, so recovery is refused there. |
 | **UDP** (`Varta.connectUdp(addr)`) | Same-host or LAN when UDS is unavailable (or on Windows). Beats are `NetworkUnverified`; recovery is refused by the observer. |
 | **Secure UDP** (`Varta.connectSecureUdp(addr, key)`) | Same use case as UDP, plus ChaCha20-Poly1305 AEAD encryption for beat confidentiality. Still refused for recovery. |
 

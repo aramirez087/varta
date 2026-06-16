@@ -47,12 +47,15 @@ fn origin_for_peer_pid(peer_pid: u32) -> BeatOrigin {
 /// first call to [`recv_authenticated`].
 ///
 /// On Linux this sets `SO_PASSCRED` so the kernel includes `SCM_CREDENTIALS`
-/// ancillary data on every datagram.  On FreeBSD / DragonFly / NetBSD this
-/// sets `LOCAL_CREDS` so the kernel includes `SCM_CREDS` ancillary data
-/// (struct cmsgcred).  On illumos / Solaris this sets `SO_RECVUCRED` so the
-/// kernel includes `SCM_UCRED` ancillary data (opaque `ucred_t`).  On macOS
-/// pathname UDS and all other platforms this is a no-op; they fall back to
-/// socket-mode-only defence.
+/// ancillary data on every datagram. On FreeBSD this sets
+/// `LOCAL_CREDS_PERSISTENT` so the kernel includes `SCM_CREDS2` with
+/// `sockcred2.sc_pid`; on DragonFly it sets `SO_PASSCRED` so the kernel
+/// includes `SCM_CREDS` with `cmsgcred.cmcred_pid`; on NetBSD it sets
+/// `LOCAL_CREDS` so the kernel includes `SCM_CREDS` with `sockcred.sc_pid`.
+/// On illumos / Solaris this sets `SO_RECVUCRED` so the kernel includes
+/// `SCM_UCRED` ancillary data (opaque `ucred_t`). On macOS pathname UDS and
+/// all other platforms this is a no-op; they fall back to socket-mode-only
+/// defence.
 pub(crate) fn enable_credential_passing(fd: i32) -> io::Result<()> {
     #[cfg(target_os = "linux")]
     {
@@ -110,24 +113,24 @@ pub(crate) fn enable_credential_passing(fd: i32) -> io::Result<()> {
 
     #[cfg(any(target_os = "freebsd", target_os = "dragonfly", target_os = "netbsd"))]
     {
-        // `LOCAL_CREDS` is a `<sys/un.h>` PF_LOCAL-level option: it MUST be set
-        // at `SOL_LOCAL` (0), the protocol level — NOT at `SOL_SOCKET` (0xffff).
-        // At `SOL_SOCKET` the optname aliases an unrelated `SO_*` option: on
-        // FreeBSD/DragonFly `0x0002` is the get-only `SO_ACCEPTCONN`, so
-        // `setsockopt` fails `ENOPROTOOPT` and the observer never starts; on
-        // NetBSD `0x0001` is `SO_DEBUG`, which succeeds silently but never
-        // enables `SCM_CREDS`, so every datagram is dropped as un-credentialed.
-        // The macOS `LOCAL_*` family (`macos.rs`) already sets at `SOL_LOCAL`.
-        const LEVEL: i32 = plat::SOL_LOCAL;
-        const OPTNAME: i32 = plat::LOCAL_CREDS;
-        // Regression guard: pin the enabling level to `SOL_LOCAL` at compile
-        // time so a future edit cannot silently restore the `SOL_SOCKET` brick.
-        const _: () = assert!(LEVEL == plat::SOL_LOCAL && LEVEL != plat::SOL_SOCKET);
+        // The BSD-family credential option is target-specific:
+        //
+        // - FreeBSD: `LOCAL_CREDS_PERSISTENT` at `SOL_LOCAL`, because plain
+        //   `LOCAL_CREDS` emits `sockcred` with no PID.
+        // - DragonFly: `SO_PASSCRED` at `SOL_SOCKET`; it has no receiver-side
+        //   `LOCAL_CREDS` option.
+        // - NetBSD: modern `LOCAL_CREDS` at `SOL_LOCAL`, delivering
+        //   `sockcred` with `sc_pid`.
+        //
+        // Keep the constants centralized in `platform/bsd.rs` so the enabling
+        // option stays paired with the cmsg decoder for that target.
+        const LEVEL: i32 = plat::CREDENTIAL_PASS_LEVEL;
+        const OPTNAME: i32 = plat::CREDENTIAL_PASS_OPTNAME;
         let one: i32 = 1;
-        // SAFETY: `setsockopt(2)` with `LOCAL_CREDS` at level `SOL_LOCAL` (see
-        // `unix(4)`) reads `optlen` bytes from `optval`. Same invariants as the
-        // Linux branch above: `fd` is the freshly bound UDS receive socket,
-        // `addr_of!` yields a valid pointer to a stack-local i32, `optlen`
+        // SAFETY: `setsockopt(2)` with the target's credential-passing option
+        // reads `optlen` bytes from `optval`. Same invariants as the Linux
+        // branch above: `fd` is the freshly bound UDS receive socket,
+        // `addr_of!` yields a valid pointer to a stack-local i32, and `optlen`
         // matches.
         let ret = unsafe {
             plat::setsockopt(

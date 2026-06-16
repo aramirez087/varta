@@ -9,7 +9,7 @@
 //! struct cast.
 //!
 //! This is a true per-datagram credential mechanism analogous to Linux's
-//! `SO_PASSCRED` / `SCM_CREDENTIALS` and BSD's `LOCAL_CREDS` / `SCM_CREDS`.
+//! `SO_PASSCRED` / `SCM_CREDENTIALS` and BSD-family credential cmsgs.
 //!
 //! # Zone isolation
 //!

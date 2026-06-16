@@ -51,7 +51,7 @@ No polling. No persistent connection state beyond the socket file descriptor.
 
 | Transport | When to use |
 | --------- | ----------- |
-| **UDS** (`Varta.Connect`) | Same-host deployment. The observer reads kernel peer credentials (`SCM_CREDENTIALS` on Linux, `LOCAL_PEERTOKEN` on macOS), granting `BeatOrigin::KernelAttested` status. **Only kernel-attested beats are eligible for observer-driven recovery commands.** |
+| **UDS** (`Varta.Connect`) | Same-host deployment. On observer platforms with pathname-datagram peer credentials (Linux and supported BSD/illumos/Solaris targets), beats become `BeatOrigin::KernelAttested` and are eligible for observer-driven recovery. macOS pathname UDS is `SocketModeOnly`, so recovery is refused there. |
 | **UDP** (`Varta.ConnectUdp`) | Same-host or LAN when UDS is unavailable (or on Windows). Beats are `NetworkUnverified`; recovery is refused by the observer. |
 | **Secure UDP** (`Varta.ConnectSecureUdp`) | Same use case as UDP, plus ChaCha20-Poly1305 AEAD encryption for beat confidentiality. Still refused for recovery. |
 
@@ -98,13 +98,13 @@ The encoding convention is yours to decide. The observer does not interpret the 
 
 ## Unix Domain Sockets
 
-UDS is the canonical same-host transport and the only .NET transport eligible for observer-driven recovery.
+UDS is the canonical same-host transport. It is eligible for observer-driven recovery only when the observer platform can attach pathname-datagram peer credentials.
 
 ```csharp
 using var agent = global::Varta.Varta.Connect("/run/varta/observer.sock");
 ```
 
-UDS uses `AF_UNIX` + `SOCK_DGRAM`. The observer authenticates the sender via kernel-attested peer credentials (`SCM_CREDENTIALS` on Linux, `LOCAL_PEERTOKEN` on macOS), granting `BeatOrigin::KernelAttested` status — making this the only transport eligible for observer-driven recovery.
+UDS uses `AF_UNIX` + `SOCK_DGRAM`. On Linux and supported BSD/illumos/Solaris observer targets, the kernel attaches peer credentials and the observer records `BeatOrigin::KernelAttested`; on macOS pathname UDS, the observer records `SocketModeOnly`, so recovery is refused.
 
 ### Windows
 

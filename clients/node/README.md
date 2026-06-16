@@ -57,7 +57,7 @@ No polling. No persistent connection state beyond the socket file descriptor.
 
 | Transport | When to use |
 | --------- | ----------- |
-| **UDS** (`Varta.connectUds`) | Same-host deployment. The observer reads kernel peer credentials (`SCM_CREDENTIALS` on Linux, `LOCAL_PEERTOKEN` on macOS), granting `BeatOrigin::KernelAttested` status. **Only kernel-attested beats are eligible for observer-driven recovery commands.** Requires the optional `node-unix-socket` addon. |
+| **UDS** (`Varta.connectUds`) | Same-host deployment. On observer platforms with pathname-datagram peer credentials (Linux and supported BSD/illumos/Solaris targets), beats become `BeatOrigin::KernelAttested` and are eligible for observer-driven recovery. macOS pathname UDS is `SocketModeOnly`, so recovery is refused there. Requires the optional `node-unix-socket` addon. |
 | **UDP** (`Varta.connectUdp`) | Same-host or LAN when UDS is unavailable (or on Windows). Beats are `NetworkUnverified`; recovery is refused by the observer. |
 | **Secure UDP** (`Varta.connectSecureUdp`) | Same use case as UDP, plus ChaCha20-Poly1305 AEAD encryption for beat confidentiality. Still refused for recovery. |
 
@@ -104,7 +104,7 @@ The encoding convention is yours to decide. The observer does not interpret the 
 
 ## Unix Domain Sockets
 
-UDS is the canonical same-host transport and the only Node transport eligible for observer-driven recovery.
+UDS is the canonical same-host transport. It is eligible for observer-driven recovery only when the observer platform can attach pathname-datagram peer credentials; macOS pathname UDS is `SocketModeOnly`, so recovery is refused there.
 
 UDS requires the optional `node-unix-socket` addon. Prebuilds are published for:
 

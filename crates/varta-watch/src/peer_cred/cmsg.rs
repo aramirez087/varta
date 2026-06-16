@@ -1,5 +1,5 @@
-//! Ancillary-data (CMSG) walker for `SCM_CREDENTIALS` (Linux) and `SCM_CREDS`
-//! (FreeBSD / DragonFly / NetBSD).
+//! Ancillary-data (CMSG) walker for `SCM_CREDENTIALS` (Linux) and BSD-family
+//! credential messages (`SCM_CREDS` / `SCM_CREDS2`).
 //!
 //! This module concentrates **all unsafe pointer arithmetic** that walks the
 //! kernel-supplied ancillary buffer produced by `recvmsg(2)`. The Linux and
@@ -19,6 +19,7 @@
     target_os = "netbsd",
     target_os = "illumos",
     target_os = "solaris",
+    all(test, target_os = "macos"),
 ))]
 
 // ---------------------------------------------------------------------------
@@ -50,8 +51,9 @@ pub(super) const fn cmsg_align(len: usize) -> usize {
 /// Per-platform parameters for the cmsg walker.
 ///
 /// Implemented for Linux (`SCM_CREDENTIALS` / `struct ucred` /
-/// `cmsg_len: usize`), the BSD family (`SCM_CREDS` / `struct cmsgcred` /
-/// `cmsg_len: u32`), and illumos/Solaris (`SCM_UCRED` / opaque `ucred_t`).
+/// `cmsg_len: usize`), the BSD family (`SCM_CREDS` or `SCM_CREDS2` with
+/// target-specific credential structs / `cmsg_len: u32`), and
+/// illumos/Solaris (`SCM_UCRED` / opaque `ucred_t`).
 ///
 /// # Safety
 ///
@@ -60,7 +62,8 @@ pub(super) const fn cmsg_align(len: usize) -> usize {
 /// - `Hdr` is `#[repr(C)]` and matches the kernel's `struct cmsghdr` layout
 ///   on the implementing platform. Verified by layout guards in `super::plat`.
 /// - `Cred` is the platform's credential payload type. For typed payloads
-///   (Linux `struct ucred`, BSD `struct cmsgcred`) it must be `#[repr(C)]`
+///   (Linux `struct ucred`, BSD `struct cmsgcred` / `sockcred*`) it must be
+///   `#[repr(C)]`
 ///   with layout verified by layout guards. For
 ///   opaque payloads (illumos `ucred_t`) it may be the unit type `()` — in
 ///   that case `extract_pid_uid` receives a raw pointer and delegates to
@@ -325,6 +328,7 @@ pub(super) fn find_credential<P: CmsgPlatform>(mhdr: &P::Msghdr) -> Option<(u32,
 ///
 /// Soundness relies on `mhdr` having been populated by `recvmsg(2)` (or an
 /// equivalent fabricator) — the same contract as [`find_credential`].
+#[cfg_attr(all(test, target_os = "macos"), allow(dead_code))]
 pub(super) fn reclaim_scm_rights<P: CmsgPlatform>(
     mhdr: &P::Msghdr,
     scm_rights_type: i32,
@@ -394,6 +398,25 @@ mod miri_cmsg_tests {
     /// CMSG_SPACE for one integer fd payload (`SCM_PIDFD`) on Linux.
     fn cmsg_space_i32() -> usize {
         cmsg_align(cmsg_hdr_size() + mem::size_of::<i32>())
+    }
+
+    /// Build a BSD-shaped `Msghdr` from `buf` at the moment of call.
+    ///
+    /// The returned `msg_control` is freshly derived from `buf`, so callers may
+    /// mutate `buf` between calls without invalidating the raw pointer under
+    /// Miri's Stacked Borrows.
+    fn make_bsd_mhdr(buf: &mut [u8], controllen: u32) -> plat::bsd::Msghdr {
+        plat::bsd::Msghdr {
+            msg_name: core::ptr::null_mut(),
+            msg_namelen: 0,
+            _pad1: 0,
+            msg_iov: core::ptr::null_mut(),
+            msg_iovlen: 0,
+            _pad2: 0,
+            msg_control: buf.as_mut_ptr() as *mut _,
+            msg_controllen: controllen,
+            msg_flags: 0,
+        }
     }
 
     /// 8-byte-aligned scratch buffer for cmsg walker tests.
@@ -595,23 +618,24 @@ mod miri_cmsg_tests {
         assert_pid_uid_no_pidfd(result, 999, 42);
     }
 
-    /// Drives the unified walker through the BSD-family arm
-    /// (`SCM_CREDS` + `struct cmsgcred`) on the Linux test host.
+    /// Drives the unified walker through the FreeBSD arm
+    /// (`SCM_CREDS2` + `struct sockcred2`) on the Linux test host.
     ///
-    /// The BSD `Cmsghdr` / `Cmsgcred` / `Msghdr` type definitions plus the
-    /// `unsafe impl CmsgPlatform for BsdCmsg` body are compiled unconditionally
-    /// on Linux (see `peer_cred/platform/mod.rs`). The FFI and `LOCAL_CREDS`
-    /// constants stay gated to the actual BSD targets. This test fabricates a
-    /// well-formed BSD ancillary buffer and asserts `find_credential::<BsdCmsg>`
-    /// returns the expected `(pid, euid)` pair.
+    /// FreeBSD `LOCAL_CREDS` emits `SCM_CREDS` with a PID-less `sockcred`;
+    /// Varta must use `LOCAL_CREDS_PERSISTENT`, which emits `SCM_CREDS2` with
+    /// `sockcred2.sc_pid`. This fabricates the FreeBSD kernel shape and
+    /// asserts `find_credential::<FreeBsdCmsg>` returns the expected
+    /// `(pid, euid)` pair.
     ///
-    /// Without this test, the BSD walker arm is only exercised on a real
-    /// BSD CI host — which CI doesn't currently provide. Running it under
-    /// Miri here proves the pointer arithmetic of the unified walker is
-    /// provenance-clean for the BSD-shaped layout too.
+    /// Without this test, the FreeBSD walker arm is only exercised on a real
+    /// BSD CI host. Running it under Miri here proves the pointer arithmetic
+    /// of the unified walker is provenance-clean for the FreeBSD-shaped layout
+    /// too.
     #[test]
-    fn bsd_shape_buffer_returns_pid_euid() {
-        use super::super::platform::bsd::{Cmsgcred, Cmsghdr, FreeBsdCmsg, Msghdr};
+    fn freebsd_shape_buffer_returns_pid_euid() {
+        use super::super::platform::bsd::{
+            Cmsghdr, FreeBsdCmsg, Sockcred2, FREEBSD_SCM_CREDS2, SOL_SOCKET,
+        };
         use core::mem;
 
         // BSD: cmsg_align uses sizeof(usize) on 64-bit, same as Linux.
@@ -620,7 +644,7 @@ mod miri_cmsg_tests {
         assert_eq!(bsd_hdr_size, cmsg_align(mem::size_of::<Cmsghdr>()));
         assert_eq!(bsd_hdr_size, 16);
 
-        let total = bsd_hdr_size + mem::size_of::<Cmsgcred>();
+        let total = bsd_hdr_size + mem::size_of::<Sockcred2>();
         let aligned_total = cmsg_align(total);
         // CRITICAL: Match recv.rs's AncBuf pattern — the buffer MUST be
         // aligned to 8 bytes. A Vec<u8> only guarantees 1-byte alignment,
@@ -631,29 +655,86 @@ mod miri_cmsg_tests {
         let mut buf_wrapper = AlignedBuf([0u8; 256]);
         let buf = &mut buf_wrapper.0[..aligned_total];
 
-        // Write BSD cmsghdr at offset 0:
+        // Write FreeBSD cmsghdr at offset 0:
         //   cmsg_len (u32, 4 bytes), cmsg_level (i32, 4), cmsg_type (i32, 4)
         let cmsg_len: u32 = total as u32;
-        let sol_socket: i32 = 0xffff; // SOL_SOCKET on BSD
-        let scm_creds: i32 = 0x03; // SCM_CREDS
         buf[0..4].copy_from_slice(&cmsg_len.to_ne_bytes());
-        buf[4..8].copy_from_slice(&sol_socket.to_ne_bytes());
-        buf[8..12].copy_from_slice(&scm_creds.to_ne_bytes());
+        buf[4..8].copy_from_slice(&SOL_SOCKET.to_ne_bytes());
+        buf[8..12].copy_from_slice(&FREEBSD_SCM_CREDS2.to_ne_bytes());
 
-        // Write cmsgcred at offset bsd_hdr_size (16):
-        //   cmcred_pid (i32, 4) @ 0, cmcred_uid (u32, 4) @ 4,
-        //   cmcred_euid (u32, 4) @ 8, ... (rest zeroed)
+        // Write sockcred2 at offset bsd_hdr_size (16):
+        //   sc_version (i32, 4) @ 0, sc_pid (i32, 4) @ 4,
+        //   sc_uid (u32, 4) @ 8, sc_euid (u32, 4) @ 12, ...
         let expected_pid: i32 = 9999;
         let expected_uid: u32 = 33;
         let expected_euid: u32 = 1500;
+        let cred_off = bsd_hdr_size;
+        let version: i32 = 0;
+        buf[cred_off..cred_off + 4].copy_from_slice(&version.to_ne_bytes());
+        buf[cred_off + 4..cred_off + 8].copy_from_slice(&expected_pid.to_ne_bytes());
+        buf[cred_off + 8..cred_off + 12].copy_from_slice(&expected_uid.to_ne_bytes());
+        buf[cred_off + 12..cred_off + 16].copy_from_slice(&expected_euid.to_ne_bytes());
+
+        // Construct a BSD Msghdr pointing at the fabricated buffer. The
+        // pure-data struct layout is identical to actual BSD on the Linux
+        // test host (see compile-time offset asserts in platform/bsd.rs).
+        let mhdr = make_bsd_mhdr(buf, aligned_total as u32);
+
+        let result = find_credential::<FreeBsdCmsg>(&mhdr);
+        assert_eq!(result, Some((expected_pid as u32, expected_euid)));
+
+        // The old FreeBSD path decoded `SCM_CREDS` as `cmsgcred`. But
+        // receiver-enabled FreeBSD `LOCAL_CREDS` actually delivers a
+        // PID-less `sockcred`, so accepting type 0x03 would mint a fake PID
+        // from the payload's first uid field. FreeBSD must accept only
+        // `SCM_CREDS2`.
+        let old_scm_creds: i32 = 0x03;
+        buf[8..12].copy_from_slice(&old_scm_creds.to_ne_bytes());
+        let mhdr = make_bsd_mhdr(buf, aligned_total as u32);
+        assert_eq!(find_credential::<FreeBsdCmsg>(&mhdr), None);
+
+        // Future sockcred2 versions must not be decoded with the v0 layout
+        // until the layout is explicitly audited.
+        buf[8..12].copy_from_slice(&FREEBSD_SCM_CREDS2.to_ne_bytes());
+        let bad_version: i32 = 1;
+        buf[cred_off..cred_off + 4].copy_from_slice(&bad_version.to_ne_bytes());
+        let mhdr = make_bsd_mhdr(buf, aligned_total as u32);
+        assert_eq!(find_credential::<FreeBsdCmsg>(&mhdr), None);
+    }
+
+    /// Drives the unified walker through the DragonFly arm
+    /// (`SCM_CREDS` + `struct cmsgcred`) on the Linux test host.
+    #[test]
+    fn dragonfly_shape_buffer_returns_pid_euid() {
+        use super::super::platform::bsd::{
+            Cmsgcred, Cmsghdr, DragonFlyCmsg, Msghdr, DRAGONFLY_SCM_CREDS, SOL_SOCKET,
+        };
+        use core::mem;
+
+        let bsd_hdr_size = <DragonFlyCmsg as CmsgPlatform>::cmsg_hdr_size();
+        assert_eq!(bsd_hdr_size, cmsg_align(mem::size_of::<Cmsghdr>()));
+        assert_eq!(bsd_hdr_size, 16);
+
+        let total = bsd_hdr_size + mem::size_of::<Cmsgcred>();
+        let aligned_total = cmsg_align(total);
+        #[repr(align(8))]
+        struct AlignedBuf([u8; 256]);
+        let mut buf_wrapper = AlignedBuf([0u8; 256]);
+        let buf = &mut buf_wrapper.0[..aligned_total];
+
+        let cmsg_len: u32 = total as u32;
+        buf[0..4].copy_from_slice(&cmsg_len.to_ne_bytes());
+        buf[4..8].copy_from_slice(&SOL_SOCKET.to_ne_bytes());
+        buf[8..12].copy_from_slice(&DRAGONFLY_SCM_CREDS.to_ne_bytes());
+
+        let expected_pid: i32 = 7777;
+        let expected_uid: u32 = 34;
+        let expected_euid: u32 = 1502;
         let cred_off = bsd_hdr_size;
         buf[cred_off..cred_off + 4].copy_from_slice(&expected_pid.to_ne_bytes());
         buf[cred_off + 4..cred_off + 8].copy_from_slice(&expected_uid.to_ne_bytes());
         buf[cred_off + 8..cred_off + 12].copy_from_slice(&expected_euid.to_ne_bytes());
 
-        // Construct a BSD Msghdr pointing at the fabricated buffer. The
-        // pure-data struct layout is identical to actual BSD on the Linux
-        // test host (see compile-time offset asserts in platform/bsd.rs).
         let mhdr = Msghdr {
             msg_name: core::ptr::null_mut(),
             msg_namelen: 0,
@@ -666,7 +747,7 @@ mod miri_cmsg_tests {
             msg_flags: 0,
         };
 
-        let result = find_credential::<FreeBsdCmsg>(&mhdr);
+        let result = find_credential::<DragonFlyCmsg>(&mhdr);
         assert_eq!(result, Some((expected_pid as u32, expected_euid)));
     }
 
@@ -676,7 +757,7 @@ mod miri_cmsg_tests {
     #[test]
     fn netbsd_shape_buffer_returns_pid_euid() {
         use super::super::platform::bsd::{
-            Cmsghdr, Msghdr, NetBsdCmsg, Sockcred, NETBSD_SCM_CREDS, SOL_SOCKET,
+            Cmsghdr, NetBsdCmsg, Sockcred, NETBSD_SCM_CREDS, SOL_SOCKET,
         };
         use core::mem;
 
@@ -704,17 +785,7 @@ mod miri_cmsg_tests {
         buf[cred_off + 4..cred_off + 8].copy_from_slice(&expected_uid.to_ne_bytes());
         buf[cred_off + 8..cred_off + 12].copy_from_slice(&expected_euid.to_ne_bytes());
 
-        let mhdr = Msghdr {
-            msg_name: core::ptr::null_mut(),
-            msg_namelen: 0,
-            _pad1: 0,
-            msg_iov: core::ptr::null_mut(),
-            msg_iovlen: 0,
-            _pad2: 0,
-            msg_control: buf.as_mut_ptr() as *mut _,
-            msg_controllen: aligned_total as u32,
-            msg_flags: 0,
-        };
+        let mhdr = make_bsd_mhdr(buf, aligned_total as u32);
 
         let result = find_credential::<NetBsdCmsg>(&mhdr);
         assert_eq!(result, Some((expected_pid as u32, expected_euid)));
@@ -722,6 +793,7 @@ mod miri_cmsg_tests {
         // FreeBSD's cmsg type must not be accepted by the NetBSD walker.
         let freebsd_scm_creds: i32 = 0x03;
         buf[8..12].copy_from_slice(&freebsd_scm_creds.to_ne_bytes());
+        let mhdr = make_bsd_mhdr(buf, aligned_total as u32);
         assert_eq!(find_credential::<NetBsdCmsg>(&mhdr), None);
     }
 

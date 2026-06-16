@@ -76,7 +76,9 @@ use platform as plat;
 
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
-    use super::*;
+    #[cfg(not(miri))]
+    use super::{read_peer_identity, PeerPidFd};
+    #[cfg(not(miri))]
     use std::os::unix::io::IntoRawFd;
 
     #[test]

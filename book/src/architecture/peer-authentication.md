@@ -50,17 +50,41 @@ The Darwin queries are:
 3. `LOCAL_PEERTOKEN` (0x0006) — returns an `audit_token_t` containing
    the peer's PID and effective UID on connected local sockets.
 
-### FreeBSD, DragonFly BSD, NetBSD
+### FreeBSD
 
-On FreeBSD-family platforms, the observer sets `LOCAL_CREDS` on the
-socket (value `0x0002` on FreeBSD/DragonFly, `0x0001` on NetBSD).  Every
-`recvmsg(2)` then receives a `SCM_CREDS` ancillary message containing a
+On FreeBSD, the observer sets `LOCAL_CREDS_PERSISTENT` on the socket
+(value `0x0003`, at `SOL_LOCAL`). Every `recvmsg(2)` then receives a
+`SCM_CREDS2` ancillary message (type `0x08`) containing a
+`struct sockcred2 { sc_version, sc_pid, sc_uid, sc_euid, sc_gid, ... }`
+populated by the kernel. The observer accepts version 0, extracts
+`sc_pid` and `sc_euid`, and performs the same PID + UID verification as
+on Linux.
+
+Plain FreeBSD `LOCAL_CREDS` is intentionally not used: it emits
+`struct sockcred`, which does not contain a sender PID and therefore
+cannot enforce `frame.pid == peer_pid`.
+
+### DragonFly BSD
+
+On DragonFly, the observer sets `SO_PASSCRED` on the socket (value
+`0x4000`, at `SOL_SOCKET`). Every `recvmsg(2)` then receives a
+`SCM_CREDS` ancillary message (type `0x03`) containing a
 `struct cmsgcred { cmcred_pid, cmcred_uid, cmcred_euid, cmcred_gid, ... }`
-populated by the kernel.  The observer extracts `cmcred_pid` and
+populated by the kernel. The observer extracts `cmcred_pid` and
 `cmcred_euid` and performs the same PID + UID verification as on Linux.
 
-The ancillary buffer is sized at 256 bytes — sufficient for the 84-byte
-`cmsgcred` with generous headroom for future kernel extensions.
+### NetBSD
+
+NetBSD uses the same `LOCAL_CREDS` / `SCM_CREDS` concept, but not the
+FreeBSD ABI. The observer enables `LOCAL_CREDS` with value `0x0004`; the
+kernel delivers `SCM_CREDS` type `0x10` containing a `struct sockcred`.
+The observer extracts `sc_pid` and `sc_euid` and performs the same PID +
+UID verification as on Linux.
+
+The ancillary buffer is sized at 256 bytes — sufficient for FreeBSD's
+32-byte minimum `sockcred2`, DragonFly's 84-byte `cmsgcred`, and
+NetBSD's 28-byte minimum `sockcred`, with generous headroom for future
+kernel extensions.
 
 ### illumos / Solaris
 
@@ -96,7 +120,9 @@ refusal.  See `book/src/architecture/namespaces.md` for the planned gate.
 |---|---|---|---|
 | Linux | `SO_PASSCRED` + `SCM_CREDENTIALS` (`struct ucred`) | Yes | Yes, after `/proc/<pid>/stat` start-time generation is pinned |
 | macOS pathname UDS | socket file permissions only (`LOCAL_PEERTOKEN` requires a connected local socket) | **No** | **No** |
-| FreeBSD / DragonFly / NetBSD | `LOCAL_CREDS` + `SCM_CREDS` (`struct cmsgcred`) | Yes | Yes (recycle-unverifiable¹) |
+| FreeBSD | `LOCAL_CREDS_PERSISTENT` + `SCM_CREDS2` (`struct sockcred2`) | Yes | Yes (recycle-unverifiable¹, not field-validated²) |
+| DragonFly | `SO_PASSCRED` + `SCM_CREDS` (`struct cmsgcred`) | Yes | Yes (recycle-unverifiable¹, not field-validated²) |
+| NetBSD | `LOCAL_CREDS` + `SCM_CREDS` (`struct sockcred`) | Yes | Yes (recycle-unverifiable¹, not field-validated²) |
 | illumos / Solaris | `SO_RECVUCRED` + `SCM_UCRED` + `ucred_t` (opaque) | Yes | Yes (recycle-unverifiable¹) |
 | OpenBSD, AIX, HP-UX, other Unix | none — `--socket-mode 0600` only | **No** | **No** |
 
@@ -113,6 +139,13 @@ refusal.  See `book/src/architecture/namespaces.md` for the planned gate.
 > immediate (same-tick) recovery path is unaffected — it has no deferral
 > window for a recycle to occur in. On Linux a `KernelAttested` slot always
 > carries a generation, so this skip never fires there.
+
+> ² **BSD field-validation status.** The FreeBSD, DragonFly, and NetBSD
+> constants and credential layouts are guarded by compile-time checks and
+> fabricated-buffer tests, but the project has not yet run live
+> `varta-watch` instances on those kernels against real kernel-delivered
+> credentials after the latest ABI split. Treat the targets as ABI-verified
+> and not yet field-validated until each host signs off one accepted beat.
 
 ### Socket-mode-only fallback
 
@@ -189,7 +222,7 @@ development or testing, not for a hospital VLAN.
 
 ### Why no kernel-level UDP credentials
 
-Unix Domain Sockets can carry `SCM_CREDENTIALS` / `SCM_CREDS`
+Unix Domain Sockets can carry `SCM_CREDENTIALS` / `SCM_CREDS` / `SCM_CREDS2`
 per-datagram on supported kernels.  UDP carries none of those.  Even on a single
 host where `--udp-bind-addr 127.0.0.1` is used, any local process can
 send to that port — there is no equivalent of `--socket-mode 0600` for
@@ -211,7 +244,7 @@ A recovery command MUST NEVER fire for a pid whose beat lifetime is not
 
 | Transport     | Kernel-attested?         | Recovery-eligible by default? |
 |---------------|--------------------------|-------------------------------|
-| UDS on Linux / supported BSDs / illumos / Solaris | Yes — `SO_PASSCRED` / `SCM_CREDS` / `SCM_UCRED` | **Yes** |
+| UDS on Linux / supported BSDs / illumos / Solaris | Yes — `SO_PASSCRED` / `SCM_CREDS` / `SCM_CREDS2` / `SCM_UCRED` | **Yes** |
 | UDS on macOS pathname sockets / OpenBSD / other socket-mode-only targets | No — socket file permissions only | No |
 | Plaintext UDP | No — `peer_pid` is always 0                          | No                            |
 | Secure UDP    | No — frame is *cryptographically* authenticated but the kernel does not attest the sending process; a holder of the AEAD key (or a per-agent key derived from a leaked master key) can forge a beat for any pid | No                            |
@@ -469,7 +502,9 @@ metacharacter interpretation is structurally impossible.
  Process ── connect(2) to UDS ──┐
                                    ├─ [FAIL]  Kernel blocks (Layer 1: --socket-mode 0600, wrong UID)
                                    ├─ [PASS]  Layer 2: SO_PASSCRED → ucred.pid (Linux)
-                                   │          Layer 2: LOCAL_CREDS → cmsgcred.pid (FreeBSD, DragonFly, NetBSD)
+                                   │          Layer 2: LOCAL_CREDS_PERSISTENT → sockcred2.sc_pid (FreeBSD)
+                                   │          Layer 2: SO_PASSCRED → cmsgcred.pid (DragonFly)
+                                   │          Layer 2: LOCAL_CREDS → sockcred.sc_pid (NetBSD)
                                    │          ├─ [PID MISMATCH] → Drop frame + bump counter
                                    │          ├─ [UID MISMATCH] → Drop frame as IoError
                                    │          └─ [PID MATCH + UID MATCH] →
@@ -482,8 +517,10 @@ metacharacter interpretation is structurally impossible.
 The trust boundary is the kernel: a frame is only accepted if the kernel
 attests that the sending process's PID matches the one encoded in the
 VLP frame and that the sending process runs under the observer's UID.
-On Linux this is enforced per-datagram via `SO_PASSCRED`; on FreeBSD /
-DragonFly / NetBSD via `LOCAL_CREDS` + `SCM_CREDS`.  macOS pathname
+On Linux this is enforced per-datagram via `SO_PASSCRED`; on FreeBSD via
+`LOCAL_CREDS_PERSISTENT` + `SCM_CREDS2` + `struct sockcred2`; on
+DragonFly via `SO_PASSCRED` + `SCM_CREDS` + `struct cmsgcred`; on NetBSD
+via `LOCAL_CREDS` + `SCM_CREDS` + `struct sockcred`. macOS pathname
 datagram sockets and platforms without kernel-level credential passing fall
 back to `--socket-mode 0600`.
 
