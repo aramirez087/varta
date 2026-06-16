@@ -400,6 +400,25 @@ mod miri_cmsg_tests {
         cmsg_align(cmsg_hdr_size() + mem::size_of::<i32>())
     }
 
+    /// Build a BSD-shaped `Msghdr` from `buf` at the moment of call.
+    ///
+    /// The returned `msg_control` is freshly derived from `buf`, so callers may
+    /// mutate `buf` between calls without invalidating the raw pointer under
+    /// Miri's Stacked Borrows.
+    fn make_bsd_mhdr(buf: &mut [u8], controllen: u32) -> plat::bsd::Msghdr {
+        plat::bsd::Msghdr {
+            msg_name: core::ptr::null_mut(),
+            msg_namelen: 0,
+            _pad1: 0,
+            msg_iov: core::ptr::null_mut(),
+            msg_iovlen: 0,
+            _pad2: 0,
+            msg_control: buf.as_mut_ptr() as *mut _,
+            msg_controllen: controllen,
+            msg_flags: 0,
+        }
+    }
+
     /// 8-byte-aligned scratch buffer for cmsg walker tests.
     ///
     /// Plain `[u8; N]` arrays guarantee only 1-byte alignment. Miri flags
@@ -615,7 +634,7 @@ mod miri_cmsg_tests {
     #[test]
     fn freebsd_shape_buffer_returns_pid_euid() {
         use super::super::platform::bsd::{
-            Cmsghdr, FreeBsdCmsg, Msghdr, Sockcred2, FREEBSD_SCM_CREDS2, SOL_SOCKET,
+            Cmsghdr, FreeBsdCmsg, Sockcred2, FREEBSD_SCM_CREDS2, SOL_SOCKET,
         };
         use core::mem;
 
@@ -659,17 +678,7 @@ mod miri_cmsg_tests {
         // Construct a BSD Msghdr pointing at the fabricated buffer. The
         // pure-data struct layout is identical to actual BSD on the Linux
         // test host (see compile-time offset asserts in platform/bsd.rs).
-        let mhdr = Msghdr {
-            msg_name: core::ptr::null_mut(),
-            msg_namelen: 0,
-            _pad1: 0,
-            msg_iov: core::ptr::null_mut(),
-            msg_iovlen: 0,
-            _pad2: 0,
-            msg_control: buf.as_mut_ptr() as *mut _,
-            msg_controllen: aligned_total as u32,
-            msg_flags: 0,
-        };
+        let mhdr = make_bsd_mhdr(buf, aligned_total as u32);
 
         let result = find_credential::<FreeBsdCmsg>(&mhdr);
         assert_eq!(result, Some((expected_pid as u32, expected_euid)));
@@ -681,6 +690,7 @@ mod miri_cmsg_tests {
         // `SCM_CREDS2`.
         let old_scm_creds: i32 = 0x03;
         buf[8..12].copy_from_slice(&old_scm_creds.to_ne_bytes());
+        let mhdr = make_bsd_mhdr(buf, aligned_total as u32);
         assert_eq!(find_credential::<FreeBsdCmsg>(&mhdr), None);
 
         // Future sockcred2 versions must not be decoded with the v0 layout
@@ -688,6 +698,7 @@ mod miri_cmsg_tests {
         buf[8..12].copy_from_slice(&FREEBSD_SCM_CREDS2.to_ne_bytes());
         let bad_version: i32 = 1;
         buf[cred_off..cred_off + 4].copy_from_slice(&bad_version.to_ne_bytes());
+        let mhdr = make_bsd_mhdr(buf, aligned_total as u32);
         assert_eq!(find_credential::<FreeBsdCmsg>(&mhdr), None);
     }
 
@@ -746,7 +757,7 @@ mod miri_cmsg_tests {
     #[test]
     fn netbsd_shape_buffer_returns_pid_euid() {
         use super::super::platform::bsd::{
-            Cmsghdr, Msghdr, NetBsdCmsg, Sockcred, NETBSD_SCM_CREDS, SOL_SOCKET,
+            Cmsghdr, NetBsdCmsg, Sockcred, NETBSD_SCM_CREDS, SOL_SOCKET,
         };
         use core::mem;
 
@@ -774,17 +785,7 @@ mod miri_cmsg_tests {
         buf[cred_off + 4..cred_off + 8].copy_from_slice(&expected_uid.to_ne_bytes());
         buf[cred_off + 8..cred_off + 12].copy_from_slice(&expected_euid.to_ne_bytes());
 
-        let mhdr = Msghdr {
-            msg_name: core::ptr::null_mut(),
-            msg_namelen: 0,
-            _pad1: 0,
-            msg_iov: core::ptr::null_mut(),
-            msg_iovlen: 0,
-            _pad2: 0,
-            msg_control: buf.as_mut_ptr() as *mut _,
-            msg_controllen: aligned_total as u32,
-            msg_flags: 0,
-        };
+        let mhdr = make_bsd_mhdr(buf, aligned_total as u32);
 
         let result = find_credential::<NetBsdCmsg>(&mhdr);
         assert_eq!(result, Some((expected_pid as u32, expected_euid)));
@@ -792,6 +793,7 @@ mod miri_cmsg_tests {
         // FreeBSD's cmsg type must not be accepted by the NetBSD walker.
         let freebsd_scm_creds: i32 = 0x03;
         buf[8..12].copy_from_slice(&freebsd_scm_creds.to_ne_bytes());
+        let mhdr = make_bsd_mhdr(buf, aligned_total as u32);
         assert_eq!(find_credential::<NetBsdCmsg>(&mhdr), None);
     }
 

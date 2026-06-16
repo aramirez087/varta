@@ -436,11 +436,13 @@ unsafe impl super::super::cmsg::CmsgPlatform for NetBsdCmsg {
 }
 
 /// Extract peer PID and effective UID after a successful `recvmsg` on BSD.
-pub(crate) fn peer_pid_after_recv(_fd: i32, mhdr: &Msghdr) -> Option<(u32, u32, NonePidFd)> {
+#[cfg(any(target_os = "freebsd", target_os = "dragonfly", target_os = "netbsd"))]
+pub(crate) fn peer_pid_after_recv(
+    _fd: i32,
+    mhdr: &Msghdr,
+) -> Option<(u32, u32, Option<super::super::types::PeerPidFd>)> {
     super::super::cmsg::find_credential::<BsdCmsg>(mhdr).map(|(pid, uid)| (pid, uid, None))
 }
-
-type NonePidFd = Option<super::super::types::PeerPidFd>;
 
 /// Build a zero-initialised `Msghdr` for use as the `recvmsg(2)` argument.
 pub(crate) fn msghdr_for_recv(
@@ -561,6 +563,20 @@ mod layout_tests {
         let mut buf_wrapper = AlignedBuf([0u8; 256]);
         let buf = &mut buf_wrapper.0[..aligned_total];
 
+        fn make_mhdr(buf: &mut [u8], controllen: u32) -> super::Msghdr {
+            super::Msghdr {
+                msg_name: core::ptr::null_mut(),
+                msg_namelen: 0,
+                _pad1: 0,
+                msg_iov: core::ptr::null_mut(),
+                msg_iovlen: 0,
+                _pad2: 0,
+                msg_control: buf.as_mut_ptr() as *mut _,
+                msg_controllen: controllen,
+                msg_flags: 0,
+            }
+        }
+
         let cmsg_len: u32 = total as u32;
         buf[0..4].copy_from_slice(&cmsg_len.to_ne_bytes());
         buf[4..8].copy_from_slice(&SOL_SOCKET.to_ne_bytes());
@@ -576,17 +592,7 @@ mod layout_tests {
         buf[cred_off + 8..cred_off + 12].copy_from_slice(&uid.to_ne_bytes());
         buf[cred_off + 12..cred_off + 16].copy_from_slice(&expected_euid.to_ne_bytes());
 
-        let mhdr = super::Msghdr {
-            msg_name: core::ptr::null_mut(),
-            msg_namelen: 0,
-            _pad1: 0,
-            msg_iov: core::ptr::null_mut(),
-            msg_iovlen: 0,
-            _pad2: 0,
-            msg_control: buf.as_mut_ptr() as *mut _,
-            msg_controllen: aligned_total as u32,
-            msg_flags: 0,
-        };
+        let mhdr = make_mhdr(buf, aligned_total as u32);
 
         assert_eq!(
             cmsg::find_credential::<FreeBsdCmsg>(&mhdr),
@@ -595,11 +601,13 @@ mod layout_tests {
 
         let old_scm_creds: i32 = 0x03;
         buf[8..12].copy_from_slice(&old_scm_creds.to_ne_bytes());
+        let mhdr = make_mhdr(buf, aligned_total as u32);
         assert_eq!(cmsg::find_credential::<FreeBsdCmsg>(&mhdr), None);
 
         let bad_version: i32 = 1;
         buf[8..12].copy_from_slice(&FREEBSD_SCM_CREDS2.to_ne_bytes());
         buf[cred_off..cred_off + 4].copy_from_slice(&bad_version.to_ne_bytes());
+        let mhdr = make_mhdr(buf, aligned_total as u32);
         assert_eq!(cmsg::find_credential::<FreeBsdCmsg>(&mhdr), None);
     }
 }
