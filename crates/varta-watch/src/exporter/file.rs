@@ -52,7 +52,9 @@ pub trait Exporter {
 ///
 /// `kind` ∈ `{beat, stall, decode, io, mismatch}`. For `decode`, `io`, and
 /// `mismatch` events the pid / nonce / status / payload columns are written
-/// as `-` so the line count and column count remain stable.
+/// as `-` so the line count and column count remain stable. Text payloads are
+/// backslash-escaped (`\t`, `\n`, `\r`, `\\`, and `\xNN` for other ASCII
+/// control bytes) before they are written into the final field.
 ///
 /// `observer_ns` is the observer-local nanosecond timestamp carried by every
 /// [`Event`], captured at observer poll time. All exporters sharing an event
@@ -494,6 +496,7 @@ impl Drop for CreatedPathGuard {
 
 impl Exporter for FileExporter {
     fn record(&mut self, ev: &Event) -> io::Result<()> {
+        let mut escaped_line_len = None;
         let line_len: u64 = match ev {
             Event::Beat {
                 pid,
@@ -590,10 +593,14 @@ impl Exporter for FileExporter {
                 "{observer_ns}\tstall\t{pid}\t{last_nonce}\tstall\t-",
             ),
             Event::Decode(err, observer_ns) => {
-                writeln!(self.sink, "{observer_ns}\tdecode\t-\t-\t-\t{err:?}")
+                let msg = format!("{err:?}");
+                escaped_line_len = Some(text_event_line_len(*observer_ns, "decode", &msg));
+                write_text_event_line(&mut self.sink, *observer_ns, "decode", &msg)
             }
             Event::Io(err, observer_ns) => {
-                writeln!(self.sink, "{observer_ns}\tio\t-\t-\t-\t{err}")
+                let msg = err.to_string();
+                escaped_line_len = Some(text_event_line_len(*observer_ns, "io", &msg));
+                write_text_event_line(&mut self.sink, *observer_ns, "io", &msg)
             }
             Event::AuthFailure {
                 claimed_pid,
@@ -625,7 +632,9 @@ impl Exporter for FileExporter {
                 )
             }
             Event::CtrlTruncated(err, observer_ns) => {
-                writeln!(self.sink, "{observer_ns}\tctrunc\t-\t-\t-\t{err}")
+                let msg = err.to_string();
+                escaped_line_len = Some(text_event_line_len(*observer_ns, "ctrunc", &msg));
+                write_text_event_line(&mut self.sink, *observer_ns, "ctrunc", &msg)
             }
         };
         if let Err(ref e) = result {
@@ -634,21 +643,12 @@ impl Exporter for FileExporter {
         match result {
             Err(e) => Err(e),
             Ok(()) => {
-                let actual_len = if line_len > 0 {
+                let actual_len = if let Some(len) = escaped_line_len {
+                    len
+                } else if line_len > 0 {
                     line_len
                 } else {
                     match ev {
-                        Event::Decode(err, observer_ns) => {
-                            format!("{observer_ns}\tdecode\t-\t-\t-\t{err:?}\n").len() as u64
-                        }
-                        Event::Io(err, observer_ns) => {
-                            let msg = err.to_string();
-                            format!("{observer_ns}\tio\t-\t-\t-\t{msg}\n").len() as u64
-                        }
-                        Event::CtrlTruncated(err, observer_ns) => {
-                            let msg = err.to_string();
-                            format!("{observer_ns}\tctrunc\t-\t-\t-\t{msg}\n").len() as u64
-                        }
                         Event::OriginConflict {
                             claimed_pid,
                             observer_ns,
@@ -680,6 +680,67 @@ impl Exporter for FileExporter {
             (None, Err(e)) => Err(e),
             (None, Ok(())) => Ok(()),
         }
+    }
+}
+
+fn write_text_event_line<W: Write>(
+    sink: &mut W,
+    observer_ns: u64,
+    kind: &str,
+    raw: &str,
+) -> io::Result<()> {
+    write!(sink, "{observer_ns}\t{kind}\t-\t-\t-\t")?;
+    write_escaped_tsv_field(sink, raw)?;
+    writeln!(sink)
+}
+
+fn text_event_line_len(observer_ns: u64, kind: &str, raw: &str) -> u64 {
+    decimal_digits(observer_ns) as u64
+        + 1 // \t
+        + kind.len() as u64
+        + 1 // \t
+        + 1 // -
+        + 1 // \t
+        + 1 // -
+        + 1 // \t
+        + 1 // -
+        + 1 // \t
+        + escaped_tsv_field_len(raw) as u64
+        + 1 // \n
+}
+
+fn write_escaped_tsv_field<W: Write>(sink: &mut W, raw: &str) -> io::Result<()> {
+    for byte in raw.bytes() {
+        match byte {
+            b'\\' => sink.write_all(br"\\")?,
+            b'\t' => sink.write_all(br"\t")?,
+            b'\n' => sink.write_all(br"\n")?,
+            b'\r' => sink.write_all(br"\r")?,
+            0x00..=0x1f | 0x7f => {
+                sink.write_all(&[b'\\', b'x', lower_hex(byte >> 4), lower_hex(byte & 0x0f)])?;
+            }
+            _ => sink.write_all(&[byte])?,
+        }
+    }
+    Ok(())
+}
+
+fn escaped_tsv_field_len(raw: &str) -> usize {
+    raw.bytes()
+        .map(|byte| match byte {
+            b'\\' | b'\t' | b'\n' | b'\r' => 2,
+            0x00..=0x1f | 0x7f => 4,
+            _ => 1,
+        })
+        .sum()
+}
+
+fn lower_hex(nibble: u8) -> u8 {
+    let nibble = nibble & 0x0f;
+    if nibble < 10 {
+        b'0' + nibble
+    } else {
+        b'a' + (nibble - 10)
     }
 }
 
@@ -894,6 +955,41 @@ mod tests {
             content.contains("namespace_conflict"),
             "expected namespace_conflict in TSV, got: {content}"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn io_error_message_is_escaped_as_one_tsv_field() {
+        let (dir, path) = rotation_reopen_fixture("io-error-escape");
+        let mut fe = FileExporter::create(&path, Some(1_000_000), 0).unwrap();
+
+        fe.record(&Event::Io(
+            io::Error::new(io::ErrorKind::Other, "bad\tcell\nrow\rslash\\\x01"),
+            77,
+        ))
+        .expect("record escaped io error");
+        fe.flush().expect("flush escaped io error");
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        let lines: Vec<_> = content.lines().collect();
+        assert_eq!(
+            lines.len(),
+            1,
+            "an error message newline must not forge a second TSV record: {content:?}"
+        );
+        let cols: Vec<_> = lines[0].split('\t').collect();
+        assert_eq!(
+            cols.len(),
+            6,
+            "an error message tab must not forge an extra TSV column: {content:?}"
+        );
+        assert_eq!(cols[5], r"bad\tcell\nrow\rslash\\\x01");
+        assert_eq!(
+            fe.bytes_written,
+            std::fs::metadata(&path).unwrap().len(),
+            "escaped byte accounting must match the real file size"
+        );
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 
