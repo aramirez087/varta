@@ -3,16 +3,16 @@
 The chart at [`charts/varta-watch/`](https://github.com/aramirez087/Varta/tree/main/charts/varta-watch)
 is published as an OCI artifact at
 `oci://ghcr.io/aramirez087/charts/varta-watch`. Default render matches
-the raw manifests at
+the key observer-container fields from the raw manifests at
 [`observability/examples/kubernetes/`](https://github.com/aramirez087/Varta/tree/main/observability/examples/kubernetes)
-byte-for-byte (a `helm-parity` CI gate fails the build on drift).
+(a `helm-parity` CI gate fails the build on drift).
 
 ## Install
 
 ```sh
 helm install varta-watch \
   oci://ghcr.io/aramirez087/charts/varta-watch \
-  --version 0.1.0 \
+  --version 0.1.1 \
   --create-namespace \
   --namespace varta \
   --set prometheusToken.token=$(openssl rand -hex 32)
@@ -40,6 +40,12 @@ Switch via `--set mode=…`:
 The chart resolves the UDS volume type per mode (host path vs.
 `emptyDir`) and emits exactly one of the two object kinds.
 
+Each workload pod includes a `uds-permissions` init container that
+prepares the socket parent before `varta-watch` binds. It makes the
+directory owned by the configured observer UID/GID and mode `0755`, so
+Kubernetes `fsGroup` handling cannot leave `/run/varta` in a
+group-writable state that the observer rejects.
+
 ## Values reference
 
 The full reference is the chart's own
@@ -55,6 +61,7 @@ Most-touched knobs:
 | `prometheusToken.existingSecret.name`       | `""`                                      | Out-of-band Secret name                                               |
 | `uds.path`                                  | `/run/varta/varta.sock`                   |                                                                       |
 | `uds.hostPath`                              | `/run/varta`                              | `daemonset` mode only                                                 |
+| `udsInit.image.repository`                  | `busybox`                                 | Init image that prepares the UDS parent directory                     |
 | `selfWatchdogSecs`                          | `4`                                       | Matches the example systemd unit's half-WatchdogSec                   |
 | `extraArgs`                                 | `[]`                                      | Verbatim appended to argv                                             |
 | `prometheus.bindAddr`                       | `0.0.0.0:9100`                            | `""` disables the HTTP endpoint                                       |
@@ -94,7 +101,7 @@ bumps the chart patch.
 ## Verifying the chart artifact
 
 ```sh
-cosign verify oci://ghcr.io/aramirez087/charts/varta-watch:0.1.0 \
+cosign verify oci://ghcr.io/aramirez087/charts/varta-watch:0.1.1 \
   --certificate-identity-regexp '^https://github.com/aramirez087/Varta' \
   --certificate-oidc-issuer 'https://token.actions.githubusercontent.com'
 ```
@@ -112,8 +119,8 @@ sidecar at the chart's namespace or override `dashboard.label` /
 Adopters who previously used
 [`observability/examples/kubernetes/`](https://github.com/aramirez087/Varta/tree/main/observability/examples/kubernetes)
 can switch to the chart with no operational disruption: the rendered
-default has byte-equivalent container args, mounts, security context,
-ports, and probes. The CI `helm-parity` job asserts this on every PR.
-Differences are limited to Helm-standard labels
-(`helm.sh/chart`, `app.kubernetes.io/managed-by`) which the rest of
-the platform should ignore.
+default keeps the observer container image repository, args, and mounts
+in sync with the raw manifest. The CI `helm-parity` job asserts this on
+every PR. Expected differences include Helm-standard labels
+(`helm.sh/chart`, `app.kubernetes.io/managed-by`) and chart-managed init
+containers for token staging and UDS directory preparation.

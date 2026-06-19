@@ -41,6 +41,26 @@ tokenInit:
       cpu: 50m
       memory: 16Mi
 
+# --- UDS directory init container --------------------------------------
+#
+# Prepares the socket parent directory before varta-watch binds
+# `/run/varta/varta.sock`. Kubelet may apply fsGroup by making an
+# emptyDir group-writable; the observer rejects group/other-writable socket
+# parents unless they are sticky. This init container keeps the tighter
+# policy by making the directory observer-owned and mode 0755.
+udsInit:
+  image:
+    repository: busybox
+    tag: "1.36"
+    pullPolicy: IfNotPresent
+  resources:
+    requests:
+      cpu: 5m
+      memory: 8Mi
+    limits:
+      cpu: 50m
+      memory: 16Mi
+
 # --- Bearer token for /metrics -----------------------------------------
 #
 # Two paths:

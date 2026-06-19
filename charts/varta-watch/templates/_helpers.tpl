@@ -153,6 +153,40 @@ escape hatch — see book/src/operations/helm.md for the full rationale.
 {{- end -}}
 
 {{/*
+Init-container that prepares the UDS parent directory before the observer
+binds its socket. Kubernetes fsGroup may make writable volumes group-writable;
+varta-watch rejects that unless the directory is sticky. Prefer the tighter
+posture: make the directory observer-owned and not writable by group/other.
+*/}}
+{{- define "varta-watch.udsInitContainer" -}}
+- name: uds-permissions
+  image: {{ printf "%s:%s" .Values.udsInit.image.repository .Values.udsInit.image.tag | quote }}
+  imagePullPolicy: {{ .Values.udsInit.image.pullPolicy }}
+  command: ["/bin/sh", "-c"]
+  args:
+    - |
+      set -eu
+      chown {{ .Values.podSecurityContext.runAsUser }}:{{ .Values.podSecurityContext.runAsGroup }} {{ dir .Values.uds.path | quote }}
+      chmod 0755 {{ dir .Values.uds.path | quote }}
+  securityContext:
+    runAsUser: 0
+    runAsGroup: 0
+    runAsNonRoot: false
+    allowPrivilegeEscalation: false
+    readOnlyRootFilesystem: true
+    capabilities:
+      drop: ["ALL"]
+      add: ["CHOWN", "FOWNER", "DAC_OVERRIDE"]
+    seccompProfile:
+      type: RuntimeDefault
+  resources:
+    {{- toYaml .Values.udsInit.resources | nindent 4 }}
+  volumeMounts:
+    - name: uds
+      mountPath: {{ dir .Values.uds.path }}
+{{- end -}}
+
+{{/*
 ExecStart-equivalent argv block — shared by daemonset and deployment
 templates. Emitted as a YAML list under `args:`.
 

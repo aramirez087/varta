@@ -29,10 +29,24 @@ jobs:
           fetch-depth: 0
 
       - name: install mdbook
-        run: cargo install --locked mdbook
+        env:
+          CARGO_HTTP_MULTIPLEXING: "false"
+        run: |
+          set -euo pipefail
+          retry_cargo_install() {
+            crate="$1"
+            attempt=1
+            until cargo install --locked "$crate"; do
+              if [ "$attempt" -ge 3 ]; then
+                return 1
+              fi
+              sleep "$((attempt * 10))"
+              attempt="$((attempt + 1))"
+            done
+          }
 
-      - name: install mdbook-mermaid
-        run: cargo install --locked mdbook-mermaid
+          retry_cargo_install mdbook
+          retry_cargo_install mdbook-mermaid
 
       - name: sync governance docs into book
         run: |

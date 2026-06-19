@@ -37,6 +37,7 @@ spec:
       securityContext:
         {{- toYaml .Values.podSecurityContext | nindent 8 }}
       initContainers:
+        {{- include "varta-watch.udsInitContainer" . | nindent 8 }}
         {{- include "varta-watch.tokenInitContainer" . | nindent 8 }}
       containers:
         - name: varta-watch
