@@ -677,7 +677,16 @@ fn validate_socket_parent(path: &Path) -> io::Result<()> {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
     let parent = socket_parent(path);
-    let meta = std::fs::metadata(parent)?;
+    let meta = std::fs::symlink_metadata(parent)?;
+    if meta.file_type().is_symlink() {
+        return Err(io::Error::new(
+            ErrorKind::InvalidInput,
+            format!(
+                "observer socket parent {} must not be a symlink",
+                parent.display()
+            ),
+        ));
+    }
     if !meta.is_dir() {
         return Err(io::Error::new(
             ErrorKind::InvalidInput,
@@ -962,6 +971,46 @@ mod tests {
         drop(listener);
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_dir(&dir);
+    }
+
+    #[test]
+    fn uds_bind_rejects_symlink_parent_component() {
+        let (root, _) = short_temp_socket_path_with_mode("sl", 0o755);
+        let real = root.join("real");
+        let link = root.join("link");
+        std::fs::create_dir(&real).expect("create real parent");
+        std::os::unix::fs::symlink(&real, &link).expect("create parent symlink");
+
+        let path = link.join("s");
+        let real_socket = real.join("s");
+        let _bind_guard = BIND_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let err = match super::UdsListener::bind(
+            &path,
+            0o600,
+            Duration::from_millis(100),
+            0,
+            &pre_thread(),
+        ) {
+            Ok(listener) => {
+                drop(listener);
+                panic!("bind must reject a symlinked socket parent")
+            }
+            Err(err) => err,
+        };
+
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(
+            err.to_string().contains("symlink"),
+            "error should identify the symlinked parent component: {err}"
+        );
+        assert!(
+            !real_socket.exists(),
+            "bind rejection must not create a socket through the symlink target"
+        );
+
+        let _ = std::fs::remove_file(&link);
+        let _ = std::fs::remove_dir(&real);
+        let _ = std::fs::remove_dir(&root);
     }
 }
 
