@@ -10,11 +10,11 @@ During `bind(2)`, the observer temporarily narrows its process umask so
 the socket file is created as `0600` by default (owner read and write
 only). It does not apply the mode with a post-bind pathname `chmod(2)`;
 that avoids a time-of-check/time-of-use window where a replaceable parent
-directory could redirect the chmod to another file. The socket parent must
-be owned by the observer or root, and group/other-writable parents are
-accepted only when the sticky bit is set (`/tmp`-style semantics). Only
-processes running under the same UID as the observer can `connect(2)` to
-the default socket.
+directory could redirect the chmod to another file. The socket parent itself
+must be a real directory rather than a symlink, must be owned by the observer
+or root, and group/other-writable parents are accepted only when the sticky
+bit is set (`/tmp`-style semantics). Only processes running under the same
+UID as the observer can `connect(2)` to the default socket.
 
 | Flag               | Default | Format | Behaviour |
 |--------------------|---------|--------|-----------|
