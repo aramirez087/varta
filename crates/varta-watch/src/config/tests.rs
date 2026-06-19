@@ -1449,6 +1449,52 @@ fn parses_recovery_env_repeatable() {
 }
 
 #[test]
+fn recovery_env_rejects_missing_equals() {
+    match Config::from_args(args(&[
+        "--socket",
+        "/s",
+        "--threshold-ms",
+        "100",
+        "--recovery-env",
+        "FOO",
+    ])) {
+        Err(ConfigError::BadRecoveryEnv(raw)) => assert_eq!(raw, "FOO"),
+        other => panic!("expected BadRecoveryEnv, got {other:?}"),
+    }
+}
+
+#[test]
+fn recovery_env_rejects_empty_key() {
+    match Config::from_args(args(&[
+        "--socket",
+        "/s",
+        "--threshold-ms",
+        "100",
+        "--recovery-env",
+        "=bar",
+    ])) {
+        Err(ConfigError::BadRecoveryEnv(raw)) => assert_eq!(raw, "=bar"),
+        other => panic!("expected BadRecoveryEnv, got {other:?}"),
+    }
+}
+
+#[test]
+fn recovery_env_rejects_nul_byte() {
+    let raw = "FOO=bar\0baz";
+    match Config::from_args(args(&[
+        "--socket",
+        "/s",
+        "--threshold-ms",
+        "100",
+        "--recovery-env",
+        raw,
+    ])) {
+        Err(ConfigError::BadRecoveryEnv(err_raw)) => assert_eq!(err_raw, raw),
+        other => panic!("expected BadRecoveryEnv, got {other:?}"),
+    }
+}
+
+#[test]
 fn recovery_env_defaults_to_empty() {
     let cfg = Config::from_args(args(&["--socket", "/s", "--threshold-ms", "100"])).expect("parse");
     assert!(cfg.recovery_env.is_empty());

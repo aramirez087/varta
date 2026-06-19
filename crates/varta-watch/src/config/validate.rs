@@ -1,5 +1,7 @@
 use std::path::Path;
 
+use super::types::ConfigError;
+
 /// Validate that a secret file (recovery command, key, or token) meets the
 /// hardened requirements: regular file, owned by the observer's UID, mode
 /// `0o600` or stricter, no symlinks (`O_NOFOLLOW` open).
@@ -63,4 +65,19 @@ pub fn parse_exec_cmd(cmd: &str) -> std::io::Result<(String, Vec<String>)> {
     let program = parts.remove(0).to_string();
     let args: Vec<String> = parts.into_iter().map(|s| s.to_string()).collect();
     Ok((program, args))
+}
+
+/// Validate a recovery child environment override.
+///
+/// `std::process::Command::env` rejects names with `=` or NUL and values with
+/// NUL at spawn time. The parser rejects those shapes up front so recovery
+/// does not fail only after an agent has already stalled.
+pub(super) fn validate_recovery_env_entry(raw: &str) -> Result<(), ConfigError> {
+    let Some((key, value)) = raw.split_once('=') else {
+        return Err(ConfigError::BadRecoveryEnv(raw.to_string()));
+    };
+    if key.is_empty() || key.contains('\0') || value.contains('\0') {
+        return Err(ConfigError::BadRecoveryEnv(raw.to_string()));
+    }
+    Ok(())
 }

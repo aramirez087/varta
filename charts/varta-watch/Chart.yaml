@@ -7,7 +7,7 @@ type: application
 # release.yml workflow keeps `appVersion` synced with the released
 # v* tag; the chart's own `version` follows SemVer for the chart
 # itself and bumps on chart-shape changes.
-version: 0.1.0
+version: 0.1.1
 appVersion: "0.2.0"
 
 home: https://varta.sh

@@ -94,6 +94,39 @@ recovery_env = LANG=C.UTF-8
 }
 
 #[test]
+fn recovery_env_missing_equals_is_rejected() {
+    let bad = "\
+socket = /tmp/x.sock
+threshold_ms = 5000
+recovery_env = HOME
+";
+    let err = parse_kv(bad).expect_err("recovery_env without '=' must error");
+    assert!(err.contains("recovery_env"), "got: {err}");
+}
+
+#[test]
+fn recovery_env_empty_key_is_rejected() {
+    let bad = "\
+socket = /tmp/x.sock
+threshold_ms = 5000
+recovery_env = =/root
+";
+    let err = parse_kv(bad).expect_err("recovery_env with empty key must error");
+    assert!(err.contains("recovery_env"), "got: {err}");
+}
+
+#[test]
+fn recovery_env_nul_byte_is_rejected() {
+    let bad = "\
+socket = /tmp/x.sock
+threshold_ms = 5000
+recovery_env = HOME=/root\0bad
+";
+    let err = parse_kv(bad).expect_err("recovery_env with NUL must error");
+    assert!(err.contains("recovery_env"), "got: {err}");
+}
+
+#[test]
 fn out_of_range_iteration_budget_is_rejected() {
     let bad = "\
 socket = /tmp/x.sock

@@ -7,7 +7,7 @@ Health-protocol observer for distributed local agents.
 ```sh
 helm install varta-watch \
   oci://ghcr.io/aramirez087/charts/varta-watch \
-  --version 0.1.0 \
+  --version 0.1.1 \
   --create-namespace \
   --namespace varta \
   --set prometheusToken.token=$(openssl rand -hex 32)
@@ -38,7 +38,7 @@ Switch with `--set mode=daemonset` or `--set mode=sidecar`.
 The chart is signed with cosign (keyless OIDC). Adopters can verify:
 
 ```sh
-cosign verify oci://ghcr.io/aramirez087/charts/varta-watch:0.1.0 \
+cosign verify oci://ghcr.io/aramirez087/charts/varta-watch:0.1.1 \
   --certificate-identity-regexp '^https://github.com/aramirez087/Varta' \
   --certificate-oidc-issuer 'https://token.actions.githubusercontent.com'
 ```

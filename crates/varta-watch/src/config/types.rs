@@ -10,9 +10,9 @@ use crate::tracker::EvictionPolicy;
 /// without an explicit `--recovery-debounce-ms`.
 pub const DEFAULT_RECOVERY_DEBOUNCE_MS: u64 = 1000;
 
-/// Default UDS file permissions applied after bind (octal 0600 — owner-only
-/// read and write). Tightens the blast radius so only the owning UID can
-/// speak to the observer socket.
+/// Default UDS file permissions created at bind time (octal 0600 —
+/// owner-only read and write). Tightens the blast radius so only the owning
+/// UID can speak to the observer socket.
 pub const DEFAULT_SOCKET_MODE: u32 = 0o600;
 
 /// Default UDS read timeout in milliseconds. Capped so a stalled peer
@@ -327,7 +327,7 @@ pub struct Config {
     /// reaped on completion but never killed. Set via
     /// `--recovery-timeout-ms`.
     pub recovery_timeout: Option<Duration>,
-    /// UDS file mode applied after bind (octal, e.g. `0o600`).
+    /// UDS file mode created at bind time (octal, e.g. `0o600`).
     /// Defaults to [`DEFAULT_SOCKET_MODE`].
     pub socket_mode: u32,
     /// UDS read timeout for the bound socket. Defaults to
@@ -577,6 +577,8 @@ pub enum ConfigError {
     },
     /// A value on `--socket-mode` could not be parsed as octal.
     BadSocketMode(String),
+    /// `--recovery-env` was not a valid child environment entry.
+    BadRecoveryEnv(String),
     /// `--prom-addr` value did not parse as `IP:PORT`.
     BadAddr(String),
     /// A value for a string-enum flag was not one of the accepted choices.
@@ -847,6 +849,10 @@ impl core::fmt::Display for ConfigError {
                     "--socket-mode: expected octal digits (e.g. 600, 0600, or 0o600), got: {raw:?}"
                 )
             }
+            ConfigError::BadRecoveryEnv(raw) => write!(
+                f,
+                "--recovery-env: expected KEY=VALUE with a non-empty key and no NUL bytes, got: {raw:?}"
+            ),
             ConfigError::BadAddr(raw) => {
                 write!(f, "--prom-addr: not a valid socket address: {raw:?}")
             }
@@ -1023,6 +1029,7 @@ impl core::fmt::Display for ConfigError {
             | ConfigError::UnknownFlag(_)
             | ConfigError::BadInteger { .. }
             | ConfigError::BadSocketMode(_)
+            | ConfigError::BadRecoveryEnv(_)
             | ConfigError::BadAddr(_)
             | ConfigError::BadValue { .. }
             | ConfigError::HelpRequested

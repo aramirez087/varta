@@ -35,6 +35,8 @@ use super::types::{
     MIN_RECOVERY_AUDIT_MAX_BYTES, MIN_RECOVERY_CAPTURE_BYTES, MIN_RECOVERY_TIMEOUT_MS,
     MIN_SCRAPE_BUDGET_MS, MIN_SELF_WATCHDOG_SECS, MIN_SHUTDOWN_GRACE_MS, MIN_THRESHOLD_MS,
 };
+#[cfg(not(feature = "compile-time-config"))]
+use super::validate::validate_recovery_env_entry;
 
 #[cfg(not(feature = "compile-time-config"))]
 impl Config {
@@ -161,6 +163,7 @@ impl Config {
                     let v = iter
                         .next()
                         .ok_or(ConfigError::MissingValue("--recovery-env"))?;
+                    validate_recovery_env_entry(&v)?;
                     recovery_env.push(v);
                 }
                 "--recovery-inherit-env" => {

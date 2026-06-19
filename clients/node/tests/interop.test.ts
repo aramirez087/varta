@@ -28,6 +28,12 @@ import { locateWatchBinary, makeTempDir } from "./helpers.js";
 // and the Python interop test's `PROM_TOKEN_HEX`.
 const PROM_TOKEN_HEX =
   "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+const SCRAPE_ATTEMPTS = 5;
+const SCRAPE_RETRY_DELAY_MS = 50;
+
+async function sleep(ms: number): Promise<void> {
+  await new Promise((r) => setTimeout(r, ms));
+}
 
 async function pickEphemeralUdpPort(): Promise<number> {
   return await new Promise<number>((resolveFn, rejectFn) => {
@@ -117,7 +123,7 @@ async function spawnObserver(binary: string): Promise<{
     } catch {
       // Already dead.
     }
-    await new Promise((r) => setTimeout(r, 200));
+    await sleep(200);
     try {
       proc.kill("SIGKILL");
     } catch {
@@ -129,7 +135,16 @@ async function spawnObserver(binary: string): Promise<{
   return { promAddr, agentPort, udsPath, proc, cleanup };
 }
 
-async function scrapeMetrics(addr: { host: string; port: number }): Promise<string> {
+function isTransientScrapeError(err: unknown): boolean {
+  if (err instanceof Error && "code" in err) {
+    const code = (err as { code?: unknown }).code;
+    if (code === "ECONNRESET") return true;
+  }
+  const message = err instanceof Error ? err.message : String(err);
+  return message === "/metrics HTTP 405: ";
+}
+
+async function scrapeMetricsOnce(addr: { host: string; port: number }): Promise<string> {
   return await new Promise<string>((resolveFn, rejectFn) => {
     const req = request(
       {
@@ -158,6 +173,26 @@ async function scrapeMetrics(addr: { host: string; port: number }): Promise<stri
   });
 }
 
+async function scrapeMetrics(addr: { host: string; port: number }): Promise<string> {
+  let lastError: unknown;
+  for (let attempt = 1; attempt <= SCRAPE_ATTEMPTS; attempt++) {
+    try {
+      return await scrapeMetricsOnce(addr);
+    } catch (err) {
+      lastError = err;
+      if (!isTransientScrapeError(err) || attempt === SCRAPE_ATTEMPTS) {
+        throw err;
+      }
+      // The observer's /metrics endpoint is poll-loop bounded. On loaded
+      // macOS runners, Node can complete TCP connect before the HTTP bytes
+      // are readable by the accepted non-blocking stream; retry the scrape
+      // instead of failing on that single empty 405/reset race.
+      await sleep(SCRAPE_RETRY_DELAY_MS * attempt);
+    }
+  }
+  throw lastError instanceof Error ? lastError : new Error(String(lastError));
+}
+
 test("Node agent beats reach varta-watch over UDP and appear in /metrics", async () => {
   const binary = locateWatchBinary();
   if (!binary || !existsSync(binary)) {
@@ -178,7 +213,7 @@ test("Node agent beats reach varta-watch over UDP and appear in /metrics", async
       if (outcome.kind === "sent") sent += 1;
       else if (outcome.kind === "dropped") {
         // Kernel-queue-full under burst is fine — slow down slightly.
-        await new Promise((r) => setTimeout(r, 1));
+        await sleep(1);
       } else {
         assert.fail(`unexpected outcome: ${JSON.stringify(outcome)}`);
       }
@@ -188,7 +223,7 @@ test("Node agent beats reach varta-watch over UDP and appear in /metrics", async
     assert.ok(sent >= 10, `expected ≥10 successful beats, got ${sent}`);
 
     // Give the observer one poll-loop iteration to consume datagrams.
-    await new Promise((r) => setTimeout(r, 500));
+    await sleep(500);
 
     const body = await scrapeMetrics(observer.promAddr);
     assert.ok(body.length > 0, "empty /metrics body");
@@ -243,7 +278,7 @@ test("Node agent beats reach varta-watch over UDS and appear in /metrics", async
         if (Date.now() - start > 5000) {
           assert.fail(`observer never created UDS path ${observer.udsPath}`);
         }
-        await new Promise((r) => setTimeout(r, 25));
+        await sleep(25);
       }
     }
 
@@ -253,7 +288,7 @@ test("Node agent beats reach varta-watch over UDS and appear in /metrics", async
       const outcome = agent.beat(Status.Ok);
       if (outcome.kind === "sent") sent += 1;
       else if (outcome.kind === "dropped") {
-        await new Promise((r) => setTimeout(r, 1));
+        await sleep(1);
       } else {
         assert.fail(`unexpected outcome: ${JSON.stringify(outcome)}`);
       }
@@ -261,7 +296,7 @@ test("Node agent beats reach varta-watch over UDS and appear in /metrics", async
     agent.close();
 
     assert.ok(sent >= 10, `expected ≥10 successful beats, got ${sent}`);
-    await new Promise((r) => setTimeout(r, 500));
+    await sleep(500);
 
     const body = await scrapeMetrics(observer.promAddr);
     assert.ok(body.includes("varta_"), `no varta_ metrics in body: ${body.slice(0, 400)}`);

@@ -74,6 +74,9 @@ impl super::types::Config {
                 reason: "multiple recovery command sources configured",
             });
         }
+        for entry in &self.recovery_env {
+            super::validate::validate_recovery_env_entry(entry)?;
+        }
         if self.recovery_capture_stdio && !has_recovery {
             return Err(ConfigError::RecoveryCaptureRequiresRecovery);
         }
@@ -334,6 +337,17 @@ mod tests {
             Err(ConfigError::CompileTimeConfigInvalid {
                 reason: "recovery on secure UDP requires explicit acknowledgement"
             })
+        ));
+    }
+
+    #[test]
+    fn validate_runtime_rejects_malformed_recovery_env() {
+        let mut cfg = valid_config();
+        cfg.recovery_env = vec!["MISSING_SEPARATOR".to_string()];
+
+        assert!(matches!(
+            cfg.validate_runtime(),
+            Err(ConfigError::BadRecoveryEnv(raw)) if raw == "MISSING_SEPARATOR"
         ));
     }
 
