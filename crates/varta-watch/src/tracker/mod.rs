@@ -313,17 +313,15 @@ pub enum StallFreshness {
     /// `kill(2)`/`systemctl restart` would target it.
     PidRecycled,
     /// The slot is recovery-eligible (`KernelAttested`) and still
-    /// silence-latched, but it carries **no** start-time generation, so a PID
-    /// recycle inside the deferral window cannot be ruled out. This happens on
-    /// credential-passing platforms without `/proc` —
-    /// FreeBSD/DragonFly/NetBSD/illumos/Solaris — where the kernel attests the
-    /// sender PID (minting `KernelAttested`) but [`crate::peer_cred::read_pid_start_time`]
-    /// always returns `None`. On Linux a `KernelAttested` slot always carries a
-    /// generation (recovery authority requires complete identity), so this arm
-    /// is unreachable there. Treated as a safety skip — firing a deferred
-    /// recovery we cannot prove fresh risks killing a recycled bystander, the
-    /// same harm [`Self::PidRecycled`] guards against, only here the recycle is
-    /// *unverifiable* rather than *confirmed*.
+    /// silence-latched, but PID freshness cannot be proved at fire time: either
+    /// the queued stall carries **no** start-time generation, or the pinned
+    /// generation cannot be re-read before recovery fires. This happens
+    /// structurally on credential-passing platforms without `/proc` and can also
+    /// happen on Linux when `/proc/<pid>/stat` disappears or becomes unreadable
+    /// while a deferred stall waits behind the spawn budget. Treated as a safety
+    /// skip — firing a deferred recovery we cannot prove fresh risks killing a
+    /// recycled bystander, the same harm [`Self::PidRecycled`] guards against,
+    /// only here the recycle is *unverifiable* rather than *confirmed*.
     UnverifiableGeneration,
 }
 
@@ -1092,8 +1090,9 @@ impl Tracker {
     ///
     /// Returns [`StallFreshness::Warranted`] only while the slot stays present,
     /// used, and silence-latched (`stall_emitted`) AND — for a kernel-attested
-    /// slot with a pinned start-time `generation` — the live process still
-    /// matches that generation. This is the fire-time mirror of the recycle
+    /// slot with a pinned start-time `generation` — the live process can still
+    /// be read and still matches that generation. This is the fire-time mirror
+    /// of the recycle
     /// check `drain_stalled_slots` already runs at *enqueue* time: a PID
     /// recycle that lands inside the spawn-budget deferral window leaves the
     /// stall-latched slot untouched (the new occupant never beat), so without
@@ -1101,22 +1100,20 @@ impl Tracker {
     /// innocent recycled process.
     ///
     /// `generation` is the token carried on the queued `Event::Stall`; pass
-    /// `None` for non-kernel-attested / non-Linux slots, which skips the
-    /// recycle check and degrades to the silence-latch test alone.
+    /// `None` for non-kernel-attested / non-Linux slots. A recovery-eligible
+    /// `KernelAttested` stall without a token, or whose token cannot be re-read
+    /// at fire time, is treated as unverifiable rather than warranted.
     pub fn stall_freshness(&self, pid: u32, generation: Option<u64>) -> StallFreshness {
-        self.stall_freshness_with_recycle_check(pid, generation, |pid, pinned_generation| {
-            matches!(
-                crate::peer_cred::read_pid_start_time(pid),
-                Some(current_generation) if current_generation != pinned_generation
-            )
+        self.stall_freshness_with_generation_read(pid, generation, |pid, _| {
+            crate::peer_cred::read_pid_start_time(pid)
         })
     }
 
-    fn stall_freshness_with_recycle_check(
+    fn stall_freshness_with_generation_read(
         &self,
         pid: u32,
         generation: Option<u64>,
-        mut generation_recycled: impl FnMut(u32, u64) -> bool,
+        mut read_generation: impl FnMut(u32, u64) -> Option<u64>,
     ) -> StallFreshness {
         let Some(slot) = self
             .pid_to_index
@@ -1130,28 +1127,26 @@ impl Tracker {
             return StallFreshness::AgentResumed;
         }
         match generation {
-            Some(pinned_generation) => {
-                if generation_recycled(pid, pinned_generation) {
-                    StallFreshness::PidRecycled
-                } else {
+            Some(pinned_generation) => match read_generation(pid, pinned_generation) {
+                Some(current_generation) if current_generation == pinned_generation => {
                     StallFreshness::Warranted
                 }
-            }
+                Some(_) => StallFreshness::PidRecycled,
+                None => {
+                    if slot.origin == BeatOrigin::KernelAttested {
+                        StallFreshness::UnverifiableGeneration
+                    } else {
+                        StallFreshness::Warranted
+                    }
+                }
+            },
             None => {
-                // No generation token to verify freshness against. A
-                // `KernelAttested` slot is recovery-eligible, but on
-                // credential-only platforms without `/proc`
-                // (FreeBSD/DragonFly/NetBSD/illumos/Solaris) the kernel attests
-                // the sender PID — minting `KernelAttested` — while
-                // `read_pid_start_time` always returns `None`, so the recycle
-                // gate is structurally blind. Refuse to fire a recovery-eligible
-                // deferred stall we cannot prove fresh rather than risk
-                // `kill(2)`/restart against an innocent recycled PID. On Linux a
-                // `KernelAttested` slot always carries a generation (recovery
-                // authority requires complete identity), so this arm is reached
-                // only on those platforms. Non-eligible origins keep the
-                // silence-latch verdict: `on_stall` refuses them regardless of
-                // freshness, so the label they already produce is unchanged.
+                // No generation token to verify freshness against. Refuse to
+                // fire a recovery-eligible deferred stall we cannot prove fresh
+                // rather than risk `kill(2)`/restart against an innocent
+                // recycled PID. Non-eligible origins keep the silence-latch
+                // verdict: `on_stall` refuses them regardless of freshness, so
+                // the label they already produce is unchanged.
                 if slot.origin == BeatOrigin::KernelAttested {
                     StallFreshness::UnverifiableGeneration
                 } else {
@@ -1159,6 +1154,22 @@ impl Tracker {
                 }
             }
         }
+    }
+
+    #[cfg(test)]
+    fn stall_freshness_with_recycle_check(
+        &self,
+        pid: u32,
+        generation: Option<u64>,
+        mut generation_recycled: impl FnMut(u32, u64) -> bool,
+    ) -> StallFreshness {
+        self.stall_freshness_with_generation_read(pid, generation, |pid, pinned_generation| {
+            if generation_recycled(pid, pinned_generation) {
+                Some(pinned_generation.wrapping_add(1))
+            } else {
+                Some(pinned_generation)
+            }
+        })
     }
 
     /// Find newly-stalled slots and mark them emitted in one atomic pass.

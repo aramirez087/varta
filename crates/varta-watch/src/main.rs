@@ -1242,8 +1242,8 @@ fn run(cfg: Config) -> std::io::Result<()> {
                             varta_info_pid!(
                                 *pid,
                                 "recovery for pid {pid} SKIPPED: kernel-attested stall \
-                                 has no start-time generation on this platform, so a PID \
-                                 recycle in the deferral window cannot be ruled out — \
+                                 cannot prove start-time generation at fire time, so a PID \
+                                 recycle in the deferral window cannot be ruled out; \
                                  refusing recovery to avoid targeting a recycled bystander"
                             );
                             continue;

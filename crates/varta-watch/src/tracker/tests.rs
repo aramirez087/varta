@@ -450,6 +450,34 @@ fn stall_freshness_detects_pid_recycle_in_deferral_window() {
     );
 }
 
+/// A pinned Linux start-time token is only useful if it can still be re-read at
+/// fire time. If `/proc/<pid>/stat` becomes unavailable while a deferred stall
+/// waits behind the spawn budget, the observer can no longer prove that the
+/// numeric PID still names the stalled process. Treat that as unverifiable,
+/// not warranted, so recovery does not race a disappearing/recycled PID.
+#[test]
+fn stall_freshness_unavailable_generation_read_is_unverifiable() {
+    let mut t = Tracker::new(4, EvictionPolicy::Strict, DEFAULT_EVICTION_SCAN_WINDOW);
+    let threshold_ns = 100;
+
+    assert_eq!(
+        t.record_with_generation(&frame(1, 1), 0, threshold_ns, ORIGIN, None, Some(42)),
+        Update::Inserted
+    );
+    t.drain_stalled_slots_with_generation_check(
+        threshold_ns * 2,
+        threshold_ns,
+        |_, _| false,
+        |_, _, _, _, _, _| {},
+    );
+
+    assert_eq!(
+        t.stall_freshness_with_generation_read(1, Some(42), |_, _| None),
+        StallFreshness::UnverifiableGeneration,
+        "a recovery-eligible stall whose generation cannot be re-read must not fire blind"
+    );
+}
+
 /// The missing-generation escalation is scoped to recovery-eligible
 /// (`KernelAttested`) slots. A non-eligible origin (UDP `NetworkUnverified`,
 /// `SocketModeOnly`) keeps the silence-latch verdict (`Warranted`): `on_stall`
