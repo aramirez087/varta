@@ -376,6 +376,10 @@ pub fn parse_kv(input: &str) -> Result<ParsedConfig, String> {
 }
 
 fn validate_value(spec: &FlagSpec, value: &str, lineno: usize) -> Result<(), String> {
+    if spec.key == "recovery_env" {
+        return validate_recovery_env_entry(value, lineno);
+    }
+
     match spec.kind {
         FlagKind::Path | FlagKind::Str | FlagKind::List => Ok(()),
         FlagKind::Bool => match value {
@@ -443,6 +447,20 @@ fn validate_value(spec: &FlagSpec, value: &str, lineno: usize) -> Result<(), Str
             )),
         },
     }
+}
+
+fn validate_recovery_env_entry(value: &str, lineno: usize) -> Result<(), String> {
+    let Some((key, env_value)) = value.split_once('=') else {
+        return Err(format!(
+            "line {lineno}: recovery_env: expected KEY=VALUE, got {value:?}"
+        ));
+    };
+    if key.is_empty() || key.contains('\0') || env_value.contains('\0') {
+        return Err(format!(
+            "line {lineno}: recovery_env: expected non-empty KEY and no NUL bytes, got {value:?}"
+        ));
+    }
+    Ok(())
 }
 
 fn has_key(parsed: &ParsedConfig, key: &str) -> bool {

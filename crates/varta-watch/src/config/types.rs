@@ -577,6 +577,8 @@ pub enum ConfigError {
     },
     /// A value on `--socket-mode` could not be parsed as octal.
     BadSocketMode(String),
+    /// `--recovery-env` was not a valid child environment entry.
+    BadRecoveryEnv(String),
     /// `--prom-addr` value did not parse as `IP:PORT`.
     BadAddr(String),
     /// A value for a string-enum flag was not one of the accepted choices.
@@ -847,6 +849,10 @@ impl core::fmt::Display for ConfigError {
                     "--socket-mode: expected octal digits (e.g. 600, 0600, or 0o600), got: {raw:?}"
                 )
             }
+            ConfigError::BadRecoveryEnv(raw) => write!(
+                f,
+                "--recovery-env: expected KEY=VALUE with a non-empty key and no NUL bytes, got: {raw:?}"
+            ),
             ConfigError::BadAddr(raw) => {
                 write!(f, "--prom-addr: not a valid socket address: {raw:?}")
             }
@@ -1023,6 +1029,7 @@ impl core::fmt::Display for ConfigError {
             | ConfigError::UnknownFlag(_)
             | ConfigError::BadInteger { .. }
             | ConfigError::BadSocketMode(_)
+            | ConfigError::BadRecoveryEnv(_)
             | ConfigError::BadAddr(_)
             | ConfigError::BadValue { .. }
             | ConfigError::HelpRequested
