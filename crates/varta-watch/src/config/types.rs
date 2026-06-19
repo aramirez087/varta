@@ -48,11 +48,11 @@ const _: () = assert!(
 
 /// Maximum accepted UDS read timeout for the active watchdog configuration.
 ///
-/// The static Poll-stage ceiling protects prometheus-enabled builds that have
-/// per-stage aborts. Default/Class-A builds rely on the full-iteration
-/// `--self-watchdog-secs` deadline instead, so a configured 1 s watchdog must
-/// lower the read-timeout ceiling to 500 ms. `None` means no in-process
-/// watchdog, leaving the static ceiling in force.
+/// The static Poll-stage ceiling protects the feature-independent per-stage
+/// abort. A configured 1 s full-iteration watchdog must still lower the
+/// read-timeout ceiling to 500 ms so one idle receive cannot consume the
+/// entire watchdog window. `None` means no in-process watchdog, leaving the
+/// static ceiling in force.
 pub fn max_read_timeout_ms(self_watchdog: Option<Duration>) -> u64 {
     match self_watchdog {
         Some(deadline) => {
@@ -78,9 +78,8 @@ pub const MAINTENANCE_STAGE_ABORT_MS: u64 = 500;
 /// Half the abort threshold leaves headroom for the co-resident Maintenance
 /// work (eviction drains, the 10 ms `flush_audit_pending`) plus the watchdog's
 /// tick granularity, exactly as [`MAX_READ_TIMEOUT_MS`] does for the Poll
-/// stage. 250 ms is also far below the *default*-build full-iteration deadline
-/// (`--self-watchdog-secs`, min 1 s), so the bound protects both feature
-/// profiles (the per-stage abort itself is `prometheus-exporter`-gated).
+/// stage. 250 ms is also far below the minimum full-iteration deadline
+/// (`--self-watchdog-secs`, min 1 s), so the bound protects both checks.
 pub const MAX_AUDIT_ROTATION_BUDGET_MS: u32 = (MAINTENANCE_STAGE_ABORT_MS / 2) as u32;
 
 const _: () = assert!(

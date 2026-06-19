@@ -21,13 +21,11 @@ use std::fs::OpenOptions;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-#[cfg(feature = "prometheus-exporter")]
 use std::sync::atomic::AtomicU8;
 use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-#[cfg(feature = "prometheus-exporter")]
-use varta_watch::exporter::IterStage;
+use varta_watch::exporter::{IterStage, STAGE_LABELS};
 use varta_watch::log_ratelimit::LogKind;
 #[cfg(feature = "prometheus-exporter")]
 use varta_watch::PromExporter;
@@ -103,7 +101,6 @@ static WATCHDOG_LAST_NS: AtomicU64 = AtomicU64::new(0);
 /// the full [`LAST_TICK_NS`] deadline.  Indexed by [`IterStage as usize`].
 ///
 /// Initialised to 0; the watchdog treats 0 as "stage not yet entered".
-#[cfg(feature = "prometheus-exporter")]
 static LAST_STAGE_ENTRY_NS: [AtomicU64; 6] = [
     AtomicU64::new(0),
     AtomicU64::new(0),
@@ -116,8 +113,10 @@ static LAST_STAGE_ENTRY_NS: [AtomicU64; 6] = [
 /// Index of the stage the main thread is currently executing, or `u8::MAX`
 /// when the loop is idle (between iterations or in the throttle sleep).
 /// Written by the main thread, read by the self-watchdog thread.
-#[cfg(feature = "prometheus-exporter")]
 static CURRENT_STAGE: AtomicU8 = AtomicU8::new(u8::MAX);
+
+/// Sentinel value stored in [`CURRENT_STAGE`] while the loop is idle.
+const STAGE_IDLE: u8 = u8::MAX;
 
 /// Per-stage hard abort threshold in nanoseconds.  If the main thread stays
 /// in the same stage for longer than this value, the watchdog calls
@@ -125,7 +124,6 @@ static CURRENT_STAGE: AtomicU8 = AtomicU8::new(u8::MAX);
 /// transient overruns under scrape load do not trigger a false positive.
 ///
 /// Indexed by [`IterStage as usize`] — must stay in sync with the enum.
-#[cfg(feature = "prometheus-exporter")]
 const STAGE_ABORT_NS: [u64; 6] = [
     2_000 * 1_000_000, // DrainPending: 2 s (5× 20 ms soft budget)
     varta_watch::config::POLL_STAGE_ABORT_MS * 1_000_000, // Poll: capped vs MAX_READ_TIMEOUT_MS
@@ -234,15 +232,64 @@ fn watchdog_expired(now_ns: u64, last_ns: u64, deadline_ns: u64) -> bool {
 /// iteration yet (it stamps [`LAST_TICK_NS`] only at the foot of the loop), so
 /// petting systemd here would feed its `WatchdogSec` timer while the loop is
 /// wedged in its very first pass — e.g. a hung fsync or an NFS audit dir that
-/// blocks the first maintenance write before any tick. That masks the wedge
-/// from systemd exactly as `watchdog_expired`'s `last == 0` skip masks it from
-/// the in-process abort, defeating *both* liveness layers (on the default build
-/// Check 2 is `prometheus-exporter`-gated, so Check 1 is the only in-process
-/// guard). Withholding the pet until the first real tick lets systemd's timer
-/// fire instead. Once the loop has ticked at least once the pet resumes and
-/// still detects watchdog-thread death (no pet → systemd trips).
+/// blocks the first maintenance write before any tick. Withholding the pet
+/// until the first real tick preserves the systemd backstop while the
+/// in-process stage guard is still converging on the first published stage.
+/// Once the loop has ticked at least once the pet resumes and still detects
+/// watchdog-thread death (no pet → systemd trips).
 fn watchdog_should_pet_systemd(last_ns: u64) -> bool {
     last_ns != 0
+}
+
+struct StageWedge {
+    label: &'static str,
+    abort_ns: u64,
+}
+
+/// Publish the stage currently executing in the poll loop.
+///
+/// When the self-watchdog is disabled, this is a no-op so builds that do not
+/// request watchdog supervision do not pay extra monotonic-clock reads.
+/// Otherwise the entry timestamp is published first, then the stage index is
+/// stored with Release ordering. The watchdog thread's Acquire load of
+/// [`CURRENT_STAGE`] observes the matching timestamp.
+fn publish_stage(enabled: bool, stage: IterStage) {
+    if !enabled {
+        return;
+    }
+    let stage_idx = stage as usize;
+    if let Some(a) = LAST_STAGE_ENTRY_NS.get(stage_idx) {
+        a.store(watchdog_now_ns(), Ordering::Relaxed);
+    }
+    CURRENT_STAGE.store(stage as u8, Ordering::Release);
+}
+
+/// Mark the loop as idle between iterations.
+fn publish_idle_stage(enabled: bool) {
+    if enabled {
+        CURRENT_STAGE.store(STAGE_IDLE, Ordering::Release);
+    }
+}
+
+/// Return the wedged stage, if the current stage has exceeded its hard abort
+/// threshold.
+fn current_stage_wedge(now_ns: u64) -> Option<StageWedge> {
+    // Acquire pairs with the Release store in `publish_stage`. The matching
+    // LAST_STAGE_ENTRY_NS write happens-before that Release, so the Relaxed
+    // load below observes the timestamp belonging to this stage entry.
+    let stage_idx = CURRENT_STAGE.load(Ordering::Acquire);
+    if stage_idx == STAGE_IDLE {
+        return None;
+    }
+    let stage_idx = stage_idx as usize;
+    let abort_ns = *STAGE_ABORT_NS.get(stage_idx)?;
+    let entry_ns = LAST_STAGE_ENTRY_NS.get(stage_idx)?.load(Ordering::Relaxed);
+    if entry_ns != 0 && now_ns.saturating_sub(entry_ns) > abort_ns {
+        let label = STAGE_LABELS.get(stage_idx).copied().unwrap_or("unknown");
+        Some(StageWedge { label, abort_ns })
+    } else {
+        None
+    }
 }
 
 struct HeartbeatTempPath {
@@ -915,8 +962,8 @@ fn run(cfg: Config) -> std::io::Result<()> {
     // closure: with emission moved off the main loop, a silently-dead
     // watchdog thread stops WATCHDOG=1 and systemd's `WatchdogSec=` fires,
     // even when the main loop is still ticking.  The beat path and observer
-    // loop remain single-threaded; the watchdog reads two atomics and writes
-    // to its own dup-ed socket fd only.
+    // loop remain single-threaded; the watchdog reads a small fixed set of
+    // atomics and writes to its own dup-ed socket fd only.
     //
     // Enabled when EITHER `--self-watchdog-secs` is passed OR systemd
     // provided `$WATCHDOG_USEC`.  The latter is the "auto-enable" path: an
@@ -936,6 +983,7 @@ fn run(cfg: Config) -> std::io::Result<()> {
         (None, true) => Some(Duration::from_secs(AUTO_DEADLINE_SECS)),
         (None, false) => None,
     };
+    let stage_watchdog_enabled = wdt_deadline.is_some();
     // Captured so we can join the watchdog thread before emitting STOPPING=1
     // on clean shutdown — otherwise a tick scheduled before the join can
     // append a stray WATCHDOG=1 after STOPPING=1 (race seen on macOS CI).
@@ -982,40 +1030,14 @@ fn run(cfg: Config) -> std::io::Result<()> {
 
                 // Check 2: per-stage deadline.  If the main thread is stuck
                 // inside one phase for longer than STAGE_ABORT_NS[stage], abort
-                // even if the full-iteration deadline has not yet expired.  This
-                // catches e.g. a hung serve_pending that takes 1.9 s — visible
-                // via the stage histogram immediately but not caught by the 4 s
-                // iteration deadline until two full cycles later.
-                //
-                // Gated on `prometheus-exporter` because LAST_STAGE_ENTRY_NS and
-                // CURRENT_STAGE are only compiled under that feature.
-                #[cfg(feature = "prometheus-exporter")]
-                {
-                    // Acquire pairs with the Release store on CURRENT_STAGE in
-                    // the main thread. The matching LAST_STAGE_ENTRY_NS write
-                    // happens-before that Release, so a Relaxed load below
-                    // observes the timestamp belonging to *this* stage entry,
-                    // not a stale one from a prior visit.
-                    let stage_idx = CURRENT_STAGE.load(Ordering::Acquire);
-                    if stage_idx != u8::MAX {
-                        let stage_idx = stage_idx as usize;
-                        if let (Some(abort_ns), Some(entry_atom)) = (
-                            STAGE_ABORT_NS.get(stage_idx),
-                            LAST_STAGE_ENTRY_NS.get(stage_idx),
-                        ) {
-                            let entry_ns = entry_atom.load(Ordering::Relaxed);
-                            if entry_ns != 0 && now.saturating_sub(entry_ns) > *abort_ns {
-                                let stage_label = varta_watch::exporter::STAGE_LABELS
-                                    .get(stage_idx)
-                                    .copied()
-                                    .unwrap_or("unknown");
-                                eprintln!(
-                                    "varta-watch stage '{stage_label}' wedged for >{abort_ns}ns; aborting"
-                                );
-                                std::process::abort();
-                            }
-                        }
-                    }
+                // even if the full-iteration deadline has not yet expired.
+                if let Some(wedge) = current_stage_wedge(now) {
+                    let stage_label = wedge.label;
+                    let abort_ns = wedge.abort_ns;
+                    eprintln!(
+                        "varta-watch stage '{stage_label}' wedged for >{abort_ns}ns; aborting"
+                    );
+                    std::process::abort();
                 }
 
                 // Emit WATCHDOG=1 to keep systemd informed of *our* liveness
@@ -1090,18 +1112,7 @@ fn run(cfg: Config) -> std::io::Result<()> {
         // DrainPending starts at iter_start (no separate Instant needed).
         #[cfg(feature = "prometheus-exporter")]
         let mut stage_start = iter_start;
-        // Signal to the watchdog that DrainPending is now active.
-        // Publish the entry timestamp FIRST (Relaxed) then the stage index
-        // (Release): the Release on CURRENT_STAGE forms the happens-before
-        // edge that makes the matching ENTRY_NS write visible to the
-        // watchdog's Acquire load on CURRENT_STAGE.
-        #[cfg(feature = "prometheus-exporter")]
-        {
-            if let Some(a) = LAST_STAGE_ENTRY_NS.get(IterStage::DrainPending as usize) {
-                a.store(watchdog_now_ns(), Ordering::Relaxed);
-            }
-            CURRENT_STAGE.store(IterStage::DrainPending as u8, Ordering::Release);
-        }
+        publish_stage(stage_watchdog_enabled, IterStage::DrainPending);
 
         // ------ 1a. Ingress pre-drain before deferred stalls may fire ------
         // A queued stall is only as fresh as the tracker state behind it, and
@@ -1402,24 +1413,16 @@ fn run(cfg: Config) -> std::io::Result<()> {
         }
 
         // Record drain_pending stage, then reset timer for the poll phase.
-        // Stage *publication* (CURRENT_STAGE / LAST_STAGE_ENTRY_NS) is
-        // unconditional under the feature so the per-stage self-watchdog
-        // advances past DrainPending even when `--prom-addr` is unset
-        // (prom_export == None); only the histogram needs the live exporter.
-        // Without this split, CURRENT_STAGE was stuck at DrainPending for the
-        // whole iteration and Check 2 timed every stage against the wrong
-        // ceiling and mislabeled aborts.
+        // Only the histogram needs a live exporter; stage publication feeds
+        // the self-watchdog even in default/Class-A builds.
         #[cfg(feature = "prometheus-exporter")]
         {
             if let Some(pe) = prom_export.as_mut() {
                 pe.record_stage_duration(IterStage::DrainPending, stage_start.elapsed());
             }
             stage_start = Instant::now();
-            if let Some(a) = LAST_STAGE_ENTRY_NS.get(IterStage::Poll as usize) {
-                a.store(watchdog_now_ns(), Ordering::Relaxed);
-            }
-            CURRENT_STAGE.store(IterStage::Poll as u8, Ordering::Release);
         }
+        publish_stage(stage_watchdog_enabled, IterStage::Poll);
 
         // ----- 2. One non-blocking I/O poll for new beats / decode / auth ------
         // poll() never returns stalls — those are surfaced exclusively via
@@ -1440,18 +1443,14 @@ fn run(cfg: Config) -> std::io::Result<()> {
         }
 
         // Record poll stage, then reset timer for the maintenance phase.
-        // Publication unconditional under the feature (see DrainPending above).
         #[cfg(feature = "prometheus-exporter")]
         {
             if let Some(pe) = prom_export.as_mut() {
                 pe.record_stage_duration(IterStage::Poll, stage_start.elapsed());
             }
             stage_start = Instant::now();
-            if let Some(a) = LAST_STAGE_ENTRY_NS.get(IterStage::Maintenance as usize) {
-                a.store(watchdog_now_ns(), Ordering::Relaxed);
-            }
-            CURRENT_STAGE.store(IterStage::Maintenance as u8, Ordering::Release);
         }
+        publish_stage(stage_watchdog_enabled, IterStage::Maintenance);
 
         // ------ 3. Maintenance (evictions, capacity, reaping, /metrics) ------
         let evicted = observer.drain_evictions();
@@ -1801,18 +1800,14 @@ fn run(cfg: Config) -> std::io::Result<()> {
         }
 
         // Record maintenance stage, then reset timer for the recovery_reap phase.
-        // Publication unconditional under the feature (see DrainPending above).
         #[cfg(feature = "prometheus-exporter")]
         {
             if let Some(pe) = prom_export.as_mut() {
                 pe.record_stage_duration(IterStage::Maintenance, stage_start.elapsed());
             }
             stage_start = Instant::now();
-            if let Some(a) = LAST_STAGE_ENTRY_NS.get(IterStage::RecoveryReap as usize) {
-                a.store(watchdog_now_ns(), Ordering::Relaxed);
-            }
-            CURRENT_STAGE.store(IterStage::RecoveryReap as u8, Ordering::Release);
         }
+        publish_stage(stage_watchdog_enabled, IterStage::RecoveryReap);
 
         // Reap completed or timeout-exceeded children each tick.
         if let Some(rec) = recovery.as_mut() {
@@ -1857,19 +1852,15 @@ fn run(cfg: Config) -> std::io::Result<()> {
             }
         }
 
-        // Publish the recovery_reap → serve_pending → housekeeping transitions
-        // unconditionally under the feature (see DrainPending above); only the
-        // serve_pending WORK and its histograms need the live exporter.
+        // Publish the recovery_reap → serve_pending → housekeeping transitions;
+        // only the serve_pending work and its histograms need the live exporter.
         #[cfg(feature = "prometheus-exporter")]
         {
             // Record recovery_reap stage before entering serve_pending.
             if let Some(pe) = prom_export.as_mut() {
                 pe.record_stage_duration(IterStage::RecoveryReap, stage_start.elapsed());
             }
-            if let Some(a) = LAST_STAGE_ENTRY_NS.get(IterStage::ServePending as usize) {
-                a.store(watchdog_now_ns(), Ordering::Relaxed);
-            }
-            CURRENT_STAGE.store(IterStage::ServePending as u8, Ordering::Release);
+            publish_stage(stage_watchdog_enabled, IterStage::ServePending);
 
             if let Some(pe) = prom_export.as_mut() {
                 // Bracket serve_pending so its wall time is observable
@@ -1889,11 +1880,8 @@ fn run(cfg: Config) -> std::io::Result<()> {
                 pe.record_stage_duration(IterStage::ServePending, serve_elapsed);
             }
             stage_start = Instant::now(); // housekeeping starts after serve_pending
-            if let Some(a) = LAST_STAGE_ENTRY_NS.get(IterStage::Housekeeping as usize) {
-                a.store(watchdog_now_ns(), Ordering::Relaxed);
-            }
-            CURRENT_STAGE.store(IterStage::Housekeeping as u8, Ordering::Release);
         }
+        publish_stage(stage_watchdog_enabled, IterStage::Housekeeping);
 
         // ----- 4. Heartbeat file, self-watchdog tick, and HW watchdog kick ------
         // These run before the iteration histogram capture so a slow disk
@@ -1940,8 +1928,7 @@ fn run(cfg: Config) -> std::io::Result<()> {
         // deadline between iterations (the throttle sleep is not work).
         // Release matches every other CURRENT_STAGE store so the watchdog's
         // single Acquire load always sees a consistent stage transition.
-        #[cfg(feature = "prometheus-exporter")]
-        CURRENT_STAGE.store(u8::MAX, Ordering::Release);
+        publish_idle_stage(stage_watchdog_enabled);
 
         // ----- 6. Throttle: sleep only when truly idle ------
         // Avoid busy-waiting when there is no I/O and no queued stalls.
@@ -2011,6 +1998,8 @@ mod tests {
     #[cfg(unix)]
     static SIGNAL_TEST_LOCK: Mutex<()> = Mutex::new(());
 
+    static STAGE_TEST_LOCK: Mutex<()> = Mutex::new(());
+
     #[test]
     fn watchdog_expired_returns_false_before_first_tick() {
         // last == 0 means no tick yet — must never fire.
@@ -2049,6 +2038,53 @@ mod tests {
         // absence of a tick).
         assert!(watchdog_should_pet_systemd(1));
         assert!(watchdog_should_pet_systemd(u64::MAX));
+    }
+
+    #[test]
+    fn stage_watchdog_detects_wedged_stage_without_prometheus_exporter() {
+        let _guard = STAGE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        for entry in &LAST_STAGE_ENTRY_NS {
+            entry.store(0, Ordering::Relaxed);
+        }
+        CURRENT_STAGE.store(STAGE_IDLE, Ordering::Release);
+
+        let stage = IterStage::Maintenance;
+        let stage_idx = stage as usize;
+        let entry_ns = 1_000_000_000u64;
+        LAST_STAGE_ENTRY_NS[stage_idx].store(entry_ns, Ordering::Relaxed);
+        CURRENT_STAGE.store(stage as u8, Ordering::Release);
+
+        assert!(
+            current_stage_wedge(entry_ns + STAGE_ABORT_NS[stage_idx]).is_none(),
+            "the abort threshold is strict: equal-to-threshold is still tolerated"
+        );
+
+        let wedge = current_stage_wedge(entry_ns + STAGE_ABORT_NS[stage_idx] + 1)
+            .expect("stage overrun must be detected");
+        assert_eq!(wedge.label, STAGE_LABELS[stage_idx]);
+        assert_eq!(wedge.abort_ns, STAGE_ABORT_NS[stage_idx]);
+
+        publish_idle_stage(true);
+        assert!(
+            current_stage_wedge(u64::MAX).is_none(),
+            "idle loop time must not be judged against the last active stage"
+        );
+    }
+
+    #[test]
+    fn stage_publication_is_noop_when_watchdog_disabled() {
+        let _guard = STAGE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        for entry in &LAST_STAGE_ENTRY_NS {
+            entry.store(0, Ordering::Relaxed);
+        }
+        CURRENT_STAGE.store(STAGE_IDLE, Ordering::Release);
+
+        publish_stage(false, IterStage::Poll);
+
+        assert_eq!(CURRENT_STAGE.load(Ordering::Acquire), STAGE_IDLE);
+        assert!(LAST_STAGE_ENTRY_NS
+            .iter()
+            .all(|entry| entry.load(Ordering::Relaxed) == 0));
     }
 
     #[test]

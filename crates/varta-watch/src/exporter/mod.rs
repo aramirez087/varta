@@ -254,7 +254,6 @@ const ITERATION_BUCKET_BOUNDS_S: [f64; 8] =
 /// Every stage emits on every scrape (including zero-count stages) so
 /// `absent()` alert rules and `histogram_quantile()` stay correct from the
 /// first scrape.
-#[cfg(feature = "prometheus-exporter")]
 #[derive(Clone, Copy)]
 pub enum IterStage {
     /// Drain queued stall events from the observer stall queue.
@@ -274,7 +273,6 @@ pub enum IterStage {
 /// Prometheus `stage=` label values for each [`IterStage`] variant, indexed
 /// by `stage as usize`. Stable-label-set contract: emit every element on
 /// every scrape, even at zero.
-#[cfg(feature = "prometheus-exporter")]
 pub const STAGE_LABELS: [&str; 6] = [
     "drain_pending",
     "poll",
