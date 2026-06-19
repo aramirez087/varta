@@ -8,7 +8,6 @@
 
 use core::marker::PhantomData;
 use std::io::{self, ErrorKind};
-use std::os::unix::fs::PermissionsExt;
 use std::os::unix::io::AsRawFd;
 use std::os::unix::net::UnixDatagram;
 use std::path::{Path, PathBuf};
@@ -391,10 +390,13 @@ pub struct UdsListener {
 impl UdsListener {
     /// Bind a Unix datagram socket at `path` and return a [`UdsListener`].
     ///
-    /// The socket file permissions are set to `socket_mode` (octal, e.g.
-    /// `0o600`) after a successful bind. Credential passing is enabled on
-    /// the socket so that `recv` can verify the PID of every sender against
-    /// the kernel's `SO_PASSCRED` / `LOCAL_CREDS` attestation.
+    /// The socket file permissions are created as `socket_mode` (octal, e.g.
+    /// `0o600`) by temporarily narrowing the process umask around `bind(2)`.
+    /// Avoiding a post-bind pathname `chmod(2)` keeps the socket path from
+    /// becoming a TOCTOU target in writable parent directories. Credential
+    /// passing is enabled on the socket so that `recv` can verify the PID of
+    /// every sender against the kernel's `SO_PASSCRED` / `LOCAL_CREDS`
+    /// attestation.
     ///
     /// If a genuine stale socket exists at `path` (a socket inode with no
     /// listener), it is cleaned up and the bind succeeds. If another
@@ -413,8 +415,10 @@ impl UdsListener {
     ) -> io::Result<Self> {
         let path = path.as_ref();
         let owned_path: PathBuf = path.to_path_buf();
+        validate_socket_parent(path)?;
+        let effective_socket_mode = socket_mode & 0o777;
 
-        let restrict_umask = !socket_mode & 0o777;
+        let restrict_umask = !effective_socket_mode & 0o777;
         let _umask_guard = UmaskGuard(unsafe { umask(restrict_umask) });
         let bind_result = UnixDatagram::bind(path);
         let sock = match bind_result {
@@ -467,11 +471,13 @@ impl UdsListener {
                         }
                         let _umask_guard = UmaskGuard(unsafe { umask(restrict_umask) });
                         let sock = UnixDatagram::bind(path)?;
-                        std::fs::set_permissions(
-                            path,
-                            std::fs::Permissions::from_mode(socket_mode),
-                        )?;
-                        return Self::finish_bind(sock, owned_path, read_timeout, uds_rcvbuf_bytes);
+                        return Self::finish_bind(
+                            sock,
+                            owned_path,
+                            read_timeout,
+                            uds_rcvbuf_bytes,
+                            effective_socket_mode,
+                        );
                     }
                     Err(e) => {
                         return Err(io::Error::new(
@@ -484,8 +490,13 @@ impl UdsListener {
             Err(e) => return Err(e),
         };
 
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(socket_mode))?;
-        Self::finish_bind(sock, owned_path, read_timeout, uds_rcvbuf_bytes)
+        Self::finish_bind(
+            sock,
+            owned_path,
+            read_timeout,
+            uds_rcvbuf_bytes,
+            effective_socket_mode,
+        )
     }
 
     fn finish_bind(
@@ -493,9 +504,8 @@ impl UdsListener {
         path: PathBuf,
         read_timeout: Duration,
         uds_rcvbuf_bytes: u32,
+        expected_mode: u32,
     ) -> io::Result<Self> {
-        use std::os::unix::fs::MetadataExt;
-
         // The observer's round-robin `poll()` is contractually non-blocking:
         // it pulls at most one datagram per listener per call and must never
         // wait on an idle socket (`book/.../observer-liveness.md`, p99 ≤ 5 ms).
@@ -517,11 +527,11 @@ impl UdsListener {
         let raw_fd = sock.as_raw_fd();
         peer_cred::enable_credential_passing(raw_fd)?;
 
-        let meta = std::fs::metadata(&path)?;
-        let bound_dev = meta.dev();
-        let bound_ino = meta.ino();
+        let identity = bound_socket_identity(&path, expected_mode)?;
+        let bound_dev = identity.dev;
+        let bound_ino = identity.ino;
 
-        // Fsync the parent directory so the unlink+bind+chmod sequence is
+        // Fsync the parent directory so the unlink+bind sequence is
         // durable across power loss or an unclean shutdown.  The bind has
         // already succeeded — a directory-fsync failure is treated as a soft
         // durability degradation rather than a startup failure (some exotic
@@ -572,9 +582,12 @@ impl BeatListener for UdsListener {
 
 impl Drop for UdsListener {
     fn drop(&mut self) {
-        use std::os::unix::fs::MetadataExt;
-        if let Ok(meta) = std::fs::metadata(&self.path) {
-            if meta.dev() == self.bound_dev && meta.ino() == self.bound_ino {
+        use std::os::unix::fs::{FileTypeExt, MetadataExt};
+        if let Ok(meta) = std::fs::symlink_metadata(&self.path) {
+            if meta.file_type().is_socket()
+                && meta.dev() == self.bound_dev
+                && meta.ino() == self.bound_ino
+            {
                 let _ = std::fs::remove_file(&self.path);
             }
         }
@@ -653,6 +666,85 @@ fn path_occupant(path: &Path) -> io::Result<PathOccupant> {
     }
 }
 
+fn socket_parent(path: &Path) -> &Path {
+    match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    }
+}
+
+fn validate_socket_parent(path: &Path) -> io::Result<()> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let parent = socket_parent(path);
+    let meta = std::fs::metadata(parent)?;
+    if !meta.is_dir() {
+        return Err(io::Error::new(
+            ErrorKind::InvalidInput,
+            format!(
+                "observer socket parent {} is not a directory",
+                parent.display()
+            ),
+        ));
+    }
+
+    let owner = meta.uid();
+    let observer_uid = peer_cred::observer_uid();
+    if owner != observer_uid && owner != 0 {
+        return Err(io::Error::new(
+            ErrorKind::PermissionDenied,
+            format!(
+                "observer socket parent {} is owned by uid {owner}, expected uid {observer_uid} or root",
+                parent.display()
+            ),
+        ));
+    }
+
+    let mode = meta.permissions().mode() & 0o7777;
+    let group_or_other_writable = mode & 0o022 != 0;
+    let sticky = mode & 0o1000 != 0;
+    if group_or_other_writable && !sticky {
+        return Err(io::Error::new(
+            ErrorKind::PermissionDenied,
+            format!(
+                "observer socket parent {} is writable by group/other without the sticky bit",
+                parent.display()
+            ),
+        ));
+    }
+
+    Ok(())
+}
+
+fn bound_socket_identity(path: &Path, expected_mode: u32) -> io::Result<SocketIdentity> {
+    use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
+
+    let meta = std::fs::symlink_metadata(path)?;
+    if !meta.file_type().is_socket() {
+        return Err(io::Error::new(
+            ErrorKind::AddrInUse,
+            format!(
+                "observer socket path {} was replaced before bind completed",
+                path.display()
+            ),
+        ));
+    }
+    let actual_mode = meta.permissions().mode() & 0o777;
+    if actual_mode != expected_mode {
+        return Err(io::Error::new(
+            ErrorKind::PermissionDenied,
+            format!(
+                "observer socket at {} was created with mode {actual_mode:03o}, expected {expected_mode:03o}",
+                path.display()
+            ),
+        ));
+    }
+    Ok(SocketIdentity {
+        dev: meta.dev(),
+        ino: meta.ino(),
+    })
+}
+
 /// Probe whether a live listener is bound at `path`.
 fn probe_live(path: &Path) -> io::Result<bool> {
     let sock = UnixDatagram::unbound()?;
@@ -671,12 +763,15 @@ fn probe_live(path: &Path) -> io::Result<bool> {
 mod tests {
     use super::probe_live;
     use std::io::ErrorKind;
+    use std::os::unix::fs::PermissionsExt;
     use std::os::unix::net::UnixDatagram;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::sync::Mutex;
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+    static BIND_LOCK: Mutex<()> = Mutex::new(());
 
     fn temp_socket_path(label: &str) -> (PathBuf, PathBuf) {
         let mut dir = std::env::temp_dir();
@@ -690,8 +785,27 @@ mod tests {
             std::process::id()
         ));
         std::fs::create_dir(&dir).expect("create temp socket dir");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod temp socket dir");
         let path = dir.join("sock");
         (dir, path)
+    }
+
+    fn short_temp_socket_path_with_mode(label: &str, mode: u32) -> (PathBuf, PathBuf) {
+        let seq = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir = PathBuf::from(format!("/tmp/vw-{label}-{}-{seq}", std::process::id()));
+        let _ = std::fs::remove_dir(&dir);
+        std::fs::create_dir(&dir).expect("create short temp socket dir");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(mode))
+            .expect("chmod short temp socket dir");
+        let path = dir.join("s");
+        (dir, path)
+    }
+
+    fn pre_thread() -> super::PreThreadAttestation {
+        // SAFETY: listener unit tests use private, per-test paths and do not
+        // create concurrent filesystem objects during this bind window.
+        unsafe { super::PreThreadAttestation::new_unchecked() }
     }
 
     #[test]
@@ -770,6 +884,7 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         // The test runner is multi-threaded; the umask-race probe would fail.
         let pre_thread = unsafe { super::PreThreadAttestation::new_unchecked() };
+        let _bind_guard = BIND_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let mut listener = UdsListener::bind(
             &path,
             0o600,
@@ -797,6 +912,56 @@ mod tests {
 
         drop(listener);
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn uds_bind_rejects_writable_parent_without_sticky_bit() {
+        let (dir, path) = short_temp_socket_path_with_mode("up", 0o777);
+        let _bind_guard = BIND_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let err = match super::UdsListener::bind(
+            &path,
+            0o600,
+            Duration::from_millis(100),
+            0,
+            &pre_thread(),
+        ) {
+            Ok(_) => panic!("bind must reject replaceable socket parent"),
+            Err(err) => err,
+        };
+
+        assert_eq!(err.kind(), ErrorKind::PermissionDenied);
+        assert!(
+            err.to_string().contains("without the sticky bit"),
+            "error should explain the parent-directory replacement hazard: {err}"
+        );
+        assert!(
+            !path.exists(),
+            "bind rejection must not leave a socket file behind"
+        );
+
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755))
+            .expect("restore temp socket dir mode");
+        let _ = std::fs::remove_dir(&dir);
+    }
+
+    #[test]
+    fn uds_bind_allows_sticky_tmp_style_parent_and_creates_requested_mode() {
+        let (dir, path) = short_temp_socket_path_with_mode("sp", 0o1777);
+        let _bind_guard = BIND_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let listener =
+            super::UdsListener::bind(&path, 0o660, Duration::from_millis(100), 0, &pre_thread())
+                .expect("sticky world-writable parent mirrors /tmp and must be accepted");
+
+        let meta = std::fs::symlink_metadata(&path).expect("socket metadata");
+        assert_eq!(
+            meta.permissions().mode() & 0o777,
+            0o660,
+            "bind-time umask must create the requested socket mode without pathname chmod"
+        );
+
+        drop(listener);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir(&dir);
     }
 }
 

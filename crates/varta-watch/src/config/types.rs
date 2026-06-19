@@ -10,9 +10,9 @@ use crate::tracker::EvictionPolicy;
 /// without an explicit `--recovery-debounce-ms`.
 pub const DEFAULT_RECOVERY_DEBOUNCE_MS: u64 = 1000;
 
-/// Default UDS file permissions applied after bind (octal 0600 — owner-only
-/// read and write). Tightens the blast radius so only the owning UID can
-/// speak to the observer socket.
+/// Default UDS file permissions created at bind time (octal 0600 —
+/// owner-only read and write). Tightens the blast radius so only the owning
+/// UID can speak to the observer socket.
 pub const DEFAULT_SOCKET_MODE: u32 = 0o600;
 
 /// Default UDS read timeout in milliseconds. Capped so a stalled peer
@@ -327,7 +327,7 @@ pub struct Config {
     /// reaped on completion but never killed. Set via
     /// `--recovery-timeout-ms`.
     pub recovery_timeout: Option<Duration>,
-    /// UDS file mode applied after bind (octal, e.g. `0o600`).
+    /// UDS file mode created at bind time (octal, e.g. `0o600`).
     /// Defaults to [`DEFAULT_SOCKET_MODE`].
     pub socket_mode: u32,
     /// UDS read timeout for the bound socket. Defaults to

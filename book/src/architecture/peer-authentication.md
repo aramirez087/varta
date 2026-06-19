@@ -6,13 +6,19 @@ can reach the Unix Domain Socket.
 
 ## Layer 1: socket file permissions (`--socket-mode`)
 
-After `bind(2)`, the observer `chmod`s the socket file to `0600` by
-default (owner read and write only).  Only processes running under the
-same UID as the observer can `connect(2)` to the socket.
+During `bind(2)`, the observer temporarily narrows its process umask so
+the socket file is created as `0600` by default (owner read and write
+only). It does not apply the mode with a post-bind pathname `chmod(2)`;
+that avoids a time-of-check/time-of-use window where a replaceable parent
+directory could redirect the chmod to another file. The socket parent must
+be owned by the observer or root, and group/other-writable parents are
+accepted only when the sticky bit is set (`/tmp`-style semantics). Only
+processes running under the same UID as the observer can `connect(2)` to
+the default socket.
 
 | Flag               | Default | Format | Behaviour |
 |--------------------|---------|--------|-----------|
-| `--socket-mode`    | `0600`  | Octal (e.g. `0660`) | File mode applied via `chmod(2)` after bind.  Pass `0660` to allow group access. |
+| `--socket-mode`    | `0600`  | Octal (e.g. `0660`) | File mode created by the bind-time umask. Pass `0660` to allow group access. |
 
 ## Layer 2: kernel credential verification
 

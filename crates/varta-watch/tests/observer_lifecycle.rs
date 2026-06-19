@@ -7,8 +7,9 @@
 use std::io::ErrorKind;
 use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::os::unix::net::UnixDatagram;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
 use std::time::Duration;
 
 use varta_watch::listener::{drain_bind_dir_fsync_failures, PreThreadAttestation};
@@ -32,6 +33,7 @@ fn pre_thread() -> PreThreadAttestation {
 }
 
 static COUNTER: AtomicU64 = AtomicU64::new(0);
+static BIND_LOCK: Mutex<()> = Mutex::new(());
 
 fn unique_path(label: &str) -> PathBuf {
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -45,16 +47,12 @@ fn unique_path(label: &str) -> PathBuf {
 
 const THRESHOLD: Duration = Duration::from_secs(1);
 
-/// M5 baseline — Observer::bind creates the socket file with correct permissions.
-#[test]
-fn bind_succeeds_on_clean_path() {
-    let path = unique_path("clean");
-    assert!(!path.exists(), "path must not pre-exist");
-
-    let _obs = Observer::bind(
-        &path,
+fn bind_observer(path: &Path, socket_mode: u32) -> std::io::Result<Observer> {
+    let _guard = BIND_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    Observer::bind(
+        path,
         THRESHOLD,
-        0o600,
+        socket_mode,
         Duration::from_millis(100),
         0,
         64,
@@ -66,7 +64,15 @@ fn bind_succeeds_on_clean_path() {
         ClockSource::Monotonic,
         &pre_thread(),
     )
-    .expect("bind on clean path should succeed");
+}
+
+/// M5 baseline — Observer::bind creates the socket file with correct permissions.
+#[test]
+fn bind_succeeds_on_clean_path() {
+    let path = unique_path("clean");
+    assert!(!path.exists(), "path must not pre-exist");
+
+    let _obs = bind_observer(&path, 0o600).expect("bind on clean path should succeed");
 
     assert!(path.exists(), "socket file must exist after bind");
     let meta = std::fs::metadata(&path).expect("metadata");
@@ -90,40 +96,11 @@ fn bind_succeeds_on_clean_path() {
 fn bind_fails_when_live_observer_present() {
     let path = unique_path("live");
 
-    let _first = Observer::bind(
-        &path,
-        THRESHOLD,
-        0o600,
-        Duration::from_millis(100),
-        0,
-        64,
-        EvictionPolicy::Strict,
-        DEFAULT_EVICTION_SCAN_WINDOW,
-        None,
-        0,
-        0,
-        ClockSource::Monotonic,
-        &pre_thread(),
-    )
-    .expect("first bind must succeed");
+    let _first = bind_observer(&path, 0o600).expect("first bind must succeed");
 
-    let err = Observer::bind(
-        &path,
-        THRESHOLD,
-        0o600,
-        Duration::from_millis(100),
-        0,
-        64,
-        EvictionPolicy::Strict,
-        DEFAULT_EVICTION_SCAN_WINDOW,
-        None,
-        0,
-        0,
-        ClockSource::Monotonic,
-        &pre_thread(),
-    )
-    .err()
-    .expect("second bind on live socket must fail");
+    let err = bind_observer(&path, 0o600)
+        .err()
+        .expect("second bind on live socket must fail");
 
     assert_eq!(err.kind(), ErrorKind::AddrInUse);
     assert!(
@@ -152,22 +129,7 @@ fn bind_cleans_up_stale_socket_file() {
         "test setup must leave a stale socket inode"
     );
 
-    let _obs = Observer::bind(
-        &path,
-        THRESHOLD,
-        0o600,
-        Duration::from_millis(100),
-        0,
-        64,
-        EvictionPolicy::Strict,
-        DEFAULT_EVICTION_SCAN_WINDOW,
-        None,
-        0,
-        0,
-        ClockSource::Monotonic,
-        &pre_thread(),
-    )
-    .expect("bind over stale socket must succeed");
+    let _obs = bind_observer(&path, 0o600).expect("bind over stale socket must succeed");
 
     let meta = std::fs::metadata(&path).expect("metadata");
     assert!(
@@ -187,23 +149,9 @@ fn bind_preserves_non_socket_file_at_path() {
 
     std::fs::write(&path, b"do not delete").expect("create regular file");
 
-    let err = Observer::bind(
-        &path,
-        THRESHOLD,
-        0o600,
-        Duration::from_millis(100),
-        0,
-        64,
-        EvictionPolicy::Strict,
-        DEFAULT_EVICTION_SCAN_WINDOW,
-        None,
-        0,
-        0,
-        ClockSource::Monotonic,
-        &pre_thread(),
-    )
-    .err()
-    .expect("bind over regular file must fail");
+    let err = bind_observer(&path, 0o600)
+        .err()
+        .expect("bind over regular file must fail");
 
     assert_eq!(err.kind(), ErrorKind::AddrInUse);
     assert!(
@@ -224,22 +172,7 @@ fn bind_preserves_non_socket_file_at_path() {
 fn drop_unlinks_bound_socket() {
     let path = unique_path("drop-unlink");
 
-    let obs = Observer::bind(
-        &path,
-        THRESHOLD,
-        0o600,
-        Duration::from_millis(100),
-        0,
-        64,
-        EvictionPolicy::Strict,
-        DEFAULT_EVICTION_SCAN_WINDOW,
-        None,
-        0,
-        0,
-        ClockSource::Monotonic,
-        &pre_thread(),
-    )
-    .expect("bind must succeed");
+    let obs = bind_observer(&path, 0o600).expect("bind must succeed");
 
     assert!(path.exists(), "socket must exist after bind");
 
@@ -253,22 +186,7 @@ fn drop_unlinks_bound_socket() {
 fn drop_swallows_missing_file() {
     let path = unique_path("drop-missing");
 
-    let obs = Observer::bind(
-        &path,
-        THRESHOLD,
-        0o600,
-        Duration::from_millis(100),
-        0,
-        64,
-        EvictionPolicy::Strict,
-        DEFAULT_EVICTION_SCAN_WINDOW,
-        None,
-        0,
-        0,
-        ClockSource::Monotonic,
-        &pre_thread(),
-    )
-    .expect("bind must succeed");
+    let obs = bind_observer(&path, 0o600).expect("bind must succeed");
 
     std::fs::remove_file(&path).expect("manual remove");
     assert!(!path.exists());
@@ -283,22 +201,7 @@ fn bind_fsyncs_parent_directory_without_error() {
     let path = unique_path("dirfsync");
     let pre = drain_bind_dir_fsync_failures();
 
-    let _obs = Observer::bind(
-        &path,
-        THRESHOLD,
-        0o600,
-        Duration::from_millis(100),
-        0,
-        64,
-        EvictionPolicy::Strict,
-        DEFAULT_EVICTION_SCAN_WINDOW,
-        None,
-        0,
-        0,
-        ClockSource::Monotonic,
-        &pre_thread(),
-    )
-    .expect("bind must succeed and dir-fsync must not error");
+    let _obs = bind_observer(&path, 0o600).expect("bind must succeed and dir-fsync must not error");
 
     let post = drain_bind_dir_fsync_failures();
     assert_eq!(
@@ -318,22 +221,8 @@ fn bind_fsyncs_parent_directory_after_stale_recovery() {
 
     let pre = drain_bind_dir_fsync_failures();
 
-    let _obs = Observer::bind(
-        &path,
-        THRESHOLD,
-        0o600,
-        Duration::from_millis(100),
-        0,
-        64,
-        EvictionPolicy::Strict,
-        DEFAULT_EVICTION_SCAN_WINDOW,
-        None,
-        0,
-        0,
-        ClockSource::Monotonic,
-        &pre_thread(),
-    )
-    .expect("stale-recovery bind must succeed and dir-fsync must not error");
+    let _obs = bind_observer(&path, 0o600)
+        .expect("stale-recovery bind must succeed and dir-fsync must not error");
 
     let post = drain_bind_dir_fsync_failures();
     assert_eq!(
@@ -396,41 +285,11 @@ fn pre_thread_attestation_rejects_multi_threaded_process() {
 fn drop_preserves_foreign_inode() {
     let path = unique_path("drop-inode");
 
-    let obs_a = Observer::bind(
-        &path,
-        THRESHOLD,
-        0o600,
-        Duration::from_millis(100),
-        0,
-        64,
-        EvictionPolicy::Strict,
-        DEFAULT_EVICTION_SCAN_WINDOW,
-        None,
-        0,
-        0,
-        ClockSource::Monotonic,
-        &pre_thread(),
-    )
-    .expect("first bind must succeed");
+    let obs_a = bind_observer(&path, 0o600).expect("first bind must succeed");
 
     std::fs::remove_file(&path).expect("manual remove for inode swap");
 
-    let obs_b = Observer::bind(
-        &path,
-        THRESHOLD,
-        0o600,
-        Duration::from_millis(100),
-        0,
-        64,
-        EvictionPolicy::Strict,
-        DEFAULT_EVICTION_SCAN_WINDOW,
-        None,
-        0,
-        0,
-        ClockSource::Monotonic,
-        &pre_thread(),
-    )
-    .expect("second bind must succeed");
+    let obs_b = bind_observer(&path, 0o600).expect("second bind must succeed");
 
     drop(obs_a);
     assert!(
