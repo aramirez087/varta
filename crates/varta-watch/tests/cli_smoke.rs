@@ -758,9 +758,10 @@ fn cli_hw_watchdog_rejects_regular_file() {
     );
 }
 
-/// A character device passes the CLI validation and does not prevent a clean
-/// observer shutdown. `/dev/null` is used only to exercise the descriptor-type
-/// gate; unit tests cover the exact kick and magic-close bytes.
+/// On non-Linux targets there is no portable watchdog ioctl API, so the CLI
+/// validation stops at the descriptor-type gate. `/dev/null` is used only to
+/// exercise that gate; unit tests cover the exact kick and magic-close bytes.
+#[cfg(not(target_os = "linux"))]
 #[cfg_attr(miri, ignore)] // JUSTIFY: miri cannot model process spawning (Command::new)
 #[test]
 fn cli_hw_watchdog_accepts_character_device() {
@@ -783,6 +784,39 @@ fn cli_hw_watchdog_accepts_character_device() {
         out.status.success(),
         "character device should pass watchdog validation; status={:?}, stderr={}",
         out.status,
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// On Linux, a character device is not enough: `/dev/null` accepts writes but
+/// does not implement the watchdog ioctl API, so startup must fail before the
+/// observer begins treating writes as watchdog kicks.
+#[cfg(target_os = "linux")]
+#[cfg_attr(miri, ignore)] // JUSTIFY: miri cannot model process spawning (Command::new)
+#[test]
+fn cli_hw_watchdog_rejects_character_device_without_watchdog_ioctl() {
+    let socket = unique_uds_path("hwwdt-null");
+    let out = Command::new(env!("CARGO_BIN_EXE_varta-watch"))
+        .args([
+            "--socket",
+            socket.as_str(),
+            "--threshold-ms",
+            "100",
+            "--hw-watchdog",
+            "/dev/null",
+            "--shutdown-after-secs",
+            "1",
+        ])
+        .output()
+        .expect("spawn varta-watch with --hw-watchdog /dev/null");
+
+    assert!(
+        !out.status.success(),
+        "/dev/null must not pass Linux watchdog ioctl validation"
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("WDIOC_GETTIMEOUT failed"),
+        "startup error must name the missing watchdog ioctl; stderr: {}",
         String::from_utf8_lossy(&out.stderr)
     );
 }

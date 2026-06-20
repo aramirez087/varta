@@ -4,6 +4,10 @@
 //! it once per poll iteration.  If the observer crashes or hangs the device
 //! is not kicked, the kernel watchdog timer expires, and the host reboots.
 //!
+//! On Linux, opening the device also verifies the standard watchdog ioctl API
+//! and enforces the documented timeout floor.  A character device that accepts
+//! writes but does not answer `WDIOC_GETTIMEOUT` is not a watchdog.
+//!
 //! **Magic close:** on a clean shutdown (SIGTERM/SIGINT followed by graceful
 //! exit) [`HwWatchdog::arm_disarm_on_drop`] is called before the value is
 //! dropped.  The `Drop` impl writes the magic byte `'V'` (the POSIX "magic
@@ -16,6 +20,31 @@ use std::io::Write;
 use std::os::unix::fs::FileTypeExt;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
+
+/// Minimum hardware-watchdog timeout accepted by `varta-watch`.
+///
+/// The operator guide derives this from the observer's p99 iteration time,
+/// soft iteration budget, and self-watchdog deadline.  Shorter device
+/// timeouts can reboot a healthy observer during transient filesystem or
+/// scrape pressure.
+pub const MIN_HW_WATCHDOG_TIMEOUT_SECS: i32 = 30;
+
+#[cfg(any(
+    test,
+    all(
+        target_os = "linux",
+        any(
+            target_arch = "x86_64",
+            target_arch = "aarch64",
+            target_arch = "riscv64"
+        )
+    )
+))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WatchdogTimeoutOp {
+    GetTimeout,
+    SetTimeout,
+}
 
 /// Hardware watchdog driver for `varta-watch`.
 ///
@@ -44,7 +73,11 @@ impl HwWatchdog {
     /// is not a character device.
     pub fn open(path: &Path) -> std::io::Result<Self> {
         let file = OpenOptions::new().write(true).open(path)?;
-        if !file.metadata()?.file_type().is_char_device() {
+        let metadata = match file.metadata() {
+            Ok(metadata) => metadata,
+            Err(e) => return Err(disarm_after_failed_open(file, e)),
+        };
+        if !metadata.file_type().is_char_device() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 format!(
@@ -52,6 +85,9 @@ impl HwWatchdog {
                     path.display()
                 ),
             ));
+        }
+        if let Err(e) = enforce_timeout_floor(&file) {
+            return Err(disarm_after_failed_open(file, e));
         }
         Ok(Self {
             file,
@@ -90,9 +126,215 @@ impl Drop for HwWatchdog {
     }
 }
 
+fn disarm_after_failed_open(mut file: File, err: std::io::Error) -> std::io::Error {
+    // Opening a Linux watchdog can arm it. If startup validation rejects the
+    // descriptor after open(2), send the magic-close byte before returning the
+    // error so a clean startup failure does not leave a real watchdog running.
+    let _ = file.write_all(b"V");
+    err
+}
+
+#[cfg(target_os = "linux")]
+fn enforce_timeout_floor(file: &File) -> std::io::Result<()> {
+    linux_watchdog::enforce_timeout_floor(file)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn enforce_timeout_floor(_file: &File) -> std::io::Result<()> {
+    Ok(())
+}
+
+#[cfg(any(
+    test,
+    all(
+        target_os = "linux",
+        any(
+            target_arch = "x86_64",
+            target_arch = "aarch64",
+            target_arch = "riscv64"
+        )
+    )
+))]
+fn enforce_timeout_floor_with<F>(mut ioctl: F) -> std::io::Result<()>
+where
+    F: FnMut(WatchdogTimeoutOp, &mut i32) -> std::io::Result<()>,
+{
+    let mut timeout = 0;
+    ioctl(WatchdogTimeoutOp::GetTimeout, &mut timeout)
+        .map_err(|e| std::io::Error::new(e.kind(), format!("WDIOC_GETTIMEOUT failed: {e}")))?;
+
+    if timeout >= MIN_HW_WATCHDOG_TIMEOUT_SECS {
+        return Ok(());
+    }
+
+    let observed = timeout;
+    timeout = MIN_HW_WATCHDOG_TIMEOUT_SECS;
+    ioctl(WatchdogTimeoutOp::SetTimeout, &mut timeout).map_err(|e| {
+        std::io::Error::new(
+            e.kind(),
+            format!(
+                "watchdog timeout {observed}s is below required \
+                 {MIN_HW_WATCHDOG_TIMEOUT_SECS}s and WDIOC_SETTIMEOUT failed: {e}"
+            ),
+        )
+    })?;
+
+    if timeout < MIN_HW_WATCHDOG_TIMEOUT_SECS {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "watchdog timeout {timeout}s is below required \
+                 {MIN_HW_WATCHDOG_TIMEOUT_SECS}s after requesting \
+                 {MIN_HW_WATCHDOG_TIMEOUT_SECS}s"
+            ),
+        ));
+    }
+
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+mod linux_watchdog {
+    use std::fs::File;
+    use std::io;
+
+    #[cfg(any(
+        target_arch = "x86_64",
+        target_arch = "aarch64",
+        target_arch = "riscv64"
+    ))]
+    use super::{enforce_timeout_floor_with, WatchdogTimeoutOp};
+    #[cfg(any(
+        target_arch = "x86_64",
+        target_arch = "aarch64",
+        target_arch = "riscv64"
+    ))]
+    use std::os::raw::{c_int, c_ulong};
+    #[cfg(any(
+        target_arch = "x86_64",
+        target_arch = "aarch64",
+        target_arch = "riscv64"
+    ))]
+    use std::os::unix::io::AsRawFd;
+
+    // Linux watchdog UAPI:
+    //   include/uapi/linux/watchdog.h:
+    //     WDIOC_SETTIMEOUT = _IOWR('W', 6, int)
+    //     WDIOC_GETTIMEOUT = _IOR('W', 7, int)
+    //   include/uapi/asm-generic/ioctl.h:
+    //     _IOC_NRBITS=8, _IOC_TYPEBITS=8, _IOC_SIZEBITS=14,
+    //     _IOC_DIRBITS=2, _IOC_READ=2, _IOC_WRITE=1.
+    //
+    // The default supported Linux arches for varta-watch use this
+    // asm-generic ioctl encoding.  Do not let a different arch inherit these
+    // constants silently; ioctl encodings are a known per-arch footgun.
+    #[cfg(any(
+        target_arch = "x86_64",
+        target_arch = "aarch64",
+        target_arch = "riscv64"
+    ))]
+    mod raw {
+        use std::os::raw::{c_int, c_ulong};
+
+        const IOC_NRBITS: c_ulong = 8;
+        const IOC_TYPEBITS: c_ulong = 8;
+        const IOC_SIZEBITS: c_ulong = 14;
+
+        const IOC_NRSHIFT: c_ulong = 0;
+        const IOC_TYPESHIFT: c_ulong = IOC_NRSHIFT + IOC_NRBITS;
+        const IOC_SIZESHIFT: c_ulong = IOC_TYPESHIFT + IOC_TYPEBITS;
+        const IOC_DIRSHIFT: c_ulong = IOC_SIZESHIFT + IOC_SIZEBITS;
+
+        const IOC_WRITE: c_ulong = 1;
+        const IOC_READ: c_ulong = 2;
+        const WATCHDOG_IOCTL_BASE: c_ulong = b'W' as c_ulong;
+
+        const fn ioc(dir: c_ulong, ty: c_ulong, nr: c_ulong, size: c_ulong) -> c_ulong {
+            (dir << IOC_DIRSHIFT)
+                | (ty << IOC_TYPESHIFT)
+                | (nr << IOC_NRSHIFT)
+                | (size << IOC_SIZESHIFT)
+        }
+
+        pub const WDIOC_SETTIMEOUT: c_ulong = ioc(
+            IOC_READ | IOC_WRITE,
+            WATCHDOG_IOCTL_BASE,
+            6,
+            core::mem::size_of::<c_int>() as c_ulong,
+        );
+        pub const WDIOC_GETTIMEOUT: c_ulong = ioc(
+            IOC_READ,
+            WATCHDOG_IOCTL_BASE,
+            7,
+            core::mem::size_of::<c_int>() as c_ulong,
+        );
+
+        const _: () = assert!(WDIOC_SETTIMEOUT == 0xC004_5706);
+        const _: () = assert!(WDIOC_GETTIMEOUT == 0x8004_5707);
+    }
+
+    #[cfg(any(
+        target_arch = "x86_64",
+        target_arch = "aarch64",
+        target_arch = "riscv64"
+    ))]
+    extern "C" {
+        fn ioctl(fd: c_int, request: c_ulong, ...) -> c_int;
+    }
+
+    #[cfg(any(
+        target_arch = "x86_64",
+        target_arch = "aarch64",
+        target_arch = "riscv64"
+    ))]
+    pub fn enforce_timeout_floor(file: &File) -> io::Result<()> {
+        let fd = file.as_raw_fd();
+        enforce_timeout_floor_with(|op, timeout| raw_ioctl(fd, op, timeout))
+    }
+
+    #[cfg(not(any(
+        target_arch = "x86_64",
+        target_arch = "aarch64",
+        target_arch = "riscv64"
+    )))]
+    pub fn enforce_timeout_floor(_file: &File) -> io::Result<()> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            concat!(
+                "Linux watchdog ioctl constants are not verified for this architecture; ",
+                "--hw-watchdog is disabled on this target until the ioctl ABI is pinned"
+            ),
+        ))
+    }
+
+    #[cfg(any(
+        target_arch = "x86_64",
+        target_arch = "aarch64",
+        target_arch = "riscv64"
+    ))]
+    fn raw_ioctl(fd: c_int, op: WatchdogTimeoutOp, timeout: &mut i32) -> io::Result<()> {
+        let request = match op {
+            WatchdogTimeoutOp::GetTimeout => raw::WDIOC_GETTIMEOUT,
+            WatchdogTimeoutOp::SetTimeout => raw::WDIOC_SETTIMEOUT,
+        };
+        // SAFETY: `fd` is an open file descriptor owned by `HwWatchdog`, the
+        // request constants are the Linux watchdog UAPI values for the active
+        // architecture, and `timeout` points to a valid writable `int` slot for
+        // the duration of the call.
+        let ret = unsafe { ioctl(fd, request, timeout as *mut i32) };
+        if ret == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::RefCell;
+    use std::io;
 
     fn tmp_path(tag: &str) -> std::path::PathBuf {
         let mut p = std::env::temp_dir();
@@ -125,11 +367,132 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    #[cfg(not(target_os = "linux"))]
     #[test]
     fn open_accepts_character_device() {
         let watchdog = HwWatchdog::open(Path::new("/dev/null"))
             .expect("/dev/null is a portable character-device test fixture");
         drop(watchdog);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_open_rejects_character_device_without_watchdog_ioctl() {
+        let err = HwWatchdog::open(Path::new("/dev/null"))
+            .err()
+            .expect("/dev/null is not a Linux watchdog device");
+
+        assert!(
+            err.to_string().contains("WDIOC_GETTIMEOUT failed"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn timeout_at_floor_does_not_set_timeout() {
+        let calls = RefCell::new(Vec::new());
+
+        enforce_timeout_floor_with(|op, timeout| {
+            calls.borrow_mut().push(op);
+            match op {
+                WatchdogTimeoutOp::GetTimeout => {
+                    *timeout = MIN_HW_WATCHDOG_TIMEOUT_SECS;
+                    Ok(())
+                }
+                WatchdogTimeoutOp::SetTimeout => panic!("set should not be called"),
+            }
+        })
+        .expect("timeout at the floor is acceptable");
+
+        assert_eq!(calls.into_inner(), [WatchdogTimeoutOp::GetTimeout]);
+    }
+
+    #[test]
+    fn timeout_below_floor_is_raised() {
+        let calls = RefCell::new(Vec::new());
+
+        enforce_timeout_floor_with(|op, timeout| {
+            calls.borrow_mut().push((op, *timeout));
+            match op {
+                WatchdogTimeoutOp::GetTimeout => {
+                    *timeout = 5;
+                    Ok(())
+                }
+                WatchdogTimeoutOp::SetTimeout => {
+                    assert_eq!(*timeout, MIN_HW_WATCHDOG_TIMEOUT_SECS);
+                    *timeout = MIN_HW_WATCHDOG_TIMEOUT_SECS;
+                    Ok(())
+                }
+            }
+        })
+        .expect("settable short timeout should be raised");
+
+        assert_eq!(
+            calls.into_inner(),
+            [
+                (WatchdogTimeoutOp::GetTimeout, 0),
+                (WatchdogTimeoutOp::SetTimeout, MIN_HW_WATCHDOG_TIMEOUT_SECS)
+            ]
+        );
+    }
+
+    #[test]
+    fn timeout_still_below_floor_after_set_is_rejected() {
+        let err = enforce_timeout_floor_with(|op, timeout| {
+            match op {
+                WatchdogTimeoutOp::GetTimeout => {
+                    *timeout = 5;
+                }
+                WatchdogTimeoutOp::SetTimeout => {
+                    *timeout = 8;
+                }
+            }
+            Ok(())
+        })
+        .expect_err("kernel-clamped timeout below floor must fail closed");
+
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert!(
+            err.to_string()
+                .contains("below required 30s after requesting 30s"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn get_timeout_failure_rejects_device() {
+        let err = enforce_timeout_floor_with(|op, _timeout| {
+            assert_eq!(op, WatchdogTimeoutOp::GetTimeout);
+            Err(io::Error::new(io::ErrorKind::Other, "not a watchdog"))
+        })
+        .expect_err("GETTIMEOUT failure must reject the device");
+
+        assert_eq!(err.kind(), io::ErrorKind::Other);
+        assert!(
+            err.to_string().contains("WDIOC_GETTIMEOUT failed"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn failed_post_open_validation_writes_magic_close() {
+        let path = tmp_path("failed-open-magic");
+        std::fs::write(&path, b"").unwrap();
+        let file = OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .expect("open test sink");
+
+        let err = disarm_after_failed_open(file, io::Error::new(io::ErrorKind::Other, "reject"));
+
+        assert_eq!(err.kind(), io::ErrorKind::Other);
+        let contents = std::fs::read(&path).unwrap();
+        assert_eq!(
+            contents.last().copied(),
+            Some(b'V'),
+            "post-open startup rejection must best-effort magic-close"
+        );
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
