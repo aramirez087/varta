@@ -187,6 +187,49 @@ fn unknown_generation_does_not_trigger_recycle_reclaim() {
 }
 
 #[test]
+#[cfg_attr(miri, ignore)]
+fn recycled_pid_refuses_when_orphan_reap_queue_is_full() {
+    const PID: u32 = 2100;
+
+    let mut rec = Recovery::new_exec(
+        "sleep".to_string(),
+        vec!["30".to_string()],
+        Duration::from_secs(60),
+    )
+    .with_outstanding_capacity(1);
+    rec.push_orphan_for_test(9999, "sleep", &["30"]);
+
+    match rec.on_stall(PID, BeatOrigin::KernelAttested, false, Some(1), 0) {
+        RecoveryOutcome::Spawned { .. } => {}
+        other => panic!("expected first lineage to spawn, got {other:?}"),
+    }
+
+    match rec.on_stall(PID, BeatOrigin::KernelAttested, false, Some(2), 0) {
+        RecoveryOutcome::RefusedOutstandingCapacity { pid } => assert_eq!(pid, PID),
+        other => panic!("orphan-cap pressure must refuse before reclaim, got {other:?}"),
+    }
+
+    assert_eq!(
+        rec.reaping_orphans.len(),
+        1,
+        "full orphan queue must not grow on recycle reclaim"
+    );
+    assert!(
+        rec.outstanding.contains(PID),
+        "failed reclaim must leave the original outstanding slot intact"
+    );
+    assert!(
+        rec.outstanding.get(PID).is_some_and(|entry| entry.killed),
+        "the stale recovery child must be killed even when it cannot be orphaned"
+    );
+    assert_eq!(
+        rec.outstanding_recycle_resets, 0,
+        "reclaim counter must not increment when the reclaim was refused"
+    );
+    assert_eq!(rec.take_refused_outstanding_capacity(), 1);
+}
+
+#[test]
 fn exec_mode_substitutes_pid_in_args() {
     let mut rec = Recovery::with_mode(
         RecoveryMode::Exec {

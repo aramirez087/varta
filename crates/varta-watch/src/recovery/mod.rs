@@ -116,6 +116,16 @@ pub const RECOVERY_STALL_EVAL_MAX_PER_TICK: usize = 256;
 /// of magnitude inside the 2 s `STAGE_ABORT_NS[DrainPending]` ceiling).
 pub const RECOVERY_PREDRAIN_INGRESS_MAX_PER_TICK: usize = crate::tracker::MAX_CAPACITY;
 
+/// Maximum stale-lineage children retained for later orphan reaping.
+///
+/// Recovery can hold at most one outstanding child per tracked agent, but PID
+/// recycle handling moves the old lineage's child out of that pid-keyed table
+/// before spawning for the new lineage. Without a sibling cap, an unreapable
+/// stale child plus repeated recycle churn can grow `reaping_orphans` without
+/// bound and allocate inside the observer loop. Keep the orphan backlog under
+/// the same structural capacity discipline as [`OutstandingTable`].
+const DEFAULT_ORPHAN_CAPACITY: usize = crate::tracker::MAX_CAPACITY;
+
 /// How the recovery command is executed when an agent stalls.
 ///
 /// One mode is available:
@@ -326,6 +336,8 @@ pub struct Recovery {
     /// occupant can be recovered immediately; they are reaped non-blockingly
     /// here across later ticks (mirrors the timeout-kill → later-reap split).
     pub(in crate::recovery) reaping_orphans: Vec<(u32, Outstanding)>,
+    /// Structural cap for [`Self::reaping_orphans`].
+    pub(in crate::recovery) orphan_capacity: usize,
     /// Rotating index into `reaping_orphans`, the orphan-side analogue of
     /// `reap_cursor`. Caps the per-tick `try_wait(2)` budget for the orphan
     /// reaper at [`REAP_MAX_PER_TICK`] so a large reclaimed-orphan fan cannot
@@ -388,7 +400,8 @@ impl Recovery {
             reap_cursor: 0,
             reap_truncated_total: 0,
             reap_max: REAP_MAX_PER_TICK,
-            reaping_orphans: Vec::new(),
+            reaping_orphans: Vec::with_capacity(DEFAULT_ORPHAN_CAPACITY),
+            orphan_capacity: DEFAULT_ORPHAN_CAPACITY,
             orphan_reap_cursor: 0,
             outstanding_recycle_resets: 0,
         }
@@ -405,8 +418,17 @@ impl Recovery {
 
     /// Bound the outstanding-child table to `capacity` slots.
     pub fn with_outstanding_capacity(mut self, capacity: usize) -> Self {
-        let cap = capacity.clamp(1, crate::tracker::MAX_CAPACITY);
+        let cap = capacity
+            .clamp(1, crate::tracker::MAX_CAPACITY)
+            .max(self.reaping_orphans.len());
         self.outstanding = OutstandingTable::with_capacity(cap);
+        self.orphan_capacity = cap;
+        if self.reaping_orphans.is_empty() {
+            self.reaping_orphans = Vec::with_capacity(cap);
+        } else if self.reaping_orphans.capacity() < cap {
+            self.reaping_orphans
+                .reserve_exact(cap - self.reaping_orphans.capacity());
+        }
         self
     }
 
@@ -782,7 +804,9 @@ impl Recovery {
                 // bug-346 fixed for the debounce ledger, via the sibling path
                 // the OutstandingTable left open. Reclaim the stale slot and
                 // fall through to spawn recovery for the new lineage.
-                self.reclaim_recycled_outstanding(pid);
+                if !self.reclaim_recycled_outstanding(pid, observer_ns) {
+                    return RecoveryOutcome::RefusedOutstandingCapacity { pid };
+                }
             } else if let Some(outcome) = self.reap_finished_child(pid, observer_ns) {
                 self.pending_outcomes.push(outcome);
             } else {
@@ -846,7 +870,26 @@ impl Recovery {
     /// immediately. The killed child is reaped non-blockingly on later ticks
     /// (its terminal `complete` audit row is emitted then), exactly like the
     /// timeout-kill path; we never block the poll loop on `wait(2)` here.
-    fn reclaim_recycled_outstanding(&mut self, pid: u32) {
+    fn reclaim_recycled_outstanding(&mut self, pid: u32, observer_ns: u64) -> bool {
+        if self.reaping_orphans.len() >= self.orphan_capacity {
+            if let Some(entry) = self.outstanding.get_mut(pid) {
+                if !entry.killed {
+                    let _ = entry.child.kill();
+                    entry.killed = true;
+                }
+            }
+            self.refused_outstanding_capacity = self.refused_outstanding_capacity.saturating_add(1);
+            if let Some(sink) = self.audit_sink.as_mut() {
+                sink.record_refused(&RefusedRecord {
+                    wallclock_ms: RecoveryAuditLog::wallclock_ms_now(),
+                    observer_ns,
+                    agent_pid: pid,
+                    reason: "orphan_reap_capacity",
+                });
+            }
+            return false;
+        }
+
         self.outstanding_recycle_resets = self.outstanding_recycle_resets.saturating_add(1);
         if let Some(mut entry) = self.outstanding.remove(pid) {
             if !entry.killed {
@@ -857,6 +900,7 @@ impl Recovery {
             }
             self.reaping_orphans.push((pid, entry));
         }
+        true
     }
 
     /// Non-blocking reap of [`Self::reaping_orphans`] — children reclaimed from
