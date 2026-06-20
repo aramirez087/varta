@@ -587,6 +587,19 @@ impl Observer {
                     }
                     match Frame::decode(&data) {
                         Ok(frame) => {
+                            // Compute terminal bypass state before any
+                            // observer-local rejection path. The pid_max gate
+                            // below must still pay the global bucket unless it
+                            // is the one protected dying-gasp edge.
+                            let is_terminal = frame.nonce == NONCE_TERMINAL;
+                            let terminal_after_regular = is_terminal
+                                && matches!(
+                                    self.tracker.last_observed_nonce_of(frame.pid),
+                                    Some(nonce) if nonce != NONCE_TERMINAL
+                                );
+                            let terminal_global_bypass =
+                                terminal_after_regular && peer_pid != 0 && frame.pid == peer_pid;
+
                             // Observer-side PID range gate. VLP rejects 0/1
                             // as wire-format `BadPid`; here we additionally
                             // reject any pid above the kernel's configured
@@ -595,6 +608,9 @@ impl Observer {
                             // forged. Non-Linux: `pid_max == u32::MAX`,
                             // gate is a no-op.
                             if frame.pid > self.pid_max {
+                                if !terminal_global_bypass && !self.try_admit_global(now_ns) {
+                                    continue;
+                                }
                                 self.pid_above_max_drops =
                                     self.pid_above_max_drops.saturating_add(1);
                                 continue;
@@ -646,14 +662,6 @@ impl Observer {
                             // regular→terminal edge from the per-pid limiter,
                             // mirroring `origin_upgrade`; repeated terminal
                             // frames are ordinary same-pid pressure.
-                            let is_terminal = frame.nonce == NONCE_TERMINAL;
-                            let terminal_after_regular = is_terminal
-                                && matches!(
-                                    self.tracker.last_observed_nonce_of(frame.pid),
-                                    Some(nonce) if nonce != NONCE_TERMINAL
-                                );
-                            let terminal_global_bypass =
-                                terminal_after_regular && peer_pid != 0 && frame.pid == peer_pid;
                             // Per-pid rate limiting is an O(1) tracker lookup
                             // and must run before the global bucket. A
                             // same-pid burst that is already being dropped

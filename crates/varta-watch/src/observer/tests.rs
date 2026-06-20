@@ -698,6 +698,59 @@ fn authenticated_pid_mismatches_pay_global_rate_limit() {
 }
 
 #[test]
+fn pid_above_max_rejections_pay_global_rate_limit() {
+    let mut obs = Observer::new(
+        Duration::from_secs(60),
+        64,
+        EvictionPolicy::Strict,
+        DEFAULT_EVICTION_SCAN_WINDOW,
+        None,
+        1,
+        1,
+        ClockSource::Monotonic,
+    )
+    .expect("Observer::new should succeed");
+    obs.pid_max = 100;
+
+    obs.add_listener(Box::new(ScriptedListener::with_origin_frames(&[
+        (101, 1, 0, BeatOrigin::OperatorAttestedTransport),
+        (102, 1, 0, BeatOrigin::OperatorAttestedTransport),
+    ])));
+
+    let first = obs.poll();
+    assert!(
+        first.is_none(),
+        "the first above-pid_max frame should be locally rejected, got {first:?}"
+    );
+    assert_eq!(
+        obs.drain_pid_above_max_drops(),
+        1,
+        "the first above-pid_max frame should reach the local rejection counter"
+    );
+    assert_eq!(obs.drain_global_rate_limited(), 0);
+
+    let second = obs.poll();
+    assert!(
+        second.is_none(),
+        "the exhausted global bucket must shed repeated above-pid_max frames, got {second:?}"
+    );
+    assert_eq!(
+        obs.drain_global_rate_limited(),
+        1,
+        "the shed above-pid_max frame must be visible in global limiter metrics"
+    );
+    assert_eq!(
+        obs.drain_pid_above_max_drops(),
+        0,
+        "a globally shed above-pid_max frame must not also count as a local pid_max drop"
+    );
+    assert!(
+        obs.last_poll_consumed(),
+        "a rate-limited above-pid_max datagram is still consumed I/O"
+    );
+}
+
+#[test]
 fn terminal_gasp_bypasses_per_pid_rate_limiter() {
     // Regression: a panic hook's terminal beat (`NONCE_TERMINAL` => `Critical`)
     // is the agent's single dying gasp and almost always arrives within the
