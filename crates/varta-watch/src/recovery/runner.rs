@@ -1,5 +1,6 @@
 //! Command spawn, env setup, and child capture.
 
+use std::io;
 use std::os::unix::io::AsRawFd;
 use std::process::{Child, ChildStderr, ChildStdout, Command, ExitStatus, Stdio};
 use std::time::Instant;
@@ -46,6 +47,36 @@ pub(super) struct Outstanding {
     /// pin this entry when a backgrounded grandchild keeps the pipe
     /// write-end open so the read-end never reaches EOF.
     pub(super) completed_at: Option<Instant>,
+    #[cfg(test)]
+    pub(super) kill_error_for_test: Option<io::ErrorKind>,
+}
+
+pub(super) enum KillForReclaim {
+    Killed { child_pid: u32 },
+    AlreadyExited,
+    AlreadyKilled,
+}
+
+impl Outstanding {
+    pub(super) fn kill_for_reclaim(&mut self) -> io::Result<KillForReclaim> {
+        if self.killed {
+            return Ok(KillForReclaim::AlreadyKilled);
+        }
+        #[cfg(test)]
+        if let Some(kind) = self.kill_error_for_test.take() {
+            return Err(io::Error::new(kind, "injected reclaim kill failure"));
+        }
+
+        let child_pid = self.child.id();
+        match self.child.kill() {
+            Ok(()) => {
+                self.killed = true;
+                Ok(KillForReclaim::Killed { child_pid })
+            }
+            Err(e) if e.kind() == io::ErrorKind::InvalidInput => Ok(KillForReclaim::AlreadyExited),
+            Err(e) => Err(e),
+        }
+    }
 }
 
 /// Take the piped stdout/stderr handles off `child` (when capture is enabled)
@@ -124,6 +155,8 @@ impl Recovery {
                                 truncated: false,
                                 completed_status: None,
                                 completed_at: None,
+                                #[cfg(test)]
+                                kill_error_for_test: None,
                             },
                         );
                         self.last_fired.commit_reserved(last_fired_reservation);

@@ -93,6 +93,7 @@ Current reason tokens:
 | `debounce_capacity` | The debounce ledger was full and could not preserve the debounce invariant. |
 | `outstanding_capacity` | The outstanding-child table was full. |
 | `orphan_reap_capacity` | PID-recycle reclaim could not move another stale child into the bounded orphan reaper. |
+| `stale_child_kill_failed` | PID-recycle reclaim could not prove the previous lineage's recovery child was stopped. |
 | `spawn_failed` | The recovery command failed before a child was created. |
 | `skipped_agent_resumed` | A deferred stall was skipped because the agent resumed before recovery fired. |
 | `skipped_pid_recycled` | A deferred stall was skipped because the PID was recycled before recovery fired. |

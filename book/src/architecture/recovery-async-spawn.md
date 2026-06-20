@@ -62,13 +62,17 @@ pub enum RecoveryOutcome {
         duration_ns: u64,
     },
 
-    /// A previously-`Spawned` child exceeded `recovery_timeout` and was
-    /// killed via `kill(2)` on this tick.
+    /// A previously-`Spawned` child was killed via `kill(2)` on this tick
+    /// after a timeout or a recycled-pid stale-child reclaim.
     Killed { child_pid: u32 },
 
     /// `try_wait` or `kill` failed for an outstanding child. The pid is
     /// still tracked; the observer will retry on the next tick.
     ReapFailed(std::io::Error),
+
+    /// A recycled pid's previous recovery child could not be killed, so the
+    /// old outstanding slot is retained and the new lineage is not spawned.
+    RefusedStaleChildKillFailed { pid: u32, error: std::io::Error },
 }
 
 impl Recovery {
@@ -135,6 +139,15 @@ proof and the static-allocation rationale.
 One outstanding child per stalled pid; if the pid stalls again while a
 child is still outstanding, the per-pid debounce window suppresses a
 duplicate spawn regardless of the table state.
+
+If the pid's start-time generation proves the OS recycled that numeric
+pid while a previous recovery child is still outstanding, recovery first
+tries to kill the stale child and move it to the bounded orphan reaper. A
+new lineage is spawned only after that kill succeeds or the child has
+already exited. Any other `kill(2)` failure is fail-closed as
+`RefusedStaleChildKillFailed`: the old outstanding slot stays tracked, no
+new child is spawned for the recycled pid, and the audit log records
+`stale_child_kill_failed`.
 
 ## Tick budget
 
@@ -227,5 +240,6 @@ all exec-mode children flow through it.
 - [Deployment Ceiling & Sharding](deployment-ceiling-and-sharding.md) —
   what 4096 means in practice and how to scale past it.
 - [Audit Logging](audit-log.md) — every recovery decision (Spawned /
-  Debounced / Refused / SpawnFailed / Skipped / Reaped / Killed) emits a
+  Debounced / Refused / SpawnFailed / Skipped / Reaped / Killed /
+  stale-child kill failure) emits a
   TSV record.

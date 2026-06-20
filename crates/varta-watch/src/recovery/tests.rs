@@ -230,6 +230,72 @@ fn recycled_pid_refuses_when_orphan_reap_queue_is_full() {
 }
 
 #[test]
+#[cfg_attr(miri, ignore)]
+fn recycled_pid_refuses_when_stale_child_cannot_be_killed() {
+    const PID: u32 = 2200;
+
+    let dir = audit_tmpdir("stale-kill-failed");
+    let path = dir.join("audit.log");
+    let (sink, _) = audit::RecoveryAuditLog::create(&path, audit::AuditConfig::default())
+        .expect("create audit");
+
+    let mut rec = Recovery::new_exec(
+        "sleep".to_string(),
+        vec!["30".to_string()],
+        Duration::from_secs(60),
+    )
+    .with_audit_sink(Some(sink));
+
+    match rec.on_stall(PID, BeatOrigin::KernelAttested, false, Some(1), 0) {
+        RecoveryOutcome::Spawned { .. } => {}
+        other => panic!("expected first lineage to spawn, got {other:?}"),
+    }
+    rec.outstanding
+        .get_mut(PID)
+        .expect("first lineage child is outstanding")
+        .kill_error_for_test = Some(std::io::ErrorKind::PermissionDenied);
+
+    match rec.on_stall(PID, BeatOrigin::KernelAttested, false, Some(2), 55) {
+        RecoveryOutcome::RefusedStaleChildKillFailed { pid, error } => {
+            assert_eq!(pid, PID);
+            assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        }
+        other => panic!("kill failure must fail closed, got {other:?}"),
+    }
+
+    assert!(
+        rec.outstanding.contains(PID),
+        "failed stale-child kill must keep the original slot tracked"
+    );
+    let entry = rec
+        .outstanding
+        .get(PID)
+        .expect("original outstanding slot still present");
+    assert_eq!(
+        entry.generation,
+        Some(1),
+        "new lineage must not replace the stale child after kill failure"
+    );
+    assert!(
+        !entry.killed,
+        "failed kill must not be recorded as a successful kill"
+    );
+    assert!(
+        rec.reaping_orphans.is_empty(),
+        "failed kill must not move the stale child to the orphan reaper"
+    );
+    assert_eq!(
+        rec.outstanding_recycle_resets, 0,
+        "reclaim counter must not increment when the stale child was not reclaimed"
+    );
+
+    drop(rec);
+    let body = std::fs::read_to_string(&path).expect("read audit");
+    assert_refused_reason(&body, PID, "stale_child_kill_failed");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn exec_mode_substitutes_pid_in_args() {
     let mut rec = Recovery::with_mode(
         RecoveryMode::Exec {

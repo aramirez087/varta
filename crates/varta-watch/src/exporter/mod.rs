@@ -377,7 +377,7 @@ const DROP_REASON_LABELS: [&str; 3] = ["drain", "rate_limit", "ip_table_full"];
 /// [`recovery_outcome_index`]; emitted unconditionally (every value, even
 /// at zero) so `absent()` alert rules stay green.
 #[cfg(feature = "prometheus-exporter")]
-const RECOVERY_OUTCOME_LABELS: [&str; 14] = [
+const RECOVERY_OUTCOME_LABELS: [&str; 15] = [
     "spawned",
     "debounced",
     "reaped_zero",
@@ -389,6 +389,7 @@ const RECOVERY_OUTCOME_LABELS: [&str; 14] = [
     "refused_debounce_capacity",
     "refused_outstanding_capacity",
     "refused_socket_mode_only",
+    "refused_stale_child_kill_failed",
     "skipped_agent_resumed",
     "skipped_pid_recycled",
     "skipped_stall_unverifiable",
@@ -398,12 +399,13 @@ const RECOVERY_OUTCOME_LABELS: [&str; 14] = [
 /// [`refused_reason_index`]; emitted unconditionally so `absent()` rules
 /// stay green.
 #[cfg(feature = "prometheus-exporter")]
-const RECOVERY_REFUSED_REASON_LABELS: [&str; 5] = [
+const RECOVERY_REFUSED_REASON_LABELS: [&str; 6] = [
     "unauthenticated_transport",
     "cross_namespace_agent",
     "debounce_capacity",
     "outstanding_capacity",
     "socket_mode_only",
+    "stale_child_kill_failed",
 ];
 
 /// Map a [`crate::recovery::RecoveryOutcome`] to a stable index for the
@@ -428,19 +430,19 @@ fn recovery_outcome_index(outcome: &crate::recovery::RecoveryOutcome) -> usize {
         RecoveryOutcome::RefusedDebounceCapacity { .. } => 8,
         RecoveryOutcome::RefusedOutstandingCapacity { .. } => 9,
         RecoveryOutcome::RefusedSocketModeOnly { .. } => 10,
-        RecoveryOutcome::SkippedAgentResumed { .. } => 11,
-        RecoveryOutcome::SkippedPidRecycled { .. } => 12,
-        RecoveryOutcome::SkippedStallUnverifiable { .. } => 13,
+        RecoveryOutcome::RefusedStaleChildKillFailed { .. } => 11,
+        RecoveryOutcome::SkippedAgentResumed { .. } => 12,
+        RecoveryOutcome::SkippedPidRecycled { .. } => 13,
+        RecoveryOutcome::SkippedStallUnverifiable { .. } => 14,
         // ReapFailed is not user-facing here — treat as a reap-nonzero
         // (it implies the child terminated abnormally from our POV).
         RecoveryOutcome::ReapFailed(_) => 3,
     }
 }
 
-/// Refusal reason for the `varta_recovery_refused_total` array. Currently
-/// only one reason is defined; the helper is kept to mirror the
-/// decode_kind_index / drop_reason_index pattern so adding new reasons is
-/// a localized change.
+/// Refusal reason for the `varta_recovery_refused_total` array. Kept separate
+/// from outcome labels so multiple refusal surfaces can share a stable
+/// operator-facing reason set.
 #[cfg(feature = "prometheus-exporter")]
 #[derive(Clone, Copy, Debug)]
 enum RefusedReason {
@@ -449,6 +451,7 @@ enum RefusedReason {
     DebounceCapacity,
     OutstandingCapacity,
     SocketModeOnly,
+    StaleChildKillFailed,
 }
 
 #[cfg(feature = "prometheus-exporter")]
@@ -459,6 +462,7 @@ fn refused_reason_index(r: RefusedReason) -> usize {
         RefusedReason::DebounceCapacity => 2,
         RefusedReason::OutstandingCapacity => 3,
         RefusedReason::SocketModeOnly => 4,
+        RefusedReason::StaleChildKillFailed => 5,
     }
 }
 
@@ -1095,6 +1099,11 @@ impl PromExporter {
             }
             crate::recovery::RecoveryOutcome::RefusedSocketModeOnly { .. } => {
                 let r_idx = refused_reason_index(RefusedReason::SocketModeOnly);
+                self.recovery_refused_total[r_idx] =
+                    self.recovery_refused_total[r_idx].saturating_add(1);
+            }
+            crate::recovery::RecoveryOutcome::RefusedStaleChildKillFailed { .. } => {
+                let r_idx = refused_reason_index(RefusedReason::StaleChildKillFailed);
                 self.recovery_refused_total[r_idx] =
                     self.recovery_refused_total[r_idx].saturating_add(1);
             }

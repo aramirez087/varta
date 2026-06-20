@@ -1376,6 +1376,15 @@ fn run(cfg: Config) -> std::io::Result<()> {
                                  unsafe."
                             );
                         }
+                        RecoveryOutcome::RefusedStaleChildKillFailed { pid, error } => {
+                            varta_error_pid!(
+                                pid,
+                                error,
+                                "recovery for pid {pid} REFUSED: PID recycled while a \
+                                 previous recovery child was still running, and that \
+                                 stale child could not be killed: {error}"
+                            );
+                        }
                         RecoveryOutcome::Reaped { .. }
                         | RecoveryOutcome::Killed { .. }
                         | RecoveryOutcome::ReapFailed(_) => {
@@ -1823,10 +1832,7 @@ fn run(cfg: Config) -> std::io::Result<()> {
                         );
                     }
                     RecoveryOutcome::Killed { child_pid } => {
-                        varta_warn_child!(
-                            child_pid,
-                            "recovery child {child_pid} killed after timeout"
-                        );
+                        varta_warn_child!(child_pid, "recovery child {child_pid} killed");
                     }
                     RecoveryOutcome::ReapFailed(e) => {
                         varta_error_err!(e, "recovery reap failed: {e}");

@@ -120,8 +120,8 @@ zero), so `by (label)` queries and `absent()` rules are safe day-one.
 
 | Metric                                             | Type    | Labels    | Meaning                                                                                                 |
 |----------------------------------------------------|---------|-----------|---------------------------------------------------------------------------------------------------------|
-| `varta_recovery_outcomes_total`                    | counter | `outcome` | Per-outcome counter. Labels: `spawned, debounced, reaped_zero, reaped_nonzero, killed, reap_failed, audit_failed, spawn_failed, timeout_fired, outstanding_dropped, signal_send_failed`. |
-| `varta_recovery_refused_total`                     | counter | `reason`  | Recovery refused by policy. Labels: `unauthenticated_transport, cross_namespace_agent, debounce_capacity, outstanding_capacity, socket_mode_only`. |
+| `varta_recovery_outcomes_total`                    | counter | `outcome` | Per-outcome counter. Labels: `spawned, debounced, reaped_zero, reaped_nonzero, killed, spawn_failed, refused_unauthenticated_transport, refused_cross_namespace, refused_debounce_capacity, refused_outstanding_capacity, refused_socket_mode_only, refused_stale_child_kill_failed, skipped_agent_resumed, skipped_pid_recycled, skipped_stall_unverifiable`. |
+| `varta_recovery_refused_total`                     | counter | `reason`  | Recovery refused by policy. Labels: `unauthenticated_transport, cross_namespace_agent, debounce_capacity, outstanding_capacity, socket_mode_only, stale_child_kill_failed`. |
 | `varta_recovery_duration_ns_sum`                   | counter |           | Sum of child wall-clock durations (ns).                                                                  |
 | `varta_recovery_duration_count_total`              | counter |           | Number of completions. `sum/count` ⇒ mean.                                                              |
 | `varta_recovery_last_fired_evictions_total`        | counter |           | LastFiredTable entries evicted at capacity.                                                              |

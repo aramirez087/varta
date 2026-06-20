@@ -971,6 +971,28 @@ fn recovery_refused_debounce_capacity_outcome_drives_counters() {
     );
 }
 
+#[test]
+fn recovery_refused_stale_child_kill_failed_outcome_drives_counters() {
+    let mut prom = PromExporter::bind("127.0.0.1:0".parse().unwrap(), make_token()).expect("bind");
+    let outcome = crate::recovery::RecoveryOutcome::RefusedStaleChildKillFailed {
+        pid: 42,
+        error: std::io::Error::new(std::io::ErrorKind::PermissionDenied, "kill failed"),
+    };
+    prom.record_recovery_outcome(&outcome, None);
+    prom.render_body();
+    let body = &prom.body_buf;
+    assert!(
+        body.contains(
+            "varta_recovery_outcomes_total{outcome=\"refused_stale_child_kill_failed\"} 1"
+        ),
+        "outcome counter must increment under refused_stale_child_kill_failed; body:\n{body}"
+    );
+    assert!(
+        body.contains("varta_recovery_refused_total{reason=\"stale_child_kill_failed\"} 1"),
+        "refused-reason counter must increment under stale_child_kill_failed; body:\n{body}"
+    );
+}
+
 /// The deferred-stall freshness guard surfaces its skips as a distinct,
 /// benign outcome label (NOT a `refused_*` safety reason). Confirms the new
 /// `SkippedAgentResumed` variant drives only the outcome array and leaves

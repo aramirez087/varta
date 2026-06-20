@@ -37,7 +37,7 @@ mod reaper;
 mod runner;
 
 use debounce::LastFiredTable;
-use runner::Outstanding;
+use runner::{KillForReclaim, Outstanding};
 
 /// Maximum number of outstanding pids visited per [`Recovery::try_reap`] call.
 ///
@@ -134,6 +134,7 @@ const AUDIT_REASON_OUTSTANDING_IN_FLIGHT: &str = "outstanding_in_flight";
 const AUDIT_REASON_DEBOUNCE_CAPACITY: &str = "debounce_capacity";
 const AUDIT_REASON_OUTSTANDING_CAPACITY: &str = "outstanding_capacity";
 const AUDIT_REASON_ORPHAN_REAP_CAPACITY: &str = "orphan_reap_capacity";
+const AUDIT_REASON_STALE_CHILD_KILL_FAILED: &str = "stale_child_kill_failed";
 const AUDIT_REASON_SPAWN_FAILED: &str = "spawn_failed";
 const AUDIT_REASON_SKIPPED_AGENT_RESUMED: &str = "skipped_agent_resumed";
 const AUDIT_REASON_SKIPPED_PID_RECYCLED: &str = "skipped_pid_recycled";
@@ -189,8 +190,10 @@ pub enum RecoveryOutcome {
         /// Wall-clock time from successful spawn to final reap.
         duration_ns: u64,
     },
-    /// A previously-spawned child exceeded its `recovery_timeout`
-    /// deadline and was killed via `kill(2)` on this tick.
+    /// A previously-spawned child was killed via `kill(2)` on this tick.
+    /// This can happen after a recovery timeout, or when a recycled PID's
+    /// stale-lineage recovery child is stopped before freeing the bare-pid
+    /// outstanding slot for the new lineage.
     Killed {
         /// OS process id of the child that was killed.
         child_pid: u32,
@@ -254,6 +257,17 @@ pub enum RecoveryOutcome {
     RefusedOutstandingCapacity {
         /// Agent pid whose stall was refused.
         pid: u32,
+    },
+    /// Recovery was structurally declined because a recycled PID's previous
+    /// recovery child could not be killed. Freeing the bare-pid outstanding
+    /// slot in that state would allow two recovery children to operate against
+    /// the same numeric PID lineage, so the observer fails closed and leaves
+    /// the original child tracked.
+    RefusedStaleChildKillFailed {
+        /// Agent pid whose recycled-lineage stall was refused.
+        pid: u32,
+        /// Error returned by `kill(2)` while trying to stop the stale child.
+        error: std::io::Error,
     },
     /// Recovery was skipped because the agent resumed beating before its
     /// stall fired. A mass simultaneous stall queues more events than the
@@ -579,6 +593,7 @@ impl Recovery {
                 truncated: false,
                 completed_status: None,
                 completed_at: None,
+                kill_error_for_test: None,
             },
         ));
     }
@@ -839,8 +854,8 @@ impl Recovery {
                 // bug-346 fixed for the debounce ledger, via the sibling path
                 // the OutstandingTable left open. Reclaim the stale slot and
                 // fall through to spawn recovery for the new lineage.
-                if !self.reclaim_recycled_outstanding(pid, observer_ns) {
-                    return RecoveryOutcome::RefusedOutstandingCapacity { pid };
+                if let Some(refusal) = self.reclaim_recycled_outstanding(pid, observer_ns) {
+                    return refusal;
                 }
             } else if let Some(outcome) = self.reap_finished_child(pid, observer_ns) {
                 self.pending_outcomes.push(outcome);
@@ -892,30 +907,44 @@ impl Recovery {
     /// immediately. The killed child is reaped non-blockingly on later ticks
     /// (its terminal `complete` audit row is emitted then), exactly like the
     /// timeout-kill path; we never block the poll loop on `wait(2)` here.
-    fn reclaim_recycled_outstanding(&mut self, pid: u32, observer_ns: u64) -> bool {
+    fn reclaim_recycled_outstanding(
+        &mut self,
+        pid: u32,
+        observer_ns: u64,
+    ) -> Option<RecoveryOutcome> {
         if self.reaping_orphans.len() >= self.orphan_capacity {
             if let Some(entry) = self.outstanding.get_mut(pid) {
-                if !entry.killed {
-                    let _ = entry.child.kill();
-                    entry.killed = true;
-                }
+                let _ = entry.kill_for_reclaim();
             }
             self.refused_outstanding_capacity = self.refused_outstanding_capacity.saturating_add(1);
             self.record_refused_audit(pid, observer_ns, AUDIT_REASON_ORPHAN_REAP_CAPACITY);
-            return false;
+            return Some(RecoveryOutcome::RefusedOutstandingCapacity { pid });
         }
 
-        self.outstanding_recycle_resets = self.outstanding_recycle_resets.saturating_add(1);
-        if let Some(mut entry) = self.outstanding.remove(pid) {
-            if !entry.killed {
-                // Best-effort: an already-exited child returns InvalidInput;
-                // either way the orphan reaper finishes the lifecycle.
-                let _ = entry.child.kill();
-                entry.killed = true;
+        let kill_outcome = {
+            let entry = self.outstanding.get_mut(pid)?;
+            match entry.kill_for_reclaim() {
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    self.record_refused_audit(
+                        pid,
+                        observer_ns,
+                        AUDIT_REASON_STALE_CHILD_KILL_FAILED,
+                    );
+                    return Some(RecoveryOutcome::RefusedStaleChildKillFailed { pid, error });
+                }
             }
+        };
+
+        self.outstanding_recycle_resets = self.outstanding_recycle_resets.saturating_add(1);
+        if let Some(entry) = self.outstanding.remove(pid) {
             self.reaping_orphans.push((pid, entry));
         }
-        true
+        if let KillForReclaim::Killed { child_pid } = kill_outcome {
+            self.pending_outcomes
+                .push(RecoveryOutcome::Killed { child_pid });
+        }
+        None
     }
 
     /// Non-blocking reap of [`Self::reaping_orphans`] — children reclaimed from
