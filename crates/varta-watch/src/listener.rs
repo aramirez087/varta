@@ -12,6 +12,8 @@ use std::os::unix::io::AsRawFd;
 use std::os::unix::net::UnixDatagram;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+#[cfg(test)]
+use std::sync::Mutex;
 use std::time::Duration;
 
 /// Count of `fsync_parent_dir` failures since process start.  Incremented on
@@ -19,6 +21,9 @@ use std::time::Duration;
 /// returns an error (e.g. `EINVAL` on platforms that do not support directory
 /// fsync).  Drained by [`drain_bind_dir_fsync_failures`].
 static DIR_FSYNC_FAILED: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(test)]
+static UDS_BIND_TEST_LOCK: Mutex<()> = Mutex::new(());
 
 /// Drain and reset the parent-directory fsync failure counter.
 ///
@@ -413,6 +418,10 @@ impl UdsListener {
         uds_rcvbuf_bytes: u32,
         _pre_thread: &PreThreadAttestation,
     ) -> io::Result<Self> {
+        #[cfg(test)]
+        let _test_bind_guard = UDS_BIND_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let path = path.as_ref();
         let owned_path: PathBuf = path.to_path_buf();
         validate_socket_parent(path)?;

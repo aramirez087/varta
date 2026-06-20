@@ -81,6 +81,23 @@ Emitted when a stall is detected but recovery is structurally declined
 stable short token so SIEM consumers can alert on it without parsing
 free text.
 
+Current reason tokens:
+
+| reason | meaning |
+| --- | --- |
+| `unauthenticated_transport` | Recovery was refused for a non-attested transport. |
+| `cross_namespace_agent` | The agent PID namespace differed from the observer namespace. |
+| `socket_mode_only` | The platform can only enforce socket-file mode, not per-datagram credentials. |
+| `debounced` | A same-lineage recovery was still inside its debounce window. |
+| `outstanding_in_flight` | A same-lineage recovery child was already running. |
+| `debounce_capacity` | The debounce ledger was full and could not preserve the debounce invariant. |
+| `outstanding_capacity` | The outstanding-child table was full. |
+| `orphan_reap_capacity` | PID-recycle reclaim could not move another stale child into the bounded orphan reaper. |
+| `spawn_failed` | The recovery command failed before a child was created. |
+| `skipped_agent_resumed` | A deferred stall was skipped because the agent resumed before recovery fired. |
+| `skipped_pid_recycled` | A deferred stall was skipped because the PID was recycled before recovery fired. |
+| `skipped_stall_unverifiable` | A deferred kernel-attested stall could not prove PID generation freshness at fire time. |
+
 ## Sequencing
 
 `seq` is a `u64` starting at 1 on the first `boot` record. It is strictly

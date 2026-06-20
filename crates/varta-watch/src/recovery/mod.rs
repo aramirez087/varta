@@ -126,6 +126,19 @@ pub const RECOVERY_PREDRAIN_INGRESS_MAX_PER_TICK: usize = crate::tracker::MAX_CA
 /// the same structural capacity discipline as [`OutstandingTable`].
 const DEFAULT_ORPHAN_CAPACITY: usize = crate::tracker::MAX_CAPACITY;
 
+const AUDIT_REASON_CROSS_NAMESPACE_AGENT: &str = "cross_namespace_agent";
+const AUDIT_REASON_UNAUTHENTICATED_TRANSPORT: &str = "unauthenticated_transport";
+const AUDIT_REASON_SOCKET_MODE_ONLY: &str = "socket_mode_only";
+const AUDIT_REASON_DEBOUNCED: &str = "debounced";
+const AUDIT_REASON_OUTSTANDING_IN_FLIGHT: &str = "outstanding_in_flight";
+const AUDIT_REASON_DEBOUNCE_CAPACITY: &str = "debounce_capacity";
+const AUDIT_REASON_OUTSTANDING_CAPACITY: &str = "outstanding_capacity";
+const AUDIT_REASON_ORPHAN_REAP_CAPACITY: &str = "orphan_reap_capacity";
+const AUDIT_REASON_SPAWN_FAILED: &str = "spawn_failed";
+const AUDIT_REASON_SKIPPED_AGENT_RESUMED: &str = "skipped_agent_resumed";
+const AUDIT_REASON_SKIPPED_PID_RECYCLED: &str = "skipped_pid_recycled";
+const AUDIT_REASON_SKIPPED_STALL_UNVERIFIABLE: &str = "skipped_stall_unverifiable";
+
 /// How the recovery command is executed when an agent stalls.
 ///
 /// One mode is available:
@@ -160,10 +173,12 @@ pub enum RecoveryOutcome {
         child_pid: u32,
     },
     /// The previous invocation for this pid is still inside the debounce
-    /// window; nothing was spawned.
+    /// window, or a same-lineage child is still in flight; nothing was spawned.
+    /// The non-spawn decision is logged to the audit sink.
     Debounced,
     /// `Command::spawn` failed before the child could run (e.g. fork
-    /// failure or missing executable). The error is surfaced verbatim.
+    /// failure or missing executable). The error is surfaced verbatim and the
+    /// failed recovery decision is logged to the audit sink.
     SpawnFailed(std::io::Error),
     /// A previously-spawned child has exited and was reaped on this tick.
     Reaped {
@@ -248,7 +263,8 @@ pub enum RecoveryOutcome {
     /// stale, deferred stall now would `kill(2)`/restart a healthy process.
     /// This is a benign self-heal, not a safety refusal — it is synthesized by
     /// the observer's freshness re-check (never returned by
-    /// [`Recovery::on_stall`]) and counted in Prometheus as
+    /// [`Recovery::on_stall`]), logged to the audit sink, and counted in
+    /// Prometheus as
     /// `varta_recovery_outcomes_total{outcome="skipped_agent_resumed"}`.
     SkippedAgentResumed {
         /// Agent pid whose deferred stall was skipped after it resumed beating.
@@ -263,7 +279,8 @@ pub enum RecoveryOutcome {
     /// the live process. Firing the `{pid}`-substituted `kill(2)`/restart now
     /// would target an innocent bystander. This is a safety skip — synthesized
     /// by the observer's freshness re-check (never returned by
-    /// [`Recovery::on_stall`]) and counted in Prometheus as
+    /// [`Recovery::on_stall`]), logged to the audit sink, and counted in
+    /// Prometheus as
     /// `varta_recovery_outcomes_total{outcome="skipped_pid_recycled"}`.
     SkippedPidRecycled {
         /// Agent pid whose deferred stall was skipped after PID recycle.
@@ -278,7 +295,8 @@ pub enum RecoveryOutcome {
     /// a possibly-recycled bystander, the observer skips. A non-zero count means
     /// kernel-attested recovery is operating in a degraded
     /// (recycle-unverifiable) mode. Synthesized by the observer's freshness
-    /// re-check (never returned by [`Recovery::on_stall`]) and counted as
+    /// re-check (never returned by [`Recovery::on_stall`]), logged to the
+    /// audit sink, and counted as
     /// `varta_recovery_outcomes_total{outcome="skipped_stall_unverifiable"}`.
     SkippedStallUnverifiable {
         /// Agent pid whose deferred stall was skipped as recycle-unverifiable.
@@ -571,6 +589,43 @@ impl Recovery {
         self
     }
 
+    fn record_refused_audit(&mut self, pid: u32, observer_ns: u64, reason: &'static str) {
+        if let Some(sink) = self.audit_sink.as_mut() {
+            sink.record_refused(&RefusedRecord {
+                wallclock_ms: RecoveryAuditLog::wallclock_ms_now(),
+                observer_ns,
+                agent_pid: pid,
+                reason,
+            });
+        }
+    }
+
+    /// Audit a deferred-stall skip synthesized by the observer freshness gate.
+    ///
+    /// These outcomes are not returned by [`Recovery::on_stall`], but they are
+    /// still recovery decisions: a queued stall reached the recovery stage and
+    /// the daemon deliberately did not spawn a child. Record them in the same
+    /// `refused` schema as the other non-spawning decisions so the audit log
+    /// remains the complete forensic stream for recovery handling.
+    pub fn record_deferred_skip_audit(&mut self, outcome: &RecoveryOutcome, observer_ns: u64) {
+        match outcome {
+            RecoveryOutcome::SkippedAgentResumed { pid } => {
+                self.record_refused_audit(*pid, observer_ns, AUDIT_REASON_SKIPPED_AGENT_RESUMED);
+            }
+            RecoveryOutcome::SkippedPidRecycled { pid } => {
+                self.record_refused_audit(*pid, observer_ns, AUDIT_REASON_SKIPPED_PID_RECYCLED);
+            }
+            RecoveryOutcome::SkippedStallUnverifiable { pid } => {
+                self.record_refused_audit(
+                    *pid,
+                    observer_ns,
+                    AUDIT_REASON_SKIPPED_STALL_UNVERIFIABLE,
+                );
+            }
+            _ => {}
+        }
+    }
+
     /// Drain any IO error latched by the audit sink since the previous call.
     pub fn drain_audit_err(&mut self) -> Option<std::io::Error> {
         self.audit_sink.as_mut().and_then(|s| s.take_pending_err())
@@ -736,14 +791,7 @@ impl Recovery {
         // PID namespace differs from the observer's.
         if cross_namespace_agent && !self.allow_cross_namespace {
             self.refused_cross_namespace = self.refused_cross_namespace.saturating_add(1);
-            if let Some(sink) = self.audit_sink.as_mut() {
-                sink.record_refused(&RefusedRecord {
-                    wallclock_ms: RecoveryAuditLog::wallclock_ms_now(),
-                    observer_ns,
-                    agent_pid: pid,
-                    reason: "cross_namespace_agent",
-                });
-            }
+            self.record_refused_audit(pid, observer_ns, AUDIT_REASON_CROSS_NAMESPACE_AGENT);
             return RecoveryOutcome::RefusedCrossNamespace { pid };
         }
 
@@ -757,26 +805,12 @@ impl Recovery {
             BeatOrigin::NetworkUnverified => {
                 self.refused_unauthenticated_source =
                     self.refused_unauthenticated_source.saturating_add(1);
-                if let Some(sink) = self.audit_sink.as_mut() {
-                    sink.record_refused(&RefusedRecord {
-                        wallclock_ms: RecoveryAuditLog::wallclock_ms_now(),
-                        observer_ns,
-                        agent_pid: pid,
-                        reason: "unauthenticated_transport",
-                    });
-                }
+                self.record_refused_audit(pid, observer_ns, AUDIT_REASON_UNAUTHENTICATED_TRANSPORT);
                 return RecoveryOutcome::RefusedUnauthenticatedSource { pid };
             }
             BeatOrigin::SocketModeOnly => {
                 self.refused_socket_mode_only = self.refused_socket_mode_only.saturating_add(1);
-                if let Some(sink) = self.audit_sink.as_mut() {
-                    sink.record_refused(&RefusedRecord {
-                        wallclock_ms: RecoveryAuditLog::wallclock_ms_now(),
-                        observer_ns,
-                        agent_pid: pid,
-                        reason: "socket_mode_only",
-                    });
-                }
+                self.record_refused_audit(pid, observer_ns, AUDIT_REASON_SOCKET_MODE_ONLY);
                 return RecoveryOutcome::RefusedSocketModeOnly { pid };
             }
         }
@@ -789,6 +823,7 @@ impl Recovery {
 
         if let Some(prev) = self.last_fired.get(pid, generation) {
             if now.saturating_duration_since(prev) < self.debounce {
+                self.record_refused_audit(pid, observer_ns, AUDIT_REASON_DEBOUNCED);
                 return RecoveryOutcome::Debounced;
             }
         }
@@ -810,6 +845,7 @@ impl Recovery {
             } else if let Some(outcome) = self.reap_finished_child(pid, observer_ns) {
                 self.pending_outcomes.push(outcome);
             } else {
+                self.record_refused_audit(pid, observer_ns, AUDIT_REASON_OUTSTANDING_IN_FLIGHT);
                 return RecoveryOutcome::Debounced;
             }
         }
@@ -819,14 +855,7 @@ impl Recovery {
             Err(_) => {
                 self.refused_outstanding_capacity =
                     self.refused_outstanding_capacity.saturating_add(1);
-                if let Some(sink) = self.audit_sink.as_mut() {
-                    sink.record_refused(&RefusedRecord {
-                        wallclock_ms: RecoveryAuditLog::wallclock_ms_now(),
-                        observer_ns,
-                        agent_pid: pid,
-                        reason: "outstanding_capacity",
-                    });
-                }
+                self.record_refused_audit(pid, observer_ns, AUDIT_REASON_OUTSTANDING_CAPACITY);
                 return RecoveryOutcome::RefusedOutstandingCapacity { pid };
             }
         };
@@ -837,14 +866,7 @@ impl Recovery {
         else {
             self.outstanding.release_reservation(reservation);
             self.refused_debounce_capacity = self.refused_debounce_capacity.saturating_add(1);
-            if let Some(sink) = self.audit_sink.as_mut() {
-                sink.record_refused(&RefusedRecord {
-                    wallclock_ms: RecoveryAuditLog::wallclock_ms_now(),
-                    observer_ns,
-                    agent_pid: pid,
-                    reason: "debounce_capacity",
-                });
-            }
+            self.record_refused_audit(pid, observer_ns, AUDIT_REASON_DEBOUNCE_CAPACITY);
             return RecoveryOutcome::RefusedDebounceCapacity { pid };
         };
 
@@ -879,14 +901,7 @@ impl Recovery {
                 }
             }
             self.refused_outstanding_capacity = self.refused_outstanding_capacity.saturating_add(1);
-            if let Some(sink) = self.audit_sink.as_mut() {
-                sink.record_refused(&RefusedRecord {
-                    wallclock_ms: RecoveryAuditLog::wallclock_ms_now(),
-                    observer_ns,
-                    agent_pid: pid,
-                    reason: "orphan_reap_capacity",
-                });
-            }
+            self.record_refused_audit(pid, observer_ns, AUDIT_REASON_ORPHAN_REAP_CAPACITY);
             return false;
         }
 

@@ -1213,12 +1213,11 @@ fn run(cfg: Config) -> std::io::Result<()> {
                     match observer.stall_freshness(*pid, *generation) {
                         StallFreshness::Warranted => {}
                         StallFreshness::AgentResumed => {
+                            let outcome = RecoveryOutcome::SkippedAgentResumed { pid: *pid };
+                            rec.record_deferred_skip_audit(&outcome, *observer_ns);
                             #[cfg(feature = "prometheus-exporter")]
                             if let Some(pe) = prom_export.as_mut() {
-                                pe.record_recovery_outcome(
-                                    &RecoveryOutcome::SkippedAgentResumed { pid: *pid },
-                                    None,
-                                );
+                                pe.record_recovery_outcome(&outcome, None);
                             }
                             varta_info_pid!(
                                 *pid,
@@ -1228,12 +1227,11 @@ fn run(cfg: Config) -> std::io::Result<()> {
                             continue;
                         }
                         StallFreshness::PidRecycled => {
+                            let outcome = RecoveryOutcome::SkippedPidRecycled { pid: *pid };
+                            rec.record_deferred_skip_audit(&outcome, *observer_ns);
                             #[cfg(feature = "prometheus-exporter")]
                             if let Some(pe) = prom_export.as_mut() {
-                                pe.record_recovery_outcome(
-                                    &RecoveryOutcome::SkippedPidRecycled { pid: *pid },
-                                    None,
-                                );
+                                pe.record_recovery_outcome(&outcome, None);
                             }
                             varta_info_pid!(
                                 *pid,
@@ -1243,12 +1241,11 @@ fn run(cfg: Config) -> std::io::Result<()> {
                             continue;
                         }
                         StallFreshness::UnverifiableGeneration => {
+                            let outcome = RecoveryOutcome::SkippedStallUnverifiable { pid: *pid };
+                            rec.record_deferred_skip_audit(&outcome, *observer_ns);
                             #[cfg(feature = "prometheus-exporter")]
                             if let Some(pe) = prom_export.as_mut() {
-                                pe.record_recovery_outcome(
-                                    &RecoveryOutcome::SkippedStallUnverifiable { pid: *pid },
-                                    None,
-                                );
+                                pe.record_recovery_outcome(&outcome, None);
                             }
                             varta_info_pid!(
                                 *pid,

@@ -10,7 +10,7 @@ use crate::outstanding_table::Reservation as OutstandingReservation;
 
 use super::debounce::LastFiredReservation;
 use super::env;
-use super::{Recovery, RecoveryMode, RecoveryOutcome};
+use super::{Recovery, RecoveryMode, RecoveryOutcome, AUDIT_REASON_SPAWN_FAILED};
 
 /// Bookkeeping slot for one outstanding child.
 pub(super) struct Outstanding {
@@ -140,6 +140,7 @@ impl Recovery {
                     }
                     Err(e) => {
                         self.outstanding.release_reservation(reservation);
+                        self.record_refused_audit(pid, observer_ns, AUDIT_REASON_SPAWN_FAILED);
                         RecoveryOutcome::SpawnFailed(e)
                     }
                 }

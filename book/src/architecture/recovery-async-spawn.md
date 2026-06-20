@@ -227,4 +227,5 @@ all exec-mode children flow through it.
 - [Deployment Ceiling & Sharding](deployment-ceiling-and-sharding.md) —
   what 4096 means in practice and how to scale past it.
 - [Audit Logging](audit-log.md) — every recovery decision (Spawned /
-  Debounced / Refused / Reaped / Killed) emits a TSV record.
+  Debounced / Refused / SpawnFailed / Skipped / Reaped / Killed) emits a
+  TSV record.

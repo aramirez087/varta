@@ -405,6 +405,92 @@ fn audit_sink_records_spawn_and_complete_for_exec_mode() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+fn assert_refused_reason(body: &str, pid: u32, reason: &str) {
+    let needle = format!("\trefused\t{pid}\t{reason}\t");
+    assert!(
+        body.lines().any(|line| line.contains(&needle)),
+        "expected refused audit row for pid {pid} reason {reason}; body:\n{body}"
+    );
+}
+
+#[test]
+fn audit_sink_records_non_spawning_recovery_decisions() {
+    let dir = audit_tmpdir("audit-suppressed");
+    let path = dir.join("audit.log");
+    let (sink, _) = audit::RecoveryAuditLog::create(&path, audit::AuditConfig::default())
+        .expect("create audit");
+
+    let mut rec = Recovery::with_mode(
+        RecoveryMode::Exec {
+            program: "true".to_string(),
+            args: vec![],
+        },
+        Duration::from_secs(60),
+    )
+    .with_audit_sink(Some(sink));
+
+    match rec.on_stall(321, BeatOrigin::KernelAttested, false, None, 111) {
+        RecoveryOutcome::Spawned { .. } => {}
+        other => panic!("expected initial spawn for debounce control, got {other:?}"),
+    }
+    let deadline = Instant::now() + Duration::from_millis(500);
+    loop {
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for initial reap"
+        );
+        if rec
+            .try_reap(112)
+            .iter()
+            .any(|o| matches!(o, RecoveryOutcome::Reaped { .. }))
+        {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(matches!(
+        rec.on_stall(321, BeatOrigin::KernelAttested, false, None, 113),
+        RecoveryOutcome::Debounced
+    ));
+
+    rec.mode = RecoveryMode::Exec {
+        program: dir.join("missing-command").display().to_string(),
+        args: vec![],
+    };
+    match rec.on_stall(322, BeatOrigin::KernelAttested, false, None, 221) {
+        RecoveryOutcome::SpawnFailed(e) => assert_eq!(e.kind(), std::io::ErrorKind::NotFound),
+        other => panic!("expected spawn failure, got {other:?}"),
+    }
+
+    rec.mode = RecoveryMode::Exec {
+        program: "sleep".to_string(),
+        args: vec!["30".to_string()],
+    };
+    rec.debounce = Duration::ZERO;
+    match rec.on_stall(323, BeatOrigin::KernelAttested, false, None, 331) {
+        RecoveryOutcome::Spawned { .. } => {}
+        other => panic!("expected long-running spawn, got {other:?}"),
+    }
+    assert!(matches!(
+        rec.on_stall(323, BeatOrigin::KernelAttested, false, None, 332),
+        RecoveryOutcome::Debounced
+    ));
+
+    rec.record_deferred_skip_audit(&RecoveryOutcome::SkippedAgentResumed { pid: 324 }, 441);
+    rec.record_deferred_skip_audit(&RecoveryOutcome::SkippedPidRecycled { pid: 325 }, 442);
+    rec.record_deferred_skip_audit(&RecoveryOutcome::SkippedStallUnverifiable { pid: 326 }, 443);
+    drop(rec);
+
+    let body = std::fs::read_to_string(&path).expect("read audit");
+    assert_refused_reason(&body, 321, "debounced");
+    assert_refused_reason(&body, 322, "spawn_failed");
+    assert_refused_reason(&body, 323, "outstanding_in_flight");
+    assert_refused_reason(&body, 324, "skipped_agent_resumed");
+    assert_refused_reason(&body, 325, "skipped_pid_recycled");
+    assert_refused_reason(&body, 326, "skipped_stall_unverifiable");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Regression: a `complete` audit record must carry the completion-time
 /// `observer_ns` passed to `try_reap`, not a hardcoded `0`. Before the fix,
 /// `emit_complete_audit` pinned the field to 0 (while spawn/refused records
