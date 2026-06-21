@@ -381,7 +381,7 @@ impl BeatTransport for SecureUdpTransport {
         nonce[..8].copy_from_slice(&pending_prefix);
         nonce[8..12].copy_from_slice(&pending_counter.to_le_bytes());
 
-        let result = if self.is_master_mode {
+        let (result, expected_len) = if self.is_master_mode {
             // Master-key wire format (64 bytes):
             // [agent_pid: 4] [iv_random: 8] [iv_counter: 4] [ciphertext: 32] [tag: 16]
             //
@@ -404,7 +404,7 @@ impl BeatTransport for SecureUdpTransport {
             frame[16..48].copy_from_slice(&ciphertext);
             frame[48..64].copy_from_slice(&tag);
 
-            self.sock.send(&frame)
+            (self.sock.send(&frame), SECURE_FRAME_MASTER_LEN)
         } else {
             // Shared-key wire format (60 bytes):
             // [iv_random: 8] [iv_counter: 4] [ciphertext: 32] [tag: 16]
@@ -417,7 +417,7 @@ impl BeatTransport for SecureUdpTransport {
             frame[12..44].copy_from_slice(&ciphertext);
             frame[44..60].copy_from_slice(&tag);
 
-            self.sock.send(&frame)
+            (self.sock.send(&frame), SECURE_FRAME_LEN)
         };
 
         // Commit-on-success — for all three branches.
@@ -429,28 +429,39 @@ impl BeatTransport for SecureUdpTransport {
         // unchanged `iv_session_salt`, and tries again. UDP `send(2)` is
         // datagram-atomic, so there is no "half-sent under this nonce"
         // state to reason about.
-        if result.is_ok() {
-            match advance {
-                NonceAdvance::Simple { counter } => {
-                    // counter < u32::MAX (guarded by advance_nonce), so + 1
-                    // cannot overflow.
-                    self.iv_counter = counter + 1;
-                }
-                NonceAdvance::Wrap {
-                    counter,
-                    next_prefix_index,
-                    next_prefix,
-                } => {
-                    self.iv_prefix_index = next_prefix_index;
-                    self.iv_prefix = next_prefix;
-                    self.iv_counter = counter + 1;
-                }
-                NonceAdvance::Reconnected { counter } => {
-                    self.iv_counter = counter + 1;
-                }
+        let sent = match result {
+            Ok(n) if n == expected_len => n,
+            Ok(_) => return Err(io::Error::from(io::ErrorKind::WriteZero)),
+            Err(e) => return Err(e),
+        };
+        match advance {
+            NonceAdvance::Simple { counter } => {
+                // counter < u32::MAX (guarded by advance_nonce), so + 1
+                // cannot overflow.
+                self.iv_counter = counter + 1;
+            }
+            NonceAdvance::Wrap {
+                counter,
+                next_prefix_index,
+                next_prefix,
+            } => {
+                self.iv_prefix_index = next_prefix_index;
+                self.iv_prefix = next_prefix;
+                self.iv_counter = counter + 1;
+            }
+            NonceAdvance::Reconnected { counter } => {
+                self.iv_counter = counter + 1;
             }
         }
-        result
+        Ok(sent)
+    }
+
+    fn expected_send_len(&self) -> usize {
+        if self.is_master_mode {
+            SECURE_FRAME_MASTER_LEN
+        } else {
+            SECURE_FRAME_LEN
+        }
     }
 
     /// Manual session refresh — re-binds the ephemeral socket, re-reads OS

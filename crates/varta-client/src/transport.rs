@@ -21,7 +21,23 @@ use std::path::{Path, PathBuf};
 pub trait BeatTransport: Send + 'static {
     /// Send a 32-byte frame buffer. Returns the number of bytes written on
     /// success, or an [`io::Error`] on failure.
+    ///
+    /// A successful call must report exactly [`Self::expected_send_len`]
+    /// bytes. Short `Ok(n)` results are protocol failures: [`Varta`] treats
+    /// them as [`io::ErrorKind::WriteZero`] and does not commit beat state.
+    ///
+    /// [`Varta`]: crate::Varta
     fn send(&mut self, buf: &[u8; 32]) -> io::Result<usize>;
+
+    /// Number of bytes the transport writes when one VLP frame is fully
+    /// accepted by the kernel.
+    ///
+    /// Raw UDS/UDP transports send the 32-byte VLP frame unchanged. Wrapped
+    /// transports such as secure UDP override this with their authenticated
+    /// wire size.
+    fn expected_send_len(&self) -> usize {
+        32
+    }
 
     /// Re-create the underlying connection after an observer restart.
     ///

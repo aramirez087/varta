@@ -129,6 +129,13 @@ impl BeatError {
         }
     }
 
+    fn short_send() -> Self {
+        Self {
+            errno: Self::UNKNOWN_ERRNO,
+            kind: io::ErrorKind::WriteZero,
+        }
+    }
+
     /// Capture the failure shape from an `io::Error` without cloning or allocating.
     pub fn from_io(e: &io::Error) -> Self {
         Self {
@@ -541,8 +548,10 @@ fn warn_nonce_wrapping() {
 
 impl<T: BeatTransport> Varta<T> {
     fn send_frame(&mut self) -> BeatOutcome {
+        let expected_len = self.transport.expected_send_len();
         match self.transport.send(&self.buf) {
-            Ok(_) => BeatOutcome::Sent,
+            Ok(n) if n == expected_len => BeatOutcome::Sent,
+            Ok(_) => BeatOutcome::Failed(BeatError::short_send()),
             Err(e) => classify_send_error(&e),
         }
     }
@@ -970,6 +979,7 @@ mod tests {
     #[derive(Clone, Copy)]
     enum SendStep {
         Sent,
+        Short,
         WouldBlock,
         PermissionDenied,
     }
@@ -1016,6 +1026,7 @@ mod tests {
                     self.accepted = self.accepted.saturating_add(1);
                     Ok(32)
                 }
+                SendStep::Short => Ok(31),
                 SendStep::WouldBlock => Err(io::Error::from(io::ErrorKind::WouldBlock)),
                 SendStep::PermissionDenied => Err(io::Error::from(io::ErrorKind::PermissionDenied)),
             }
@@ -1080,6 +1091,35 @@ mod tests {
         assert!(matches!(sent, BeatOutcome::Sent), "got {sent:?}");
         assert_eq!(agent.nonce, 1);
         assert_eq!(&agent.transport.attempted_nonces[..2], &[1, 1]);
+        assert_eq!(&agent.transport.accepted_nonces[..1], &[1]);
+    }
+
+    #[test]
+    fn short_success_does_not_commit_regular_nonce() {
+        let mut agent =
+            varta_with_transport(ScriptedTransport::new(&[SendStep::Short, SendStep::Sent]));
+
+        let failed = agent.beat(Status::Ok, 0);
+        match failed {
+            BeatOutcome::Failed(e) => {
+                assert_eq!(e.errno, BeatError::UNKNOWN_ERRNO);
+                assert_eq!(e.kind, io::ErrorKind::WriteZero);
+            }
+            other => panic!("expected short send to fail, got {other:?}"),
+        }
+        assert_eq!(
+            agent.nonce, 0,
+            "short send must not advance the committed VLP nonce"
+        );
+
+        let sent = agent.beat(Status::Ok, 0);
+        assert!(matches!(sent, BeatOutcome::Sent), "got {sent:?}");
+        assert_eq!(agent.nonce, 1);
+        assert_eq!(
+            &agent.transport.attempted_nonces[..2],
+            &[1, 1],
+            "retrying after a short send must reuse the same pending nonce"
+        );
         assert_eq!(&agent.transport.accepted_nonces[..1], &[1]);
     }
 
