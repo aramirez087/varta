@@ -409,6 +409,28 @@ pub(crate) fn recv_authenticated(fd: i32) -> RecvResult {
 #[cfg(test)]
 mod tests {
     use super::{origin_for_peer_pid, BeatOrigin};
+    #[cfg(unix)]
+    use std::sync::Mutex;
+
+    /// Serializes syscall tests that sample the process fd inventory (`/proc/self/fd`
+    /// on Linux, `/dev/fd` on macOS). Cargo runs lib tests in parallel; another
+    /// test opening a transient fd between before/after samples produces a
+    /// spurious +1. Zero-dep alternative to the `serial_test` crate.
+    #[cfg(unix)]
+    static FD_INVENTORY_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    #[cfg(unix)]
+    fn eventually_open_fd_count_at_most(expected: usize, sample: impl Fn() -> usize) -> usize {
+        let mut last = sample();
+        for _ in 0..50 {
+            if last <= expected {
+                return last;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+            last = sample();
+        }
+        last
+    }
 
     /// A concrete kernel-attested PID earns `KernelAttested` — the observer
     /// will enforce `frame.pid == peer_pid` and recovery is eligible.
@@ -473,9 +495,18 @@ mod tests {
             _pad: i32,
         }
 
-        fn open_fd_count() -> usize {
+        /// Count open fds whose `/proc/self/fd/<n>` target matches `target`.
+        /// Unlike a raw fd-table length, this stays stable when unrelated
+        /// parallel lib tests open transient pipes or sockets.
+        fn count_fds_with_readlink_target(target: &std::path::Path) -> usize {
             std::fs::read_dir("/proc/self/fd")
                 .expect("read /proc/self/fd")
+                .filter_map(|e| e.ok())
+                .filter_map(|e| {
+                    let fd: i32 = e.file_name().to_string_lossy().parse().ok()?;
+                    let link = std::fs::read_link(format!("/proc/self/fd/{fd}")).ok()?;
+                    (link == target).then_some(())
+                })
                 .count()
         }
 
@@ -531,7 +562,8 @@ mod tests {
             "sendmsg should send the beat"
         );
 
-        let before = open_fd_count();
+        let dev_null = std::path::Path::new("/dev/null");
+        let before = count_fds_with_readlink_target(dev_null);
         let result = recv_authenticated(observer.as_raw_fd());
 
         // Consume `result` by value before measuring: on Linux 6.5+ the kernel
@@ -540,9 +572,8 @@ mod tests {
         // and drop it here — a partial move out of the named `result` binding
         // leaves the unbound fields owned by `result` until end-of-scope, so
         // letting `..` swallow the pidfd would defer its close past the `after`
-        // sample and the count would spuriously show a +1 "leak" that is really
-        // the still-open kernel pidfd. Dropping it now isolates the
-        // peer-injected `SCM_RIGHTS` leak the test actually targets.
+        // sample. Dropping it now isolates the peer-injected `SCM_RIGHTS` leak
+        // the test actually targets.
         let (data, peer_pid) = match result {
             RecvResult::Authenticated {
                 data,
@@ -555,13 +586,14 @@ mod tests {
             }
             _ => panic!("expected an authenticated beat"),
         };
-        let after = open_fd_count();
+        let after = count_fds_with_readlink_target(dev_null);
 
         assert_eq!(data, beat, "beat payload should survive intact");
         assert_ne!(peer_pid, 0, "in-process send is kernel-attested");
         assert_eq!(
             after, before,
-            "observer leaked a peer-injected SCM_RIGHTS fd (before={before}, after={after})"
+            "observer leaked a peer-injected SCM_RIGHTS duplicate of /dev/null \
+             (before={before}, after={after})"
         );
 
         let _ = std::fs::remove_file(&path);
@@ -647,6 +679,10 @@ mod tests {
         use std::os::unix::io::AsRawFd;
         use std::os::unix::net::UnixDatagram;
 
+        let _guard = FD_INVENTORY_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
         #[repr(C)]
         struct Rlimit {
             rlim_cur: u64,
@@ -697,18 +733,6 @@ mod tests {
 
         fn open_fd_count() -> usize {
             std::fs::read_dir("/dev/fd").expect("read /dev/fd").count()
-        }
-
-        fn eventually_open_fd_count_at_most(expected: usize) -> usize {
-            let mut last = open_fd_count();
-            for _ in 0..50 {
-                if last <= expected {
-                    return last;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(1));
-                last = open_fd_count();
-            }
-            last
         }
 
         let path =
@@ -773,7 +797,7 @@ mod tests {
 
         let before = open_fd_count();
         let result = recv_authenticated(observer.as_raw_fd());
-        let after = eventually_open_fd_count_at_most(before);
+        let after = eventually_open_fd_count_at_most(before, open_fd_count);
 
         match result {
             RecvResult::Authenticated { data, origin, .. } => {
