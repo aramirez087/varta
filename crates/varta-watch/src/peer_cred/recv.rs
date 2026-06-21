@@ -409,17 +409,17 @@ pub(crate) fn recv_authenticated(fd: i32) -> RecvResult {
 #[cfg(test)]
 mod tests {
     use super::{origin_for_peer_pid, BeatOrigin};
-    #[cfg(unix)]
+    #[cfg(target_os = "macos")]
     use std::sync::Mutex;
 
-    /// Serializes syscall tests that sample the process fd inventory (`/proc/self/fd`
-    /// on Linux, `/dev/fd` on macOS). Cargo runs lib tests in parallel; another
-    /// test opening a transient fd between before/after samples produces a
-    /// spurious +1. Zero-dep alternative to the `serial_test` crate.
-    #[cfg(unix)]
+    /// Serializes macOS syscall tests that sample `/dev/fd`. Cargo runs lib tests
+    /// in parallel; another test opening a transient fd between before/after
+    /// samples produces a spurious +1. Zero-dep alternative to the `serial_test`
+    /// crate. The Linux SCM_RIGHTS test uses readlink-target counting instead.
+    #[cfg(target_os = "macos")]
     static FD_INVENTORY_TEST_LOCK: Mutex<()> = Mutex::new(());
 
-    #[cfg(unix)]
+    #[cfg(target_os = "macos")]
     fn eventually_open_fd_count_at_most(expected: usize, sample: impl Fn() -> usize) -> usize {
         let mut last = sample();
         for _ in 0..50 {
