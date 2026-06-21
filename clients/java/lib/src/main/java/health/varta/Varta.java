@@ -200,6 +200,7 @@ public final class Varta implements AutoCloseable {
             if (outcome instanceof BeatOutcome.Dropped) {
                 consecutiveDropped = saturatingIncInt(consecutiveDropped);
                 if (reconnectAfter > 0 && consecutiveDropped >= reconnectAfter) {
+                    consecutiveDropped = 0;
                     boolean reconnected;
                     try {
                         transport.reconnect();
@@ -208,12 +209,6 @@ public final class Varta implements AutoCloseable {
                         reconnected = false;
                     }
                     if (reconnected) {
-                        // Reset only on a *successful* reconnect. A failed
-                        // reconnect leaves the counter saturated so the next
-                        // Dropped beat re-crosses the threshold and retries
-                        // immediately, rather than re-arming a full
-                        // reconnectAfter-beat window.
-                        consecutiveDropped = 0;
                         BeatOutcome retry = sendScratch();
                         if (retry instanceof BeatOutcome.Sent) {
                             commitSentFrame(nextNonce, candidateTimestamp);

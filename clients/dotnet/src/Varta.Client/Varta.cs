@@ -200,6 +200,7 @@ public sealed class Varta : IDisposable
             _consecutiveDropped = SaturatingIncrementU32(_consecutiveDropped);
             if (allowRetry && _reconnectAfter > 0 && _consecutiveDropped >= _reconnectAfter)
             {
+                _consecutiveDropped = 0;
                 try
                 {
                     _transport.Reconnect();
@@ -207,14 +208,8 @@ public sealed class Varta : IDisposable
                 }
                 catch
                 {
-                    // Failed reconnect leaves the counter saturated so the
-                    // next Dropped beat re-crosses the threshold and retries
-                    // immediately, rather than re-arming a full
-                    // reconnectAfter-beat window.
                     return outcome;
                 }
-                // Reset only on a successful reconnect.
-                _consecutiveDropped = 0;
                 return TrySendWithReconnectAfter(allowRetry: false, nextNonce, candidateTimestamp);
             }
             return outcome;

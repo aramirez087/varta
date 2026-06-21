@@ -148,15 +148,10 @@ func (v *Varta) Beat(status Status, payload uint32) BeatOutcome {
 	if outcome.IsDropped() {
 		v.consecutiveDropped = saturatingAdd32(v.consecutiveDropped, 1)
 		if v.reconnectAfter > 0 && v.consecutiveDropped >= v.reconnectAfter {
+			v.consecutiveDropped = 0
 			if err := v.transport.Reconnect(); err != nil {
-				// Failed reconnect leaves the counter saturated so the
-				// next Dropped beat re-crosses the threshold and retries
-				// immediately, rather than re-arming a full
-				// reconnectAfter-beat window.
 				return outcome
 			}
-			// Reset only on a successful reconnect.
-			v.consecutiveDropped = 0
 			retry := v.sendBuffered()
 			if retry.IsSent() {
 				v.commitSentFrame(candidateNonce, candidateTimestamp, wrappedNonce)

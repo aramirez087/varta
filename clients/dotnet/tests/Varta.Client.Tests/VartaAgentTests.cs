@@ -65,13 +65,11 @@ public class VartaAgentTests
     }
 
     [Fact]
-    public void FailedReconnect_PreservesConsecutiveDropped_ForImmediateRetry()
+    public void FailedReconnect_RearmsConsecutiveDroppedWindow()
     {
-        // A failed auto-reconnect must NOT disarm the counter: once the
-        // threshold is crossed, every subsequent Dropped beat retries the
-        // reconnect immediately rather than re-arming a full window. Mirrors
-        // the Rust regression and the frozen cross-client contract (reset
-        // only on a successful reconnect).
+        // A failed auto-reconnect must re-arm the counter: once the threshold
+        // is crossed, the next Dropped beat starts a fresh reconnectAfter
+        // window instead of retrying reconnect immediately.
         var transport = new DropAndFailReconnect();
         using var agent = global::Varta.Varta.FromTransportForTest(transport);
         agent.SetReconnectAfter(2);
@@ -80,12 +78,15 @@ public class VartaAgentTests
         Assert.True(agent.Beat(Status.Ok).IsDropped);
         Assert.Equal(0, transport.Reconnects);
 
-        // Second drop: crosses the threshold; reconnect attempted and
-        // FAILS, so the counter must stay saturated at 2.
+        // Second drop crosses the threshold; reconnect is attempted and fails.
         Assert.True(agent.Beat(Status.Ok).IsDropped);
         Assert.Equal(1, transport.Reconnects);
 
-        // Third drop: threshold still crossed → reconnect retried immediately.
+        // Third drop starts a fresh window: no immediate reconnect storm.
+        Assert.True(agent.Beat(Status.Ok).IsDropped);
+        Assert.Equal(1, transport.Reconnects);
+
+        // Only after another full window should reconnect be attempted again.
         Assert.True(agent.Beat(Status.Ok).IsDropped);
         Assert.Equal(2, transport.Reconnects);
     }

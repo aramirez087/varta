@@ -216,16 +216,12 @@ export class Varta {
         this.reconnectAfter > 0 &&
         this.consecutiveDropped >= this.reconnectAfter
       ) {
+        this.consecutiveDropped = 0;
         try {
           this.transport.reconnect();
         } catch {
-          // Failed reconnect leaves the counter saturated so the next
-          // Dropped beat re-crosses the threshold and retries immediately,
-          // rather than re-arming a full reconnectAfter-beat window.
           return outcome;
         }
-        // Reset only on a successful reconnect.
-        this.consecutiveDropped = 0;
         const retry = this.sendFrame();
         if (retry.kind === "sent") {
           this.commitSentFrame(candidateNonce, candidateTimestamp, wrappedNonce);
