@@ -215,12 +215,10 @@ test("nonce sequence is monotonic and starts at 1", async () => {
   }
 });
 
-test("failed reconnect preserves consecutiveDropped for immediate retry", () => {
-  // A failed auto-reconnect must NOT disarm the counter: once the
-  // threshold is crossed, every subsequent Dropped beat retries the
-  // reconnect immediately rather than re-arming a full window. Mirrors
-  // the Rust regression and the frozen cross-client contract (reset only
-  // on a successful reconnect).
+test("failed reconnect rearms consecutiveDropped window", () => {
+  // A failed auto-reconnect must re-arm the counter: once the threshold is
+  // crossed, the next Dropped beat starts a fresh reconnectAfter window
+  // instead of retrying reconnect immediately.
   const transport = new DropAndFailReconnect();
   const agent = Varta.fromTransport(transport);
   agent.setReconnectAfter(2);
@@ -229,12 +227,15 @@ test("failed reconnect preserves consecutiveDropped for immediate retry", () => 
   assert.equal(agent.beat(Status.Ok).kind, "dropped");
   assert.equal(transport.reconnects, 0);
 
-  // Second drop: crosses the threshold; reconnect attempted and FAILS,
-  // so the counter must stay saturated at 2.
+  // Second drop crosses the threshold; reconnect is attempted and fails.
   assert.equal(agent.beat(Status.Ok).kind, "dropped");
   assert.equal(transport.reconnects, 1);
 
-  // Third drop: threshold still crossed → reconnect retried immediately.
+  // Third drop starts a fresh window: no immediate reconnect storm.
+  assert.equal(agent.beat(Status.Ok).kind, "dropped");
+  assert.equal(transport.reconnects, 1);
+
+  // Only after another full window should reconnect be attempted again.
   assert.equal(agent.beat(Status.Ok).kind, "dropped");
   assert.equal(transport.reconnects, 2);
 });

@@ -482,12 +482,10 @@ class _DropAndFailReconnect(BeatTransport):
         raise OSError(errno.ECONNREFUSED, "refused")
 
 
-def test_failed_reconnect_preserves_consecutive_dropped_for_immediate_retry() -> None:
-    # A failed auto-reconnect must NOT disarm the counter: once the
-    # threshold is crossed, every subsequent Dropped beat retries the
-    # reconnect immediately rather than re-arming a full window. Mirrors
-    # the Rust regression of the same name and the frozen cross-client
-    # contract (reset only on a successful reconnect).
+def test_failed_reconnect_rearms_consecutive_dropped_window() -> None:
+    # A failed auto-reconnect must re-arm the counter: once the threshold is
+    # crossed, the next Dropped beat starts a fresh reconnect_after window
+    # instead of retrying reconnect immediately.
     transport = _DropAndFailReconnect()
     agent = Varta(transport)
     agent.set_reconnect_after(2)
@@ -497,14 +495,20 @@ def test_failed_reconnect_preserves_consecutive_dropped_for_immediate_retry() ->
     assert agent._consecutive_dropped == 1
     assert transport.reconnect_calls == 0
 
-    # Second drop: crosses the threshold; reconnect attempted and FAILS,
-    # so the counter must stay saturated at 2.
+    # Second drop: crosses the threshold; reconnect attempted and fails, but
+    # the counter is re-armed before the attempt.
     assert agent.beat(Status.OK).is_dropped
     assert transport.reconnect_calls == 1
-    assert agent._consecutive_dropped == 2
+    assert agent._consecutive_dropped == 0
 
-    # Third drop: threshold still crossed → reconnect retried immediately.
+    # Third drop starts a fresh window: no immediate reconnect storm.
     assert agent.beat(Status.OK).is_dropped
+    assert agent._consecutive_dropped == 1
+    assert transport.reconnect_calls == 1
+
+    # Only after another full window should reconnect be attempted again.
+    assert agent.beat(Status.OK).is_dropped
+    assert agent._consecutive_dropped == 0
     assert transport.reconnect_calls == 2
 
 

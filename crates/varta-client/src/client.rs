@@ -659,21 +659,18 @@ impl<T: BeatTransport> Varta<T> {
             }
             BeatOutcome::Dropped(_) => {
                 self.consecutive_dropped = self.consecutive_dropped.saturating_add(1);
-                if self.reconnect_after > 0
-                    && self.consecutive_dropped >= self.reconnect_after
-                    && self.transport.reconnect().is_ok()
-                {
-                    // Only reset on a *successful* reconnect. A failed
-                    // reconnect leaves the counter saturated so the next
-                    // Dropped beat re-crosses the threshold and retries
-                    // immediately, rather than re-arming a full
-                    // `reconnect_after`-beat window.
+                if self.reconnect_after > 0 && self.consecutive_dropped >= self.reconnect_after {
+                    // Reset before reconnect so a failed reconnect attempt
+                    // cannot leave the counter saturated and turn every
+                    // subsequent dropped beat into another socket rebuild.
                     self.consecutive_dropped = 0;
-                    let retry = self.send_frame();
-                    if matches!(retry, BeatOutcome::Sent) {
-                        self.commit_sent_frame(candidate_nonce, timestamp, wrapped_nonce);
+                    if self.transport.reconnect().is_ok() {
+                        let retry = self.send_frame();
+                        if matches!(retry, BeatOutcome::Sent) {
+                            self.commit_sent_frame(candidate_nonce, timestamp, wrapped_nonce);
+                        }
+                        return retry;
                     }
-                    return retry;
                 }
                 outcome
             }
@@ -927,7 +924,8 @@ mod tests {
 
     /// A transport whose `send` always `WouldBlock`s (→ `Dropped`) and whose
     /// `reconnect` always fails. Used to assert that a *failed* auto-reconnect
-    /// leaves `consecutive_dropped` saturated rather than resetting it.
+    /// re-arms `consecutive_dropped` instead of turning every dropped beat into
+    /// another reconnect attempt.
     struct DropAndFailReconnect {
         reconnects: u32,
     }
@@ -1229,13 +1227,12 @@ mod tests {
         );
     }
 
-    /// Regression: a *failed* auto-reconnect must not reset
-    /// `consecutive_dropped`. The reset is gated on `reconnect().is_ok()`, so
-    /// a failed reconnect leaves the counter saturated and the next `Dropped`
-    /// beat re-crosses the threshold and retries reconnect immediately —
-    /// rather than re-arming a full `reconnect_after`-beat window.
+    /// Regression: a *failed* auto-reconnect must reset `consecutive_dropped`
+    /// before the reconnect attempt. Otherwise a dead observer leaves the
+    /// counter saturated and every subsequent dropped beat pays another
+    /// socket rebuild instead of waiting for a fresh `reconnect_after` window.
     #[test]
-    fn failed_reconnect_preserves_consecutive_dropped_for_immediate_retry() {
+    fn failed_reconnect_rearms_consecutive_dropped_window() {
         let mut agent = varta_with_transport(DropAndFailReconnect { reconnects: 0 });
         agent.set_reconnect_after(2);
 
@@ -1245,24 +1242,29 @@ mod tests {
         assert_eq!(agent.transport.reconnects, 0);
 
         // Second drop: 1 -> 2 crosses the threshold; reconnect is attempted
-        // and FAILS, so the counter must stay saturated at 2.
+        // and fails, but the counter is re-armed before the attempt.
         assert!(matches!(agent.beat(Status::Ok, 0), BeatOutcome::Dropped(_)));
         assert_eq!(
             agent.transport.reconnects, 1,
             "threshold crossing must attempt reconnect"
         );
         assert_eq!(
-            agent.consecutive_dropped, 2,
-            "a failed reconnect must NOT disarm the counter"
+            agent.consecutive_dropped, 0,
+            "a failed reconnect must re-arm the drop window"
         );
 
-        // Third drop: threshold still crossed, so reconnect is retried on the
-        // very next beat — not after another full window.
+        // Third drop starts a fresh window: no immediate reconnect storm.
         assert!(matches!(agent.beat(Status::Ok, 0), BeatOutcome::Dropped(_)));
+        assert_eq!(agent.consecutive_dropped, 1);
         assert_eq!(
-            agent.transport.reconnects, 2,
-            "next drop after a failed reconnect must retry reconnect immediately"
+            agent.transport.reconnects, 1,
+            "next drop after a failed reconnect must not retry reconnect immediately"
         );
+
+        // Only after another full window should reconnect be attempted again.
+        assert!(matches!(agent.beat(Status::Ok, 0), BeatOutcome::Dropped(_)));
+        assert_eq!(agent.consecutive_dropped, 0);
+        assert_eq!(agent.transport.reconnects, 2);
     }
 
     /// Secure-UDP path: spoofing a fork must rotate the AEAD session salt

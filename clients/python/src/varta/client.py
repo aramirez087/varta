@@ -359,16 +359,11 @@ class Varta:
                 self._reconnect_after > 0
                 and self._consecutive_dropped >= self._reconnect_after
             ):
+                self._consecutive_dropped = 0
                 try:
                     self._transport.reconnect()
                 except OSError:
-                    # Failed reconnect leaves the counter saturated so the
-                    # next Dropped beat re-crosses the threshold and retries
-                    # immediately, rather than re-arming a full
-                    # reconnect_after-beat window.
                     return outcome
-                # Reset only on a successful reconnect.
-                self._consecutive_dropped = 0
                 retry = self._send_frame()
                 if retry.is_sent:
                     self._commit_sent_frame(

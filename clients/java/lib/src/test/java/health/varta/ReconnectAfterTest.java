@@ -3,6 +3,7 @@ package health.varta;
 import health.varta.transport.BeatTransport;
 import org.junit.jupiter.api.Test;
 
+import java.io.IOException;
 import java.nio.ByteBuffer;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -19,9 +20,15 @@ class ReconnectAfterTest {
     private static final class FakeTransport implements BeatTransport {
         int reconnectCalls = 0;
         final boolean drop;
+        final boolean failReconnect;
 
         FakeTransport(boolean drop) {
+            this(drop, false);
+        }
+
+        FakeTransport(boolean drop, boolean failReconnect) {
             this.drop = drop;
+            this.failReconnect = failReconnect;
         }
 
         @Override
@@ -31,8 +38,11 @@ class ReconnectAfterTest {
         }
 
         @Override
-        public void reconnect() {
+        public void reconnect() throws IOException {
             reconnectCalls++;
+            if (failReconnect) {
+                throw new IOException("reconnect refused");
+            }
         }
 
         @Override
@@ -56,6 +66,33 @@ class ReconnectAfterTest {
         assertThat(t.reconnectCalls)
             .as("the third consecutive drop crosses the threshold and reconnects")
             .isEqualTo(1);
+    }
+
+    @Test
+    void failed_reconnect_rearms_consecutive_drop_window() {
+        FakeTransport t = new FakeTransport(true, true);
+        Varta agent = Varta.__forTest(t);
+        agent.setReconnectAfter(2);
+
+        assertThat(agent.beat(Status.OK)).isInstanceOf(BeatOutcome.Dropped.class);
+        assertThat(t.reconnectCalls)
+            .as("first drop is below threshold")
+            .isZero();
+
+        assertThat(agent.beat(Status.OK)).isInstanceOf(BeatOutcome.Dropped.class);
+        assertThat(t.reconnectCalls)
+            .as("second drop crosses threshold and attempts reconnect")
+            .isEqualTo(1);
+
+        assertThat(agent.beat(Status.OK)).isInstanceOf(BeatOutcome.Dropped.class);
+        assertThat(t.reconnectCalls)
+            .as("failed reconnect must re-arm the window, not retry immediately")
+            .isEqualTo(1);
+
+        assertThat(agent.beat(Status.OK)).isInstanceOf(BeatOutcome.Dropped.class);
+        assertThat(t.reconnectCalls)
+            .as("another full drop window attempts reconnect again")
+            .isEqualTo(2);
     }
 
     @Test
