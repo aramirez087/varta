@@ -8,6 +8,12 @@ workspace and follows [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **Solaris/illumos `ENOBUFS` is now classified as
+  `Dropped(KERNEL_QUEUE_FULL)`.** The numeric junixsocket errno table handled
+  Linux `105` and BSD/macOS `55` but missed solarish `132`, so real send-buffer
+  backpressure on Solaris/illumos could surface as `Failed` instead of a
+  transient dropped beat. This now matches the Rust, Python, and Node clients.
+
 - **Secure-UDP `reconnect()` is now transactional and never throws an unchecked
   exception.** It reconnected the inner socket first and only then called
   `rotateSession()` to refresh the IV state (entropy read + KDF). If that

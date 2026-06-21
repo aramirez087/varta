@@ -6,6 +6,7 @@ import health.varta.errno.ErrnoClassifier;
 import org.junit.jupiter.api.Test;
 
 import java.io.IOException;
+import java.lang.reflect.Method;
 import java.net.PortUnreachableException;
 import java.net.SocketException;
 import java.nio.channels.ClosedChannelException;
@@ -36,6 +37,11 @@ class ErrnoClassifierTest {
     }
 
     @Test
+    void solaris_illumos_enobufs_errno_is_kernel_queue_full() throws Exception {
+        assertThat(mapErrno(132)).isEqualTo(DropReason.KERNEL_QUEUE_FULL);
+    }
+
+    @Test
     void connection_refused_is_no_observer() {
         BeatOutcome o = ErrnoClassifier.classify(new SocketException("Connection refused"));
         assertThat(o).isInstanceOfSatisfying(BeatOutcome.Dropped.class,
@@ -60,5 +66,11 @@ class ErrnoClassifierTest {
     void unknown_message_is_failed_not_dropped() {
         BeatOutcome o = ErrnoClassifier.classify(new IOException("totally novel failure"));
         assertThat(o).isInstanceOf(BeatOutcome.Failed.class);
+    }
+
+    private static DropReason mapErrno(int errno) throws Exception {
+        Method method = ErrnoClassifier.class.getDeclaredMethod("mapErrno", int.class);
+        method.setAccessible(true);
+        return (DropReason) method.invoke(null, errno);
     }
 }

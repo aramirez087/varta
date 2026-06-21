@@ -98,10 +98,11 @@ public final class ErrnoClassifier {
         return 0;
     }
 
-    /** POSIX errno → DropReason. Linux/macOS values where they agree. */
+    /** POSIX errno → DropReason for the Unix targets supported by Varta clients. */
     private static DropReason mapErrno(int errno) {
-        // EAGAIN/EWOULDBLOCK = 11 (Linux) / 35 (macOS); ENOBUFS = 105 (Linux) / 55 (macOS).
-        if (errno == 11 || errno == 35 || errno == 105 || errno == 55) return DropReason.KERNEL_QUEUE_FULL;
+        // EAGAIN/EWOULDBLOCK = 11 (Linux) / 35 (macOS/BSD);
+        // ENOBUFS = 105 (Linux) / 55 (macOS/BSD) / 132 (Solaris/illumos).
+        if (errno == 11 || errno == 35 || errno == 105 || errno == 55 || errno == 132) return DropReason.KERNEL_QUEUE_FULL;
         // ECONNREFUSED = 111 (Linux) / 61 (macOS); ENOENT = 2.
         if (errno == 111 || errno == 61 || errno == 2) return DropReason.NO_OBSERVER;
         // ECONNRESET = 104/54; EPIPE = 32; ENOTCONN = 107/57.
