@@ -686,7 +686,12 @@ fn validate_socket_parent(path: &Path) -> io::Result<()> {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
     let parent = socket_parent(path);
-    let meta = std::fs::symlink_metadata(parent)?;
+    let link_meta = std::fs::symlink_metadata(parent)?;
+    let meta = if link_meta.file_type().is_symlink() {
+        trusted_socket_parent_symlink_metadata(parent, &link_meta)?
+    } else {
+        link_meta
+    };
     if meta.file_type().is_symlink() {
         return Err(io::Error::new(
             ErrorKind::InvalidInput,
@@ -732,6 +737,25 @@ fn validate_socket_parent(path: &Path) -> io::Result<()> {
     }
 
     Ok(())
+}
+
+fn trusted_socket_parent_symlink_metadata(
+    parent: &Path,
+    link_meta: &std::fs::Metadata,
+) -> io::Result<std::fs::Metadata> {
+    use std::os::unix::fs::MetadataExt;
+
+    if cfg!(target_os = "macos") && parent == Path::new("/tmp") && link_meta.uid() == 0 {
+        return std::fs::metadata(parent);
+    }
+
+    Err(io::Error::new(
+        ErrorKind::InvalidInput,
+        format!(
+            "observer socket parent {} must not be a symlink",
+            parent.display()
+        ),
+    ))
 }
 
 fn bound_socket_identity(path: &Path, expected_mode: u32) -> io::Result<SocketIdentity> {
@@ -980,6 +1004,26 @@ mod tests {
         drop(listener);
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_dir(&dir);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn uds_bind_allows_macos_tmp_symlink_parent() {
+        let seq = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let path = std::path::Path::new("/tmp")
+            .join(format!("vw-tmp-symlink-{}-{seq}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+
+        let _bind_guard = BIND_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let listener =
+            super::UdsListener::bind(&path, 0o600, Duration::from_millis(100), 0, &pre_thread())
+                .expect("macOS /tmp is a root-owned symlink to a sticky system temp directory");
+
+        let meta = std::fs::symlink_metadata(&path).expect("socket metadata");
+        assert_eq!(meta.permissions().mode() & 0o777, 0o600);
+
+        drop(listener);
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
