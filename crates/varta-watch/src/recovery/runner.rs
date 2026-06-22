@@ -80,23 +80,38 @@ impl Outstanding {
 }
 
 /// Take the piped stdout/stderr handles off `child` (when capture is enabled)
-/// and mark them non-blocking. Returns `(None, None)` when capture is disabled.
+/// and mark them non-blocking. Returns `(None, None, false)` when capture is
+/// disabled. If either pipe cannot be proven non-blocking, all capture handles
+/// are dropped and the boolean is `true` so the audit row records the capture
+/// as truncated instead of risking a blocking read on the observer thread.
 pub(super) fn take_capture_handles(
     child: &mut Child,
     capture_on: bool,
-) -> (Option<ChildStdout>, Option<ChildStderr>) {
+) -> (Option<ChildStdout>, Option<ChildStderr>, bool) {
+    take_capture_handles_with(child, capture_on, set_nonblocking_fd)
+}
+
+pub(super) fn take_capture_handles_with(
+    child: &mut Child,
+    capture_on: bool,
+    mut set_nonblocking: impl FnMut(i32) -> bool,
+) -> (Option<ChildStdout>, Option<ChildStderr>, bool) {
     if !capture_on {
-        return (None, None);
+        return (None, None, false);
     }
-    let out = child.stdout.take().map(|h| {
-        let _ = set_nonblocking_fd(h.as_raw_fd());
-        h
-    });
-    let err = child.stderr.take().map(|h| {
-        let _ = set_nonblocking_fd(h.as_raw_fd());
-        h
-    });
-    (out, err)
+    let out = child.stdout.take();
+    let err = child.stderr.take();
+    let out_ok = out
+        .as_ref()
+        .map_or(true, |h| set_nonblocking(h.as_raw_fd()));
+    let err_ok = err
+        .as_ref()
+        .map_or(true, |h| set_nonblocking(h.as_raw_fd()));
+    if out_ok && err_ok {
+        (out, err, false)
+    } else {
+        (None, None, true)
+    }
 }
 
 impl Recovery {
@@ -139,7 +154,8 @@ impl Recovery {
                 match cmd.spawn() {
                     Ok(mut child) => {
                         let child_pid = child.id();
-                        let (out_handle, err_handle) = take_capture_handles(&mut child, capture_on);
+                        let (out_handle, err_handle, capture_truncated) =
+                            take_capture_handles(&mut child, capture_on);
                         self.outstanding.commit_reserved(
                             reservation,
                             Outstanding {
@@ -152,7 +168,7 @@ impl Recovery {
                                 stderr_handle: err_handle,
                                 stdout_len: 0,
                                 stderr_len: 0,
-                                truncated: false,
+                                truncated: capture_truncated,
                                 completed_status: None,
                                 completed_at: None,
                                 #[cfg(test)]

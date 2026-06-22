@@ -721,6 +721,42 @@ fn capture_truncates_at_per_child_cap() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+#[test]
+#[cfg_attr(miri, ignore)]
+fn capture_setup_failure_drops_handles_and_marks_truncated() {
+    use std::process::{Command, Stdio};
+
+    let mut child = Command::new("sh")
+        .args(["-c", "sleep 30"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn child with capture pipes");
+
+    let mut attempts = 0u32;
+    let (stdout, stderr, truncated) =
+        super::runner::take_capture_handles_with(&mut child, true, |_| {
+            attempts = attempts.saturating_add(1);
+            false
+        });
+
+    assert_eq!(
+        attempts, 2,
+        "both capture fds should be probed before failing closed"
+    );
+    assert!(
+        stdout.is_none() && stderr.is_none(),
+        "possibly blocking capture handles must not be retained"
+    );
+    assert!(
+        truncated,
+        "audit completion must record capture as truncated when setup failed"
+    );
+
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
 /// Regression: a recovery command that exits immediately but backgrounds a
 /// grandchild inheriting the capture pipe write-end must not pin its
 /// outstanding slot forever. The immediate child is reaped (`completed_status`
