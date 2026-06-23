@@ -156,6 +156,10 @@ def _invalid_input_outcome() -> BeatOutcome:
     return BeatOutcome.failed(BeatError(BeatError.UNKNOWN_ERRNO, "InvalidInput"))
 
 
+def _write_zero_outcome() -> BeatOutcome:
+    return BeatOutcome.failed(BeatError(BeatError.UNKNOWN_ERRNO, "WriteZero"))
+
+
 def _errno_name(code: Optional[int]) -> str:
     if code is None:
         return "Unknown"
@@ -423,7 +427,9 @@ class Varta:
 
     def _send_frame(self) -> BeatOutcome:
         try:
-            self._transport.send(bytes(self._buf))
+            sent = self._transport.send(bytes(self._buf))
+            if sent != FRAME_BYTES:
+                return _write_zero_outcome()
             return BeatOutcome.sent()
         except OSError as exc:
             return classify_send_error(exc)

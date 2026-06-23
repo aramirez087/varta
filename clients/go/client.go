@@ -228,11 +228,14 @@ func (v *Varta) Close() error {
 // sendBuffered transmits the scratch buffer and translates the
 // transport-layer error into a BeatOutcome.
 func (v *Varta) sendBuffered() BeatOutcome {
-	_, err := v.transport.Send(v.buf[:])
-	if err == nil {
-		return BeatOutcomeSent()
+	n, err := v.transport.Send(v.buf[:])
+	if err != nil {
+		return ClassifySendError(err)
 	}
-	return ClassifySendError(err)
+	if n != len(v.buf) {
+		return BeatOutcomeFailed(BeatError{Errno: 0, Kind: "WriteZero"})
+	}
+	return BeatOutcomeSent()
 }
 
 func saturatingAdd(x, delta uint64) uint64 {

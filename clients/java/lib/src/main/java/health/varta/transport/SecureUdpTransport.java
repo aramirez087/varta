@@ -168,14 +168,18 @@ public final class SecureUdpTransport implements BeatTransport {
 
         ByteBuffer wireBuf = ByteBuffer.wrap(wire).order(ByteOrder.LITTLE_ENDIAN);
         int written = inner.send(wireBuf);
-        if (written > 0) {
-            // commit-on-success: the wrap rotation and the counter advance land
-            // only now that the frame was actually transmitted.
-            prefixIndex = sendPrefixIndex;
-            ivPrefix = sendPrefix;
-            counter = sendCounter + 1;
+        if (written == 0) {
+            return 0;
         }
-        return written == wire.length ? 32 /* report logical plaintext bytes */ : written;
+        if (written != wire.length) {
+            throw new IOException("WriteZero");
+        }
+        // commit-on-success: the wrap rotation and the counter advance land
+        // only now that the full encrypted frame was actually transmitted.
+        prefixIndex = sendPrefixIndex;
+        ivPrefix = sendPrefix;
+        counter = sendCounter + 1;
+        return 32; // report logical plaintext bytes
     }
 
     @Override

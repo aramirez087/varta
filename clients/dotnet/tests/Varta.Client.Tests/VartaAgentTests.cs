@@ -207,6 +207,16 @@ public class VartaAgentTests
         public void Dispose() { }
     }
 
+    /// <summary>Returns a positive short send without throwing.</summary>
+    private sealed class ShortSend : IBeatTransport
+    {
+        public int Send(ReadOnlySpan<byte> frame32) => frame32.Length - 1;
+
+        public void Reconnect() { }
+
+        public void Dispose() { }
+    }
+
     /// <summary>Drops the first N sends, then accepts; reconnect succeeds.</summary>
     private sealed class DropThenSend : IBeatTransport
     {
@@ -248,6 +258,18 @@ public class VartaAgentTests
     {
         using var agent = global::Varta.Varta.FromTransportForTest(new AlwaysFail());
         Assert.True(agent.Beat(Status.Ok).IsFailed);
+        Assert.Equal(1ul, agent.NonceForTest);
+    }
+
+    [Fact]
+    public void ShortSuccessfulSend_DoesNotCommitNonce()
+    {
+        using var agent = global::Varta.Varta.FromTransportForTest(new ShortSend());
+        var outcome = agent.Beat(Status.Ok);
+
+        Assert.True(outcome.IsFailed);
+        Assert.Equal(0, outcome.Error.Errno);
+        Assert.Equal("WriteZero", outcome.Error.Kind);
         Assert.Equal(1ul, agent.NonceForTest);
     }
 

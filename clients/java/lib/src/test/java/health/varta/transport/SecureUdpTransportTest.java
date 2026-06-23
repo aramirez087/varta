@@ -112,6 +112,19 @@ class SecureUdpTransportTest {
         public void close() {}
     }
 
+    private static final class ShortInner implements BeatTransport {
+        @Override
+        public int send(ByteBuffer frame) {
+            return frame.remaining() - 1;
+        }
+
+        @Override
+        public void reconnect() {}
+
+        @Override
+        public void close() {}
+    }
+
     @Test
     void wrap_at_counter_boundary_is_commit_on_success() throws Exception {
         // Regression (bug-478): at the counter-wrap boundary the IV-prefix
@@ -143,6 +156,24 @@ class SecureUdpTransportTest {
         assertThat(tx.__getPrefixIndexForTest()).isEqualTo(prefixBefore + 1);
         assertThat(tx.__getIvPrefixForTest()).isNotEqualTo(ivBefore);
         assertThat(tx.__getCounterForTest()).isEqualTo(1);
+    }
+
+    @Test
+    void short_secure_send_does_not_commit_nonce_state() {
+        SecureUdpTransport tx =
+            new SecureUdpTransport(SecureUdpTransport.Mode.SHARED, new ShortInner(), KEY32);
+
+        tx.__setCounterForTest(17);
+        int prefixBefore = tx.__getPrefixIndexForTest();
+        byte[] ivBefore = tx.__getIvPrefixForTest();
+
+        assertThatThrownBy(() -> tx.send(ByteBuffer.wrap(new byte[32]).order(ByteOrder.LITTLE_ENDIAN)))
+            .isInstanceOf(IOException.class)
+            .hasMessage("WriteZero");
+
+        assertThat(tx.__getPrefixIndexForTest()).isEqualTo(prefixBefore);
+        assertThat(tx.__getIvPrefixForTest()).isEqualTo(ivBefore);
+        assertThat(tx.__getCounterForTest()).isEqualTo(17);
     }
 
     /** Inner transport that records how many times reconnect() was called. */

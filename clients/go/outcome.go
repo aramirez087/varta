@@ -1,7 +1,9 @@
 package varta
 
 import (
+	"errors"
 	"fmt"
+	"io"
 
 	"github.com/aramirez087/Varta/clients/go/internal/errnoclass"
 )
@@ -126,6 +128,9 @@ func BeatOutcomeFailed(e BeatError) BeatOutcome {
 func ClassifySendError(err error) BeatOutcome {
 	if err == nil {
 		return BeatOutcomeSent()
+	}
+	if errors.Is(err, io.ErrShortWrite) {
+		return BeatOutcomeFailed(BeatError{Errno: 0, Kind: "WriteZero"})
 	}
 	switch errnoclass.Classify(err) {
 	case errnoclass.BucketKernelQueueFull:

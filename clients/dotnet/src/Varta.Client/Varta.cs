@@ -181,7 +181,12 @@ public sealed class Varta : IDisposable
     {
         try
         {
-            _transport.Send(_scratch);
+            int sent = _transport.Send(_scratch);
+            if (sent != FrameBytes)
+            {
+                _consecutiveDropped = 0;
+                return BeatOutcome.Failed(new BeatError(0, "WriteZero"));
+            }
             CommitSentFrame(nextNonce, candidateTimestamp);
             _consecutiveDropped = 0;
             return BeatOutcome.Sent();

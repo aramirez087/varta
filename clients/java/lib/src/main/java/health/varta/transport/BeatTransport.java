@@ -9,13 +9,15 @@ import java.nio.ByteBuffer;
  * provider-specific impl), {@code SecureUdpTransport}.
  *
  * <p>Implementations MUST be non-blocking. {@link #send(ByteBuffer)} returns
- * the number of bytes written; a return of {@code 0} indicates kernel-queue
- * backpressure (the agent maps that to {@code Dropped(KERNEL_QUEUE_FULL)}).
- * Throwing means a typed I/O failure to be classified by
+ * {@code Varta.FRAME_BYTES} after a full logical heartbeat is accepted; a
+ * return of {@code 0} indicates kernel-queue backpressure (the agent maps
+ * that to {@code Dropped(KERNEL_QUEUE_FULL)}). Any other short return is not a
+ * successful heartbeat and is treated as {@code Failed(WriteZero)}. Throwing
+ * means a typed I/O failure to be classified by
  * {@code ErrnoClassifier}.</p>
  */
 public interface BeatTransport extends AutoCloseable {
-    /** Send one frame. Returns bytes written (0 on WouldBlock). */
+    /** Send one frame. Returns {@code Varta.FRAME_BYTES} on success (0 on WouldBlock). */
     int send(ByteBuffer frame) throws IOException;
 
     /** Reopen the underlying socket. Used after fork(2) or operator-requested reconnect. */

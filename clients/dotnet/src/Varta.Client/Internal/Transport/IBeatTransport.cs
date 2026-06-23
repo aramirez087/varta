@@ -18,9 +18,10 @@ namespace Varta.Internal.Transport;
 internal interface IBeatTransport : IDisposable
 {
     /// <summary>
-    /// Emit one VLP frame (32 bytes for plaintext, 60 or 64 bytes for
-    /// secure modes). Returns the number of bytes written. Throws
-    /// <see cref="System.Net.Sockets.SocketException"/> on failure.
+    /// Emit one VLP frame. Returns <c>Varta.FrameBytes</c> only after a
+    /// full logical heartbeat is accepted; any other return value is treated as
+    /// <c>Failed(WriteZero)</c>. Throws <see cref="System.Net.Sockets.SocketException"/>
+    /// on kernel-level failure.
     /// </summary>
     int Send(ReadOnlySpan<byte> frame32);
 

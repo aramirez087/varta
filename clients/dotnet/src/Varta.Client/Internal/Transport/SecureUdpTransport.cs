@@ -40,6 +40,7 @@ internal sealed class SecureUdpTransport : IBeatTransport
     private readonly byte[] _ivPrefix = new byte[Hkdf.IvRandomBytes];
     private uint _prefixIndex;
     private uint _counter;
+    private Func<int, int>? _sendResultOverrideForTest;
 
     public SecureUdpTransport(SecureUdpMode mode, string host, int port, ReadOnlySpan<byte> key32)
     {
@@ -72,14 +73,15 @@ internal sealed class SecureUdpTransport : IBeatTransport
 
         // Reserve a counter value WITHOUT committing it — commit on send success.
         uint pendingCounter = _counter;
-        byte[] derivedKey = []; // only used / zeroed in Master mode
 
         int sent;
+        int expectedWireBytes;
         if (_mode == SecureUdpMode.Shared)
         {
             Span<byte> wire = stackalloc byte[AeadCodec.SharedFrameBytes];
             AeadCodec.EncodeShared(_key, _ivPrefix, pendingCounter, plaintext32, wire);
-            sent = _socket.Send(wire, SocketFlags.None);
+            sent = SendWire(wire);
+            expectedWireBytes = AeadCodec.SharedFrameBytes;
         }
         else // Master
         {
@@ -89,7 +91,8 @@ internal sealed class SecureUdpTransport : IBeatTransport
             try
             {
                 AeadCodec.EncodeMaster(_key, agentPid, _ivPrefix, pendingCounter, plaintext32, wire, derived);
-                sent = _socket.Send(wire, SocketFlags.None);
+                sent = SendWire(wire);
+                expectedWireBytes = AeadCodec.MasterFrameBytes;
             }
             finally
             {
@@ -97,7 +100,12 @@ internal sealed class SecureUdpTransport : IBeatTransport
             }
         }
 
-        // Commit counter advance only after a successful send (commit-on-success).
+        if (sent != expectedWireBytes)
+        {
+            return 0;
+        }
+
+        // Commit counter advance only after the full encrypted datagram is accepted.
         if (pendingCounter == uint.MaxValue)
         {
             // Counter wrap — rotate the IV prefix index and re-derive.
@@ -110,7 +118,7 @@ internal sealed class SecureUdpTransport : IBeatTransport
             _counter = pendingCounter + 1;
         }
 
-        return sent;
+        return AeadCodec.PlaintextBytes;
     }
 
     public void Reconnect()
@@ -174,4 +182,24 @@ internal sealed class SecureUdpTransport : IBeatTransport
             throw;
         }
     }
+
+    private int SendWire(ReadOnlySpan<byte> wire) =>
+        _sendResultOverrideForTest is not null
+            ? _sendResultOverrideForTest(wire.Length)
+            : _socket.Send(wire, SocketFlags.None);
+
+    // ---- Test hooks (InternalsVisibleTo Varta.Client.Tests) ----
+
+    internal void SetSendResultOverrideForTest(Func<int, int>? sendResultOverride) =>
+        _sendResultOverrideForTest = sendResultOverride;
+
+    internal uint PrefixIndexForTest => _prefixIndex;
+
+    internal uint CounterForTest
+    {
+        get => _counter;
+        set => _counter = value;
+    }
+
+    internal byte[] IvPrefixForTest => _ivPrefix.ToArray();
 }

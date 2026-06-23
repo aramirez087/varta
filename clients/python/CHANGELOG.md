@@ -8,6 +8,12 @@ governed independently — see `book/src/spec/vlp.md` in the workspace.
 
 ### Fixed
 
+- **Short successful sends are no longer committed as delivered beats.** The
+  agent now requires transports to report the full 32-byte logical frame before
+  returning `sent`; a positive short send surfaces as `failed(WriteZero)` and
+  leaves nonce/timestamp state uncommitted. Secure UDP also verifies the full
+  60- or 64-byte AEAD wire frame before advancing IV state.
+
 - **Secure-UDP nonce-wrap rotation now honours commit-on-success.** At the
   32-bit IV-counter boundary, `SecureUdpTransport.send` rotated the IV prefix
   (`_iv_prefix_index += 1`, `_iv_counter = 0`, re-derive `_iv_prefix`) *before*

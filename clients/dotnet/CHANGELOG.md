@@ -8,6 +8,12 @@ here. Versioning is independent of the Rust workspace and follows
 
 ### Fixed
 
+- **Short successful sends are no longer committed as delivered beats.** The
+  agent now requires transports to report the full 32-byte logical frame before
+  returning `Sent`; any short return surfaces as `Failed(WriteZero)` and leaves
+  nonce/timestamp state uncommitted. Secure UDP also verifies the full 60- or
+  64-byte AEAD wire frame before advancing IV state.
+
 - **`Beat()` no longer throws when a fork-recovery reconnect fails.** The
   fork-detection branch called `_transport.Reconnect()` unguarded, so if the
   forked child could not re-establish the socket the `SocketException`

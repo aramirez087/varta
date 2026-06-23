@@ -8,6 +8,12 @@ workspace and follows [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **Short successful sends are no longer committed as delivered beats.** The
+  agent now requires transports to report the full 32-byte logical frame before
+  returning `Sent`; positive short writes surface as `Failed(WriteZero)` and
+  leave nonce/timestamp state uncommitted. Secure UDP also verifies the full
+  60- or 64-byte AEAD wire frame before advancing IV state.
+
 - **Solaris/illumos `ENOBUFS` is now classified as
   `Dropped(KERNEL_QUEUE_FULL)`.** The numeric junixsocket errno table handled
   Linux `105` and BSD/macOS `55` but missed solarish `132`, so real send-buffer

@@ -246,6 +246,38 @@ def test_secure_udp_failed_send_at_wrap_does_not_rotate_prefix() -> None:
         transport.close()
 
 
+def test_secure_udp_short_send_does_not_commit_nonce_state() -> None:
+    transport = SecureUdpTransport(("127.0.0.1", 9), key=bytes(32))
+    transport._set_iv_counter_for_test(17)
+    old_state = (
+        transport._iv_prefix_index,
+        transport._iv_counter,
+        transport._iv_prefix,
+    )
+
+    class _ShortSock:
+        def send(self, wire: bytes) -> int:
+            return len(wire) - 1
+
+        def close(self) -> None:
+            pass
+
+    real = transport._sock
+    transport._sock = _ShortSock()  # type: ignore[assignment]
+    if real is not None:
+        real.close()
+
+    try:
+        assert transport.send(bytes(32)) == 0
+        assert (
+            transport._iv_prefix_index,
+            transport._iv_counter,
+            transport._iv_prefix,
+        ) == old_state
+    finally:
+        transport.close()
+
+
 def test_secure_udp_failed_reconnect_preserves_session(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -545,6 +577,16 @@ class _AlwaysFailTransport(BeatTransport):
         pass
 
 
+class _ShortSendTransport(BeatTransport):
+    """Returns a positive short send without raising."""
+
+    def send(self, buf: bytes) -> int:
+        return len(buf) - 1
+
+    def reconnect(self) -> None:
+        pass
+
+
 def test_dropped_beat_does_not_commit_nonce_or_timestamp() -> None:
     agent = Varta(_AlwaysDropTransport())
     assert agent._nonce == 0
@@ -564,6 +606,16 @@ def test_failed_beat_does_not_commit_nonce_or_timestamp() -> None:
     agent = Varta(_AlwaysFailTransport())
     out = agent.beat(Status.OK)
     assert out.is_failed
+    assert agent._nonce == 0
+    assert agent._last_timestamp == 0
+
+
+def test_short_successful_send_does_not_commit_nonce_or_timestamp() -> None:
+    agent = Varta(_ShortSendTransport())
+    out = agent.beat(Status.OK)
+    assert out.is_failed
+    assert out.error is not None
+    assert out.error.kind == "WriteZero"
     assert agent._nonce == 0
     assert agent._last_timestamp == 0
 

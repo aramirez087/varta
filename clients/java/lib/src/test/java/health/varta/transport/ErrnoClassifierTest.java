@@ -68,6 +68,13 @@ class ErrnoClassifierTest {
         assertThat(o).isInstanceOf(BeatOutcome.Failed.class);
     }
 
+    @Test
+    void write_zero_message_preserves_stable_error_kind() {
+        BeatOutcome o = ErrnoClassifier.classify(new IOException("WriteZero"));
+        assertThat(o).isInstanceOfSatisfying(BeatOutcome.Failed.class,
+            f -> assertThat(f.error().kind()).isEqualTo("WriteZero"));
+    }
+
     private static DropReason mapErrno(int errno) throws Exception {
         Method method = ErrnoClassifier.class.getDeclaredMethod("mapErrno", int.class);
         method.setAccessible(true);

@@ -1,6 +1,7 @@
 package varta
 
 import (
+	"io"
 	"syscall"
 	"testing"
 )
@@ -24,6 +25,21 @@ type alwaysFail struct{}
 func (t *alwaysFail) Send(_ []byte) (int, error) { return 0, syscall.EACCES }
 func (t *alwaysFail) Reconnect() error           { return nil }
 func (t *alwaysFail) Close() error               { return nil }
+
+// shortSuccess returns a nil error with fewer bytes than a full VLP frame.
+type shortSuccess struct{}
+
+func (t *shortSuccess) Send(_ []byte) (int, error) { return 31, nil }
+func (t *shortSuccess) Reconnect() error           { return nil }
+func (t *shortSuccess) Close() error               { return nil }
+
+// shortWriteErr returns the standard short-write sentinel used by secure UDP
+// when a positive short encrypted datagram write is detected.
+type shortWriteErr struct{}
+
+func (t *shortWriteErr) Send(_ []byte) (int, error) { return 0, io.ErrShortWrite }
+func (t *shortWriteErr) Reconnect() error           { return nil }
+func (t *shortWriteErr) Close() error               { return nil }
 
 // countingDrop drops the first n sends, then succeeds; Reconnect succeeds.
 type countingDrop struct {
@@ -69,6 +85,34 @@ func TestFailedBeatDoesNotCommitNonceOrTimestamp(t *testing.T) {
 	}
 	if v.nonce != 0 || v.lastTimestamp != 0 {
 		t.Fatalf("failed beat committed nonce=%d ts=%d, want 0/0", v.nonce, v.lastTimestamp)
+	}
+}
+
+func TestShortSuccessfulSendDoesNotCommitNonceOrTimestamp(t *testing.T) {
+	v := newVarta(&shortSuccess{})
+	out := v.Beat(StatusOK, 0)
+	if !out.IsFailed() {
+		t.Fatalf("want Failed for short successful send, got %s", out.String())
+	}
+	if got := out.Err().Kind; got != "WriteZero" {
+		t.Fatalf("short successful send kind = %q, want WriteZero", got)
+	}
+	if v.nonce != 0 || v.lastTimestamp != 0 {
+		t.Fatalf("short send committed nonce=%d ts=%d, want 0/0", v.nonce, v.lastTimestamp)
+	}
+}
+
+func TestShortWriteErrorDoesNotCommitNonceOrTimestamp(t *testing.T) {
+	v := newVarta(&shortWriteErr{})
+	out := v.Beat(StatusOK, 0)
+	if !out.IsFailed() {
+		t.Fatalf("want Failed for io.ErrShortWrite, got %s", out.String())
+	}
+	if got := out.Err().Kind; got != "WriteZero" {
+		t.Fatalf("short write error kind = %q, want WriteZero", got)
+	}
+	if v.nonce != 0 || v.lastTimestamp != 0 {
+		t.Fatalf("short write committed nonce=%d ts=%d, want 0/0", v.nonce, v.lastTimestamp)
 	}
 }
 

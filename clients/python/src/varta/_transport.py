@@ -11,7 +11,8 @@ The :class:`BeatTransport` ABC mirrors the Rust trait of the same name
 Every transport must guarantee:
 
 1. Non-blocking I/O at construction (``setblocking(False)``).
-2. ``send(buf)`` accepts a 32-byte ``bytes``-like and raises ``OSError``
+2. ``send(buf)`` accepts a 32-byte ``bytes``-like, returns ``FRAME_BYTES``
+   only after a full logical heartbeat is accepted, and raises ``OSError``
    on kernel-level failure.
 3. ``reconnect()`` rebuilds the underlying socket from the original
    construction parameters. Cold path; allocation is allowed.
@@ -55,8 +56,10 @@ class BeatTransport(abc.ABC):
     def send(self, buf: bytes) -> int:
         """Send the 32-byte frame ``buf`` over the underlying socket.
 
-        Returns the number of bytes the kernel accepted. Raises
-        ``OSError`` (including ``BlockingIOError``) on failure.
+        Returns ``FRAME_BYTES`` on full logical success. Positive short writes
+        are not successful heartbeats; the agent treats any other return value
+        as ``Failed(WriteZero)``. Raises ``OSError`` (including
+        ``BlockingIOError``) on failure.
         """
 
     @abc.abstractmethod
@@ -284,12 +287,15 @@ class SecureUdpTransport(BeatTransport):
             wire = encode_shared(self._key, iv_prefix, counter, buf)
             assert len(wire) == SECURE_SHARED_BYTES
         sent = self._sock.send(wire)
+        if sent != len(wire):
+            return 0
         # Commit-on-success: only advance state after the kernel accepts the
-        # datagram. A Dropped send must not consume a nonce or burn a prefix.
+        # full encrypted datagram. A Dropped or short send must not consume a
+        # nonce or burn a prefix.
         self._iv_prefix_index = prefix_index
         self._iv_prefix = iv_prefix
         self._iv_counter = counter + 1
-        return sent
+        return FRAME_BYTES
 
     def reconnect(self) -> None:
         sock, session_salt, iv_prefix = self._prepare_session()

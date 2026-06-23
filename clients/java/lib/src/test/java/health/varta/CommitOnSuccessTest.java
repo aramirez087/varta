@@ -73,6 +73,32 @@ class CommitOnSuccessTest {
         }
     }
 
+    /** Returns a positive short write once, then captures the accepted frame. */
+    private static final class ShortOnceThenCapture implements BeatTransport {
+        boolean shortened = false;
+        byte[] last;
+
+        @Override
+        public int send(ByteBuffer frame) {
+            if (!shortened) {
+                shortened = true;
+                return Varta.FRAME_BYTES - 1;
+            }
+            byte[] copy = new byte[frame.remaining()];
+            frame.duplicate().get(copy);
+            last = copy;
+            return Varta.FRAME_BYTES;
+        }
+
+        @Override
+        public void reconnect() {
+        }
+
+        @Override
+        public void close() {
+        }
+    }
+
     @Test
     void droppedBeatsDoNotBurnNonce_firstAcceptedFrameCarriesNonceOne() {
         DropThenCapture t = new DropThenCapture(2);
@@ -89,6 +115,18 @@ class CommitOnSuccessTest {
         FailOnceThenCapture t = new FailOnceThenCapture();
         Varta agent = Varta.__forTest(t);
         assertThat(agent.beat(Status.OK)).isInstanceOf(BeatOutcome.Failed.class);
+        assertThat(agent.beat(Status.OK)).isInstanceOf(BeatOutcome.Sent.class);
+        assertThat(Frame.decode(t.last).nonce()).isEqualTo(1L);
+    }
+
+    @Test
+    void shortSuccessfulSendDoesNotBurnNonce() {
+        ShortOnceThenCapture t = new ShortOnceThenCapture();
+        Varta agent = Varta.__forTest(t);
+
+        assertThat(agent.beat(Status.OK))
+            .isInstanceOfSatisfying(BeatOutcome.Failed.class,
+                f -> assertThat(f.error().kind()).isEqualTo("WriteZero"));
         assertThat(agent.beat(Status.OK)).isInstanceOf(BeatOutcome.Sent.class);
         assertThat(Frame.decode(t.last).nonce()).isEqualTo(1L);
     }

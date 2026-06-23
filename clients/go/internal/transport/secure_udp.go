@@ -4,6 +4,7 @@ import (
 	"crypto/rand"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"os"
 
@@ -108,8 +109,8 @@ func prepareSecureUDPSession(
 
 // Send AEAD-wraps the 32-byte plaintext into a 60- or 64-byte wire
 // frame and transmits it. The IV counter advances only after a
-// successful Write (commit-on-success), so a Dropped beat does not
-// consume a nonce.
+// full successful Write (commit-on-success), so a Dropped or short beat
+// does not consume a nonce.
 func (t *SecureUDPTransport) Send(buf []byte) (int, error) {
 	if len(buf) != 32 {
 		return 0, errors.New("secure-udp: plaintext must be exactly 32 bytes")
@@ -158,10 +159,13 @@ func (t *SecureUDPTransport) Send(buf []byte) (int, error) {
 		// untouched so a Dropped send never burns a nonce or a prefix.
 		return n, err
 	}
+	if n != len(wire) {
+		return 0, io.ErrShortWrite
+	}
 	t.prefixIndex = prefixIndex
 	t.ivPrefix = ivPrefix
 	t.counter = counter + 1
-	return n, nil
+	return len(buf), nil
 }
 
 // Reconnect rebuilds the socket and re-reads crypto/rand for a fresh

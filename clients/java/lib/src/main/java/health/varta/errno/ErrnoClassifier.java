@@ -20,6 +20,10 @@ public final class ErrnoClassifier {
     private ErrnoClassifier() {}
 
     public static BeatOutcome classify(IOException e) {
+        if ("WriteZero".equals(e.getMessage())) {
+            return BeatOutcome.failed(new BeatError(0, "WriteZero"));
+        }
+
         // 1) Typed exceptions — covered by JDK regardless of locale.
         if (e instanceof PortUnreachableException) {
             return BeatOutcome.dropped(DropReason.NO_OBSERVER);

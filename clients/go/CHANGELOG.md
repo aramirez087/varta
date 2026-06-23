@@ -26,6 +26,13 @@ governed independently — see `book/src/spec/vlp.md` in the workspace.
 
 ### Fixed
 
+- **Short successful sends are no longer committed as delivered beats.** The
+  agent now requires transports to report the full 32-byte logical frame before
+  returning `Sent`; a positive short send, or secure UDP's `io.ErrShortWrite`
+  after a partial encrypted write, surfaces as `Failed(WriteZero)` and leaves
+  nonce/timestamp state uncommitted. Secure UDP also verifies the full 60- or
+  64-byte AEAD wire frame before advancing IV state.
+
 - **Secure-UDP nonce-wrap rotation now honours commit-on-success.** At the
   32-bit IV-counter boundary, `SecureUDPTransport.Send` called `rotatePrefix()`
   — which advances `prefixIndex`, resets `counter` to 0, and re-derives the IV

@@ -243,6 +243,9 @@ public final class Varta implements AutoCloseable {
             if (written == 0) {
                 return BeatOutcome.dropped(DropReason.KERNEL_QUEUE_FULL);
             }
+            if (written != FRAME_BYTES) {
+                return BeatOutcome.failed(new BeatError(0, "WriteZero"));
+            }
             return BeatOutcome.sent();
         } catch (IOException e) {
             return ErrnoClassifier.classify(e);
