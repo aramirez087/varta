@@ -198,6 +198,64 @@ fn recycled_pid_reclaims_outstanding_slot_and_recovers_new_lineage() {
     );
 }
 
+#[test]
+#[cfg_attr(miri, ignore)]
+fn recycled_pid_orphan_reap_returns_terminal_outcome_for_metrics() {
+    const PID: u32 = 1001;
+
+    let mut rec = Recovery::new_exec(
+        "sleep".to_string(),
+        vec!["30".to_string()],
+        Duration::from_secs(60),
+    );
+
+    let stale_child_pid = match rec.on_stall(PID, BeatOrigin::KernelAttested, false, Some(1), 0) {
+        RecoveryOutcome::Spawned { child_pid } => child_pid,
+        other => panic!("expected first lineage to spawn, got {other:?}"),
+    };
+
+    match rec.on_stall(PID, BeatOrigin::KernelAttested, false, Some(2), 0) {
+        RecoveryOutcome::Spawned { .. } => {}
+        other => panic!("expected recycled lineage to spawn, got {other:?}"),
+    }
+
+    let mut saw_killed = false;
+    let mut saw_reaped = false;
+    let deadline = Instant::now() + Duration::from_millis(500);
+    while Instant::now() < deadline && !saw_reaped {
+        for outcome in rec.try_reap(0) {
+            match outcome {
+                RecoveryOutcome::Killed { child_pid } if child_pid == stale_child_pid => {
+                    saw_killed = true;
+                }
+                RecoveryOutcome::Reaped {
+                    child_pid,
+                    status,
+                    duration_ns,
+                } if child_pid == stale_child_pid => {
+                    saw_reaped = true;
+                    assert!(
+                        !status.success(),
+                        "reclaimed stale child was killed, so the terminal status must be non-zero"
+                    );
+                    assert!(
+                        duration_ns > 0,
+                        "orphan Reaped outcome must carry duration for Prometheus metrics"
+                    );
+                }
+                _ => {}
+            }
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    assert!(saw_killed, "stale child kill must still be surfaced");
+    assert!(
+        saw_reaped,
+        "orphan completion must return Reaped so logs and metrics observe it"
+    );
+}
+
 /// Generation-unknown (`None`) must stay lenient — bare-PID behaviour — so the
 /// recycle reclaim never fires when start-time tokens are unavailable
 /// (non-Linux, or a `/proc` race). A same-pid re-stall with `None` generation

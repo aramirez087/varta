@@ -227,7 +227,7 @@ impl Recovery {
         entry.stderr_handle = None;
     }
 
-    fn recovery_duration_ns(spawned_at: Instant) -> u64 {
+    pub(super) fn recovery_duration_ns(spawned_at: Instant) -> u64 {
         spawned_at.elapsed().as_nanos().min(u64::MAX as u128) as u64
     }
 

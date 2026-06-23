@@ -963,7 +963,12 @@ impl Recovery {
     /// at the exact moment a PID-recycle churn storm is in progress. The rotating
     /// [`Self::orphan_reap_cursor`] guarantees every orphan is eventually examined,
     /// so the bound staggers rather than starves reaping.
-    fn drain_orphan_reaps(&mut self, observer_ns: u64) {
+    fn drain_orphan_reaps(&mut self, observer_ns: u64, outcomes: &mut Vec<RecoveryOutcome>) {
+        enum OrphanTerminal {
+            Complete,
+            ReapFailed(std::io::Error),
+        }
+
         let mut visited = 0;
         while visited < self.reap_max {
             let len = self.reaping_orphans.len();
@@ -979,7 +984,7 @@ impl Recovery {
             // Orphans are still recovery children with audit-visible capture
             // state. Preserve the normal reap path's bounded drain semantics
             // before emitting their terminal complete record.
-            let remove_now = {
+            let terminal = {
                 let entry = &mut self.reaping_orphans[i].1;
                 Self::drain_outstanding_capture(entry, self.capture_cap);
 
@@ -988,41 +993,87 @@ impl Recovery {
                         Ok(Some(status)) => {
                             entry.completed_status = Some(status);
                             entry.completed_at = Some(Instant::now());
-                            Self::capture_drained(entry)
+                            if Self::capture_drained(entry) {
+                                Some(OrphanTerminal::Complete)
+                            } else {
+                                None
+                            }
                         }
                         Ok(None) => {
                             self.orphan_reap_cursor += 1;
                             continue;
                         }
-                        Err(_) => true,
+                        Err(error) => Some(OrphanTerminal::ReapFailed(error)),
                     }
+                } else if Self::capture_drained(entry) {
+                    Some(OrphanTerminal::Complete)
                 } else {
-                    Self::capture_drained(entry)
+                    None
                 }
             };
 
-            if !remove_now {
+            let Some(terminal) = terminal else {
                 self.orphan_reap_cursor += 1;
                 continue;
-            }
+            };
 
             // `swap_remove` moves the tail entry into slot `i`; leave the cursor
             // on `i` so that swapped-in entry is examined next (it wraps to 0 via
             // the `>= len` guard when `i` was the final slot).
             let (orphan_pid, entry) = self.reaping_orphans.swap_remove(i);
             let child_pid = entry.child.id();
-            self.emit_complete_audit(
-                orphan_pid,
-                child_pid,
-                crate::audit::CompleteOutcome::Killed,
-                entry.completed_status.as_ref(),
-                entry.spawned_at,
-                entry.wallclock_at_spawn_ms,
-                entry.stdout_len,
-                entry.stderr_len,
-                entry.truncated,
-                observer_ns,
-            );
+            let killed = entry.killed;
+            let status = entry.completed_status;
+            let spawned_at = entry.spawned_at;
+            let wallclock_at_spawn_ms = entry.wallclock_at_spawn_ms;
+            let stdout_len = entry.stdout_len;
+            let stderr_len = entry.stderr_len;
+            let truncated = entry.truncated;
+            match terminal {
+                OrphanTerminal::Complete => {
+                    let Some(status) = status else {
+                        debug_assert!(false, "complete orphan must carry exit status");
+                        continue;
+                    };
+                    let duration_ns = Self::recovery_duration_ns(spawned_at);
+                    self.emit_complete_audit(
+                        orphan_pid,
+                        child_pid,
+                        if killed {
+                            crate::audit::CompleteOutcome::Killed
+                        } else {
+                            crate::audit::CompleteOutcome::Reaped
+                        },
+                        Some(&status),
+                        spawned_at,
+                        wallclock_at_spawn_ms,
+                        stdout_len,
+                        stderr_len,
+                        truncated,
+                        observer_ns,
+                    );
+                    outcomes.push(RecoveryOutcome::Reaped {
+                        child_pid,
+                        status,
+                        duration_ns,
+                    });
+                }
+                OrphanTerminal::ReapFailed(error) => {
+                    self.emit_complete_audit(
+                        orphan_pid,
+                        child_pid,
+                        crate::audit::CompleteOutcome::ReapFailed,
+                        None,
+                        spawned_at,
+                        wallclock_at_spawn_ms,
+                        stdout_len,
+                        stderr_len,
+                        truncated,
+                        observer_ns,
+                    );
+                    outcomes.push(RecoveryOutcome::ReapFailed(error));
+                }
+            }
         }
     }
 
@@ -1040,7 +1091,7 @@ impl Recovery {
         outcomes.append(&mut self.pending_outcomes);
 
         // Reap stale-lineage children reclaimed from recycled PID slots.
-        self.drain_orphan_reaps(observer_ns);
+        self.drain_orphan_reaps(observer_ns, &mut outcomes);
 
         self.reap_scratch.clear();
         self.reap_scratch.extend(self.outstanding.iter_pids());
