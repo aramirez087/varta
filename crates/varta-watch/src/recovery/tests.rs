@@ -670,19 +670,26 @@ fn capture_records_nonzero_length_for_chatty_child() {
 #[test]
 #[cfg_attr(miri, ignore)]
 fn capture_setup_failure_drops_handles_and_marks_truncated() {
-    let mut child = std::process::Command::new("sh")
-        .arg("-c")
-        .arg("sleep 30")
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .expect("spawn child with piped capture");
+    use std::process::{Command, Stdio};
 
+    let mut child = Command::new("sh")
+        .args(["-c", "sleep 30"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn child with capture pipes");
+
+    let mut attempts = 0u32;
     let capture = super::runner::take_capture_handles_for_test(&mut child, true, |fd| {
         assert!(fd >= 0, "child pipe fd must be valid");
+        attempts = attempts.saturating_add(1);
         false
     });
 
+    assert_eq!(
+        attempts, 2,
+        "both capture fds should be probed before failing closed"
+    );
     assert!(
         capture.stdout.is_none(),
         "stdout handle must be dropped when nonblocking setup fails"

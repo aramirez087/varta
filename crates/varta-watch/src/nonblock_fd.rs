@@ -24,13 +24,13 @@
 //! any two values fails to build with an error naming the violated
 //! invariant.
 //!
-//! # Failure mode is graceful
+//! # Failure mode is fail-closed
 //!
 //! `set_nonblocking_fd` returns a boolean proof, not a best-effort hint. If
 //! the fcntl call ever fails (or a future platform deviates from the pinned
-//! values), [`crate::recovery`] drops the capture handles and marks the child
-//! capture truncated. The poll loop never reads a pipe unless this module first
-//! proved the fd is non-blocking.
+//! values), recovery capture drops the child pipes and records the capture as
+//! truncated. The observer poll loop never reads from a pipe unless this module
+//! first proved the fd is non-blocking.
 //!
 //! # Per-platform value sources
 //!

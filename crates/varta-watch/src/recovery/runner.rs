@@ -125,7 +125,9 @@ fn take_capture_handles_with(
         return CaptureHandles::setup_failed();
     };
 
-    if !set_nonblocking(out.as_raw_fd()) || !set_nonblocking(err.as_raw_fd()) {
+    let out_ok = set_nonblocking(out.as_raw_fd());
+    let err_ok = set_nonblocking(err.as_raw_fd());
+    if !out_ok || !err_ok {
         return CaptureHandles::setup_failed();
     }
 
