@@ -210,7 +210,7 @@ jobs:
           provenance: true
           sbom: true
           cache-from: type=gha
-          cache-to: type=gha,mode=max
+          cache-to: type=gha,mode=max,ignore-error=true
 
   # ---------- 3. SBOMs (binaries + image) ------------------------------
   sbom:
