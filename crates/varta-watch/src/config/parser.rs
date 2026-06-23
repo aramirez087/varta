@@ -31,7 +31,7 @@ use super::types::{
     DEFAULT_PROM_RATE_LIMIT_PER_SEC, DEFAULT_READ_TIMEOUT_MS, DEFAULT_RECOVERY_CAPTURE_BYTES,
     DEFAULT_RECOVERY_DEBOUNCE_MS, DEFAULT_SHUTDOWN_GRACE_MS, DEFAULT_SOCKET_MODE,
     MAX_AUDIT_ROTATION_BUDGET_MS, MAX_ITERATION_BUDGET_MS, MAX_RECOVERY_CAPTURE_BYTES,
-    MAX_SCRAPE_BUDGET_MS, MAX_SHUTDOWN_GRACE_MS, MIN_EXPORT_FILE_MAX_BYTES,
+    MAX_SCRAPE_BUDGET_MS, MAX_SHUTDOWN_GRACE_MS, MAX_UDS_RCVBUF_BYTES, MIN_EXPORT_FILE_MAX_BYTES,
     MIN_ITERATION_BUDGET_MS, MIN_READ_TIMEOUT_MS, MIN_RECOVERY_AUDIT_MAX_BYTES,
     MIN_RECOVERY_CAPTURE_BYTES, MIN_RECOVERY_TIMEOUT_MS, MIN_SCRAPE_BUDGET_MS,
     MIN_SELF_WATCHDOG_SECS, MIN_SHUTDOWN_GRACE_MS, MIN_THRESHOLD_MS,
@@ -808,6 +808,15 @@ impl Config {
             });
         }
 
+        let uds_rcvbuf_bytes_resolved =
+            uds_rcvbuf_bytes.unwrap_or(super::types::DEFAULT_UDS_RCVBUF_BYTES);
+        if uds_rcvbuf_bytes_resolved > MAX_UDS_RCVBUF_BYTES {
+            return Err(ConfigError::UdsRcvbufBytesTooLarge {
+                value: uds_rcvbuf_bytes_resolved,
+                max: MAX_UDS_RCVBUF_BYTES,
+            });
+        }
+
         Ok(Config {
             socket,
             threshold: Duration::from_millis(threshold_ms),
@@ -841,7 +850,7 @@ impl Config {
             },
             global_beat_rate: global_beat_rate.unwrap_or(super::types::DEFAULT_GLOBAL_BEAT_RATE),
             global_beat_burst: global_beat_burst.unwrap_or(super::types::DEFAULT_GLOBAL_BEAT_BURST),
-            uds_rcvbuf_bytes: uds_rcvbuf_bytes.unwrap_or(super::types::DEFAULT_UDS_RCVBUF_BYTES),
+            uds_rcvbuf_bytes: uds_rcvbuf_bytes_resolved,
             heartbeat_file,
             self_watchdog,
             hw_watchdog,

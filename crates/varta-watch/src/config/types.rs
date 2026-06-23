@@ -140,6 +140,12 @@ pub const DEFAULT_GLOBAL_BEAT_BURST: u32 = 10_000;
 #[cfg(not(feature = "compile-time-config"))]
 pub const DEFAULT_UDS_RCVBUF_BYTES: u32 = 1_048_576;
 
+/// Maximum receive-buffer request accepted for `SO_RCVBUF`.
+///
+/// POSIX `setsockopt(SO_RCVBUF)` takes an `int`, so accepting a larger `u32`
+/// would wrap before the syscall on the observer listener path.
+pub const MAX_UDS_RCVBUF_BYTES: u32 = i32::MAX as u32;
+
 /// Default wall-clock budget (in milliseconds) [`crate::recovery::Recovery`]
 /// blocks in its [`Drop`] impl waiting for outstanding recovery children to
 /// exit after a `kill(2)`. Five seconds preserves the v0.1 hard-coded
@@ -765,6 +771,16 @@ pub enum ConfigError {
         /// The maximum allowed value.
         max: usize,
     },
+    /// `--uds-rcvbuf-bytes` exceeded [`MAX_UDS_RCVBUF_BYTES`]. The socket API
+    /// accepts `SO_RCVBUF` as a signed C `int`; larger parsed `u32` values
+    /// would wrap before `setsockopt(2)` and silently lose the requested burst
+    /// headroom.
+    UdsRcvbufBytesTooLarge {
+        /// The value provided, in bytes.
+        value: u32,
+        /// The maximum allowed value, in bytes.
+        max: u32,
+    },
     /// `--tracker-capacity` was outside the accepted range
     /// (`[1, crate::tracker::MAX_CAPACITY]`).
     TrackerCapacityOutOfRange {
@@ -977,6 +993,11 @@ impl core::fmt::Display for ConfigError {
                 f,
                 "--eviction-scan-window: {value} is outside the accepted range [{min}, {max}]"
             ),
+            ConfigError::UdsRcvbufBytesTooLarge { value, max } => write!(
+                f,
+                "--uds-rcvbuf-bytes: {value} exceeds the maximum {max} bytes \
+                 (SO_RCVBUF is passed to setsockopt as a signed int)"
+            ),
             ConfigError::TrackerCapacityOutOfRange { value, min, max } => write!(
                 f,
                 "--tracker-capacity: {value} is outside the accepted range [{min}, {max}]"
@@ -1067,6 +1088,10 @@ impl core::fmt::Display for ConfigError {
             | ConfigError::EvictionScanWindowOutOfRange { .. } => {
                 write!(f, "configuration error (argv path unreachable; {REF})")
             }
+            ConfigError::UdsRcvbufBytesTooLarge { value, max } => write!(
+                f,
+                "UDS receive buffer out of range: {value} bytes exceeds {max} bytes ({REF})"
+            ),
             ConfigError::TrackerCapacityOutOfRange { value, min, max } => write!(
                 f,
                 "tracker capacity out of range: {value} not in [{min}, {max}] ({REF})"

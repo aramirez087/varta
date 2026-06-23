@@ -188,8 +188,8 @@ OPTIONAL:
                                      doubles and clamps to rmem_max;
                                      the granted size is surfaced as
                                      varta_observer_uds_rcvbuf_bytes.
-                                     Default: 1048576.  Set to 0 to
-                                     leave the kernel default.
+                                     Default: 1048576.  Maximum: 2147483647.
+                                     Set to 0 to leave the kernel default.
     --heartbeat-file <PATH>        Write a timestamp + loop-counter line to
                                      this file on every poll iteration.
                                      External watchdogs can monitor the file

@@ -110,6 +110,40 @@ fn read_timeout_above_ceiling_is_rejected() {
     );
 }
 
+/// `--uds-rcvbuf-bytes` parses as `u32`, but `setsockopt(SO_RCVBUF)` receives
+/// a signed C `int`. Reject values that would wrap before the syscall.
+#[test]
+fn uds_rcvbuf_bytes_above_setsockopt_int_max_is_rejected() {
+    let too_big = super::types::MAX_UDS_RCVBUF_BYTES + 1;
+    let too_big_s = too_big.to_string();
+    match Config::from_args(args(&[
+        "--socket",
+        "/tmp/x.sock",
+        "--threshold-ms",
+        "100",
+        "--uds-rcvbuf-bytes",
+        &too_big_s,
+    ])) {
+        Err(ConfigError::UdsRcvbufBytesTooLarge { value, max }) => {
+            assert_eq!(value, too_big);
+            assert_eq!(max, super::types::MAX_UDS_RCVBUF_BYTES);
+        }
+        other => panic!("expected UdsRcvbufBytesTooLarge, got {other:?}"),
+    }
+
+    let max_s = super::types::MAX_UDS_RCVBUF_BYTES.to_string();
+    let cfg = Config::from_args(args(&[
+        "--socket",
+        "/tmp/x.sock",
+        "--threshold-ms",
+        "100",
+        "--uds-rcvbuf-bytes",
+        &max_s,
+    ]))
+    .expect("SO_RCVBUF signed-int maximum must parse");
+    assert_eq!(cfg.uds_rcvbuf_bytes, super::types::MAX_UDS_RCVBUF_BYTES);
+}
+
 /// The static read-timeout ceiling is not enough when the operator configures
 /// the minimum 1 s self-watchdog. A 1000 ms idle `recv(2)` can consume the
 /// whole full-iteration watchdog deadline before the loop gets to tick again,

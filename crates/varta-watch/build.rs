@@ -25,6 +25,8 @@ use std::env;
 use std::fs;
 use std::path::PathBuf;
 
+const MAX_UDS_RCVBUF_BYTES: u32 = i32::MAX as u32;
+
 // Pull in FlagKind, FlagSpec, and FLAGS from the flag catalogue.  The catalogue
 // is the single source of truth for both the CLI parser and the build script.
 // It uses only `std`-level identifiers so it compiles cleanly here.
@@ -216,6 +218,17 @@ pub fn parse_kv(input: &str) -> Result<ParsedConfig, String> {
             .map_err(|_| format!("tracker_capacity: not a valid usize: {v:?}"))?;
         if !(1..=4096).contains(&n) {
             return Err(format!("tracker_capacity: {n} out of range [1, 4096]"));
+        }
+    }
+    if let Some(v) = out.singletons.get("uds_rcvbuf_bytes") {
+        let n: u32 = v
+            .parse()
+            .map_err(|_| format!("uds_rcvbuf_bytes: not a valid u32: {v:?}"))?;
+        if n > MAX_UDS_RCVBUF_BYTES {
+            return Err(format!(
+                "uds_rcvbuf_bytes: {n} exceeds maximum ({MAX_UDS_RCVBUF_BYTES}); \
+                 SO_RCVBUF is passed to setsockopt as a signed int"
+            ));
         }
     }
     if let Some(v) = out.singletons.get("shutdown_grace_ms") {
@@ -668,6 +681,10 @@ fn render_constructor(parsed: &ParsedConfig, test_hooks_active: bool) -> String 
         "        global_beat_burst: {global_beat_burst},\n"
     ));
     let uds_rcvbuf_bytes: u32 = singleton_u32(parsed, "uds_rcvbuf_bytes", 1_048_576);
+    assert!(
+        uds_rcvbuf_bytes <= MAX_UDS_RCVBUF_BYTES,
+        "uds_rcvbuf_bytes exceeds SO_RCVBUF signed int range"
+    );
     s.push_str(&format!("        uds_rcvbuf_bytes: {uds_rcvbuf_bytes},\n"));
     emit_option_path(&mut s, parsed, "heartbeat_file");
     // self_watchdog

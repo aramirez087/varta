@@ -272,6 +272,25 @@ read_timeout_ms = 1000
 }
 
 #[test]
+fn uds_rcvbuf_bytes_above_setsockopt_int_max_is_rejected() {
+    let bad = "\
+socket = /tmp/x.sock
+threshold_ms = 5000
+uds_rcvbuf_bytes = 2147483648
+";
+    let err = parse_kv(bad).expect_err("uds_rcvbuf_bytes above i32::MAX must error");
+    assert!(err.contains("uds_rcvbuf_bytes"), "got: {err}");
+    assert!(err.contains("2147483647"), "got: {err}");
+
+    let max = "\
+socket = /tmp/x.sock
+threshold_ms = 5000
+uds_rcvbuf_bytes = 2147483647
+";
+    parse_kv(max).expect("SO_RCVBUF signed-int maximum must parse");
+}
+
+#[test]
 fn recovery_audit_sync_every_zero_is_rejected() {
     let bad = "\
 socket = /tmp/x.sock

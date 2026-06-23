@@ -39,10 +39,10 @@ impl super::types::Config {
         use super::types::{
             max_read_timeout_ms, ConfigError, MAX_AUDIT_ROTATION_BUDGET_MS,
             MAX_ITERATION_BUDGET_MS, MAX_RECOVERY_CAPTURE_BYTES, MAX_SCRAPE_BUDGET_MS,
-            MAX_SHUTDOWN_GRACE_MS, MIN_EXPORT_FILE_MAX_BYTES, MIN_ITERATION_BUDGET_MS,
-            MIN_READ_TIMEOUT_MS, MIN_RECOVERY_AUDIT_MAX_BYTES, MIN_RECOVERY_CAPTURE_BYTES,
-            MIN_RECOVERY_TIMEOUT_MS, MIN_SCRAPE_BUDGET_MS, MIN_SELF_WATCHDOG_SECS,
-            MIN_SHUTDOWN_GRACE_MS, MIN_THRESHOLD_MS,
+            MAX_SHUTDOWN_GRACE_MS, MAX_UDS_RCVBUF_BYTES, MIN_EXPORT_FILE_MAX_BYTES,
+            MIN_ITERATION_BUDGET_MS, MIN_READ_TIMEOUT_MS, MIN_RECOVERY_AUDIT_MAX_BYTES,
+            MIN_RECOVERY_CAPTURE_BYTES, MIN_RECOVERY_TIMEOUT_MS, MIN_SCRAPE_BUDGET_MS,
+            MIN_SELF_WATCHDOG_SECS, MIN_SHUTDOWN_GRACE_MS, MIN_THRESHOLD_MS,
         };
 
         if self.threshold < std::time::Duration::from_millis(MIN_THRESHOLD_MS) {
@@ -73,6 +73,12 @@ impl super::types::Config {
             return Err(ConfigError::RecoveryCaptureBytesTooLarge {
                 value: self.recovery_capture_bytes,
                 max: MAX_RECOVERY_CAPTURE_BYTES,
+            });
+        }
+        if self.uds_rcvbuf_bytes > MAX_UDS_RCVBUF_BYTES {
+            return Err(ConfigError::UdsRcvbufBytesTooLarge {
+                value: self.uds_rcvbuf_bytes,
+                max: MAX_UDS_RCVBUF_BYTES,
             });
         }
         let has_recovery = self.recovery_exec_cmd.is_some() || self.recovery_exec_file.is_some();
@@ -395,6 +401,19 @@ mod tests {
                 value: 501,
                 max: 500
             })
+        ));
+    }
+
+    #[test]
+    fn validate_runtime_rejects_uds_rcvbuf_bytes_above_setsockopt_int_max() {
+        let mut cfg = valid_config();
+        cfg.uds_rcvbuf_bytes = super::super::types::MAX_UDS_RCVBUF_BYTES + 1;
+
+        assert!(matches!(
+            cfg.validate_runtime(),
+            Err(ConfigError::UdsRcvbufBytesTooLarge { value, max })
+                if value == super::super::types::MAX_UDS_RCVBUF_BYTES + 1
+                    && max == super::super::types::MAX_UDS_RCVBUF_BYTES
         ));
     }
 

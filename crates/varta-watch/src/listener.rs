@@ -618,7 +618,12 @@ fn set_rcvbuf(fd: i32, bytes: u32) -> io::Result<u32> {
     use core::ffi::c_void;
     use core::mem;
 
-    let val = bytes as i32;
+    let val = i32::try_from(bytes).map_err(|_| {
+        io::Error::new(
+            ErrorKind::InvalidInput,
+            "SO_RCVBUF size exceeds signed int range",
+        )
+    })?;
     let ret = unsafe {
         setsockopt(
             fd,
