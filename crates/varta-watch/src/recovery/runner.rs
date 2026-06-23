@@ -27,9 +27,10 @@ pub(super) struct Outstanding {
     /// Wall-clock ms at spawn time; recorded into the audit log on
     /// completion alongside the monotonic duration.
     pub(super) wallclock_at_spawn_ms: u64,
-    /// `Some` iff capture is enabled. Drains accumulate here non-blockingly
-    /// across `try_reap` calls; truncation is set when either stream's
-    /// captured bytes reach the per-child cap.
+    /// `Some` iff capture is enabled and both captured pipes were proven
+    /// non-blocking. Drains accumulate here across `try_reap` calls; truncation
+    /// is set when setup failed or either stream's captured bytes reach the
+    /// per-child cap.
     pub(super) stdout_handle: Option<ChildStdout>,
     /// See `stdout_handle`.
     pub(super) stderr_handle: Option<ChildStderr>,
@@ -37,7 +38,8 @@ pub(super) struct Outstanding {
     pub(super) stdout_len: u32,
     /// Accumulated captured stderr bytes.
     pub(super) stderr_len: u32,
-    /// True iff either pipe's reads hit the per-child cap and we stopped reading.
+    /// True iff capture setup failed or either pipe's reads hit the per-child
+    /// cap and we stopped reading.
     pub(super) truncated: bool,
     /// Exit status captured once `try_wait` reaps the child, while bounded
     /// stdio draining may still need later ticks before audit completion.
@@ -79,24 +81,68 @@ impl Outstanding {
     }
 }
 
+pub(super) struct CaptureHandles {
+    pub(super) stdout: Option<ChildStdout>,
+    pub(super) stderr: Option<ChildStderr>,
+    pub(super) truncated: bool,
+}
+
+impl CaptureHandles {
+    fn disabled() -> Self {
+        Self {
+            stdout: None,
+            stderr: None,
+            truncated: false,
+        }
+    }
+
+    fn setup_failed() -> Self {
+        Self {
+            stdout: None,
+            stderr: None,
+            truncated: true,
+        }
+    }
+}
+
 /// Take the piped stdout/stderr handles off `child` (when capture is enabled)
-/// and mark them non-blocking. Returns `(None, None)` when capture is disabled.
-pub(super) fn take_capture_handles(
+/// and mark them non-blocking. Capture is fail-closed: if either expected pipe
+/// is missing or cannot be proven non-blocking, both handles are dropped and the
+/// child is marked truncated so completion audit records show degraded capture.
+pub(super) fn take_capture_handles(child: &mut Child, capture_on: bool) -> CaptureHandles {
+    take_capture_handles_with(child, capture_on, set_nonblocking_fd)
+}
+
+fn take_capture_handles_with(
     child: &mut Child,
     capture_on: bool,
-) -> (Option<ChildStdout>, Option<ChildStderr>) {
+    mut set_nonblocking: impl FnMut(i32) -> bool,
+) -> CaptureHandles {
     if !capture_on {
-        return (None, None);
+        return CaptureHandles::disabled();
     }
-    let out = child.stdout.take().map(|h| {
-        let _ = set_nonblocking_fd(h.as_raw_fd());
-        h
-    });
-    let err = child.stderr.take().map(|h| {
-        let _ = set_nonblocking_fd(h.as_raw_fd());
-        h
-    });
-    (out, err)
+    let (Some(out), Some(err)) = (child.stdout.take(), child.stderr.take()) else {
+        return CaptureHandles::setup_failed();
+    };
+
+    if !set_nonblocking(out.as_raw_fd()) || !set_nonblocking(err.as_raw_fd()) {
+        return CaptureHandles::setup_failed();
+    }
+
+    CaptureHandles {
+        stdout: Some(out),
+        stderr: Some(err),
+        truncated: false,
+    }
+}
+
+#[cfg(test)]
+pub(super) fn take_capture_handles_for_test(
+    child: &mut Child,
+    capture_on: bool,
+    set_nonblocking: impl FnMut(i32) -> bool,
+) -> CaptureHandles {
+    take_capture_handles_with(child, capture_on, set_nonblocking)
 }
 
 impl Recovery {
@@ -139,7 +185,7 @@ impl Recovery {
                 match cmd.spawn() {
                     Ok(mut child) => {
                         let child_pid = child.id();
-                        let (out_handle, err_handle) = take_capture_handles(&mut child, capture_on);
+                        let capture = take_capture_handles(&mut child, capture_on);
                         self.outstanding.commit_reserved(
                             reservation,
                             Outstanding {
@@ -148,11 +194,11 @@ impl Recovery {
                                 killed: false,
                                 generation,
                                 wallclock_at_spawn_ms: wallclock_ms,
-                                stdout_handle: out_handle,
-                                stderr_handle: err_handle,
+                                stdout_handle: capture.stdout,
+                                stderr_handle: capture.stderr,
                                 stdout_len: 0,
                                 stderr_len: 0,
-                                truncated: false,
+                                truncated: capture.truncated,
                                 completed_status: None,
                                 completed_at: None,
                                 #[cfg(test)]

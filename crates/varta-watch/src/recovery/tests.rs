@@ -668,6 +668,39 @@ fn capture_records_nonzero_length_for_chatty_child() {
 }
 
 #[test]
+#[cfg_attr(miri, ignore)]
+fn capture_setup_failure_drops_handles_and_marks_truncated() {
+    let mut child = std::process::Command::new("sh")
+        .arg("-c")
+        .arg("sleep 30")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn child with piped capture");
+
+    let capture = super::runner::take_capture_handles_for_test(&mut child, true, |fd| {
+        assert!(fd >= 0, "child pipe fd must be valid");
+        false
+    });
+
+    assert!(
+        capture.stdout.is_none(),
+        "stdout handle must be dropped when nonblocking setup fails"
+    );
+    assert!(
+        capture.stderr.is_none(),
+        "stderr handle must be dropped when nonblocking setup fails"
+    );
+    assert!(
+        capture.truncated,
+        "degraded capture setup must be audit-visible as truncated"
+    );
+
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+#[test]
 fn capture_truncates_at_per_child_cap() {
     let dir = audit_tmpdir("truncate");
     let path = dir.join("audit.log");

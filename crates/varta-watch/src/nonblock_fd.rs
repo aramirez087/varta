@@ -26,11 +26,11 @@
 //!
 //! # Failure mode is graceful
 //!
-//! `set_nonblocking_fd` is documented as best-effort. If the fcntl call
-//! ever fails (or a future platform deviates from the pinned values), the
-//! caller's drain loop in [`crate::recovery`] catches `WouldBlock` and
-//! falls back to a single bounded blocking `read`. A broken probe can
-//! never block the observer poll loop.
+//! `set_nonblocking_fd` returns a boolean proof, not a best-effort hint. If
+//! the fcntl call ever fails (or a future platform deviates from the pinned
+//! values), [`crate::recovery`] drops the capture handles and marks the child
+//! capture truncated. The poll loop never reads a pipe unless this module first
+//! proved the fd is non-blocking.
 //!
 //! # Per-platform value sources
 //!
@@ -227,10 +227,10 @@ extern "C" {
     fn fcntl(fd: i32, cmd: i32, ...) -> i32;
 }
 
-/// Best-effort set `O_NONBLOCK` on a raw fd. Failure is logged-only — the
-/// drain loop in [`crate::recovery`] checks `WouldBlock` and falls back
-/// to a single bounded `read` if the flag could not be set, so a failing
-/// fcntl never blocks the observer.
+/// Set `O_NONBLOCK` on a raw fd and return whether the proof succeeded.
+///
+/// Callers must fail closed on `false`: do not retain a pipe handle for later
+/// recovery-drain reads unless this function proved the kernel flag was set.
 pub(crate) fn set_nonblocking_fd(fd: i32) -> bool {
     // SAFETY: F_GETFL / F_SETFL are standard fcntl commands. The fd is
     // owned by the ChildStdout / ChildStderr handle for the duration of
