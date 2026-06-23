@@ -706,11 +706,18 @@ jobs:
           /tmp/varta-smoke-venv/bin/python -c "import varta; print(varta.__version__)"
 
   go-client:
-    name: go-client (${{ matrix.os }})
+    name: go-client (${{ matrix.os }}, go-${{ matrix.go }})
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        include:
+          - os: ubuntu-latest
+            go: '1.21'
+          # macos-latest dyld rejects Go 1.21 test binaries before test code
+          # runs ("missing LC_UUID load command"). Keep the Go 1.21 floor on
+          # Ubuntu and use the current stable toolchain on macOS.
+          - os: macos-latest
+            go: 'stable'
     runs-on: ${{ matrix.os }}
     steps:
       - name: checkout
@@ -719,7 +726,7 @@ jobs:
       - name: setup go
         uses: actions/setup-go@v5
         with:
-          go-version: '1.21'
+          go-version: ${{ matrix.go }}
 
       - name: rust toolchain (stable)
         uses: dtolnay/rust-toolchain@stable
