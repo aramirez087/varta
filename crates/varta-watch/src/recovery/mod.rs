@@ -750,7 +750,8 @@ impl Recovery {
     /// Override the Drop-time shutdown grace.
     pub fn with_shutdown_grace(mut self, grace: Duration) -> Self {
         let min = Duration::from_millis(crate::config::MIN_SHUTDOWN_GRACE_MS);
-        self.shutdown_grace = grace.max(min);
+        let max = Duration::from_millis(crate::config::MAX_SHUTDOWN_GRACE_MS);
+        self.shutdown_grace = grace.max(min).min(max);
         self
     }
 
@@ -1148,8 +1149,8 @@ impl Drop for Recovery {
             children.push(entry.child);
         }
 
-        let deadline = Instant::now() + self.shutdown_grace;
-        while !children.is_empty() && Instant::now() < deadline {
+        let started = Instant::now();
+        while !children.is_empty() && started.elapsed() < self.shutdown_grace {
             children.retain_mut(|child| match child.try_wait() {
                 Ok(Some(_)) | Err(_) => false,
                 Ok(None) => true,

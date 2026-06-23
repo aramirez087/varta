@@ -39,9 +39,10 @@ impl super::types::Config {
         use super::types::{
             max_read_timeout_ms, ConfigError, MAX_AUDIT_ROTATION_BUDGET_MS,
             MAX_ITERATION_BUDGET_MS, MAX_RECOVERY_CAPTURE_BYTES, MAX_SCRAPE_BUDGET_MS,
-            MIN_EXPORT_FILE_MAX_BYTES, MIN_ITERATION_BUDGET_MS, MIN_READ_TIMEOUT_MS,
-            MIN_RECOVERY_AUDIT_MAX_BYTES, MIN_RECOVERY_CAPTURE_BYTES, MIN_RECOVERY_TIMEOUT_MS,
-            MIN_SCRAPE_BUDGET_MS, MIN_SELF_WATCHDOG_SECS, MIN_SHUTDOWN_GRACE_MS, MIN_THRESHOLD_MS,
+            MAX_SHUTDOWN_GRACE_MS, MIN_EXPORT_FILE_MAX_BYTES, MIN_ITERATION_BUDGET_MS,
+            MIN_READ_TIMEOUT_MS, MIN_RECOVERY_AUDIT_MAX_BYTES, MIN_RECOVERY_CAPTURE_BYTES,
+            MIN_RECOVERY_TIMEOUT_MS, MIN_SCRAPE_BUDGET_MS, MIN_SELF_WATCHDOG_SECS,
+            MIN_SHUTDOWN_GRACE_MS, MIN_THRESHOLD_MS,
         };
 
         if self.threshold < std::time::Duration::from_millis(MIN_THRESHOLD_MS) {
@@ -54,6 +55,12 @@ impl super::types::Config {
             return Err(ConfigError::ShutdownGraceTooLow {
                 value: duration_ms_saturating(self.shutdown_grace),
                 min: MIN_SHUTDOWN_GRACE_MS,
+            });
+        }
+        if self.shutdown_grace > std::time::Duration::from_millis(MAX_SHUTDOWN_GRACE_MS) {
+            return Err(ConfigError::ShutdownGraceTooLarge {
+                value: duration_ms_saturating(self.shutdown_grace),
+                max: MAX_SHUTDOWN_GRACE_MS,
             });
         }
         if self.recovery_capture_bytes < MIN_RECOVERY_CAPTURE_BYTES {
@@ -359,6 +366,20 @@ mod tests {
         assert!(matches!(
             cfg.validate_runtime(),
             Err(ConfigError::SelfWatchdogTooLow { value: 0, min: 1 })
+        ));
+    }
+
+    #[test]
+    fn validate_runtime_rejects_shutdown_grace_too_large() {
+        let mut cfg = valid_config();
+        cfg.shutdown_grace =
+            Duration::from_millis(super::super::types::MAX_SHUTDOWN_GRACE_MS.saturating_add(1));
+
+        assert!(matches!(
+            cfg.validate_runtime(),
+            Err(ConfigError::ShutdownGraceTooLarge { value, max })
+                if value == super::super::types::MAX_SHUTDOWN_GRACE_MS + 1
+                    && max == super::super::types::MAX_SHUTDOWN_GRACE_MS
         ));
     }
 

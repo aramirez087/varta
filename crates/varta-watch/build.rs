@@ -225,6 +225,9 @@ pub fn parse_kv(input: &str) -> Result<ParsedConfig, String> {
         if n < 100 {
             return Err(format!("shutdown_grace_ms: {n} is below the minimum (100)"));
         }
+        if n > 60_000 {
+            return Err(format!("shutdown_grace_ms: {n} exceeds maximum (60000)"));
+        }
     }
     if let Some(v) = out.singletons.get("recovery_audit_sync_every") {
         let n: u32 = v

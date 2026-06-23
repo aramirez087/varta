@@ -55,9 +55,9 @@ observer poll loop. Each step is deterministic and bounded.
    order. The load-bearing ones:
    * **`Recovery`** — kill all outstanding children immediately, then
      `try_wait` in a 10 ms-poll loop with a single shared deadline of
-     `--shutdown-grace-ms` (default 5 s, minimum 100 ms). Children still
-     alive at the deadline are reparented to PID 1 and the process exits
-     anyway.
+     `--shutdown-grace-ms` (default 5 s, range 100 ms..60 s). Children
+     still alive at the deadline are reparented to PID 1 and the process
+     exits anyway.
    * **`RecoveryAuditLog`** — drain the in-memory ring via
      `flush_pending(Duration::MAX)`, then a final `fdatasync(2)` so every
      append is durable on disk before the process leaves the kernel.
@@ -72,9 +72,9 @@ observer poll loop. Each step is deterministic and bounded.
 
 ## Tuning knobs
 
-| flag | default | minimum | role |
+| flag | default | accepted range | role |
 |------|---------|---------|------|
-| `--shutdown-grace-ms` | `5000` | `100` | bound on `Recovery::Drop`'s child-reap window |
+| `--shutdown-grace-ms` | `5000` | `100..60000` | bound on `Recovery::Drop`'s child-reap window |
 | `--audit-fsync-budget-ms` | `50` | — | bound on per-fdatasync wall time during audit drain |
 
 The systemd unit's `TimeoutStopSec=` should be **at least**
@@ -135,4 +135,5 @@ listener cleanup.
 * Signal handler installation: `crates/varta-watch/src/signal_install/`
 * Observer self-liveness (the WATCHDOG=1 channel): [Stall Detection & Liveness]
 * Configuration constants: `DEFAULT_SHUTDOWN_GRACE_MS`,
-  `MIN_SHUTDOWN_GRACE_MS` in `crates/varta-watch/src/config/types.rs`
+  `MIN_SHUTDOWN_GRACE_MS`, `MAX_SHUTDOWN_GRACE_MS` in
+  `crates/varta-watch/src/config/types.rs`

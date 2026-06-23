@@ -446,7 +446,7 @@ surface in core dumps and ASLR-defeated speculative reads.
 
 ## Shutdown grace and systemd
 
-`--shutdown-grace-ms` (default 5000, minimum 100) bounds the time
+`--shutdown-grace-ms` (default 5000, range 100..60000) bounds the time
 `Recovery::drop` blocks waiting for outstanding recovery children to
 exit after issuing SIGKILL during shutdown.  Children that outlive the
 grace are abandoned to PID 1 for reaping; the observer process exits

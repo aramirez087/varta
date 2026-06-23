@@ -8,7 +8,7 @@ use crate::tracker::MAX_CAPACITY;
 
 use super::types::{
     Config, ConfigError, DEFAULT_PROM_RATE_LIMIT_BURST, DEFAULT_PROM_RATE_LIMIT_PER_SEC,
-    DEFAULT_SHUTDOWN_GRACE_MS, MIN_SHUTDOWN_GRACE_MS, MIN_THRESHOLD_MS,
+    DEFAULT_SHUTDOWN_GRACE_MS, MAX_SHUTDOWN_GRACE_MS, MIN_SHUTDOWN_GRACE_MS, MIN_THRESHOLD_MS,
 };
 use super::validate::{parse_exec_cmd, validate_secret_file};
 
@@ -823,6 +823,25 @@ fn shutdown_grace_below_minimum_is_rejected() {
             assert_eq!(min, MIN_SHUTDOWN_GRACE_MS);
         }
         other => panic!("expected ShutdownGraceTooLow, got {other:?}"),
+    }
+}
+
+#[test]
+fn shutdown_grace_above_maximum_is_rejected() {
+    let too_large = (MAX_SHUTDOWN_GRACE_MS + 1).to_string();
+    match Config::from_args(args(&[
+        "--socket",
+        "/s",
+        "--threshold-ms",
+        "100",
+        "--shutdown-grace-ms",
+        &too_large,
+    ])) {
+        Err(ConfigError::ShutdownGraceTooLarge { value, max }) => {
+            assert_eq!(value, MAX_SHUTDOWN_GRACE_MS + 1);
+            assert_eq!(max, MAX_SHUTDOWN_GRACE_MS);
+        }
+        other => panic!("expected ShutdownGraceTooLarge, got {other:?}"),
     }
 }
 

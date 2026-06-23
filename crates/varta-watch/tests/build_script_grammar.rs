@@ -138,6 +138,17 @@ iteration_budget_ms = 5
 }
 
 #[test]
+fn out_of_range_shutdown_grace_is_rejected() {
+    let bad = "\
+socket = /tmp/x.sock
+threshold_ms = 5000
+shutdown_grace_ms = 60001
+";
+    let err = parse_kv(bad).expect_err("shutdown grace out of range must error");
+    assert!(err.contains("shutdown_grace_ms"), "got: {err}");
+}
+
+#[test]
 fn recovery_inherit_env_is_accepted_as_bool() {
     let cfg = "\
 socket = /tmp/x.sock

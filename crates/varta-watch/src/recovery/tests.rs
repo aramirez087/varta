@@ -35,6 +35,39 @@ fn capacity_builders_cap_untrusted_values() {
 }
 
 #[test]
+fn shutdown_grace_builder_clamps_untrusted_values() {
+    let rec = Recovery::with_mode(
+        RecoveryMode::Exec {
+            program: "true".to_string(),
+            args: vec![],
+        },
+        Duration::ZERO,
+    )
+    .with_shutdown_grace(Duration::from_millis(
+        crate::config::MAX_SHUTDOWN_GRACE_MS + 1,
+    ));
+
+    assert_eq!(
+        rec.shutdown_grace,
+        Duration::from_millis(crate::config::MAX_SHUTDOWN_GRACE_MS)
+    );
+
+    let rec = Recovery::with_mode(
+        RecoveryMode::Exec {
+            program: "true".to_string(),
+            args: vec![],
+        },
+        Duration::ZERO,
+    )
+    .with_shutdown_grace(Duration::ZERO);
+
+    assert_eq!(
+        rec.shutdown_grace,
+        Duration::from_millis(crate::config::MIN_SHUTDOWN_GRACE_MS)
+    );
+}
+
+#[test]
 fn exec_mode_spawns_command_via_execvp() {
     let mut rec = Recovery::with_mode(
         RecoveryMode::Exec {

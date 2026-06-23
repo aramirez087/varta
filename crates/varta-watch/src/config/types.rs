@@ -152,6 +152,15 @@ pub const DEFAULT_SHUTDOWN_GRACE_MS: u64 = 5_000;
 /// round under load, which would orphan every outstanding child to PID 1.
 pub const MIN_SHUTDOWN_GRACE_MS: u64 = 100;
 
+/// Maximum accepted value for `--shutdown-grace-ms`.
+///
+/// This window starts after recovery children have already received
+/// `kill(2)`, so very large values do not make shutdown safer; they only let
+/// the health observer hang while the service manager is trying to stop it.
+/// The ceiling also prevents impossible `Instant` deadlines from being
+/// accepted via CLI or compile-time configuration.
+pub const MAX_SHUTDOWN_GRACE_MS: u64 = 60_000;
+
 /// Minimum accepted value for `--recovery-timeout-ms`. This flag is the
 /// kill-after deadline for a still-running recovery child: the reap gate in
 /// [`crate::recovery::Recovery`] `kill(2)`s a child once
@@ -317,9 +326,10 @@ pub struct Config {
     pub shutdown_after: Option<Duration>,
     /// Maximum wall-clock time [`crate::recovery::Recovery::drop`] blocks
     /// waiting for outstanding recovery children after issuing `kill(2)`.
-    /// Defaults to [`DEFAULT_SHUTDOWN_GRACE_MS`]; minimum
-    /// [`MIN_SHUTDOWN_GRACE_MS`].  systemd `TimeoutStopSec` must be at
-    /// least this value plus a small reap margin (~2 s).
+    /// Defaults to [`DEFAULT_SHUTDOWN_GRACE_MS`]; accepted range
+    /// [`MIN_SHUTDOWN_GRACE_MS`]..=[`MAX_SHUTDOWN_GRACE_MS`]. systemd
+    /// `TimeoutStopSec` must be at least this value plus a small reap margin
+    /// (~2 s).
     pub shutdown_grace: Duration,
     /// Optional kill-after deadline for outstanding recovery children.
     /// `None` (the default) preserves v0.1.0 semantics: children are
@@ -647,6 +657,13 @@ pub enum ConfigError {
         /// The minimum allowed value.
         min: u64,
     },
+    /// `--shutdown-grace-ms` was above [`MAX_SHUTDOWN_GRACE_MS`].
+    ShutdownGraceTooLarge {
+        /// The value provided on the CLI.
+        value: u64,
+        /// The maximum allowed value.
+        max: u64,
+    },
     /// `--recovery-timeout-ms` was below [`MIN_RECOVERY_TIMEOUT_MS`]. A value of
     /// `0` (and any value below the floor) makes the reap gate kill every
     /// still-running recovery child on the first reap tick, silently neutering
@@ -887,6 +904,10 @@ impl core::fmt::Display for ConfigError {
                 f,
                 "--shutdown-grace-ms: {value} is below the minimum allowed value ({min} ms)"
             ),
+            ConfigError::ShutdownGraceTooLarge { value, max } => write!(
+                f,
+                "--shutdown-grace-ms: {value} exceeds the maximum allowed value ({max} ms)"
+            ),
             ConfigError::RecoveryTimeoutTooLow { value, min } => write!(
                 f,
                 "--recovery-timeout-ms: {value} is below the minimum {min} ms \
@@ -1036,6 +1057,7 @@ impl core::fmt::Display for ConfigError {
             | ConfigError::RemovedFlag { .. }
             | ConfigError::PromAddrRequiresToken
             | ConfigError::ShutdownGraceTooLow { .. }
+            | ConfigError::ShutdownGraceTooLarge { .. }
             | ConfigError::RecoveryCaptureBytesTooLarge { .. }
             | ConfigError::RecoveryCaptureRequiresRecovery
             | ConfigError::RecoveryRequiresAuthenticatedTransport { .. }

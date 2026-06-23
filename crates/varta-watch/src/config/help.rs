@@ -92,9 +92,9 @@ OPTIONAL:
                                      Recovery::drop waiting for outstanding
                                      recovery children to exit after SIGKILL
                                      during shutdown.  Default 5000.  Minimum
-                                     100.  systemd unit's TimeoutStopSec
-                                     must be at least this value plus ~2
-                                     seconds of reap margin.
+                                     100, maximum 60000.  systemd unit's
+                                     TimeoutStopSec must be at least this
+                                     value plus ~2 seconds of reap margin.
     --recovery-timeout-ms <MS>     Kill-after deadline for recovery children;
                                      if a child runs longer than this it is
                                      killed via kill(2) (default: none —
