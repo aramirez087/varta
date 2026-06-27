@@ -437,6 +437,17 @@ impl ScriptedListener {
         }
         Self { results }
     }
+
+    fn with_ctrl_truncated(count: usize) -> Self {
+        let mut results = VecDeque::new();
+        for _ in 0..count {
+            results.push_back(RecvResult::CtrlTruncated(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "test ancillary truncation",
+            )));
+        }
+        Self { results }
+    }
 }
 
 impl BeatListener for ScriptedListener {
@@ -694,6 +705,45 @@ fn authenticated_pid_mismatches_pay_global_rate_limit() {
     assert!(
         obs.last_poll_consumed(),
         "a rate-limited PID mismatch is still consumed I/O"
+    );
+}
+
+#[test]
+fn ctrl_truncated_events_pay_global_rate_limit() {
+    let mut obs = Observer::new(
+        Duration::from_secs(60),
+        64,
+        EvictionPolicy::Strict,
+        DEFAULT_EVICTION_SCAN_WINDOW,
+        None,
+        1,
+        1,
+        ClockSource::Monotonic,
+    )
+    .expect("Observer::new should succeed");
+
+    obs.add_listener(Box::new(ScriptedListener::with_ctrl_truncated(2)));
+
+    let first = obs.poll();
+    assert!(
+        matches!(first, Some(Event::CtrlTruncated(_, _))),
+        "the first control-truncation event should consume the burst token, got {first:?}"
+    );
+    assert_eq!(obs.drain_global_rate_limited(), 0);
+
+    let second = obs.poll();
+    assert!(
+        second.is_none(),
+        "the exhausted global bucket must shed repeated control-truncation events, got {second:?}"
+    );
+    assert_eq!(
+        obs.drain_global_rate_limited(),
+        1,
+        "the shed control-truncation event must be visible in global limiter metrics"
+    );
+    assert!(
+        obs.last_poll_consumed(),
+        "a rate-limited control-truncation datagram is still consumed I/O"
     );
 }
 

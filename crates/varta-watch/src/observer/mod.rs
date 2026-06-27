@@ -832,9 +832,17 @@ impl Observer {
                 RecvResult::WouldBlock => continue,
                 RecvResult::ShortRead => continue,
                 RecvResult::CtrlTruncated(e) => {
+                    // Ancillary truncation happens before VLP decode, but it
+                    // still produces an exported rejection event. Spend the
+                    // shared bucket here too so a peer that can force
+                    // MSG_CTRUNC cannot bypass the same event-pressure guard
+                    // paid by authenticated decode and PID-rejection paths.
+                    if !self.try_admit_global(now_ns) {
+                        continue;
+                    }
                     if first_event.is_none() {
                         self.next_listener_start = (i + 1) % len;
-                        first_event = Some(Event::CtrlTruncated(e, self.now_ns()));
+                        first_event = Some(Event::CtrlTruncated(e, now_ns));
                     }
                 }
                 RecvResult::IoError(e) => {
