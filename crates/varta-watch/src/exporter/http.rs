@@ -133,7 +133,7 @@ impl super::PromExporter {
     /// building up under a connection flood (hostile client opening
     /// thousands of connections).
     pub fn serve_pending(&mut self) -> io::Result<()> {
-        let render_fresh = self
+        let mut render_fresh = self
             .last_scrape
             .map_or(true, |last| last.elapsed() >= PROM_MIN_SCRAPE_INTERVAL);
         let serve_deadline = Instant::now() + std::time::Duration::from_millis(100);
@@ -162,7 +162,12 @@ impl super::PromExporter {
                         continue;
                     }
                     match self.serve_one(stream, render_fresh) {
-                        ServeOutcome::ServedFresh => served_fresh = true,
+                        ServeOutcome::ServedFresh => {
+                            served_fresh = true;
+                            // `last_scrape` is committed after the batch, so
+                            // consume the freshness token locally now.
+                            render_fresh = false;
+                        }
                         ServeOutcome::ServedCached => {
                             self.scrape_skipped_total = self.scrape_skipped_total.saturating_add(1);
                         }

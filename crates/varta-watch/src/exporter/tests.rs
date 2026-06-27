@@ -215,6 +215,18 @@ fn one_get(prom: &mut PromExporter, addr: SocketAddr, auth: Option<&str>) -> Str
     response
 }
 
+fn authorized_get_stream(addr: SocketAddr) -> TcpStream {
+    let mut stream = TcpStream::connect(addr).expect("connect");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .expect("read timeout");
+    let req = format!(
+        "GET /metrics HTTP/1.0\r\nHost: localhost\r\nAuthorization: Bearer {TEST_TOKEN_HEX}\r\nConnection: close\r\n\r\n"
+    );
+    stream.write_all(req.as_bytes()).expect("write");
+    stream
+}
+
 #[test]
 fn metrics_requires_bearer_token() {
     let mut prom = PromExporter::bind("127.0.0.1:0".parse().unwrap(), make_token()).expect("bind");
@@ -235,6 +247,41 @@ fn metrics_requires_bearer_token() {
     assert_eq!(
         prom.frame_auth_failures_total, 0,
         "frame_auth_failures_total must NOT bump on a /metrics bearer failure"
+    );
+}
+
+#[test]
+fn queued_authorized_scrapes_share_one_fresh_render() {
+    let mut prom = PromExporter::bind("127.0.0.1:0".parse().unwrap(), make_token()).expect("bind");
+    let addr = prom.local_addr().expect("local_addr");
+
+    let mut first = authorized_get_stream(addr);
+    let mut second = authorized_get_stream(addr);
+    std::thread::sleep(Duration::from_millis(30));
+
+    prom.serve_pending().expect("serve_pending");
+
+    let mut first_response = String::new();
+    first
+        .read_to_string(&mut first_response)
+        .expect("read first response");
+    let mut second_response = String::new();
+    second
+        .read_to_string(&mut second_response)
+        .expect("read second response");
+
+    assert!(
+        first_response.starts_with("HTTP/1.0 200 OK"),
+        "first scrape should succeed, got: {first_response:?}"
+    );
+    assert!(
+        second_response.starts_with("HTTP/1.0 200 OK"),
+        "second scrape should succeed, got: {second_response:?}"
+    );
+    assert_eq!(
+        prom.scrape_skipped_total, 1,
+        "only the first queued authorized scrape should render fresh; later \
+         scrapes in the same serve_pending call must use the cache"
     );
 }
 
