@@ -60,8 +60,23 @@ internal sealed class SecureUdpTransport : IBeatTransport
         _port = port;
         _key = key32.ToArray();
 
-        _socket = BuildConnected(host, port);
-        RefreshIvState();
+        Socket? socket = null;
+        try
+        {
+            socket = BuildConnected(host, port);
+            RefreshIvState();
+            _socket = socket;
+            socket = null;
+        }
+        catch
+        {
+            CryptographicOperations.ZeroMemory(_key);
+            throw;
+        }
+        finally
+        {
+            DisposeBestEffort(socket);
+        }
     }
 
     public int Send(ReadOnlySpan<byte> plaintext32)
@@ -127,19 +142,28 @@ internal sealed class SecureUdpTransport : IBeatTransport
         // propagation between the salt read and the IV derivation
         // (matches the Rust SecureUdpTransport::reconnect transactional
         // pattern — cerebrum 2026-05-15).
-        var newSocket = BuildConnected(_host, _port);
-        var newSalt = new byte[Hkdf.SessionSaltBytes];
-        RandomNumberGenerator.Fill(newSalt);
-        var newPrefix = new byte[Hkdf.IvRandomBytes];
-        Hkdf.DeriveIvPrefix(newSalt, prefixIndex: 0, newPrefix);
+        Socket? newSocket = null;
+        try
+        {
+            newSocket = BuildConnected(_host, _port);
+            var newSalt = new byte[Hkdf.SessionSaltBytes];
+            RandomNumberGenerator.Fill(newSalt);
+            var newPrefix = new byte[Hkdf.IvRandomBytes];
+            Hkdf.DeriveIvPrefix(newSalt, prefixIndex: 0, newPrefix);
 
-        var old = _socket;
-        _socket = newSocket;
-        newSalt.CopyTo(_sessionSalt, 0);
-        newPrefix.CopyTo(_ivPrefix, 0);
-        _prefixIndex = 0;
-        _counter = 0;
-        try { old.Dispose(); } catch { /* best-effort */ }
+            var old = _socket;
+            newSalt.CopyTo(_sessionSalt, 0);
+            newPrefix.CopyTo(_ivPrefix, 0);
+            _prefixIndex = 0;
+            _counter = 0;
+            _socket = newSocket;
+            newSocket = null;
+            DisposeBestEffort(old);
+        }
+        finally
+        {
+            DisposeBestEffort(newSocket);
+        }
     }
 
     public void Dispose()
@@ -187,6 +211,11 @@ internal sealed class SecureUdpTransport : IBeatTransport
         _sendResultOverrideForTest is not null
             ? _sendResultOverrideForTest(wire.Length)
             : _socket.Send(wire, SocketFlags.None);
+
+    private static void DisposeBestEffort(Socket? socket)
+    {
+        try { socket?.Dispose(); } catch { /* best-effort */ }
+    }
 
     // ---- Test hooks (InternalsVisibleTo Varta.Client.Tests) ----
 

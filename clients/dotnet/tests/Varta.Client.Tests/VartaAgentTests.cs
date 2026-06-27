@@ -1,5 +1,6 @@
 using System.Net.Sockets;
 using System.Runtime.InteropServices;
+using System.Security.Cryptography;
 using Varta.Internal.Transport;
 using Varta.Tests.Helpers;
 using Xunit;
@@ -44,6 +45,41 @@ public class VartaAgentTests
         public void Reconnect()
         {
             Reconnects++;
+        }
+
+        public void Dispose() { }
+    }
+
+    private sealed class ThrowingTransport : IBeatTransport
+    {
+        private readonly Exception? _sendException;
+        private readonly Exception? _reconnectException;
+        public int Sends;
+        public int Reconnects;
+
+        public ThrowingTransport(Exception? sendException = null, Exception? reconnectException = null)
+        {
+            _sendException = sendException;
+            _reconnectException = reconnectException;
+        }
+
+        public int Send(ReadOnlySpan<byte> frame32)
+        {
+            Sends++;
+            if (_sendException is not null)
+            {
+                throw _sendException;
+            }
+            return frame32.Length;
+        }
+
+        public void Reconnect()
+        {
+            Reconnects++;
+            if (_reconnectException is not null)
+            {
+                throw _reconnectException;
+            }
         }
 
         public void Dispose() { }
@@ -111,6 +147,27 @@ public class VartaAgentTests
             outcome.IsFailed,
             "a failed fork reconnect must surface as Failed, not throw");
         Assert.Equal(1, transport.Reconnects);
+    }
+
+    [Fact]
+    public void Beat_ForkReconnectNonSocketFailure_ReturnsFailed_NeverThrows()
+    {
+        // Secure UDP fork recovery refreshes entropy/HKDF state after opening
+        // the replacement socket. Crypto/session setup failures must still obey
+        // Beat()'s no-throw contract and must not mark the fork as recovered.
+        var transport = new ThrowingTransport(
+            reconnectException: new CryptographicException("session salt unavailable"));
+        using var agent = global::Varta.Varta.FromTransportForTest(transport);
+        agent.SetConnectPidForTest(Environment.ProcessId + 1);
+
+        var outcome = agent.Beat(Status.Ok);
+
+        Assert.True(outcome.IsFailed);
+        Assert.Equal(0, outcome.Error.Errno);
+        Assert.Equal(nameof(CryptographicException), outcome.Error.Kind);
+        Assert.Equal(1, transport.Reconnects);
+        Assert.Equal(0ul, agent.ForkRecoveries);
+        Assert.Equal(1ul, agent.NonceForTest);
     }
 
     [SkipOnWindowsFact]
@@ -258,6 +315,22 @@ public class VartaAgentTests
     {
         using var agent = global::Varta.Varta.FromTransportForTest(new AlwaysFail());
         Assert.True(agent.Beat(Status.Ok).IsFailed);
+        Assert.Equal(1ul, agent.NonceForTest);
+    }
+
+    [Fact]
+    public void NonSocketFailedBeat_DoesNotThrowOrCommitNonce()
+    {
+        var transport = new ThrowingTransport(
+            sendException: new CryptographicException("seal failed"));
+        using var agent = global::Varta.Varta.FromTransportForTest(transport);
+
+        var outcome = agent.Beat(Status.Ok);
+
+        Assert.True(outcome.IsFailed);
+        Assert.Equal(0, outcome.Error.Errno);
+        Assert.Equal(nameof(CryptographicException), outcome.Error.Kind);
+        Assert.Equal(1, transport.Sends);
         Assert.Equal(1ul, agent.NonceForTest);
     }
 

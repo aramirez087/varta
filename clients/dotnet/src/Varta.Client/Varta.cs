@@ -132,15 +132,14 @@ public sealed class Varta : IDisposable
                 {
                     _transport.Reconnect();
                 }
-                catch (SocketException ex)
+                catch (Exception ex) when (IsNonFatalTransportException(ex))
                 {
                     // Beat() must never throw (the documented contract). A failed
                     // fork-recovery reconnect is surfaced as Failed — matching the
                     // Rust reference (client.rs: `Err(e) => BeatOutcome::Failed`)
                     // and the Go/Python/Node clients. _connectPid is left
                     // unchanged so the next beat retries the reconnect.
-                    return BeatOutcome.Failed(
-                        new BeatError(ex.NativeErrorCode, ex.SocketErrorCode.ToString()));
+                    return BeatOutcome.Failed(BeatErrorFromTransportException(ex));
                 }
                 _connectPid = currentPid;
                 _nonce = 1;
@@ -218,6 +217,14 @@ public sealed class Varta : IDisposable
                 return TrySendWithReconnectAfter(allowRetry: false, nextNonce, candidateTimestamp);
             }
             return outcome;
+        }
+        catch (Exception ex) when (IsNonFatalTransportException(ex))
+        {
+            // Secure transports can fail before the kernel send, e.g. while
+            // sealing a frame. Keep Beat()'s no-throw contract and leave the
+            // candidate nonce/timestamp uncommitted for the next beat.
+            _consecutiveDropped = 0;
+            return BeatOutcome.Failed(BeatErrorFromTransportException(ex));
         }
     }
 
@@ -311,6 +318,16 @@ public sealed class Varta : IDisposable
     private static uint SaturatingIncrementU32(uint v) => v == uint.MaxValue ? v : v + 1;
     private static bool IsAgentStatus(Status status) =>
         status == Status.Ok || status == Status.Degraded || status == Status.Critical;
+
+    private static bool IsNonFatalTransportException(Exception ex) =>
+        ex is not OutOfMemoryException
+        && ex is not StackOverflowException
+        && ex is not AccessViolationException;
+
+    private static BeatError BeatErrorFromTransportException(Exception ex) =>
+        ex is SocketException socketException
+            ? new BeatError(socketException.NativeErrorCode, socketException.SocketErrorCode.ToString())
+            : new BeatError(0, ex.GetType().Name);
 
     // Convert 100-ns Stopwatch ticks to nanoseconds, saturating instead of
     // overflowing. `ticks * 100` is signed-long arithmetic; after a
