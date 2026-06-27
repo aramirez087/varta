@@ -7,8 +7,8 @@ use crate::probe_table::{mix32, BoundedIndex};
 use super::debounce::{InsertOutcome, LastFiredTable, MAX_LAST_FIRED_CAPACITY};
 use super::reaper::{CAPTURE_DRAIN_BYTES_PER_TICK, POST_EXIT_CAPTURE_DRAIN_GRACE};
 use super::{
-    Recovery, RecoveryMode, RecoveryOutcome, RECOVERY_SPAWN_MAX_PER_TICK,
-    RECOVERY_STALL_EVAL_MAX_PER_TICK,
+    Recovery, RecoveryMode, RecoveryOutcome, RECOVERY_REAP_OUTCOME_MAX_PER_TICK,
+    RECOVERY_SPAWN_MAX_PER_TICK, RECOVERY_STALL_EVAL_MAX_PER_TICK,
 };
 
 /// The per-tick stall *evaluation* budget must stay at or above the per-tick
@@ -32,6 +32,36 @@ fn capacity_builders_cap_untrusted_values() {
     .with_outstanding_capacity(usize::MAX);
 
     assert_eq!(rec.reap_scratch.capacity(), crate::tracker::MAX_CAPACITY);
+    assert!(
+        rec.pending_outcomes.capacity() >= RECOVERY_STALL_EVAL_MAX_PER_TICK,
+        "pending reap outcomes must be preallocated for the observer's per-tick stall budget"
+    );
+}
+
+#[test]
+fn try_reap_into_clears_and_reuses_caller_buffer_for_pending_outcomes() {
+    let mut rec = Recovery::new_exec("true".to_string(), vec![], Duration::ZERO);
+    rec.pending_outcomes
+        .push(RecoveryOutcome::Killed { child_pid: 11 });
+    rec.pending_outcomes
+        .push(RecoveryOutcome::Killed { child_pid: 12 });
+
+    let mut outcomes = Vec::with_capacity(RECOVERY_REAP_OUTCOME_MAX_PER_TICK);
+    outcomes.push(RecoveryOutcome::Debounced);
+    let capacity = outcomes.capacity();
+
+    rec.try_reap_into(0, &mut outcomes);
+
+    assert_eq!(outcomes.capacity(), capacity);
+    assert_eq!(outcomes.len(), 2);
+    assert!(matches!(
+        outcomes.as_slice(),
+        [
+            RecoveryOutcome::Killed { child_pid: 11 },
+            RecoveryOutcome::Killed { child_pid: 12 }
+        ]
+    ));
+    assert!(rec.pending_outcomes.is_empty());
 }
 
 #[test]
@@ -1526,6 +1556,47 @@ fn try_reap_no_truncation_within_cap() {
         3,
         "all 3 children should be reaped"
     );
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn try_reap_into_reuses_output_buffer_for_completed_children() {
+    let mut rec = Recovery::new_exec("true".to_string(), vec![], Duration::from_secs(10))
+        .with_reap_scratch_capacity(3);
+    for pid in 1u32..=3 {
+        match rec.on_stall(pid, BeatOrigin::KernelAttested, false, None, 0) {
+            RecoveryOutcome::Spawned { .. } => {}
+            other => panic!("expected Spawned for pid {pid}, got {other:?}"),
+        }
+    }
+
+    let mut outcomes = Vec::with_capacity(RECOVERY_REAP_OUTCOME_MAX_PER_TICK);
+    let capacity = outcomes.capacity();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let mut total_reaped = 0usize;
+    loop {
+        if Instant::now() >= deadline {
+            panic!("timed out waiting for completed children");
+        }
+        rec.try_reap_into(0, &mut outcomes);
+        assert_eq!(
+            outcomes.capacity(),
+            capacity,
+            "try_reap_into must reuse the caller's output allocation"
+        );
+        total_reaped += outcomes
+            .iter()
+            .filter(|o| matches!(o, RecoveryOutcome::Reaped { .. }))
+            .count();
+        if total_reaped == 3 {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    rec.try_reap_into(0, &mut outcomes);
+    assert_eq!(outcomes.capacity(), capacity);
+    assert!(outcomes.is_empty());
 }
 
 #[test]

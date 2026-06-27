@@ -9,9 +9,10 @@
 //!
 //! A per-pid debounce window suppresses repeat invocations during a single
 //! silence run. Children are spawned asynchronously; they never block the
-//! observer's poll loop. On each tick, [`Recovery::try_reap`] drains
-//! completed or deadline-exceeded children and returns outcomes for
-//! logging.
+//! observer's poll loop. On each tick, [`Recovery::try_reap_into`] drains
+//! completed or deadline-exceeded children into caller-owned scratch storage
+//! for logging; [`Recovery::try_reap`] remains as an allocating convenience
+//! wrapper for non-poll-loop callers.
 //!
 //! # Security
 //!
@@ -39,17 +40,30 @@ mod runner;
 use debounce::LastFiredTable;
 use runner::{KillForReclaim, Outstanding};
 
-/// Maximum number of outstanding pids visited per [`Recovery::try_reap`] call.
+/// Maximum number of outstanding pids visited per [`Recovery::try_reap_into`] call.
 ///
 /// Bounds the `waitpid(2, WNOHANG)` + optional `kill(2)` syscall budget to at
 /// most 64 per poll tick, preventing a large outstanding-child fan from
 /// blowing the `recovery_reap` phase budget. A rotating cursor ensures
 /// fairness: pids not visited this tick are visited first next tick.
-const REAP_MAX_PER_TICK: usize = 64;
+pub const RECOVERY_REAP_MAX_PER_TICK: usize = 64;
+
+/// Maximum recovery outcomes the observer's normal poll loop can receive from
+/// one [`Recovery::try_reap_into`] call without caller-buffer growth.
+///
+/// A tick can queue at most [`RECOVERY_STALL_EVAL_MAX_PER_TICK`] pending
+/// outcomes while draining deferred stalls, then surface at most one orphan
+/// reap outcome and one outstanding-child outcome for each
+/// [`RECOVERY_REAP_MAX_PER_TICK`] visit. Direct library callers may still pass
+/// a smaller buffer and let it grow; the daemon preallocates this size during
+/// startup so the recovery-reap stage does not allocate under a completion
+/// storm.
+pub const RECOVERY_REAP_OUTCOME_MAX_PER_TICK: usize =
+    RECOVERY_STALL_EVAL_MAX_PER_TICK + (RECOVERY_REAP_MAX_PER_TICK * 2);
 
 /// Maximum recovery children `fork(2)`+`exec`'d in one observer poll tick.
 ///
-/// The sibling of [`REAP_MAX_PER_TICK`] for the *spawn* side. A mass
+/// The sibling of [`RECOVERY_REAP_MAX_PER_TICK`] for the *spawn* side. A mass
 /// simultaneous stall (a shared dependency dies and the whole fleet stops
 /// beating at once, or a VM live-migration / suspend-resume forward clock jump
 /// trips every tracked slot's threshold in a single pass) queues up to
@@ -61,7 +75,7 @@ const REAP_MAX_PER_TICK: usize = 64;
 /// in trouble. The remainder stays queued (the `stall_queue`/`stall_cursor`
 /// cursor resumes next tick) and recovery is staggered across ticks — which
 /// also defuses the thundering-herd of simultaneous recovery commands.
-/// Smaller than [`REAP_MAX_PER_TICK`] because `fork`+`exec` is far costlier
+/// Smaller than [`RECOVERY_REAP_MAX_PER_TICK`] because `fork`+`exec` is far costlier
 /// than the non-blocking `waitpid(WNOHANG)` the reap side performs.
 pub const RECOVERY_SPAWN_MAX_PER_TICK: usize = 16;
 
@@ -198,8 +212,8 @@ pub enum RecoveryOutcome {
         /// OS process id of the child that was killed.
         child_pid: u32,
     },
-    /// `try_wait` or `kill` failed for an outstanding child. The pid is
-    /// still tracked; the observer will retry on the next tick.
+    /// `try_wait` or `kill` failed for an outstanding child, and the child
+    /// handle was removed after emitting a terminal audit record.
     ReapFailed(std::io::Error),
     /// Recovery was structurally declined because the stalled pid's beat
     /// lifetime included a non-kernel-attested transport (any UDP variant),
@@ -355,7 +369,7 @@ pub struct Recovery {
     pub(crate) allow_cross_namespace: bool,
     pub(crate) refused_cross_namespace: u64,
     pub(crate) refused_debounce_capacity: u64,
-    /// Scratch buffer reused across [`Recovery::try_reap`] calls.
+    /// Scratch buffer reused across [`Recovery::try_reap_into`] calls.
     pub(crate) reap_scratch: Vec<u32>,
     /// Rotating index into `reap_scratch` used to ensure fairness across ticks.
     pub(crate) reap_cursor: usize,
@@ -372,7 +386,7 @@ pub struct Recovery {
     pub(in crate::recovery) orphan_capacity: usize,
     /// Rotating index into `reaping_orphans`, the orphan-side analogue of
     /// `reap_cursor`. Caps the per-tick `try_wait(2)` budget for the orphan
-    /// reaper at [`REAP_MAX_PER_TICK`] so a large reclaimed-orphan fan cannot
+    /// reaper at [`RECOVERY_REAP_MAX_PER_TICK`] so a large reclaimed-orphan fan cannot
     /// blow the `RecoveryReap` stage budget; the cursor guarantees every orphan
     /// is eventually examined (no reap starvation under churn).
     pub(in crate::recovery) orphan_reap_cursor: usize,
@@ -416,7 +430,7 @@ impl Recovery {
             timeout,
             outstanding: OutstandingTable::with_capacity(crate::tracker::MAX_CAPACITY),
             refused_outstanding_capacity: 0,
-            pending_outcomes: Vec::new(),
+            pending_outcomes: Vec::with_capacity(RECOVERY_STALL_EVAL_MAX_PER_TICK),
             recovery_env: Vec::new(),
             recovery_inherit_env: false,
             shutdown_grace: Duration::from_millis(crate::config::DEFAULT_SHUTDOWN_GRACE_MS),
@@ -431,7 +445,7 @@ impl Recovery {
             reap_scratch: Vec::new(),
             reap_cursor: 0,
             reap_truncated_total: 0,
-            reap_max: REAP_MAX_PER_TICK,
+            reap_max: RECOVERY_REAP_MAX_PER_TICK,
             reaping_orphans: Vec::with_capacity(DEFAULT_ORPHAN_CAPACITY),
             orphan_capacity: DEFAULT_ORPHAN_CAPACITY,
             orphan_reap_cursor: 0,
@@ -439,7 +453,7 @@ impl Recovery {
         }
     }
 
-    /// Pre-size the scratch buffer used by [`Recovery::try_reap`] to the
+    /// Pre-size the scratch buffer used by [`Recovery::try_reap_into`] to the
     /// observer's `tracker_capacity`. Optional — the buffer grows on first
     /// use if not pre-sized.
     pub fn with_reap_scratch_capacity(mut self, capacity: usize) -> Self {
@@ -519,10 +533,10 @@ impl Recovery {
         n
     }
 
-    /// Take and reset the count of [`try_reap`] calls that were truncated
-    /// because the outstanding-child count exceeded [`REAP_MAX_PER_TICK`].
+    /// Take and reset the count of [`try_reap_into`] calls that were truncated
+    /// because the outstanding-child count exceeded [`RECOVERY_REAP_MAX_PER_TICK`].
     ///
-    /// [`try_reap`]: Recovery::try_reap
+    /// [`try_reap_into`]: Recovery::try_reap_into
     pub fn take_reap_truncated(&mut self) -> u64 {
         let n = self.reap_truncated_total;
         self.reap_truncated_total = 0;
@@ -951,7 +965,7 @@ impl Recovery {
     /// Non-blocking reap of [`Self::reaping_orphans`] — children reclaimed from
     /// recycled PID slots. Emits each one's terminal `complete` audit row on
     /// exit (mirroring [`Self::reap_finished_child`]) and drops it; still-running
-    /// orphans are retained for a later tick. Runs every [`Self::try_reap`].
+    /// orphans are retained for a later tick. Runs every [`Self::try_reap_into`].
     ///
     /// Bounded to [`Self::reap_max`] `try_wait(2)` calls per tick (the orphan-side
     /// analogue of the outstanding-table reap budget): `reclaim_recycled_outstanding`
@@ -1077,21 +1091,24 @@ impl Recovery {
         }
     }
 
-    /// Drain completed or timeout-exceeded children.
+    /// Drain completed or timeout-exceeded children into caller-owned storage.
     ///
-    /// Never blocks; returns an empty vector when no children have
-    /// transitioned since the last tick.
+    /// Never blocks. `outcomes` is cleared before use, retaining its capacity;
+    /// it is empty on return when no children have transitioned since the last
+    /// tick. The observer's poll loop uses this method with a setup-time
+    /// preallocated buffer so completion bursts do not allocate in the
+    /// `recovery_reap` stage.
     ///
     /// `observer_ns` is the observer-local monotonic timestamp of the current
     /// poll tick (`Observer::now_ns()`); it is stamped into every `complete`
     /// audit record so completions land on the same timeline as the event
     /// stream (see `CompleteRecord::observer_ns`).
-    pub fn try_reap(&mut self, observer_ns: u64) -> Vec<RecoveryOutcome> {
-        let mut outcomes = Vec::new();
+    pub fn try_reap_into(&mut self, observer_ns: u64, outcomes: &mut Vec<RecoveryOutcome>) {
+        outcomes.clear();
         outcomes.append(&mut self.pending_outcomes);
 
         // Reap stale-lineage children reclaimed from recycled PID slots.
-        self.drain_orphan_reaps(observer_ns, &mut outcomes);
+        self.drain_orphan_reaps(observer_ns, outcomes);
 
         self.reap_scratch.clear();
         self.reap_scratch.extend(self.outstanding.iter_pids());
@@ -1101,7 +1118,7 @@ impl Recovery {
         );
         let n = self.reap_scratch.len();
         if n == 0 {
-            return outcomes;
+            return;
         }
 
         let limit = self.reap_max.min(n);
@@ -1176,7 +1193,17 @@ impl Recovery {
                 }
             }
         }
+    }
 
+    /// Drain completed or timeout-exceeded children.
+    ///
+    /// Never blocks; returns an empty vector when no children have
+    /// transitioned since the last tick. This convenience wrapper allocates an
+    /// outcome vector on demand. The observer binary uses
+    /// [`Self::try_reap_into`] to reuse setup-time scratch storage instead.
+    pub fn try_reap(&mut self, observer_ns: u64) -> Vec<RecoveryOutcome> {
+        let mut outcomes = Vec::new();
+        self.try_reap_into(observer_ns, &mut outcomes);
         outcomes
     }
 }

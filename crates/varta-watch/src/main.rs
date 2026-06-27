@@ -898,6 +898,11 @@ fn run(cfg: Config) -> std::io::Result<()> {
             .with_reap_scratch_capacity(cfg.tracker_capacity)
             .with_outstanding_capacity(cfg.tracker_capacity)
     });
+    let mut recovery_reap_outcomes = if recovery.is_some() {
+        Vec::with_capacity(varta_watch::recovery::RECOVERY_REAP_OUTCOME_MAX_PER_TICK)
+    } else {
+        Vec::new()
+    };
     let mut file_export: Option<FileExporter> = match cfg.file_export.as_ref() {
         Some(path) => Some(FileExporter::create(
             path,
@@ -1817,7 +1822,8 @@ fn run(cfg: Config) -> std::io::Result<()> {
 
         // Reap completed or timeout-exceeded children each tick.
         if let Some(rec) = recovery.as_mut() {
-            for outcome in rec.try_reap(observer.now_ns()) {
+            rec.try_reap_into(observer.now_ns(), &mut recovery_reap_outcomes);
+            for outcome in recovery_reap_outcomes.drain(..) {
                 #[cfg(feature = "prometheus-exporter")]
                 if let Some(pe) = prom_export.as_mut() {
                     pe.record_recovery_outcome(&outcome, outcome.duration_ns());
