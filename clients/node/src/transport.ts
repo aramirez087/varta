@@ -24,6 +24,7 @@ import {
   encodeMaster,
   encodeShared,
   IV_RANDOM_BYTES,
+  PLAINTEXT_BYTES,
   SESSION_SALT_BYTES,
   deriveIvPrefix,
 } from "./vlp_secure.js";
@@ -193,6 +194,7 @@ export class UdsTransport implements BeatTransport {
 // queue is normally empty by the second beat; this cap exists only to
 // guard against a `connect` that never fires (peer DNS issues etc.).
 const PRE_CONNECT_QUEUE_LIMIT = 64;
+const U32_MAX = 0xffffffff;
 
 export class UdpTransport implements BeatTransport {
   private socket: Socket;
@@ -311,6 +313,11 @@ interface SecureKeyMaster {
 }
 type SecureKey = SecureKeyShared | SecureKeyMaster;
 
+interface NonceReservation {
+  ivRandom: Buffer;
+  counter: number;
+}
+
 export class SecureUdpTransport implements BeatTransport {
   private socket: Socket;
   private readonly host: string;
@@ -389,6 +396,10 @@ export class SecureUdpTransport implements BeatTransport {
   __setCounterForTest(v: number): void {
     this.counter = v >>> 0;
   }
+  __setPrefixIndexForTest(v: number): void {
+    this.prefixIndex = v >>> 0;
+    this.ivPrefix = deriveIvPrefix(this.sessionSalt, this.prefixIndex);
+  }
   __getCounterForTest(): number {
     return this.counter;
   }
@@ -399,24 +410,46 @@ export class SecureUdpTransport implements BeatTransport {
     return Buffer.from(this.ivPrefix);
   }
 
-  send(buf: Buffer): void {
-    const queued = takePendingError(this);
-    if (queued !== null) throw queued;
+  private reserveNonce(): NonceReservation {
+    if (this.counter === U32_MAX && this.prefixIndex === U32_MAX) {
+      // The 64-bit per-session nonce space is exhausted. Match the Rust
+      // reference: rotate the whole secure session before emitting another
+      // frame, rather than wrapping back to prefix index 0 under the same salt.
+      this.reconnect();
+    }
 
-    // IV reservation is synchronous (cerebrum 2026-05-17 §4): every
-    // queued frame carries a unique nonce even under concurrent
-    // emits. A libuv-reported failure burns a nonce slot — harmless,
-    // since nonces are one-shot.
-    const ivRandom = Buffer.alloc(IV_RANDOM_BYTES);
-    this.ivPrefix.copy(ivRandom, 0, 0, IV_RANDOM_BYTES);
+    const ivRandom = Buffer.from(this.ivPrefix.subarray(0, IV_RANDOM_BYTES));
     const counter = this.counter;
-    if (this.counter === 0xffffffff) {
+    if (this.counter === U32_MAX) {
       this.prefixIndex = (this.prefixIndex + 1) >>> 0;
       this.ivPrefix = deriveIvPrefix(this.sessionSalt, this.prefixIndex);
       this.counter = 0;
     } else {
       this.counter = (this.counter + 1) >>> 0;
     }
+
+    return { ivRandom, counter };
+  }
+
+  send(buf: Buffer): void {
+    const queued = takePendingError(this);
+    if (queued !== null) throw queued;
+    if (buf.length !== PLAINTEXT_BYTES) {
+      throw new RangeError("plaintext must be a 32-byte VLP frame");
+    }
+    if (!this.connected && this.preConnectQueue.length >= PRE_CONNECT_QUEUE_LIMIT) {
+      const e: NodeJS.ErrnoException = new Error(
+        "SecureUdpTransport: pre-connect queue full",
+      );
+      e.code = "ENOBUFS";
+      throw e;
+    }
+
+    // IV reservation is synchronous (cerebrum 2026-05-17 §4): every
+    // queued frame carries a unique nonce even under concurrent
+    // emits. A libuv-reported failure burns a nonce slot — harmless,
+    // since nonces are one-shot.
+    const { ivRandom, counter } = this.reserveNonce();
 
     let wire: Buffer;
     if (this.secret.kind === "shared") {
@@ -432,13 +465,6 @@ export class SecureUdpTransport implements BeatTransport {
     }
 
     if (!this.connected) {
-      if (this.preConnectQueue.length >= PRE_CONNECT_QUEUE_LIMIT) {
-        const e: NodeJS.ErrnoException = new Error(
-          "SecureUdpTransport: pre-connect queue full",
-        );
-        e.code = "ENOBUFS";
-        throw e;
-      }
       this.preConnectQueue.push(wire);
       return;
     }

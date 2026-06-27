@@ -30,6 +30,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Node secure-UDP no longer wraps the AEAD nonce space back to the original
+  session prefix (bug-535).** When both the 32-bit IV counter and 32-bit prefix
+  index were exhausted, `SecureUdpTransport` wrapped `prefixIndex` to `0` under
+  the same session salt, eventually reusing the original ChaCha20-Poly1305
+  nonce stream. The Node client now mirrors the Rust reference: double
+  exhaustion triggers a transactional secure-session reconnect before another
+  frame is built, and failed emergency reconnects leave the prior AEAD state
+  unchanged.
 - **Forked Rust clients remain nonce-safe after PID recycling (bug-442).** `Varta` and
   direct `SecureUdpTransport` callers now pair PID checks with a process-lineage
   epoch advanced by `pthread_atfork` in every child. A descendant that later

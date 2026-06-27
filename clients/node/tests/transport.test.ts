@@ -373,3 +373,70 @@ test("SecureUdpTransport failed reconnect preserves socket and AEAD state", asyn
     await listener.close();
   }
 });
+
+test("SecureUdpTransport double nonce exhaustion reconnects before reuse", async () => {
+  const listener = await bindUdpRecorder();
+  try {
+    const key = randomBytes(32);
+    const t = SecureUdpTransport.shared(listener.host, listener.port, key);
+    const buf = Buffer.alloc(FRAME_BYTES);
+    encodeInto(buf, Status.Ok, 12345, 1n, 1n, 1);
+    t.send(buf);
+    await listener.wait(1);
+
+    const initialPrefix = t.__getIvPrefixForTest();
+    t.__setPrefixIndexForTest(0xffffffff);
+    t.__setCounterForTest(0xffffffff);
+
+    encodeInto(buf, Status.Ok, 12345, 2n, 2n, 2);
+    t.send(buf);
+    await listener.wait(2);
+
+    assert.equal(t.__getPrefixIndexForTest(), 0, "reconnect starts a fresh prefix epoch");
+    assert.equal(t.__getCounterForTest(), 1, "first beat after reconnect commits counter 0");
+    assert.notDeepEqual(
+      t.__getIvPrefixForTest(),
+      initialPrefix,
+      "double exhaustion must not wrap to the original session prefix",
+    );
+
+    const plaintext = decodeShared(key, listener.received[1]!);
+    assert.equal(decode(plaintext).payload, 2);
+    t.close();
+  } finally {
+    await listener.close();
+  }
+});
+
+test("SecureUdpTransport double-exhaustion reconnect failure preserves AEAD state", async () => {
+  const listener = await bindUdpRecorder();
+  try {
+    const key = randomBytes(32);
+    const t = SecureUdpTransport.shared(listener.host, listener.port, key);
+    const buf = Buffer.alloc(FRAME_BYTES);
+    encodeInto(buf, Status.Ok, 12345, 1n, 1n, 1);
+    t.send(buf);
+    await listener.wait(1);
+
+    t.__setPrefixIndexForTest(0xffffffff);
+    t.__setCounterForTest(0xffffffff);
+    const prefixBefore = t.__getIvPrefixForTest();
+    const internal = t as unknown as {
+      openSocket: () => never;
+    };
+    internal.openSocket = () => {
+      const err: NodeJS.ErrnoException = new Error("simulated fd exhaustion");
+      err.code = "EMFILE";
+      throw err;
+    };
+
+    encodeInto(buf, Status.Ok, 12345, 2n, 2n, 2);
+    assert.throws(() => t.send(buf), /simulated fd exhaustion/);
+    assert.equal(t.__getPrefixIndexForTest(), 0xffffffff);
+    assert.equal(t.__getCounterForTest(), 0xffffffff);
+    assert.deepEqual(t.__getIvPrefixForTest(), prefixBefore);
+    t.close();
+  } finally {
+    await listener.close();
+  }
+});
