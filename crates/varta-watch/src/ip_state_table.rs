@@ -21,6 +21,46 @@ use std::time::{Duration, Instant};
 
 use crate::probe_table::{BoundedIndex, ProbeExhausted};
 
+#[cfg(test)]
+use std::alloc::{GlobalAlloc, Layout, System};
+#[cfg(test)]
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+#[cfg(test)]
+struct GuardAlloc;
+
+#[cfg(test)]
+thread_local! {
+    static ALLOC_GUARD_ARMED: AtomicBool = const { AtomicBool::new(false) };
+}
+
+#[cfg(test)]
+static ALLOC_GUARD_COUNT: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(test)]
+fn note_allocation_if_armed() {
+    let armed = ALLOC_GUARD_ARMED.with(|flag| flag.load(Ordering::Relaxed));
+    if armed {
+        ALLOC_GUARD_COUNT.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+#[cfg(test)]
+unsafe impl GlobalAlloc for GuardAlloc {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        note_allocation_if_armed();
+        unsafe { System.alloc(layout) }
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        unsafe { System.dealloc(ptr, layout) }
+    }
+}
+
+#[cfg(test)]
+#[global_allocator]
+static ALLOC_GUARD: GuardAlloc = GuardAlloc;
+
 /// Slab full and probe-budget exhausted.  The caller already has an
 /// existing fallback (force-evict the oldest entry); `insert` returning
 /// `Err(Full)` is the signal that even that fallback couldn't make room.
@@ -37,6 +77,7 @@ pub struct IpStateTable<V: Copy> {
     slab: Vec<Option<IpSlot<V>>>,
     free_list: Vec<u32>,
     ip_to_slot: BoundedIndex<IpAddr>,
+    evict_scratch: Vec<IpAddr>,
 }
 
 #[derive(Clone, Copy)]
@@ -56,10 +97,12 @@ impl<V: Copy> IpStateTable<V> {
         for i in (0..capacity as u32).rev() {
             free_list.push(i);
         }
+        let evict_scratch = Vec::with_capacity(capacity);
         Self {
             slab,
             free_list,
             ip_to_slot: BoundedIndex::new(capacity),
+            evict_scratch,
         }
     }
 
@@ -135,15 +178,15 @@ impl<V: Copy + LastSeen> IpStateTable<V> {
     /// capacity is fixed at construction so the work is bounded.
     pub fn evict_older_than(&mut self, now: Instant, ttl: Duration) {
         // Snapshot the IPs to evict before mutating, so we don't perturb
-        // the slab while iterating it.  Bounded by `len()` which is in
-        // turn bounded by capacity.
-        let mut victims: Vec<IpAddr> = Vec::new();
+        // the slab while iterating it. The scratch vector is preallocated
+        // to table capacity at construction, so this sweep never reallocates.
+        self.evict_scratch.clear();
         for s in self.slab.iter().flatten() {
             if now.saturating_duration_since(s.state.last_seen()) >= ttl {
-                victims.push(s.ip);
+                self.evict_scratch.push(s.ip);
             }
         }
-        for ip in victims {
+        while let Some(ip) = self.evict_scratch.pop() {
             self.remove(ip);
         }
     }
@@ -313,6 +356,35 @@ mod tests {
         assert_eq!(t.len(), 1);
         assert!(t.get_mut(ip(1)).is_none());
         assert!(t.get_mut(ip(2)).is_some());
+    }
+
+    #[test]
+    fn evict_older_than_does_not_allocate_after_setup() {
+        let mut t: IpStateTable<TestState> = IpStateTable::with_capacity(4);
+        let now = Instant::now();
+        let stale = now - Duration::from_secs(120);
+        for n in 1..=4 {
+            t.insert(
+                ip(n),
+                TestState {
+                    seen: stale,
+                    payload: n as u32,
+                },
+            )
+            .expect("insert");
+        }
+
+        ALLOC_GUARD_COUNT.store(0, Ordering::Relaxed);
+        ALLOC_GUARD_ARMED.with(|armed| armed.store(true, Ordering::Relaxed));
+        t.evict_older_than(now, Duration::from_secs(60));
+        ALLOC_GUARD_ARMED.with(|armed| armed.store(false, Ordering::Relaxed));
+
+        assert_eq!(t.len(), 0);
+        assert_eq!(
+            ALLOC_GUARD_COUNT.load(Ordering::Relaxed),
+            0,
+            "stale-IP eviction must reuse preallocated storage"
+        );
     }
 
     #[test]
