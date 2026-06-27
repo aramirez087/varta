@@ -903,6 +903,11 @@ fn run(cfg: Config) -> std::io::Result<()> {
     } else {
         Vec::new()
     };
+    let mut audit_fsync_durations = if recovery.is_some() {
+        Vec::with_capacity(varta_watch::audit::AUDIT_FSYNC_HISTORY_CAP)
+    } else {
+        Vec::new()
+    };
     let mut file_export: Option<FileExporter> = match cfg.file_export.as_ref() {
         Some(path) => Some(FileExporter::create(
             path,
@@ -1765,8 +1770,9 @@ fn run(cfg: Config) -> std::io::Result<()> {
                 if budget_exceeded > 0 {
                     pe.record_audit_flush_budget_exceeded(budget_exceeded);
                 }
-                // New: per-fsync histogram + budget overrun counters.
-                for d in rec.take_audit_fsync_durations() {
+                // Per-fsync histogram + budget overrun counters.
+                rec.take_audit_fsync_durations_into(&mut audit_fsync_durations);
+                for d in audit_fsync_durations.drain(..) {
                     pe.record_audit_fsync_duration(d);
                 }
                 let fsync_overrun = rec.take_audit_fsync_budget_exceeded();
@@ -1791,7 +1797,8 @@ fn run(cfg: Config) -> std::io::Result<()> {
                 // Drain new counters even without the exporter so they
                 // do not accumulate unbounded; the values are simply
                 // dropped on the floor.
-                let _ = rec.take_audit_fsync_durations();
+                rec.take_audit_fsync_durations_into(&mut audit_fsync_durations);
+                audit_fsync_durations.clear();
                 let _ = rec.take_audit_fsync_budget_exceeded();
                 let _ = rec.take_audit_rotation_budget_exceeded();
                 let _ = rec.take_audit_ring_watermark_warn();

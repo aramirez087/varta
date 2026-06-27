@@ -683,6 +683,14 @@ impl Recovery {
             .unwrap_or(0)
     }
 
+    /// Drain buffered `fdatasync` durations from the audit sink into caller-owned storage.
+    pub fn take_audit_fsync_durations_into(&mut self, out: &mut Vec<std::time::Duration>) {
+        out.clear();
+        if let Some(s) = self.audit_sink.as_mut() {
+            s.take_audit_fsync_durations_into(out);
+        }
+    }
+
     /// Drain (and clear) buffered `fdatasync` durations from the audit sink.
     pub fn take_audit_fsync_durations(&mut self) -> Vec<std::time::Duration> {
         self.audit_sink

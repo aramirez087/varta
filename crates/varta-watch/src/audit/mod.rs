@@ -43,6 +43,9 @@ use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+/// Maximum number of recent `fdatasync(2)` durations buffered for export.
+pub const AUDIT_FSYNC_HISTORY_CAP: usize = FSYNC_HISTORY_CAP;
+
 /// Append-only audit sink. One file descriptor held for the daemon's life,
 /// reopened on rotation. Writes never block the recovery path: on IO error
 /// the failure is latched in `pending_err` and the daemon's main loop
@@ -388,11 +391,21 @@ impl RecoveryAuditLog {
         core::mem::replace(&mut self.audit_flush_budget_exceeded_total, 0)
     }
 
-    /// Drain (and clear) buffered `fdatasync` durations for the exporter.
+    /// Drain buffered `fdatasync` durations into caller-owned storage.
+    ///
+    /// Callers on the observer poll loop should preallocate `out` to
+    /// [`AUDIT_FSYNC_HISTORY_CAP`] during setup so the maintenance stage does
+    /// not allocate when audit fsync samples are exported.
+    pub fn take_audit_fsync_durations_into(&mut self, out: &mut Vec<Duration>) {
+        out.clear();
+        out.extend(self.fsync_durations.drain(..));
+    }
+
+    /// Drain (and clear) buffered `fdatasync` durations for cold callers.
     pub fn take_audit_fsync_durations(&mut self) -> Vec<Duration> {
         let n = self.fsync_durations.len();
         let mut out = Vec::with_capacity(n);
-        out.extend(self.fsync_durations.drain(..));
+        self.take_audit_fsync_durations_into(&mut out);
         out
     }
 
@@ -473,6 +486,58 @@ mod tests {
             sync_interval: None,
             rotation_budget: Duration::from_millis(50),
         }
+    }
+
+    #[test]
+    fn audit_fsync_duration_drain_reuses_caller_buffer() {
+        let dir = tmpdir("fsync-drain");
+        let path = dir.join("audit.log");
+        let (mut log, _) = RecoveryAuditLog::create(&path, cfg(None, 1)).expect("create");
+
+        let mut durations = Vec::with_capacity(AUDIT_FSYNC_HISTORY_CAP);
+        let initial_capacity = durations.capacity();
+        durations.push(Duration::from_secs(99));
+
+        log.take_audit_fsync_durations_into(&mut durations);
+        assert_eq!(
+            durations.capacity(),
+            initial_capacity,
+            "audit fsync drain must reuse caller-owned storage"
+        );
+
+        durations.clear();
+        log.record_spawn(&SpawnRecord {
+            wallclock_ms: 1_700_000_000_000,
+            observer_ns: 42,
+            agent_pid: 7,
+            child_pid: 9001,
+            mode: "exec",
+            program: "/usr/bin/restart-agent",
+            source: "inline",
+            template_len: 22,
+        });
+        log.flush_pending(Duration::MAX);
+
+        log.take_audit_fsync_durations_into(&mut durations);
+        assert!(
+            !durations.is_empty(),
+            "flushing a synced audit record should export at least one fsync sample"
+        );
+        assert_eq!(
+            durations.capacity(),
+            initial_capacity,
+            "filled audit fsync drain must preserve preallocated capacity"
+        );
+
+        log.take_audit_fsync_durations_into(&mut durations);
+        assert!(durations.is_empty());
+        assert_eq!(
+            durations.capacity(),
+            initial_capacity,
+            "empty audit fsync drain must preserve preallocated capacity"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
