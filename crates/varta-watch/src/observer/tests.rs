@@ -635,6 +635,54 @@ fn per_pid_limited_frame_does_not_spend_global_token() {
 }
 
 #[test]
+fn per_pid_rate_above_one_ghz_saturates_to_one_ns() {
+    let mut obs = Observer::new(
+        Duration::from_secs(60),
+        64,
+        EvictionPolicy::Strict,
+        DEFAULT_EVICTION_SCAN_WINDOW,
+        Some(u32::MAX),
+        0,
+        0,
+        ClockSource::Monotonic,
+    )
+    .expect("Observer::new should succeed");
+
+    assert_eq!(
+        obs.rate_limit_interval_ns,
+        Some(1),
+        "nonzero per-pid rates above 1 GHz must saturate to a 1 ns interval, not 0"
+    );
+
+    // Freeze the observer's forward-clamped clock so both polls observe the
+    // same timestamp. Before the fix, the computed interval was 0 ns and
+    // `delta < interval` was false, so the second same-pid beat was accepted.
+    obs.last_now_ns = u64::MAX / 2;
+    obs.add_listener(Box::new(ScriptedListener::with_frames(&[
+        (10, 1, 100),
+        (10, 2, 101),
+    ])));
+
+    let first = obs.poll();
+    assert!(
+        matches!(first, Some(Event::Beat { pid: 10, .. })),
+        "first beat should be accepted, got {first:?}"
+    );
+
+    let second = obs.poll();
+    assert!(
+        second.is_none(),
+        "same-pid beat at the same observer timestamp must be limited, got {second:?}"
+    );
+    assert_eq!(
+        obs.drain_per_pid_rate_limited(),
+        1,
+        "the second beat should pay the per-pid limiter"
+    );
+    let _ = obs.drain_clock_regressions();
+}
+
+#[test]
 fn authenticated_decode_errors_pay_global_rate_limit() {
     let mut obs = Observer::new(
         Duration::from_secs(60),

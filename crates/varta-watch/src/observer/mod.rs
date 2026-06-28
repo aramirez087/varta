@@ -411,7 +411,7 @@ impl Observer {
             } else {
                 // Convert beats/sec to nanosecond interval.
                 // Saturate at 1 ns (1 GHz rate) to avoid overflow.
-                let interval_ns = 1_000_000_000u64.checked_div(rps as u64).unwrap_or(1);
+                let interval_ns = (1_000_000_000u64 / rps as u64).max(1);
                 Some(interval_ns)
             }
         });
