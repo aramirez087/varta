@@ -601,21 +601,6 @@ impl Observer {
                             let terminal_global_bypass =
                                 terminal_after_regular && peer_pid != 0 && frame.pid == peer_pid;
 
-                            // Observer-side PID range gate. VLP rejects 0/1
-                            // as wire-format `BadPid`; here we additionally
-                            // reject any pid above the kernel's configured
-                            // `pid_max` (Linux) — no live process can hold
-                            // that id, so the frame is either corrupted or
-                            // forged. Non-Linux: `pid_max == u32::MAX`,
-                            // gate is a no-op.
-                            if frame.pid > self.pid_max {
-                                if !terminal_global_bypass && !self.try_admit_global(now_ns) {
-                                    continue;
-                                }
-                                self.pid_above_max_drops =
-                                    self.pid_above_max_drops.saturating_add(1);
-                                continue;
-                            }
                             // Per-datagram PID verification — works on Linux
                             // (SCM_CREDENTIALS via SO_PASSCRED) and macOS
                             // (LOCAL_PEERTOKEN via getsockopt). For transports
@@ -632,6 +617,27 @@ impl Observer {
                                     });
                                 }
                                 break;
+                            }
+                            // Observer-side PID range gate. VLP rejects 0/1
+                            // as wire-format `BadPid`; here we additionally
+                            // reject unauthenticated frames whose claimed pid
+                            // exceeds the kernel's configured `pid_max`
+                            // (Linux). This runs after the kernel credential
+                            // equality check above: `pid_max` controls future
+                            // PID allocation and can be lowered while older
+                            // processes with higher PIDs are still alive. A
+                            // per-datagram kernel credential proving
+                            // `peer_pid == frame.pid` is stronger evidence
+                            // than the cached allocation ceiling. Non-Linux:
+                            // `pid_max == u32::MAX`, gate is a no-op.
+                            let kernel_pid_verified = peer_pid != 0;
+                            if !kernel_pid_verified && frame.pid > self.pid_max {
+                                if !terminal_global_bypass && !self.try_admit_global(now_ns) {
+                                    continue;
+                                }
+                                self.pid_above_max_drops =
+                                    self.pid_above_max_drops.saturating_add(1);
+                                continue;
                             }
                             // Capture the slot's pre-record pinned origin (if
                             // any) so an OriginConflict event can report what

@@ -936,6 +936,58 @@ fn pid_above_max_rejections_pay_global_rate_limit() {
 }
 
 #[test]
+fn kernel_attested_pid_above_cached_pid_max_is_admitted() {
+    let pid = std::process::id();
+    assert!(
+        pid > 1,
+        "VLP pid 0/1 are reserved; test process must have a beatable pid"
+    );
+
+    let mut obs = Observer::new(
+        Duration::from_secs(60),
+        64,
+        EvictionPolicy::Strict,
+        DEFAULT_EVICTION_SCAN_WINDOW,
+        None,
+        1,
+        1,
+        ClockSource::Monotonic,
+    )
+    .expect("Observer::new should succeed");
+    obs.pid_max = pid - 1;
+
+    obs.add_listener(Box::new(ScriptedListener::with_origin_frames(&[(
+        pid,
+        1,
+        0xCAFE,
+        BeatOrigin::KernelAttested,
+    )])));
+
+    let event = obs.poll();
+    assert!(
+        matches!(
+            event,
+            Some(Event::Beat {
+                pid: got_pid,
+                payload: 0xCAFE,
+                ..
+            }) if got_pid == pid
+        ),
+        "a same-pid kernel credential must outrank a stale or lowered pid_max gate, got {event:?}"
+    );
+    assert_eq!(
+        obs.drain_pid_above_max_drops(),
+        0,
+        "kernel-attested same-pid beats must not count as pid_max drops"
+    );
+    assert_eq!(
+        obs.drain_global_rate_limited(),
+        0,
+        "the admitted beat should not be reported as globally shed"
+    );
+}
+
+#[test]
 fn terminal_gasp_bypasses_per_pid_rate_limiter() {
     // Regression: a panic hook's terminal beat (`NONCE_TERMINAL` => `Critical`)
     // is the agent's single dying gasp and almost always arrives within the

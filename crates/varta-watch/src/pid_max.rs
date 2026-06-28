@@ -2,12 +2,13 @@
 //!
 //! Frames decoded by [`varta_vlp::Frame::decode`] reject `pid ∈ {0, 1}` as
 //! [`varta_vlp::DecodeError::BadPid`] — those are wire-format invariants
-//! enforced by VLP. The observer additionally rejects frames whose `pid`
-//! exceeds the kernel's configured maximum (`/proc/sys/kernel/pid_max`),
-//! since any pid above that ceiling cannot map to a live process on this
-//! host. This is a policy check, not a wire-format check, so it lives on
-//! the observer side (varta-vlp is `#![no_std]` and has no filesystem
-//! access).
+//! enforced by VLP. The observer additionally rejects unauthenticated frames
+//! whose claimed `pid` exceeds the kernel's configured allocation ceiling
+//! (`/proc/sys/kernel/pid_max`). Kernel credential equality still outranks
+//! this cache: `pid_max` controls future PID allocation and can be lowered
+//! while older processes with higher PIDs are still alive. This is a policy
+//! check, not a wire-format check, so it lives on the observer side
+//! (varta-vlp is `#![no_std]` and has no filesystem access).
 //!
 //! Read once at observer startup; cheap to query on the hot path (`u32`
 //! comparison).
