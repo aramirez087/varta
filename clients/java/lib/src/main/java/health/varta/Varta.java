@@ -12,6 +12,7 @@ import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.file.Path;
 import java.util.Objects;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.zip.CRC32C;
 
 /**
@@ -37,6 +38,7 @@ public final class Varta implements AutoCloseable {
     public static final int FRAME_BYTES = Codec.FRAME_BYTES;
     public static final long NONCE_TERMINAL = Codec.NONCE_TERMINAL;
     public static final long NONCE_MIN = Codec.NONCE_MIN;
+    private static final AtomicBoolean NONCE_WRAP_WARNED = new AtomicBoolean(false);
 
     private final Object lock = new Object();
     private final BeatTransport transport;
@@ -175,16 +177,16 @@ public final class Varta implements AutoCloseable {
             // (next_regular_nonce / commit_sent_frame).
             long candidateNonce = nonce;
             long nextNonce;
+            boolean wrappedNonce = false;
             if (candidateNonce == NONCE_TERMINAL) {
-                System.err.println("[varta] nonce wrapped past terminal; recycling from " + NONCE_MIN);
-                candidateNonce = NONCE_MIN;
+                // NONCE_TERMINAL is reserved for panic-hook Critical frames.
+                // The regular stream wraps to wire nonce 0 and only commits
+                // to nonce 1 after the send succeeds.
+                candidateNonce = 0L;
                 nextNonce = NONCE_MIN;
+                wrappedNonce = true;
             } else {
                 nextNonce = candidateNonce + 1;
-                if (nextNonce == NONCE_TERMINAL && status != Status.CRITICAL) {
-                    // Avoid resting the counter on the reserved terminal sentinel.
-                    nextNonce = NONCE_MIN;
-                }
             }
 
             // 5) Encode + send. On a Dropped outcome, mirror the cross-client
@@ -195,7 +197,7 @@ public final class Varta implements AutoCloseable {
             Codec.encodeInto(scratchBuf, status, currentPid, wireTimestamp, candidateNonce, payload, crc);
             BeatOutcome outcome = sendScratch();
             if (outcome instanceof BeatOutcome.Sent) {
-                commitSentFrame(nextNonce, candidateTimestamp);
+                commitSentFrame(nextNonce, candidateTimestamp, wrappedNonce);
                 consecutiveDropped = 0;
                 return outcome;
             }
@@ -213,7 +215,7 @@ public final class Varta implements AutoCloseable {
                     if (reconnected) {
                         BeatOutcome retry = sendScratch();
                         if (retry instanceof BeatOutcome.Sent) {
-                            commitSentFrame(nextNonce, candidateTimestamp);
+                            commitSentFrame(nextNonce, candidateTimestamp, wrappedNonce);
                         }
                         return retry;
                     }
@@ -232,9 +234,18 @@ public final class Varta implements AutoCloseable {
      * Advance the committed nonce/timestamp after the kernel accepted the
      * datagram (commit-on-success).
      */
-    private void commitSentFrame(long nextNonce, long timestamp) {
+    private void commitSentFrame(long nextNonce, long timestamp, boolean wrappedNonce) {
         nonce = nextNonce;
         lastTimestamp = timestamp;
+        if (wrappedNonce) {
+            warnNonceWrapping();
+        }
+    }
+
+    private static void warnNonceWrapping() {
+        if (NONCE_WRAP_WARNED.compareAndSet(false, true)) {
+            System.err.println("[varta] nonce exhausted; wrapping to 0");
+        }
     }
 
     /** Send the already-encoded scratch buffer once and classify the result. */

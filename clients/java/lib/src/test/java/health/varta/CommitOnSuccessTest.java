@@ -99,6 +99,28 @@ class CommitOnSuccessTest {
         }
     }
 
+    private static final class CaptureAll implements BeatTransport {
+        byte[][] frames = new byte[2][];
+        int sends = 0;
+
+        @Override
+        public int send(ByteBuffer frame) {
+            byte[] copy = new byte[frame.remaining()];
+            frame.duplicate().get(copy);
+            frames[sends] = copy;
+            sends++;
+            return Varta.FRAME_BYTES;
+        }
+
+        @Override
+        public void reconnect() {
+        }
+
+        @Override
+        public void close() {
+        }
+    }
+
     private static final class CountingTransport implements BeatTransport {
         int sends = 0;
         int reconnects = 0;
@@ -189,5 +211,33 @@ class CommitOnSuccessTest {
 
         assertThat(agent.beat(Status.OK)).isInstanceOf(BeatOutcome.Sent.class);
         assertThat(Frame.decode(t.last).nonce()).isEqualTo(2L);
+    }
+
+    @Test
+    void regularNonceWrapEmitsZeroAfterTerminalMinusOne() {
+        CaptureAll t = new CaptureAll();
+        Varta agent = Varta.__forTest(t);
+        agent.__setNonceForTest(Varta.NONCE_TERMINAL - 1);
+
+        assertThat(agent.beat(Status.OK)).isInstanceOf(BeatOutcome.Sent.class);
+        assertThat(agent.beat(Status.OK)).isInstanceOf(BeatOutcome.Sent.class);
+
+        assertThat(Frame.decode(t.frames[0]).nonce()).isEqualTo(Varta.NONCE_TERMINAL - 1);
+        assertThat(Frame.decode(t.frames[1]).nonce()).isZero();
+        assertThat(agent.__getNonceForTest()).isEqualTo(Varta.NONCE_MIN);
+    }
+
+    @Test
+    void droppedWrapAttemptDoesNotCommitNonceZero() {
+        DropThenCapture t = new DropThenCapture(1);
+        Varta agent = Varta.__forTest(t);
+        agent.__setNonceForTest(Varta.NONCE_TERMINAL);
+
+        assertThat(agent.beat(Status.OK)).isInstanceOf(BeatOutcome.Dropped.class);
+        assertThat(agent.__getNonceForTest()).isEqualTo(Varta.NONCE_TERMINAL);
+
+        assertThat(agent.beat(Status.OK)).isInstanceOf(BeatOutcome.Sent.class);
+        assertThat(Frame.decode(t.last).nonce()).isZero();
+        assertThat(agent.__getNonceForTest()).isEqualTo(Varta.NONCE_MIN);
     }
 }
