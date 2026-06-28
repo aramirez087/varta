@@ -99,6 +99,26 @@ class CommitOnSuccessTest {
         }
     }
 
+    private static final class CountingTransport implements BeatTransport {
+        int sends = 0;
+        int reconnects = 0;
+
+        @Override
+        public int send(ByteBuffer frame) {
+            sends++;
+            return Varta.FRAME_BYTES;
+        }
+
+        @Override
+        public void reconnect() {
+            reconnects++;
+        }
+
+        @Override
+        public void close() {
+        }
+    }
+
     @Test
     void droppedBeatsDoNotBurnNonce_firstAcceptedFrameCarriesNonceOne() {
         DropThenCapture t = new DropThenCapture(2);
@@ -129,6 +149,20 @@ class CommitOnSuccessTest {
                 f -> assertThat(f.error().kind()).isEqualTo("WriteZero"));
         assertThat(agent.beat(Status.OK)).isInstanceOf(BeatOutcome.Sent.class);
         assertThat(Frame.decode(t.last).nonce()).isEqualTo(1L);
+    }
+
+    @Test
+    void nullStatusReturnsFailedInvalidInputWithoutTransportSideEffects() {
+        CountingTransport t = new CountingTransport();
+        Varta agent = Varta.__forTest(t);
+        agent.setReconnectAfter(1);
+
+        assertThat(agent.beat(null, 0))
+            .isInstanceOfSatisfying(BeatOutcome.Failed.class,
+                f -> assertThat(f.error().kind()).isEqualTo("InvalidInput"));
+        assertThat(t.sends).isZero();
+        assertThat(t.reconnects).isZero();
+        assertThat(agent.__getNonceForTest()).isEqualTo(Varta.NONCE_MIN);
     }
 
     @Test

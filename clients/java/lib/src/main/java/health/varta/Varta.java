@@ -116,7 +116,9 @@ public final class Varta implements AutoCloseable {
 
     /** Emit one beat with the supplied 32-bit payload. Non-blocking; never throws. */
     public BeatOutcome beat(Status status, int payload) {
-        Objects.requireNonNull(status, "status");
+        if (status == null) {
+            return BeatOutcome.failed(new BeatError(0, "InvalidInput"));
+        }
         synchronized (lock) {
             if (closed) {
                 return BeatOutcome.failed(new BeatError(0, "Varta agent is closed"));

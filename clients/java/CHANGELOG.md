@@ -18,6 +18,13 @@ workspace and follows [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **`beat(null, payload)` now returns `Failed(InvalidInput)` instead of
+  throwing `NullPointerException`.** The JVM client documents `beat()` as
+  non-throwing, and `null` is the only invalid status value Java callers can
+  pass through the public type. The agent now rejects it before reconnect,
+  encoding, nonce advancement, or transport I/O, matching the invalid-status
+  outcome shape used by the Rust, Go, Python, Node, and .NET clients.
+
 - **Short successful sends are no longer committed as delivered beats.** The
   agent now requires transports to report the full 32-byte logical frame before
   returning `Sent`; positive short writes surface as `Failed(WriteZero)` and
