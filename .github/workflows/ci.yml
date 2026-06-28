@@ -174,9 +174,15 @@ jobs:
           while IFS=$'\t' read -r name file kind; do
             case "$name" in \#*|"") continue ;; esac
             case "$kind" in
-              test|no-harness)
+              test)
                 grep -qE "^[[:space:]]*(pub(\([^)]+\))?[[:space:]]+)?fn[[:space:]]+${name}\b" "$file" \
                   || { echo "FAIL [$kind] $name @ $file"; exit 1; }
+                ;;
+              no-harness)
+                grep -qE "^[[:space:]]*(pub(\([^)]+\))?[[:space:]]+)?fn[[:space:]]+${name}\b" "$file" \
+                  || { echo "FAIL [$kind] $name @ $file"; exit 1; }
+                grep -qF "name: \"${name}\"" crates/varta-tests/tests/end_to_end.rs \
+                  || { echo "FAIL [$kind] $name is defined but not dispatched by end_to_end.rs"; exit 1; }
                 ;;
               bench-assertion)
                 grep -qF "$name" "$file" \

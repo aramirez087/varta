@@ -22,6 +22,13 @@ client_reconnect_after_observer_restart	crates/varta-tests/tests/end_to_end/reco
 client_auto_reconnect_after_dropped	crates/varta-tests/tests/end_to_end/reconnect.rs	no-harness
 signal_handling_graceful_shutdown	crates/varta-tests/tests/end_to_end/reconnect.rs	no-harness
 status_degraded_visible_in_metrics	crates/varta-tests/tests/end_to_end/basic.rs	no-harness
+clock_source_monotonic_smoke	crates/varta-tests/tests/end_to_end/basic.rs	no-harness
+clock_source_boottime_smoke	crates/varta-tests/tests/end_to_end/basic.rs	no-harness
 iteration_budget_holds_under_slow_scrape_load	crates/varta-tests/tests/end_to_end/observability.rs	no-harness
 serve_pending_seconds_separates_scrape_from_beat_path	crates/varta-tests/tests/end_to_end/observability.rs	no-harness
+alert_rules_match_live_metrics	crates/varta-tests/tests/end_to_end/observability.rs	no-harness
 hostile_frame_rejected_at_decode_with_label_emit	crates/varta-tests/tests/end_to_end/observability.rs	no-harness
+udp_client_to_observer_beats_and_stall	crates/varta-tests/tests/end_to_end/secure_udp.rs	no-harness
+secure_udp_client_to_observer_beats	crates/varta-tests/tests/end_to_end/secure_udp.rs	no-harness
+secure_udp_counter_wrap_continues_under_load	crates/varta-tests/tests/end_to_end/secure_udp.rs	no-harness
+secure_udp_fork_safe_under_real_fork	crates/varta-tests/tests/end_to_end/secure_udp.rs	no-harness

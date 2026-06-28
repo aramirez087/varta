@@ -61,6 +61,131 @@ const MULTI_AGENT_COUNT: usize = 10;
 /// Number of beats each agent process sends.
 const MULTI_AGENT_BEATS: usize = 20;
 
+struct TestCase {
+    name: &'static str,
+    run: fn(),
+}
+
+static TESTS: &[TestCase] = &[
+    TestCase {
+        name: "client_to_observer_to_recovery_full_loop",
+        run: basic::client_to_observer_to_recovery_full_loop,
+    },
+    TestCase {
+        name: "panic_handler_critical_beat_visible_in_metrics",
+        run: basic::panic_handler_critical_beat_visible_in_metrics,
+    },
+    TestCase {
+        name: "concurrent_multi_agent_beats_visible_in_metrics",
+        run: basic::concurrent_multi_agent_beats_visible_in_metrics,
+    },
+    TestCase {
+        name: "recovery_exec_mode_touch_marker_file",
+        run: recovery::recovery_exec_mode_touch_marker_file,
+    },
+    TestCase {
+        name: "recovery_cmd_file_mode",
+        run: recovery::recovery_cmd_file_mode,
+    },
+    TestCase {
+        name: "recovery_exec_file_mode",
+        run: recovery::recovery_exec_file_mode,
+    },
+    TestCase {
+        name: "recovery_timeout_kill_after",
+        run: recovery::recovery_timeout_kill_after,
+    },
+    TestCase {
+        name: "recovery_env_isolation",
+        run: recovery::recovery_env_isolation,
+    },
+    TestCase {
+        name: "recovery_audit_log_records_spawn_and_complete",
+        run: recovery::recovery_audit_log_records_spawn_and_complete,
+    },
+    TestCase {
+        name: "recovery_audit_log_chain_survives_rotation_and_restart",
+        run: recovery::recovery_audit_log_chain_survives_rotation_and_restart,
+    },
+    TestCase {
+        name: "max_beat_rate_limits_and_reports_metric",
+        run: observability::max_beat_rate_limits_and_reports_metric,
+    },
+    TestCase {
+        name: "file_export_writes_tsv",
+        run: observability::file_export_writes_tsv,
+    },
+    TestCase {
+        name: "file_export_rotation",
+        run: observability::file_export_rotation,
+    },
+    TestCase {
+        name: "tracker_capacity_exceeded_reports_eviction_metric",
+        run: observability::tracker_capacity_exceeded_reports_eviction_metric,
+    },
+    TestCase {
+        name: "client_reconnect_after_observer_restart",
+        run: reconnect::client_reconnect_after_observer_restart,
+    },
+    TestCase {
+        name: "client_auto_reconnect_after_dropped",
+        run: reconnect::client_auto_reconnect_after_dropped,
+    },
+    TestCase {
+        name: "signal_handling_graceful_shutdown",
+        run: reconnect::signal_handling_graceful_shutdown,
+    },
+    TestCase {
+        name: "status_degraded_visible_in_metrics",
+        run: basic::status_degraded_visible_in_metrics,
+    },
+    TestCase {
+        name: "iteration_budget_holds_under_slow_scrape_load",
+        run: observability::iteration_budget_holds_under_slow_scrape_load,
+    },
+    TestCase {
+        name: "serve_pending_seconds_separates_scrape_from_beat_path",
+        run: observability::serve_pending_seconds_separates_scrape_from_beat_path,
+    },
+    TestCase {
+        name: "hostile_frame_rejected_at_decode_with_label_emit",
+        run: observability::hostile_frame_rejected_at_decode_with_label_emit,
+    },
+    TestCase {
+        name: "alert_rules_match_live_metrics",
+        run: observability::alert_rules_match_live_metrics,
+    },
+    #[cfg(feature = "udp")]
+    TestCase {
+        name: "udp_client_to_observer_beats_and_stall",
+        run: secure_udp::udp_client_to_observer_beats_and_stall,
+    },
+    #[cfg(feature = "secure-udp")]
+    TestCase {
+        name: "secure_udp_client_to_observer_beats",
+        run: secure_udp::secure_udp_client_to_observer_beats,
+    },
+    #[cfg(all(feature = "secure-udp", feature = "test-hooks"))]
+    TestCase {
+        name: "secure_udp_counter_wrap_continues_under_load",
+        run: secure_udp::secure_udp_counter_wrap_continues_under_load,
+    },
+    #[cfg(all(feature = "secure-udp", target_family = "unix"))]
+    TestCase {
+        name: "secure_udp_fork_safe_under_real_fork",
+        run: secure_udp::secure_udp_fork_safe_under_real_fork,
+    },
+    TestCase {
+        name: "clock_source_monotonic_smoke",
+        run: basic::clock_source_monotonic_smoke,
+    },
+    #[cfg(target_os = "linux")]
+    TestCase {
+        name: "clock_source_boottime_smoke",
+        run: basic::clock_source_boottime_smoke,
+    },
+];
+
 /// Hand-rolled test runner. Runs as the panic child when the dispatch env
 /// var is set; otherwise executes both contract tests sequentially.
 fn main() -> ExitCode {
@@ -81,120 +206,8 @@ fn main() -> ExitCode {
     let total = expected_test_count();
     let mut failed = 0u32;
     eprintln!("running {total} tests");
-    failed += run_one(
-        "client_to_observer_to_recovery_full_loop",
-        basic::client_to_observer_to_recovery_full_loop,
-    );
-    failed += run_one(
-        "panic_handler_critical_beat_visible_in_metrics",
-        basic::panic_handler_critical_beat_visible_in_metrics,
-    );
-    failed += run_one(
-        "concurrent_multi_agent_beats_visible_in_metrics",
-        basic::concurrent_multi_agent_beats_visible_in_metrics,
-    );
-    failed += run_one(
-        "recovery_exec_mode_touch_marker_file",
-        recovery::recovery_exec_mode_touch_marker_file,
-    );
-    failed += run_one("recovery_cmd_file_mode", recovery::recovery_cmd_file_mode);
-    failed += run_one("recovery_exec_file_mode", recovery::recovery_exec_file_mode);
-    failed += run_one(
-        "recovery_timeout_kill_after",
-        recovery::recovery_timeout_kill_after,
-    );
-    failed += run_one("recovery_env_isolation", recovery::recovery_env_isolation);
-    failed += run_one(
-        "recovery_audit_log_records_spawn_and_complete",
-        recovery::recovery_audit_log_records_spawn_and_complete,
-    );
-    failed += run_one(
-        "recovery_audit_log_chain_survives_rotation_and_restart",
-        recovery::recovery_audit_log_chain_survives_rotation_and_restart,
-    );
-    failed += run_one(
-        "max_beat_rate_limits_and_reports_metric",
-        observability::max_beat_rate_limits_and_reports_metric,
-    );
-    failed += run_one(
-        "file_export_writes_tsv",
-        observability::file_export_writes_tsv,
-    );
-    failed += run_one("file_export_rotation", observability::file_export_rotation);
-    failed += run_one(
-        "tracker_capacity_exceeded_reports_eviction_metric",
-        observability::tracker_capacity_exceeded_reports_eviction_metric,
-    );
-    failed += run_one(
-        "client_reconnect_after_observer_restart",
-        reconnect::client_reconnect_after_observer_restart,
-    );
-    failed += run_one(
-        "client_auto_reconnect_after_dropped",
-        reconnect::client_auto_reconnect_after_dropped,
-    );
-    failed += run_one(
-        "signal_handling_graceful_shutdown",
-        reconnect::signal_handling_graceful_shutdown,
-    );
-    failed += run_one(
-        "status_degraded_visible_in_metrics",
-        basic::status_degraded_visible_in_metrics,
-    );
-    failed += run_one(
-        "iteration_budget_holds_under_slow_scrape_load",
-        observability::iteration_budget_holds_under_slow_scrape_load,
-    );
-    failed += run_one(
-        "serve_pending_seconds_separates_scrape_from_beat_path",
-        observability::serve_pending_seconds_separates_scrape_from_beat_path,
-    );
-    failed += run_one(
-        "hostile_frame_rejected_at_decode_with_label_emit",
-        observability::hostile_frame_rejected_at_decode_with_label_emit,
-    );
-    failed += run_one(
-        "alert_rules_match_live_metrics",
-        observability::alert_rules_match_live_metrics,
-    );
-    #[cfg(feature = "udp")]
-    {
-        failed += run_one(
-            "udp_client_to_observer_beats_and_stall",
-            secure_udp::udp_client_to_observer_beats_and_stall,
-        );
-    }
-    #[cfg(feature = "secure-udp")]
-    {
-        failed += run_one(
-            "secure_udp_client_to_observer_beats",
-            secure_udp::secure_udp_client_to_observer_beats,
-        );
-    }
-    #[cfg(all(feature = "secure-udp", feature = "test-hooks"))]
-    {
-        failed += run_one(
-            "secure_udp_counter_wrap_continues_under_load",
-            secure_udp::secure_udp_counter_wrap_continues_under_load,
-        );
-    }
-    #[cfg(all(feature = "secure-udp", target_family = "unix"))]
-    {
-        failed += run_one(
-            "secure_udp_fork_safe_under_real_fork",
-            secure_udp::secure_udp_fork_safe_under_real_fork,
-        );
-    }
-    failed += run_one(
-        "clock_source_monotonic_smoke",
-        basic::clock_source_monotonic_smoke,
-    );
-    #[cfg(target_os = "linux")]
-    {
-        failed += run_one(
-            "clock_source_boottime_smoke",
-            basic::clock_source_boottime_smoke,
-        );
+    for test in TESTS {
+        failed += run_one(test.name, test.run);
     }
 
     let passed = total - failed;
@@ -214,20 +227,7 @@ fn main() -> ExitCode {
 const PER_TEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 fn expected_test_count() -> u32 {
-    21u32
-        + if cfg!(feature = "udp") { 1 } else { 0 }
-        + if cfg!(feature = "secure-udp") { 1 } else { 0 }
-        + if cfg!(all(feature = "secure-udp", feature = "test-hooks")) {
-            1
-        } else {
-            0
-        }
-        + if cfg!(all(feature = "secure-udp", target_family = "unix")) {
-            1
-        } else {
-            0
-        }
-        + if cfg!(target_os = "linux") { 1 } else { 0 }
+    TESTS.len() as u32
 }
 
 fn run_one(name: &str, f: fn()) -> u32 {
