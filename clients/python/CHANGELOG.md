@@ -41,6 +41,15 @@ governed independently — see `book/src/spec/vlp.md` in the workspace.
 
 ### Security
 
+- **Secure-UDP reconnects before terminal AEAD nonce exhaustion.** At
+  `(prefix_index, counter) == (u32::MAX, u32::MAX)`, the next local prefix
+  rotation attempted to derive an IV prefix for index `2^32`, escaping the
+  beat path through the u32 packing/KDF boundary instead of refreshing the
+  secure session. The transport now treats the per-session nonce space as
+  exhausted and runs the existing transactional reconnect before sealing
+  another frame; a failed emergency reconnect leaves the prior socket and AEAD
+  state unchanged.
+
 - **Beat path: closed an AEAD nonce-reuse hole under fork + PID recycling.**
   `Varta.beat` detected `fork(2)` by comparing only the live PID to the
   connect-time PID. A descendant that inherited a secure-UDP session

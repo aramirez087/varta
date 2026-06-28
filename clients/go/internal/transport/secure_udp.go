@@ -124,9 +124,18 @@ func (t *SecureUDPTransport) Send(buf []byte) (int, error) {
 	counter := t.counter
 	ivPrefix := t.ivPrefix
 	if counter >= aeadCounterLimit {
-		prefixIndex++
-		counter = 0
-		ivPrefix = vlpsecure.DeriveIVPrefix(t.sessionSalt, prefixIndex)
+		if prefixIndex >= aeadCounterLimit {
+			if err := t.Reconnect(); err != nil {
+				return 0, err
+			}
+			prefixIndex = t.prefixIndex
+			counter = t.counter
+			ivPrefix = t.ivPrefix
+		} else {
+			prefixIndex++
+			counter = 0
+			ivPrefix = vlpsecure.DeriveIVPrefix(t.sessionSalt, prefixIndex)
+		}
 	}
 	var pt [32]byte
 	copy(pt[:], buf)
@@ -202,6 +211,10 @@ func (t *SecureUDPTransport) Close() error {
 func (t *SecureUDPTransport) SetCounterForTest(v uint32) { t.counter = v }
 func (t *SecureUDPTransport) CounterForTest() uint32     { return t.counter }
 func (t *SecureUDPTransport) PrefixIndexForTest() uint32 { return t.prefixIndex }
+func (t *SecureUDPTransport) SetPrefixIndexForTest(v uint32) {
+	t.prefixIndex = v
+	t.ivPrefix = vlpsecure.DeriveIVPrefix(t.sessionSalt, v)
+}
 func (t *SecureUDPTransport) IVPrefixForTest() [vlpsecure.IVRandomBytes]byte {
 	return t.ivPrefix
 }

@@ -231,3 +231,67 @@ func TestUnitSecureUDPFailedSendAtWrapDoesNotRotatePrefix(t *testing.T) {
 		t.Fatal("failed wrap-boundary send re-derived the IV prefix")
 	}
 }
+
+func TestUnitSecureUDPDoubleExhaustionReconnectsBeforeNonceReuse(t *testing.T) {
+	addr, err := net.ResolveUDPAddr("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	listener, err := net.ListenUDP("udp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+
+	port := listener.LocalAddr().(*net.UDPAddr).Port
+	transport, err := NewSecureUDPShared("127.0.0.1", port, make([]byte, 32))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer transport.Close()
+
+	initialPrefix := transport.ivPrefix
+	transport.SetPrefixIndexForTest(aeadCounterLimit)
+	transport.SetCounterForTest(aeadCounterLimit)
+
+	if _, err := transport.Send(make([]byte, 32)); err != nil {
+		t.Fatalf("Send at double exhaustion: %v", err)
+	}
+	if got := transport.PrefixIndexForTest(); got != 0 {
+		t.Fatalf("double exhaustion should reconnect to prefix index 0, got %d", got)
+	}
+	if got := transport.CounterForTest(); got != 1 {
+		t.Fatalf("first send after reconnect should commit counter 0 -> 1, got %d", got)
+	}
+	if transport.ivPrefix == initialPrefix {
+		t.Fatal("double exhaustion wrapped to the original session prefix instead of reconnecting")
+	}
+}
+
+func TestUnitSecureUDPDoubleExhaustionFailedReconnectPreservesState(t *testing.T) {
+	transport, err := NewSecureUDPShared("127.0.0.1", 9, make([]byte, 32))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer transport.Close()
+
+	transport.SetPrefixIndexForTest(aeadCounterLimit)
+	transport.SetCounterForTest(aeadCounterLimit)
+	oldConn := transport.conn
+	oldSalt := transport.sessionSalt
+	oldPrefix := transport.ivPrefix
+	oldPrefixIndex := transport.prefixIndex
+	oldCounter := transport.counter
+
+	transport.host = "["
+	if _, err := transport.Send(make([]byte, 32)); err == nil {
+		t.Fatal("Send at double exhaustion unexpectedly succeeded after failed reconnect")
+	}
+	if transport.conn != oldConn ||
+		transport.sessionSalt != oldSalt ||
+		transport.ivPrefix != oldPrefix ||
+		transport.prefixIndex != oldPrefixIndex ||
+		transport.counter != oldCounter {
+		t.Fatal("failed double-exhaustion reconnect partially replaced secure session state")
+	}
+}

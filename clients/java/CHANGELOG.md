@@ -6,6 +6,16 @@ workspace and follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Security
+
+- **Secure-UDP reconnects before terminal AEAD nonce exhaustion.** The JVM
+  client intentionally uses `Integer.MAX_VALUE` as its conservative local
+  counter boundary, but the double-exhaustion state still followed the ordinary
+  prefix-rotation path and could overflow the signed prefix index. It now
+  treats that terminal state as session exhaustion and runs the existing
+  transactional reconnect before sealing another frame, preserving
+  commit-on-success semantics for the ordinary wrap beat.
+
 ### Fixed
 
 - **Short successful sends are no longer committed as delivered beats.** The

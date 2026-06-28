@@ -278,6 +278,62 @@ def test_secure_udp_short_send_does_not_commit_nonce_state() -> None:
         transport.close()
 
 
+def test_secure_udp_double_exhaustion_reconnects_before_nonce_reuse() -> None:
+    listener = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    listener.bind(("127.0.0.1", 0))
+    transport = SecureUdpTransport(listener.getsockname(), key=bytes(32))
+    try:
+        initial_prefix = transport._iv_prefix
+        transport._set_iv_prefix_index_for_test(_AEAD_COUNTER_LIMIT)
+        transport._set_iv_counter_for_test(_AEAD_COUNTER_LIMIT)
+
+        assert transport.send(bytes(32)) == 32
+
+        assert transport._iv_prefix_index == 0
+        assert transport._iv_counter == 1
+        assert transport._iv_prefix != initial_prefix, (
+            "double exhaustion must reconnect instead of wrapping to prefix 0 "
+            "under the original session salt"
+        )
+    finally:
+        transport.close()
+        listener.close()
+
+
+def test_secure_udp_double_exhaustion_failed_reconnect_preserves_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    transport = SecureUdpTransport(("127.0.0.1", 9), key=bytes(32))
+    transport._set_iv_prefix_index_for_test(_AEAD_COUNTER_LIMIT)
+    transport._set_iv_counter_for_test(_AEAD_COUNTER_LIMIT)
+    old_sock = transport._sock
+    old_session = (
+        transport._session_salt,
+        transport._iv_prefix,
+        transport._iv_prefix_index,
+        transport._iv_counter,
+    )
+
+    def fail_entropy(_: int) -> bytes:
+        raise OSError(errno.EIO, "simulated entropy failure")
+
+    monkeypatch.setattr("varta._transport.os.urandom", fail_entropy)
+    try:
+        with pytest.raises(OSError):
+            transport.send(bytes(32))
+        assert transport._sock is old_sock
+        assert old_sock is not None
+        assert old_sock.fileno() >= 0
+        assert (
+            transport._session_salt,
+            transport._iv_prefix,
+            transport._iv_prefix_index,
+            transport._iv_counter,
+        ) == old_session
+    finally:
+        transport.close()
+
+
 def test_secure_udp_failed_reconnect_preserves_session(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

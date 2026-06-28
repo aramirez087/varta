@@ -159,6 +159,25 @@ class SecureUdpTransportTest {
     }
 
     @Test
+    void double_exhaustion_reconnects_before_nonce_reuse() throws Exception {
+        RecordingInner inner = new RecordingInner();
+        SecureUdpTransport tx =
+            new SecureUdpTransport(SecureUdpTransport.Mode.SHARED, inner, KEY32);
+
+        byte[] initialPrefix = tx.__getIvPrefixForTest();
+        tx.__setPrefixIndexForTest(Integer.MAX_VALUE);
+        tx.__setCounterForTest(Integer.MAX_VALUE);
+
+        int sent = tx.send(ByteBuffer.wrap(new byte[32]).order(ByteOrder.LITTLE_ENDIAN));
+
+        assertThat(sent).isEqualTo(32);
+        assertThat(inner.reconnects).isEqualTo(1);
+        assertThat(tx.__getPrefixIndexForTest()).isZero();
+        assertThat(tx.__getCounterForTest()).isEqualTo(1);
+        assertThat(tx.__getIvPrefixForTest()).isNotEqualTo(initialPrefix);
+    }
+
+    @Test
     void short_secure_send_does_not_commit_nonce_state() {
         SecureUdpTransport tx =
             new SecureUdpTransport(SecureUdpTransport.Mode.SHARED, new ShortInner(), KEY32);

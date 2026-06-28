@@ -273,9 +273,15 @@ class SecureUdpTransport(BeatTransport):
         counter = self._iv_counter
         iv_prefix = self._iv_prefix
         if counter >= _AEAD_COUNTER_LIMIT:
-            prefix_index += 1
-            counter = 0
-            iv_prefix = derive_iv_prefix(self._session_salt, prefix_index)
+            if prefix_index >= _AEAD_COUNTER_LIMIT:
+                self.reconnect()
+                prefix_index = self._iv_prefix_index
+                counter = self._iv_counter
+                iv_prefix = self._iv_prefix
+            else:
+                prefix_index += 1
+                counter = 0
+                iv_prefix = derive_iv_prefix(self._session_salt, prefix_index)
         if self._master_key is not None:
             agent_pid = os.getpid() & 0xFFFFFFFF
             wire = encode_master(
@@ -319,6 +325,10 @@ class SecureUdpTransport(BeatTransport):
     # Test hooks (parity with Rust `set_iv_counter_for_test` etc.).
     def _set_iv_counter_for_test(self, value: int) -> None:
         self._iv_counter = value & 0xFFFFFFFF
+
+    def _set_iv_prefix_index_for_test(self, value: int) -> None:
+        self._iv_prefix_index = value & 0xFFFFFFFF
+        self._iv_prefix = derive_iv_prefix(self._session_salt, self._iv_prefix_index)
 
     def _iv_prefix_for_test(self) -> bytes:
         return self._iv_prefix

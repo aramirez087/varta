@@ -34,6 +34,14 @@ here. Versioning is independent of the Rust workspace and follows
 
 ### Security
 
+- **Secure-UDP reconnects before terminal AEAD nonce exhaustion.** At
+  `(prefixIndex, counter) == (uint.MaxValue, uint.MaxValue)`, the transport
+  sent the last counter under the old prefix and then let the next prefix
+  rotation wrap back toward prefix index `0` under the same session salt. It now
+  reserves the nonce state before encoding, treats the double-exhaustion state
+  as session exhaustion, and runs the existing transactional reconnect before
+  sealing another frame. Ordinary wrap rotation remains commit-on-success.
+
 - Secure-UDP panic emitter (`SignalHandler.InstallSecureUdp`) now derives its
   ChaCha20-Poly1305 IV prefix from a 16-byte install-time salt plus the
   per-fire `(pid, timestamp)` via HKDF-SHA256 (`Hkdf.DerivePanicIvPrefix`),

@@ -157,9 +157,16 @@ public final class SecureUdpTransport implements BeatTransport {
         int sendCounter = counter;
         byte[] sendPrefix = ivPrefix;
         if (sendCounter == Integer.MAX_VALUE) {
-            sendPrefixIndex = prefixIndex + 1;
-            sendCounter = 0;
-            sendPrefix = Hkdf.deriveIvPrefix(sessionSalt, sendPrefixIndex);
+            if (sendPrefixIndex == Integer.MAX_VALUE) {
+                reconnect();
+                sendPrefixIndex = prefixIndex;
+                sendCounter = counter;
+                sendPrefix = ivPrefix;
+            } else {
+                sendPrefixIndex = prefixIndex + 1;
+                sendCounter = 0;
+                sendPrefix = Hkdf.deriveIvPrefix(sessionSalt, sendPrefixIndex);
+            }
         }
 
         byte[] wire = (mode == Mode.SHARED)
@@ -217,5 +224,9 @@ public final class SecureUdpTransport implements BeatTransport {
     int __getCounterForTest() { return counter; }
     int __getPrefixIndexForTest() { return prefixIndex; }
     void __setCounterForTest(int c) { this.counter = c; }
+    void __setPrefixIndexForTest(int p) {
+        this.prefixIndex = p;
+        this.ivPrefix = Hkdf.deriveIvPrefix(sessionSalt, p);
+    }
     byte[] __getIvPrefixForTest() { return ivPrefix.clone(); }
 }

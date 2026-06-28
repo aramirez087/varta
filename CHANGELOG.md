@@ -30,6 +30,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Go, Python, Java, and .NET secure-UDP no longer reuse or overflow terminal
+  AEAD nonce state at double exhaustion (bug-539).** The earlier
+  commit-on-success fixes covered the ordinary counter-wrap beat, but the final
+  per-session state where both the IV counter and IV prefix index are exhausted
+  still diverged outside Rust/Node. Go and .NET could wrap back toward the
+  original session prefix, Python raised from the u32 HKDF packing path, and
+  Java could overflow its conservative signed boundary. All four clients now
+  treat the per-session nonce space as exhausted and run the existing
+  transactional secure-session reconnect before reserving another nonce; failed
+  emergency reconnects leave the previous AEAD state untouched.
 - **Node secure-UDP no longer wraps the AEAD nonce space back to the original
   session prefix (bug-535).** When both the 32-bit IV counter and 32-bit prefix
   index were exhausted, `SecureUdpTransport` wrapped `prefixIndex` to `0` under

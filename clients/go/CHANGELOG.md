@@ -8,6 +8,14 @@ governed independently — see `book/src/spec/vlp.md` in the workspace.
 
 ### Security
 
+- **Secure-UDP reconnects before terminal AEAD nonce exhaustion.** At
+  `(prefixIndex, counter) == (u32::MAX, u32::MAX)`, the transport previously
+  advanced the prefix index with normal `uint32` arithmetic, wrapping to
+  prefix index `0` under the same session salt and reopening the original nonce
+  stream. It now treats the per-session nonce space as exhausted and runs the
+  existing transactional reconnect before sealing another frame; a failed
+  emergency reconnect leaves the prior socket and AEAD state unchanged.
+
 - **Secure-UDP panic handler: closed an AEAD nonce-reuse hole under PID
   recycling.** The handler detected `fork(2)` by comparing the live PID to the
   install-time PID and only re-randomized its IV salt on a mismatch. A

@@ -86,15 +86,38 @@ internal sealed class SecureUdpTransport : IBeatTransport
             throw new ArgumentException($"plaintext must be {AeadCodec.PlaintextBytes} bytes", nameof(plaintext32));
         }
 
-        // Reserve a counter value WITHOUT committing it — commit on send success.
+        // Reserve nonce state WITHOUT committing ordinary wrap state. When the
+        // 64-bit per-session space is exhausted, reconnect before encoding so
+        // prefix index 0 is never reused under the same session salt.
+        uint pendingPrefixIndex = _prefixIndex;
         uint pendingCounter = _counter;
+        Span<byte> pendingPrefix = stackalloc byte[Hkdf.IvRandomBytes];
+        _ivPrefix.AsSpan().CopyTo(pendingPrefix);
+        bool pendingPrefixRotated = false;
+        if (pendingCounter == uint.MaxValue)
+        {
+            if (pendingPrefixIndex == uint.MaxValue)
+            {
+                Reconnect();
+                pendingPrefixIndex = _prefixIndex;
+                pendingCounter = _counter;
+                _ivPrefix.AsSpan().CopyTo(pendingPrefix);
+            }
+            else
+            {
+                pendingPrefixIndex++;
+                pendingCounter = 0;
+                Hkdf.DeriveIvPrefix(_sessionSalt, pendingPrefixIndex, pendingPrefix);
+                pendingPrefixRotated = true;
+            }
+        }
 
         int sent;
         int expectedWireBytes;
         if (_mode == SecureUdpMode.Shared)
         {
             Span<byte> wire = stackalloc byte[AeadCodec.SharedFrameBytes];
-            AeadCodec.EncodeShared(_key, _ivPrefix, pendingCounter, plaintext32, wire);
+            AeadCodec.EncodeShared(_key, pendingPrefix, pendingCounter, plaintext32, wire);
             sent = SendWire(wire);
             expectedWireBytes = AeadCodec.SharedFrameBytes;
         }
@@ -105,7 +128,7 @@ internal sealed class SecureUdpTransport : IBeatTransport
             uint agentPid = (uint)Environment.ProcessId;
             try
             {
-                AeadCodec.EncodeMaster(_key, agentPid, _ivPrefix, pendingCounter, plaintext32, wire, derived);
+                AeadCodec.EncodeMaster(_key, agentPid, pendingPrefix, pendingCounter, plaintext32, wire, derived);
                 sent = SendWire(wire);
                 expectedWireBytes = AeadCodec.MasterFrameBytes;
             }
@@ -120,18 +143,12 @@ internal sealed class SecureUdpTransport : IBeatTransport
             return 0;
         }
 
-        // Commit counter advance only after the full encrypted datagram is accepted.
-        if (pendingCounter == uint.MaxValue)
+        if (pendingPrefixRotated)
         {
-            // Counter wrap — rotate the IV prefix index and re-derive.
-            _prefixIndex++;
-            _counter = 0;
-            Hkdf.DeriveIvPrefix(_sessionSalt, _prefixIndex, _ivPrefix);
+            pendingPrefix.CopyTo(_ivPrefix.AsSpan());
+            _prefixIndex = pendingPrefixIndex;
         }
-        else
-        {
-            _counter = pendingCounter + 1;
-        }
+        _counter = pendingCounter + 1;
 
         return AeadCodec.PlaintextBytes;
     }
@@ -223,6 +240,12 @@ internal sealed class SecureUdpTransport : IBeatTransport
         _sendResultOverrideForTest = sendResultOverride;
 
     internal uint PrefixIndexForTest => _prefixIndex;
+
+    internal void SetPrefixIndexForTest(uint value)
+    {
+        _prefixIndex = value;
+        Hkdf.DeriveIvPrefix(_sessionSalt, _prefixIndex, _ivPrefix);
+    }
 
     internal uint CounterForTest
     {
