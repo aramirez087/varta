@@ -1184,7 +1184,12 @@ mod udp_impl {
                             return RecvResult::WouldBlock;
                         }
                         io::ErrorKind::Interrupted => continue,
-                        _ => return RecvResult::IoError(e),
+                        _ => {
+                            return RecvResult::IoError {
+                                error: e,
+                                consumed: false,
+                            };
+                        }
                     },
                 }
             }
@@ -1232,7 +1237,7 @@ mod udp_impl {
                         panic!("overlong datagram with valid VLP prefix must be rejected")
                     }
                     RecvResult::WouldBlock => panic!("listener did not receive test datagram"),
-                    RecvResult::CtrlTruncated(e) | RecvResult::IoError(e) => {
+                    RecvResult::CtrlTruncated(e) | RecvResult::IoError { error: e, .. } => {
                         panic!("unexpected receive error: {e}")
                     }
                 }

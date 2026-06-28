@@ -1093,7 +1093,7 @@ fn recv_returns_after_one_decrypt_failure_even_when_valid_frame_is_queued() {
                 panic!("recv must not drain past an invalid frame to a queued valid frame")
             }
             RecvResult::ShortRead => panic!("test sends only secure-frame-sized datagrams"),
-            RecvResult::CtrlTruncated(e) | RecvResult::IoError(e) => {
+            RecvResult::CtrlTruncated(e) | RecvResult::IoError { error: e, .. } => {
                 panic!("unexpected receive error: {e}")
             }
         }

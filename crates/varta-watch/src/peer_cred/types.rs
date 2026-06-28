@@ -215,14 +215,37 @@ pub enum RecvResult {
     WouldBlock,
     /// A wrong-size (non-32-byte) datagram — dropped.
     ShortRead,
-    /// Fatal I/O error.  Also surfaced when the kernel fails to attach
-    /// `SCM_CREDENTIALS` despite `SO_PASSCRED` being set — that case is
-    /// observable as `Event::Io` rather than a silent drop so operators
-    /// can detect kernel/socket misconfiguration.
-    IoError(io::Error),
+    /// Fatal I/O error.
+    ///
+    /// `consumed` distinguishes errors returned before a datagram was dequeued
+    /// from peer-triggered rejection after a datagram was already consumed
+    /// (for example a UID mismatch or missing kernel credentials). The
+    /// observer uses that bit to rate-limit peer-triggered exported errors
+    /// without treating local socket failures as productive I/O.
+    IoError {
+        /// Underlying I/O or credential-validation failure.
+        error: io::Error,
+        /// Whether the listener had already dequeued a datagram when the
+        /// error was produced.
+        consumed: bool,
+    },
     /// Ancillary data truncated by the kernel (`MSG_CTRUNC` on Linux).
     /// Indicates `ANCILLARY_BUFFER_SIZE` is too small for the kernel's
     /// per-message metadata — a kernel buffer sizing issue that operators
     /// should monitor separately from generic I/O errors.
     CtrlTruncated(io::Error),
+}
+
+impl RecvResult {
+    /// Return whether this receive result dequeued a datagram from the
+    /// transport's ingress queue.
+    pub fn consumed_datagram(&self) -> bool {
+        match self {
+            RecvResult::Authenticated { .. }
+            | RecvResult::ShortRead
+            | RecvResult::CtrlTruncated(_) => true,
+            RecvResult::IoError { consumed, .. } => *consumed,
+            RecvResult::WouldBlock => false,
+        }
+    }
 }

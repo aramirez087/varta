@@ -260,7 +260,12 @@ pub(crate) fn recv_authenticated(fd: i32) -> RecvResult {
                         return RecvResult::WouldBlock;
                     }
                     io::ErrorKind::Interrupted => continue,
-                    _ => return RecvResult::IoError(err),
+                    _ => {
+                        return RecvResult::IoError {
+                            error: err,
+                            consumed: false,
+                        };
+                    }
                 }
             }
             break ret;
@@ -297,21 +302,27 @@ pub(crate) fn recv_authenticated(fd: i32) -> RecvResult {
         let (peer_pid, peer_uid, peer_pidfd) = match plat::peer_pid_after_recv(fd, &mhdr) {
             Some((pid, uid, pidfd)) => (pid, uid, pidfd),
             None => {
-                return RecvResult::IoError(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "kernel did not attach peer credentials",
-                ));
+                return RecvResult::IoError {
+                    error: io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "kernel did not attach peer credentials",
+                    ),
+                    consumed: true,
+                };
             }
         };
 
         let my_uid = observer_uid();
         if peer_pid != 0 && peer_uid != my_uid {
-            return RecvResult::IoError(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                format!(
-                    "peer credential UID mismatch: kernel reports uid {peer_uid}, expected uid {my_uid}"
+            return RecvResult::IoError {
+                error: io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    format!(
+                        "peer credential UID mismatch: kernel reports uid {peer_uid}, expected uid {my_uid}"
+                    ),
                 ),
-            ));
+                consumed: true,
+            };
         }
 
         // PID-namespace inode resolution is intentionally NOT done here.
@@ -382,7 +393,12 @@ pub(crate) fn recv_authenticated(fd: i32) -> RecvResult {
                         return RecvResult::WouldBlock;
                     }
                     io::ErrorKind::Interrupted => continue,
-                    _ => return RecvResult::IoError(err),
+                    _ => {
+                        return RecvResult::IoError {
+                            error: err,
+                            consumed: false,
+                        };
+                    }
                 }
             }
             break ret as isize;

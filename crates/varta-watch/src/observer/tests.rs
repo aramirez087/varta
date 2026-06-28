@@ -448,6 +448,17 @@ impl ScriptedListener {
         }
         Self { results }
     }
+
+    fn with_io_errors(count: usize, consumed: bool) -> Self {
+        let mut results = VecDeque::new();
+        for _ in 0..count {
+            results.push_back(RecvResult::IoError {
+                error: std::io::Error::new(std::io::ErrorKind::PermissionDenied, "test io error"),
+                consumed,
+            });
+        }
+        Self { results }
+    }
 }
 
 impl BeatListener for ScriptedListener {
@@ -744,6 +755,81 @@ fn ctrl_truncated_events_pay_global_rate_limit() {
     assert!(
         obs.last_poll_consumed(),
         "a rate-limited control-truncation datagram is still consumed I/O"
+    );
+}
+
+#[test]
+fn consumed_io_errors_pay_global_rate_limit() {
+    let mut obs = Observer::new(
+        Duration::from_secs(60),
+        64,
+        EvictionPolicy::Strict,
+        DEFAULT_EVICTION_SCAN_WINDOW,
+        None,
+        1,
+        1,
+        ClockSource::Monotonic,
+    )
+    .expect("Observer::new should succeed");
+
+    obs.add_listener(Box::new(ScriptedListener::with_io_errors(2, true)));
+
+    let first = obs.poll();
+    assert!(
+        matches!(first, Some(Event::Io(_, _))),
+        "the first consumed I/O rejection should consume the burst token, got {first:?}"
+    );
+    assert_eq!(obs.drain_global_rate_limited(), 0);
+    assert!(
+        obs.last_poll_consumed(),
+        "a consumed I/O rejection is still ingress work"
+    );
+
+    let second = obs.poll();
+    assert!(
+        second.is_none(),
+        "the exhausted global bucket must shed repeated consumed I/O rejections, got {second:?}"
+    );
+    assert_eq!(
+        obs.drain_global_rate_limited(),
+        1,
+        "the shed consumed I/O rejection must be visible in global limiter metrics"
+    );
+    assert!(
+        obs.last_poll_consumed(),
+        "a rate-limited consumed I/O rejection is still consumed ingress"
+    );
+}
+
+#[test]
+fn local_io_errors_do_not_spend_global_tokens_or_report_consumed_ingress() {
+    let mut obs = Observer::new(
+        Duration::from_secs(60),
+        64,
+        EvictionPolicy::Strict,
+        DEFAULT_EVICTION_SCAN_WINDOW,
+        None,
+        1,
+        1,
+        ClockSource::Monotonic,
+    )
+    .expect("Observer::new should succeed");
+
+    obs.add_listener(Box::new(ScriptedListener::with_io_errors(1, false)));
+
+    let event = obs.poll();
+    assert!(
+        matches!(event, Some(Event::Io(_, _))),
+        "a local socket error should stay operator-visible, got {event:?}"
+    );
+    assert_eq!(
+        obs.drain_global_rate_limited(),
+        0,
+        "local pre-recv errors must not spend peer-ingress admission tokens"
+    );
+    assert!(
+        !obs.last_poll_consumed(),
+        "a local pre-recv error did not dequeue a datagram and must not keep the loop spinning"
     );
 }
 

@@ -564,12 +564,13 @@ impl Observer {
             // the Authenticated arm below as the slot's beat timestamp.
             let now_ns = self.now_ns();
             let result = self.listeners[i].recv(now_ns);
-            // Any result other than `WouldBlock` means a datagram was pulled
-            // off the socket queue this pass — including the drop paths below
-            // that `continue` without yielding an `Event`. Record it so the
-            // main loop keeps draining instead of treating a dropped beat as
-            // an idle tick (see `last_poll_consumed`).
-            if !matches!(result, RecvResult::WouldBlock) || self.listeners[i].last_recv_consumed() {
+            // Results that consumed a datagram — including drop paths below
+            // that `continue` without yielding an `Event` — keep the main
+            // loop draining instead of sleeping on a non-idle socket. Local
+            // errors returned before a datagram is dequeued do not count as
+            // consumed work; otherwise a persistent socket error can spin the
+            // poll loop.
+            if result.consumed_datagram() || self.listeners[i].last_recv_consumed() {
                 consumed = true;
             }
             match result {
@@ -845,10 +846,23 @@ impl Observer {
                         first_event = Some(Event::CtrlTruncated(e, now_ns));
                     }
                 }
-                RecvResult::IoError(e) => {
+                RecvResult::IoError {
+                    error: e,
+                    consumed: io_consumed,
+                } => {
+                    // Some `IoError` values are peer-triggered rejection
+                    // events after a datagram has already been consumed (for
+                    // example a UID mismatch or missing credentials). Spend
+                    // the same shared admission token as other exported
+                    // malformed-input events. Local socket errors that happen
+                    // before a datagram is dequeued remain unthrottled so
+                    // operators see the fault directly.
+                    if io_consumed && !self.try_admit_global(now_ns) {
+                        continue;
+                    }
                     if first_event.is_none() {
                         self.next_listener_start = (i + 1) % len;
-                        first_event = Some(Event::Io(e, self.now_ns()));
+                        first_event = Some(Event::Io(e, now_ns));
                     }
                 }
             }
