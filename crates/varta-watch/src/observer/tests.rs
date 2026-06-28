@@ -441,10 +441,10 @@ impl ScriptedListener {
     fn with_ctrl_truncated(count: usize) -> Self {
         let mut results = VecDeque::new();
         for _ in 0..count {
-            results.push_back(RecvResult::CtrlTruncated(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "test ancillary truncation",
-            )));
+            results.push_back(RecvResult::CtrlTruncated(
+                std::io::Error::new(std::io::ErrorKind::InvalidData, "test ancillary truncation")
+                    .into(),
+            ));
         }
         Self { results }
     }
@@ -453,7 +453,8 @@ impl ScriptedListener {
         let mut results = VecDeque::new();
         for _ in 0..count {
             results.push_back(RecvResult::IoError {
-                error: std::io::Error::new(std::io::ErrorKind::PermissionDenied, "test io error"),
+                error: std::io::Error::new(std::io::ErrorKind::PermissionDenied, "test io error")
+                    .into(),
                 consumed,
             });
         }

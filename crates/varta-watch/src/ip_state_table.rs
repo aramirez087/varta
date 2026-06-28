@@ -21,46 +21,6 @@ use std::time::{Duration, Instant};
 
 use crate::probe_table::{BoundedIndex, ProbeExhausted};
 
-#[cfg(test)]
-use std::alloc::{GlobalAlloc, Layout, System};
-#[cfg(test)]
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-
-#[cfg(test)]
-struct GuardAlloc;
-
-#[cfg(test)]
-thread_local! {
-    static ALLOC_GUARD_ARMED: AtomicBool = const { AtomicBool::new(false) };
-}
-
-#[cfg(test)]
-static ALLOC_GUARD_COUNT: AtomicU64 = AtomicU64::new(0);
-
-#[cfg(test)]
-fn note_allocation_if_armed() {
-    let armed = ALLOC_GUARD_ARMED.with(|flag| flag.load(Ordering::Relaxed));
-    if armed {
-        ALLOC_GUARD_COUNT.fetch_add(1, Ordering::Relaxed);
-    }
-}
-
-#[cfg(test)]
-unsafe impl GlobalAlloc for GuardAlloc {
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        note_allocation_if_armed();
-        unsafe { System.alloc(layout) }
-    }
-
-    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        unsafe { System.dealloc(ptr, layout) }
-    }
-}
-
-#[cfg(test)]
-#[global_allocator]
-static ALLOC_GUARD: GuardAlloc = GuardAlloc;
-
 /// Slab full and probe-budget exhausted.  The caller already has an
 /// existing fallback (force-evict the oldest entry); `insert` returning
 /// `Err(Full)` is the signal that even that fallback couldn't make room.
@@ -374,14 +334,14 @@ mod tests {
             .expect("insert");
         }
 
-        ALLOC_GUARD_COUNT.store(0, Ordering::Relaxed);
-        ALLOC_GUARD_ARMED.with(|armed| armed.store(true, Ordering::Relaxed));
+        crate::test_alloc::reset();
+        crate::test_alloc::arm();
         t.evict_older_than(now, Duration::from_secs(60));
-        ALLOC_GUARD_ARMED.with(|armed| armed.store(false, Ordering::Relaxed));
+        crate::test_alloc::disarm();
 
         assert_eq!(t.len(), 0);
         assert_eq!(
-            ALLOC_GUARD_COUNT.load(Ordering::Relaxed),
+            crate::test_alloc::count(),
             0,
             "stale-IP eviction must reuse preallocated storage"
         );

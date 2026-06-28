@@ -761,7 +761,7 @@ impl BeatListener for SecureUdpListener {
                     io::ErrorKind::Interrupted => continue,
                     _ => {
                         return RecvResult::IoError {
-                            error: e,
+                            error: e.into(),
                             consumed: false,
                         };
                     }

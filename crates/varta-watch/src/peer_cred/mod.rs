@@ -36,7 +36,7 @@ pub(crate) use ns_inode::{observer_pid_namespace_inode, read_pid_namespace_inode
 pub(crate) use recv::{enable_credential_passing, recv_authenticated};
 pub(crate) use start_time::read_pid_start_time;
 pub(crate) use types::observer_uid;
-pub use types::{BeatOrigin, PeerPidFd, RecvResult};
+pub use types::{BeatOrigin, PeerPidFd, RecvError, RecvResult};
 
 /// Read PID namespace and start-time metadata for a kernel-attested peer.
 ///

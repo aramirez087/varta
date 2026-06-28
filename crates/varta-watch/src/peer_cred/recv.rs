@@ -262,7 +262,7 @@ pub(crate) fn recv_authenticated(fd: i32) -> RecvResult {
                     io::ErrorKind::Interrupted => continue,
                     _ => {
                         return RecvResult::IoError {
-                            error: err,
+                            error: err.into(),
                             consumed: false,
                         };
                     }
@@ -284,7 +284,7 @@ pub(crate) fn recv_authenticated(fd: i32) -> RecvResult {
         if plat::ctrl_truncated(&mhdr) {
             #[cfg(target_os = "linux")]
             plat::close_received_fds(&mhdr);
-            return RecvResult::CtrlTruncated(io::Error::new(
+            return RecvResult::CtrlTruncated(super::RecvError::static_msg(
                 io::ErrorKind::InvalidData,
                 "ancillary data truncated by kernel (ANCILLARY_BUFFER_SIZE too small)",
             ));
@@ -303,7 +303,7 @@ pub(crate) fn recv_authenticated(fd: i32) -> RecvResult {
             Some((pid, uid, pidfd)) => (pid, uid, pidfd),
             None => {
                 return RecvResult::IoError {
-                    error: io::Error::new(
+                    error: super::RecvError::static_msg(
                         io::ErrorKind::InvalidData,
                         "kernel did not attach peer credentials",
                     ),
@@ -315,11 +315,9 @@ pub(crate) fn recv_authenticated(fd: i32) -> RecvResult {
         let my_uid = observer_uid();
         if peer_pid != 0 && peer_uid != my_uid {
             return RecvResult::IoError {
-                error: io::Error::new(
+                error: super::RecvError::static_msg(
                     io::ErrorKind::PermissionDenied,
-                    format!(
-                        "peer credential UID mismatch: kernel reports uid {peer_uid}, expected uid {my_uid}"
-                    ),
+                    "peer credential UID mismatch",
                 ),
                 consumed: true,
             };
@@ -395,7 +393,7 @@ pub(crate) fn recv_authenticated(fd: i32) -> RecvResult {
                     io::ErrorKind::Interrupted => continue,
                     _ => {
                         return RecvResult::IoError {
-                            error: err,
+                            error: err.into(),
                             consumed: false,
                         };
                     }
@@ -610,6 +608,123 @@ mod tests {
             after, before,
             "observer leaked a peer-injected SCM_RIGHTS duplicate of /dev/null \
              (before={before}, after={after})"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Regression: peer-triggered ancillary truncation must not allocate before
+    /// the observer's global admission bucket gets a chance to shed the event.
+    /// Before `RecvError` carried static rejection tokens, this path built an
+    /// `io::Error::new(...)` inside `recv_authenticated`, so a same-UID peer
+    /// could spend allocator work even when the observer later rate-limited
+    /// every exported `CtrlTruncated` event.
+    #[cfg(all(
+        target_os = "linux",
+        not(feature = "force-socketmode-fallback"),
+        not(miri)
+    ))]
+    #[test]
+    fn ctrl_truncated_receive_result_does_not_allocate() {
+        use super::plat;
+        use super::{enable_credential_passing, recv_authenticated, RecvResult};
+        use std::os::unix::io::AsRawFd;
+        use std::os::unix::net::UnixDatagram;
+
+        extern "C" {
+            fn close(fd: i32) -> i32;
+            fn dup(fd: i32) -> i32;
+            fn sendmsg(fd: i32, msg: *const plat::Msghdr, flags: i32) -> isize;
+        }
+
+        const NFDS: usize = 96;
+
+        #[repr(C, align(8))]
+        struct ManyScmRightsCmsg {
+            hdr: plat::Cmsghdr,
+            fds: [i32; NFDS],
+        }
+
+        assert!(
+            core::mem::size_of::<ManyScmRightsCmsg>() > plat::ANCILLARY_BUFFER_SIZE,
+            "test cmsg must overflow the receiver ancillary buffer"
+        );
+
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "varta-ctrltrunc-{}-{unique}.sock",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+
+        let observer = UnixDatagram::bind(&path).expect("bind observer");
+        enable_credential_passing(observer.as_raw_fd()).expect("enable credential passing");
+
+        let sender = UnixDatagram::unbound().expect("sender socket");
+        sender.connect(&path).expect("connect sender");
+
+        let passed = std::fs::File::open("/dev/null").expect("open /dev/null");
+        let mut fds = [0i32; NFDS];
+        for fd in &mut fds {
+            // SAFETY: `passed` is an open fd; `dup` returns a new owned fd or
+            // -1.  The test closes every successful duplicate after sendmsg.
+            *fd = unsafe { dup(passed.as_raw_fd()) };
+            assert!(*fd >= 0, "dup /dev/null fd");
+        }
+
+        let mut beat = [0u8; super::VLP_FRAME_LEN];
+        let mut iov = plat::Iovec {
+            iov_base: beat.as_mut_ptr() as *mut core::ffi::c_void,
+            iov_len: beat.len(),
+        };
+        let mut cmsg = ManyScmRightsCmsg {
+            hdr: plat::Cmsghdr {
+                cmsg_len: core::mem::size_of::<plat::Cmsghdr>()
+                    + (NFDS * core::mem::size_of::<i32>()),
+                cmsg_level: plat::SOL_SOCKET,
+                cmsg_type: plat::SCM_RIGHTS,
+            },
+            fds,
+        };
+        let mhdr = plat::Msghdr {
+            msg_name: core::ptr::null_mut(),
+            msg_namelen: 0,
+            _pad1: 0,
+            msg_iov: &mut iov,
+            msg_iovlen: 1,
+            msg_control: &mut cmsg as *mut ManyScmRightsCmsg as *mut core::ffi::c_void,
+            msg_controllen: core::mem::size_of::<ManyScmRightsCmsg>(),
+            msg_flags: 0,
+            _pad2: 0,
+        };
+
+        // SAFETY: `mhdr` describes one 32-byte datagram and a valid
+        // SCM_RIGHTS cmsg containing live fds. The kernel only reads these
+        // buffers during the call.
+        let sent = unsafe { sendmsg(sender.as_raw_fd(), &mhdr, 0) };
+        assert_eq!(sent, super::VLP_FRAME_LEN as isize, "sendmsg");
+        for fd in &cmsg.fds {
+            // SAFETY: each fd was returned by `dup` above and is still owned
+            // by this test process after sendmsg.
+            unsafe { close(*fd) };
+        }
+
+        crate::test_alloc::reset();
+        crate::test_alloc::arm();
+        let result = recv_authenticated(observer.as_raw_fd());
+        crate::test_alloc::disarm();
+
+        assert!(
+            matches!(result, RecvResult::CtrlTruncated(_)),
+            "expected CtrlTruncated, got a different RecvResult"
+        );
+        assert_eq!(
+            crate::test_alloc::count(),
+            0,
+            "ancillary truncation must return a static receive error without heap allocation"
         );
 
         let _ = std::fs::remove_file(&path);

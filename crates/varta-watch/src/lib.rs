@@ -67,6 +67,57 @@ macro_rules! assert_field_offset {
     }};
 }
 
+#[cfg(all(test, any(feature = "prometheus-exporter", target_os = "linux")))]
+pub(crate) mod test_alloc {
+    use std::alloc::{GlobalAlloc, Layout, System};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+    pub(crate) struct GuardAlloc;
+
+    thread_local! {
+        static ALLOC_GUARD_ARMED: AtomicBool = const { AtomicBool::new(false) };
+    }
+
+    static ALLOC_GUARD_COUNT: AtomicU64 = AtomicU64::new(0);
+
+    fn note_allocation_if_armed() {
+        let armed = ALLOC_GUARD_ARMED.with(|flag| flag.load(Ordering::Relaxed));
+        if armed {
+            ALLOC_GUARD_COUNT.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    unsafe impl GlobalAlloc for GuardAlloc {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            note_allocation_if_armed();
+            unsafe { System.alloc(layout) }
+        }
+
+        unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+            unsafe { System.dealloc(ptr, layout) }
+        }
+    }
+
+    #[global_allocator]
+    static ALLOC_GUARD: GuardAlloc = GuardAlloc;
+
+    pub(crate) fn reset() {
+        ALLOC_GUARD_COUNT.store(0, Ordering::Relaxed);
+    }
+
+    pub(crate) fn count() -> u64 {
+        ALLOC_GUARD_COUNT.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn arm() {
+        ALLOC_GUARD_ARMED.with(|armed| armed.store(true, Ordering::Relaxed));
+    }
+
+    pub(crate) fn disarm() {
+        ALLOC_GUARD_ARMED.with(|armed| armed.store(false, Ordering::Relaxed));
+    }
+}
+
 pub mod audit;
 pub mod clock;
 pub mod config;

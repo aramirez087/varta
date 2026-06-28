@@ -50,6 +50,55 @@ pub(crate) fn observer_uid() -> u32 {
     *UID.get_or_init(|| unsafe { getuid() })
 }
 
+/// Allocation-free receive-path error.
+///
+/// Local syscall failures keep the original [`io::Error`]. Peer-triggered
+/// rejection paths use a static `(kind, message)` token so the receive layer
+/// can hand the observer a shed-able error without allocating before global
+/// admission decides whether an exported [`crate::observer::Event`] will be
+/// constructed.
+#[derive(Debug)]
+pub enum RecvError {
+    /// Concrete OS error returned by the kernel before a datagram was accepted.
+    Io(io::Error),
+    /// Static rejection reason produced after a datagram was accepted.
+    Static {
+        /// Error kind reported to downstream exporters when admitted.
+        kind: io::ErrorKind,
+        /// Static diagnostic text reported to downstream exporters when admitted.
+        message: &'static str,
+    },
+}
+
+impl RecvError {
+    /// Construct a static receive-path error token.
+    pub const fn static_msg(kind: io::ErrorKind, message: &'static str) -> Self {
+        Self::Static { kind, message }
+    }
+
+    /// Return the coarse error kind without allocating.
+    pub fn kind(&self) -> io::ErrorKind {
+        match self {
+            RecvError::Io(error) => error.kind(),
+            RecvError::Static { kind, .. } => *kind,
+        }
+    }
+
+    /// Convert into an [`io::Error`] for an admitted exported event.
+    pub fn into_io_error(self) -> io::Error {
+        match self {
+            RecvError::Io(error) => error,
+            RecvError::Static { kind, message } => io::Error::new(kind, message),
+        }
+    }
+}
+
+impl From<io::Error> for RecvError {
+    fn from(error: io::Error) -> Self {
+        RecvError::Io(error)
+    }
+}
+
 /// Stable kernel handle for a Linux datagram sender.
 ///
 /// On Linux kernels that support `SO_PASSPIDFD`, `recvmsg(2)` can attach an
@@ -224,7 +273,7 @@ pub enum RecvResult {
     /// without treating local socket failures as productive I/O.
     IoError {
         /// Underlying I/O or credential-validation failure.
-        error: io::Error,
+        error: RecvError,
         /// Whether the listener had already dequeued a datagram when the
         /// error was produced.
         consumed: bool,
@@ -233,7 +282,7 @@ pub enum RecvResult {
     /// Indicates `ANCILLARY_BUFFER_SIZE` is too small for the kernel's
     /// per-message metadata — a kernel buffer sizing issue that operators
     /// should monitor separately from generic I/O errors.
-    CtrlTruncated(io::Error),
+    CtrlTruncated(RecvError),
 }
 
 impl RecvResult {

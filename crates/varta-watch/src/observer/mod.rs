@@ -843,7 +843,7 @@ impl Observer {
                     }
                     if first_event.is_none() {
                         self.next_listener_start = (i + 1) % len;
-                        first_event = Some(Event::CtrlTruncated(e, now_ns));
+                        first_event = Some(Event::CtrlTruncated(e.into_io_error(), now_ns));
                     }
                 }
                 RecvResult::IoError {
@@ -862,7 +862,7 @@ impl Observer {
                     }
                     if first_event.is_none() {
                         self.next_listener_start = (i + 1) % len;
-                        first_event = Some(Event::Io(e, now_ns));
+                        first_event = Some(Event::Io(e.into_io_error(), now_ns));
                     }
                 }
             }

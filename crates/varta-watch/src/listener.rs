@@ -1186,7 +1186,7 @@ mod udp_impl {
                         io::ErrorKind::Interrupted => continue,
                         _ => {
                             return RecvResult::IoError {
-                                error: e,
+                                error: e.into(),
                                 consumed: false,
                             };
                         }
@@ -1238,7 +1238,7 @@ mod udp_impl {
                     }
                     RecvResult::WouldBlock => panic!("listener did not receive test datagram"),
                     RecvResult::CtrlTruncated(e) | RecvResult::IoError { error: e, .. } => {
-                        panic!("unexpected receive error: {e}")
+                        panic!("unexpected receive error: {}", e.into_io_error())
                     }
                 }
             }
