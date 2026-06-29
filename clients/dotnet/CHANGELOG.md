@@ -8,6 +8,11 @@ here. Versioning is independent of the Rust workspace and follows
 
 ### Fixed
 
+- **`Beat()` now returns `Failed(Closed)` after `Dispose()` instead of throwing
+  `ObjectDisposedException`.** The disposed state is handled inside the normal
+  outcome path before any transport send, preserving the documented
+  never-throws contract during shutdown races.
+
 - **Short successful sends are no longer committed as delivered beats.** The
   agent now requires transports to report the full 32-byte logical frame before
   returning `Sent`; any short return surfaces as `Failed(WriteZero)` and leaves

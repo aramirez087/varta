@@ -145,6 +145,22 @@ def test_beat_rejects_observer_only_stall_without_side_effects(status: object) -
     assert agent._consecutive_dropped == 0
 
 
+def test_beat_after_close_returns_failed_without_sending() -> None:
+    transport = _SimpleSendTransport()
+    agent = Varta(transport)
+
+    agent.close()
+    outcome = agent.beat(Status.OK)
+    agent.close()
+
+    assert outcome.is_failed
+    assert outcome.error is not None
+    assert outcome.error.errno == BeatError.UNKNOWN_ERRNO
+    assert outcome.error.kind == "Closed"
+    assert transport.send_calls == 0
+    assert transport.reconnect_calls == 0
+
+
 def test_consecutive_beats_increment_nonce(
     bound_uds_listener: Tuple[socket.socket, Path],
 ) -> None:

@@ -8,6 +8,11 @@ governed independently — see `book/src/spec/vlp.md` in the workspace.
 
 ### Fixed
 
+- **`Varta.beat()` now returns `failed(Closed)` after `close()` instead of
+  raising an internal assertion.** The agent records a closed state and refuses
+  later beats before touching the transport, preserving the outcome-based
+  never-throw contract during shutdown races.
+
 - **Short successful sends are no longer committed as delivered beats.** The
   agent now requires transports to report the full 32-byte logical frame before
   returning `sent`; a positive short send surfaces as `failed(WriteZero)` and

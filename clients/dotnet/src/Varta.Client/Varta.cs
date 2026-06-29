@@ -117,11 +117,15 @@ public sealed class Varta : IDisposable
     {
         lock (_lock)
         {
-            ObjectDisposedException.ThrowIf(_disposed, this);
             if (!IsAgentStatus(status))
             {
                 _consecutiveDropped = 0;
                 return BeatOutcome.Failed(new BeatError(0, "InvalidInput"));
+            }
+            if (_disposed)
+            {
+                _consecutiveDropped = 0;
+                return BeatOutcome.Failed(new BeatError(0, "Closed"));
             }
 
             // Per-emission PID read — never cache.

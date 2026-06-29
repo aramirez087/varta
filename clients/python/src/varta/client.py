@@ -160,6 +160,10 @@ def _write_zero_outcome() -> BeatOutcome:
     return BeatOutcome.failed(BeatError(BeatError.UNKNOWN_ERRNO, "WriteZero"))
 
 
+def _closed_outcome() -> BeatOutcome:
+    return BeatOutcome.failed(BeatError(BeatError.UNKNOWN_ERRNO, "Closed"))
+
+
 def _errno_name(code: Optional[int]) -> str:
     if code is None:
         return "Unknown"
@@ -237,6 +241,7 @@ class Varta:
         "_connect_pid",
         "_connect_fork_epoch",
         "_fork_recoveries",
+        "_closed",
     )
 
     def __init__(self, transport: BeatTransport) -> None:
@@ -254,6 +259,7 @@ class Varta:
         # PID recycling makes its PID equal this connect-time PID.
         self._connect_fork_epoch = _fork_epoch.register()
         self._fork_recoveries = 0
+        self._closed = False
 
     # --- constructors ---------------------------------------------------
 
@@ -306,6 +312,9 @@ class Varta:
         if status_value is Status.STALL:
             self._consecutive_dropped = 0
             return _invalid_input_outcome()
+        if self._closed:
+            self._consecutive_dropped = 0
+            return _closed_outcome()
 
         pid = os.getpid()
         current_fork_epoch = _fork_epoch.current()
@@ -415,6 +424,9 @@ class Varta:
         return self._fork_recoveries
 
     def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
         self._transport.close()
 
     def __enter__(self) -> "Varta":

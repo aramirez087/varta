@@ -335,6 +335,23 @@ public class VartaAgentTests
     }
 
     [Fact]
+    public void Beat_AfterDispose_ReturnsFailedWithoutSending()
+    {
+        var transport = new CountingTransport();
+        using var agent = global::Varta.Varta.FromTransportForTest(transport);
+
+        agent.Dispose();
+        var outcome = agent.Beat(Status.Ok);
+        agent.Dispose();
+
+        Assert.True(outcome.IsFailed);
+        Assert.Equal(0, outcome.Error.Errno);
+        Assert.Equal("Closed", outcome.Error.Kind);
+        Assert.Equal(0, transport.Sends);
+        Assert.Equal(0, transport.Reconnects);
+    }
+
+    [Fact]
     public void ShortSuccessfulSend_DoesNotCommitNonce()
     {
         using var agent = global::Varta.Varta.FromTransportForTest(new ShortSend());

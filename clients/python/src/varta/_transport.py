@@ -21,6 +21,7 @@ Every transport must guarantee:
 from __future__ import annotations
 
 import abc
+import errno
 import os
 import socket
 from typing import Optional, Tuple, Union
@@ -41,6 +42,10 @@ __all__ = [
     "UdpTransport",
     "SecureUdpTransport",
 ]
+
+
+def _closed_socket_error() -> OSError:
+    return OSError(errno.EBADF, "transport is closed")
 
 
 class BeatTransport(abc.ABC):
@@ -96,8 +101,10 @@ class UdsTransport(BeatTransport):
         self._sock: Optional[socket.socket] = _uds_socket(self._path)
 
     def send(self, buf: bytes) -> int:
-        assert self._sock is not None
-        return self._sock.send(buf)
+        sock = self._sock
+        if sock is None:
+            raise _closed_socket_error()
+        return sock.send(buf)
 
     def reconnect(self) -> None:
         sock = _uds_socket(self._path)
@@ -152,8 +159,10 @@ class UdpTransport(BeatTransport):
         self._sock: Optional[socket.socket] = _udp_socket(self._addr)
 
     def send(self, buf: bytes) -> int:
-        assert self._sock is not None
-        return self._sock.send(buf)
+        sock = self._sock
+        if sock is None:
+            raise _closed_socket_error()
+        return sock.send(buf)
 
     def reconnect(self) -> None:
         sock = _udp_socket(self._addr)
@@ -260,7 +269,9 @@ class SecureUdpTransport(BeatTransport):
         return sock, session_salt, iv_prefix
 
     def send(self, buf: bytes) -> int:
-        assert self._sock is not None
+        sock = self._sock
+        if sock is None:
+            raise _closed_socket_error()
         if len(buf) != FRAME_BYTES:
             raise ValueError("secure-UDP transport expects a 32-byte plaintext frame")
         # Compute the nonce-wrap into locals; transport state is mutated only
@@ -275,6 +286,9 @@ class SecureUdpTransport(BeatTransport):
         if counter >= _AEAD_COUNTER_LIMIT:
             if prefix_index >= _AEAD_COUNTER_LIMIT:
                 self.reconnect()
+                sock = self._sock
+                if sock is None:
+                    raise _closed_socket_error()
                 prefix_index = self._iv_prefix_index
                 counter = self._iv_counter
                 iv_prefix = self._iv_prefix
@@ -292,7 +306,7 @@ class SecureUdpTransport(BeatTransport):
             assert self._key is not None
             wire = encode_shared(self._key, iv_prefix, counter, buf)
             assert len(wire) == SECURE_SHARED_BYTES
-        sent = self._sock.send(wire)
+        sent = sock.send(wire)
         if sent != len(wire):
             return 0
         # Commit-on-success: only advance state after the kernel accepts the
