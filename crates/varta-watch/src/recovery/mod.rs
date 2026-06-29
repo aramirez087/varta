@@ -418,11 +418,21 @@ impl Recovery {
     /// `timeout = None` preserves v0.1.0 semantics: outstanding children
     /// are reaped on completion but are never killed. `timeout = Some(d)`
     /// asks `try_reap` to issue `kill(2)` once a child has been
-    /// outstanding longer than `d`.
+    /// outstanding longer than `d`. Durations below
+    /// [`crate::config::MIN_RECOVERY_TIMEOUT_MS`] are clamped to that floor so
+    /// direct library callers cannot accidentally arm an immediate-kill
+    /// deadline; use `None`, not `Some(Duration::ZERO)`, for never-kill
+    /// semantics.
     ///
     /// The [`Drop`] grace defaults to [`crate::config::DEFAULT_SHUTDOWN_GRACE_MS`].
     /// Use [`Self::with_shutdown_grace`] to override.
     pub fn with_timeout(mode: RecoveryMode, debounce: Duration, timeout: Option<Duration>) -> Self {
+        let timeout = timeout.map(|timeout| {
+            timeout.max(Duration::from_millis(
+                crate::config::MIN_RECOVERY_TIMEOUT_MS,
+            ))
+        });
+
         Recovery {
             mode,
             debounce,

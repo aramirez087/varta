@@ -98,6 +98,36 @@ fn shutdown_grace_builder_clamps_untrusted_values() {
 }
 
 #[test]
+fn timeout_builder_clamps_untrusted_values() {
+    let mode = RecoveryMode::Exec {
+        program: "true".to_string(),
+        args: vec![],
+    };
+    let min = Duration::from_millis(crate::config::MIN_RECOVERY_TIMEOUT_MS);
+
+    let rec = Recovery::with_timeout(mode.clone(), Duration::ZERO, Some(Duration::ZERO));
+    assert_eq!(
+        rec.timeout,
+        Some(min),
+        "zero must clamp to the minimum instead of killing on the first reap tick"
+    );
+
+    let rec = Recovery::with_timeout(
+        mode.clone(),
+        Duration::ZERO,
+        Some(min.saturating_sub(Duration::from_millis(1))),
+    );
+    assert_eq!(rec.timeout, Some(min));
+
+    let accepted = min + Duration::from_millis(1);
+    let rec = Recovery::with_timeout(mode.clone(), Duration::ZERO, Some(accepted));
+    assert_eq!(rec.timeout, Some(accepted));
+
+    let rec = Recovery::with_timeout(mode, Duration::ZERO, None);
+    assert_eq!(rec.timeout, None, "None remains the never-kill setting");
+}
+
+#[test]
 fn exec_mode_spawns_command_via_execvp() {
     let mut rec = Recovery::with_mode(
         RecoveryMode::Exec {
