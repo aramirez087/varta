@@ -316,6 +316,9 @@ type SecureKey = SecureKeyShared | SecureKeyMaster;
 interface NonceReservation {
   ivRandom: Buffer;
   counter: number;
+  nextPrefixIndex: number;
+  nextIvPrefix: Buffer;
+  nextCounter: number;
 }
 
 export class SecureUdpTransport implements BeatTransport {
@@ -410,7 +413,7 @@ export class SecureUdpTransport implements BeatTransport {
     return Buffer.from(this.ivPrefix);
   }
 
-  private reserveNonce(): NonceReservation {
+  private prepareNonce(): NonceReservation {
     if (this.counter === U32_MAX && this.prefixIndex === U32_MAX) {
       // The 64-bit per-session nonce space is exhausted. Match the Rust
       // reference: rotate the whole secure session before emitting another
@@ -418,17 +421,28 @@ export class SecureUdpTransport implements BeatTransport {
       this.reconnect();
     }
 
-    const ivRandom = Buffer.from(this.ivPrefix.subarray(0, IV_RANDOM_BYTES));
-    const counter = this.counter;
-    if (this.counter === U32_MAX) {
-      this.prefixIndex = (this.prefixIndex + 1) >>> 0;
-      this.ivPrefix = deriveIvPrefix(this.sessionSalt, this.prefixIndex);
-      this.counter = 0;
-    } else {
-      this.counter = (this.counter + 1) >>> 0;
+    let nextPrefixIndex = this.prefixIndex;
+    let nextIvPrefix = this.ivPrefix;
+    let counter = this.counter;
+    if (counter === U32_MAX) {
+      nextPrefixIndex = (nextPrefixIndex + 1) >>> 0;
+      nextIvPrefix = deriveIvPrefix(this.sessionSalt, nextPrefixIndex);
+      counter = 0;
     }
 
-    return { ivRandom, counter };
+    return {
+      ivRandom: Buffer.from(nextIvPrefix.subarray(0, IV_RANDOM_BYTES)),
+      counter,
+      nextPrefixIndex,
+      nextIvPrefix,
+      nextCounter: (counter + 1) >>> 0,
+    };
+  }
+
+  private commitNonce(reservation: NonceReservation): void {
+    this.prefixIndex = reservation.nextPrefixIndex;
+    this.ivPrefix = reservation.nextIvPrefix;
+    this.counter = reservation.nextCounter;
   }
 
   send(buf: Buffer): void {
@@ -445,27 +459,27 @@ export class SecureUdpTransport implements BeatTransport {
       throw e;
     }
 
-    // IV reservation is synchronous (cerebrum 2026-05-17 §4): every
-    // queued frame carries a unique nonce even under concurrent
-    // emits. A libuv-reported failure burns a nonce slot — harmless,
-    // since nonces are one-shot.
-    const { ivRandom, counter } = this.reserveNonce();
+    // Compute IV state into locals and commit only after the frame is accepted
+    // for delivery (or queued during connect). A later libuv callback error
+    // still burns the nonce slot because the datagram may already have escaped.
+    const nonce = this.prepareNonce();
 
     let wire: Buffer;
     if (this.secret.kind === "shared") {
-      wire = encodeShared(this.secret.key, ivRandom, counter, buf);
+      wire = encodeShared(this.secret.key, nonce.ivRandom, nonce.counter, buf);
     } else {
       wire = encodeMaster(
         this.secret.masterKey,
         process.pid >>> 0,
-        ivRandom,
-        counter,
+        nonce.ivRandom,
+        nonce.counter,
         buf,
       );
     }
 
     if (!this.connected) {
       this.preConnectQueue.push(wire);
+      this.commitNonce(nonce);
       return;
     }
     const socket = this.socket;
@@ -474,6 +488,7 @@ export class SecureUdpTransport implements BeatTransport {
         this.pendingError = err as NodeJS.ErrnoException;
       }
     });
+    this.commitNonce(nonce);
   }
 
   reconnect(): void {

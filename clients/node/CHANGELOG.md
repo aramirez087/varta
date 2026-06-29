@@ -26,6 +26,12 @@ governed independently — see `book/src/spec/vlp.md` in the workspace.
 
 ### Fixed
 
+- Secure-UDP counter-wrap handling now matches the Rust/Go/Java/Python
+  contract. When the 32-bit AEAD counter is exhausted, the first wrapped
+  frame is sealed under the rotated IV prefix with counter `0`, and a
+  synchronous connected-mode send failure leaves the committed prefix,
+  prefix index, and counter unchanged.
+
 - **Signal panic handler no longer destroys the host application's own
   `SIGTERM`/`SIGINT`/`SIGQUIT`/`SIGHUP` handlers.** The installed handler called
   `process.removeAllListeners(sig)` before re-raising, which stripped every

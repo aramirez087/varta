@@ -186,6 +186,78 @@ test("SecureUdpTransport counter advances commit-on-success", async () => {
   }
 });
 
+test("SecureUdpTransport counter wrap sends first frame under rotated prefix", async () => {
+  const listener = await bindUdpRecorder();
+  try {
+    const key = randomBytes(32);
+    const t = SecureUdpTransport.shared(listener.host, listener.port, key);
+    const buf = Buffer.alloc(FRAME_BYTES);
+    encodeInto(buf, Status.Ok, 12345, 1n, 1n, 0xfeed);
+
+    t.__setPrefixIndexForTest(7);
+    t.__setCounterForTest(0xffffffff);
+    const oldPrefix = t.__getIvPrefixForTest();
+
+    t.send(buf);
+    await listener.wait(1);
+
+    const wire = listener.received[0]!;
+    const wirePrefix = wire.subarray(0, 8);
+    const wireCounter = wire.readUInt32LE(8);
+    assert.equal(wireCounter, 0, "wrap must emit counter 0 under the rotated prefix");
+    assert.notDeepEqual(wirePrefix, oldPrefix, "wrap must not reuse the exhausted prefix");
+    assert.deepEqual(
+      wirePrefix,
+      t.__getIvPrefixForTest(),
+      "committed prefix must match the prefix used on the wire",
+    );
+    assert.equal(t.__getPrefixIndexForTest(), 8);
+    assert.equal(t.__getCounterForTest(), 1);
+
+    const plaintext = decodeShared(key, wire);
+    assert.equal(decode(plaintext).payload, 0xfeed);
+    t.close();
+  } finally {
+    await listener.close();
+  }
+});
+
+test("SecureUdpTransport failed send at counter wrap preserves AEAD state", async () => {
+  const listener = await bindUdpRecorder();
+  try {
+    const key = randomBytes(32);
+    const t = SecureUdpTransport.shared(listener.host, listener.port, key);
+    const buf = Buffer.alloc(FRAME_BYTES);
+    encodeInto(buf, Status.Ok, 12345, 1n, 1n, 0xbeef);
+
+    const internal = t as unknown as {
+      connected: boolean;
+      socket: { send: (wire: Buffer, cb?: (err?: Error) => void) => void };
+    };
+    internal.connected = true;
+
+    t.__setPrefixIndexForTest(7);
+    t.__setCounterForTest(0xffffffff);
+    const prefixBefore = t.__getIvPrefixForTest();
+    const prefixIndexBefore = t.__getPrefixIndexForTest();
+    const counterBefore = t.__getCounterForTest();
+
+    internal.socket.send = () => {
+      const err: NodeJS.ErrnoException = new Error("simulated send failure");
+      err.code = "ENOBUFS";
+      throw err;
+    };
+
+    assert.throws(() => t.send(buf), /simulated send failure/);
+    assert.deepEqual(t.__getIvPrefixForTest(), prefixBefore);
+    assert.equal(t.__getPrefixIndexForTest(), prefixIndexBefore);
+    assert.equal(t.__getCounterForTest(), counterBefore);
+    t.close();
+  } finally {
+    await listener.close();
+  }
+});
+
 test("UdsTransport.send delivers a 32-byte frame to a UDS recorder", async (t) => {
   const listener = await bindUdsRecorder();
   if (listener === null) {
