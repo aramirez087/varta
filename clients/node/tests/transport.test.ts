@@ -123,6 +123,32 @@ test("UdpTransport ignores errors from a retired socket generation", async () =>
   }
 });
 
+test("UdpTransport preserves queued pre-connect beats across reconnect", () => {
+  const t = new UdpTransport("127.0.0.1", 9);
+  const internal = t as unknown as {
+    connected: boolean;
+    openSocket: () => { close(): void };
+    preConnectQueue: Buffer[];
+    socket: { close(): void };
+  };
+  const originalSocket = internal.socket;
+  internal.socket = { close() {} };
+  originalSocket.close();
+  internal.connected = false;
+  internal.openSocket = () => ({ close() {} });
+
+  const buf = Buffer.alloc(FRAME_BYTES);
+  encodeInto(buf, Status.Ok, 12345, 1n, 1n, 0x1111);
+
+  t.send(buf);
+  assert.equal(internal.preConnectQueue.length, 1);
+
+  t.reconnect();
+  assert.equal(internal.preConnectQueue.length, 1, "reconnect must not discard queued beats");
+
+  t.close();
+});
+
 test("SecureUdpTransport (shared) wraps a frame and opens with same key", async () => {
   const listener = await bindUdpRecorder();
   try {
@@ -256,6 +282,33 @@ test("SecureUdpTransport failed send at counter wrap preserves AEAD state", asyn
   } finally {
     await listener.close();
   }
+});
+
+test("SecureUdpTransport preserves queued pre-connect beats across reconnect", () => {
+  const key = randomBytes(32);
+  const t = SecureUdpTransport.shared("127.0.0.1", 9, key);
+  const internal = t as unknown as {
+    connected: boolean;
+    openSocket: () => { close(): void };
+    preConnectQueue: Buffer[];
+    socket: { close(): void };
+  };
+  const originalSocket = internal.socket;
+  internal.socket = { close() {} };
+  originalSocket.close();
+  internal.connected = false;
+  internal.openSocket = () => ({ close() {} });
+
+  const buf = Buffer.alloc(FRAME_BYTES);
+  encodeInto(buf, Status.Ok, 12345, 1n, 1n, 0x2222);
+
+  t.send(buf);
+  assert.equal(internal.preConnectQueue.length, 1);
+
+  t.reconnect();
+  assert.equal(internal.preConnectQueue.length, 1, "reconnect must not discard queued beats");
+
+  t.close();
 });
 
 test("UdsTransport.send delivers a 32-byte frame to a UDS recorder", async (t) => {

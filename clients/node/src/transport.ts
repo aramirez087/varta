@@ -282,7 +282,10 @@ export class UdpTransport implements BeatTransport {
     this.socket = replacement;
     this.connected = false;
     this.pendingError = null;
-    this.preConnectQueue = [];
+    // Keep any beats that were queued while the previous socket was still
+    // connecting. They have not been sent yet, so discarding them would burn
+    // committed client state without giving the replacement socket a chance
+    // to deliver them.
     try {
       old.close();
     } catch {
@@ -500,7 +503,8 @@ export class SecureUdpTransport implements BeatTransport {
     this.socket = newSocket;
     this.connected = false;
     this.pendingError = null;
-    this.preConnectQueue = [];
+    // Preserve queued beats across reconnect for the same reason as the UDP
+    // transport: a queued pre-connect datagram has not been accepted yet.
     this.sessionSalt = newSalt;
     this.prefixIndex = newPrefixIndex;
     this.counter = 0;
