@@ -104,6 +104,7 @@ export class Varta {
   private clockRegressionsCount: bigint;
   private connectPid: number;
   private forkRecoveriesCount: bigint;
+  private closed: boolean;
 
   private constructor(transport: BeatTransport) {
     this.transport = transport;
@@ -116,6 +117,7 @@ export class Varta {
     this.clockRegressionsCount = 0n;
     this.connectPid = process.pid;
     this.forkRecoveriesCount = 0n;
+    this.closed = false;
   }
 
   // ─── constructors ─────────────────────────────────────────────
@@ -158,6 +160,10 @@ export class Varta {
     if (statusValue === null || statusValue === Status.Stall) {
       this.consecutiveDropped = 0;
       return BeatOutcomes.failed(new BeatError(0, "InvalidInput"));
+    }
+    if (this.closed) {
+      this.consecutiveDropped = 0;
+      return BeatOutcomes.failed(new BeatError(0, "Closed"));
     }
 
     const pid = process.pid;
@@ -260,6 +266,8 @@ export class Varta {
   }
 
   close(): void {
+    if (this.closed) return;
+    this.closed = true;
     this.transport.close();
   }
 

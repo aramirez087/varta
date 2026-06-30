@@ -26,6 +26,11 @@ governed independently — see `book/src/spec/vlp.md` in the workspace.
 
 ### Fixed
 
+- `Varta.beat()` after `close()` now returns `{ kind: "failed",
+  error.kind: "Closed" }` without touching the transport. This matches the
+  Rust/Python/Java/.NET outcome contract and prevents shutdown races from
+  sending through, or reconnecting, a closed agent.
+
 - Secure-UDP counter-wrap handling now matches the Rust/Go/Java/Python
   contract. When the 32-bit AEAD counter is exhausted, the first wrapped
   frame is sealed under the rotated IV prefix with counter `0`, and a

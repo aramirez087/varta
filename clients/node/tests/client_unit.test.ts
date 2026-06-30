@@ -39,13 +39,16 @@ class DropAndFailReconnect implements BeatTransport {
 class CountingTransport implements BeatTransport {
   sends = 0;
   reconnects = 0;
+  closes = 0;
   send(_buf: Buffer): void {
     this.sends += 1;
   }
   reconnect(): void {
     this.reconnects += 1;
   }
-  close(): void {}
+  close(): void {
+    this.closes += 1;
+  }
 }
 
 function errnoErr(code: string, errno: number): NodeJS.ErrnoException {
@@ -152,6 +155,24 @@ test("beat rejects observer-only Stall without side effects", () => {
     assert.equal(transport.reconnects, 0);
     agent.close();
   }
+});
+
+test("beat after close returns failed Closed without transport side effects", () => {
+  const transport = new CountingTransport();
+  const agent = Varta.fromTransport(transport);
+
+  agent.close();
+  agent.close();
+  const outcome = agent.beat(Status.Ok);
+
+  assert.equal(outcome.kind, "failed");
+  if (outcome.kind === "failed") {
+    assert.equal(outcome.error.errno, 0);
+    assert.equal(outcome.error.kind, "Closed");
+  }
+  assert.equal(transport.closes, 1);
+  assert.equal(transport.sends, 0);
+  assert.equal(transport.reconnects, 0);
 });
 
 test("beat against a closed listener does not throw", async () => {
