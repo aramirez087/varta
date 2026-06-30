@@ -1816,13 +1816,17 @@ mod tests {
         let end_of_b = std::fs::metadata(&path).expect("meta").len();
 
         // Append a torn fragment with no trailing newline, larger than the
-        // tail window so the window contains no newline at all.
+        // tail window so the window contains no newline at all. Use a marker
+        // outside this fixture's valid record fields; low-entropy digit runs
+        // can appear naturally in timestamps or audit-chain hex.
+        let torn_marker = "TORN_FRAGMENT_SENTINEL";
+        let torn_fragment = torn_marker.repeat((TAIL_SCAN_BYTES as usize / torn_marker.len()) + 2);
         {
             let mut f = OpenOptions::new()
                 .append(true)
                 .open(&path)
                 .expect("open append");
-            f.write_all(&vec![b'9'; 5000]).expect("torn write");
+            f.write_all(torn_fragment.as_bytes()).expect("torn write");
         }
 
         let probe = RecoveryAuditLog::probe_tail(&path).expect("probe");
@@ -1851,7 +1855,10 @@ mod tests {
             body.contains(&big_program),
             "the large durable record must not be destroyed"
         );
-        assert!(!body.contains("99999"), "the torn fragment must be removed");
+        assert!(
+            !body.contains(torn_marker),
+            "the torn fragment must be removed"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
