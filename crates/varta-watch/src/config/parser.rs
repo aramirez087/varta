@@ -613,6 +613,12 @@ impl Config {
                 b: "(missing --prom-addr)",
             });
         }
+        if allow_cross_namespace_agents && strict_namespace_check {
+            return Err(ConfigError::MutuallyExclusive {
+                a: "--allow-cross-namespace-agents",
+                b: "--strict-namespace-check",
+            });
+        }
 
         let shutdown_grace_ms = shutdown_grace_ms.unwrap_or(DEFAULT_SHUTDOWN_GRACE_MS);
         if shutdown_grace_ms < MIN_SHUTDOWN_GRACE_MS {

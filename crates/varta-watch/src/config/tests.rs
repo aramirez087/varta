@@ -1161,6 +1161,24 @@ fn namespace_flags_default_to_false() {
 }
 
 #[test]
+fn namespace_flags_are_mutually_exclusive() {
+    match Config::from_args(args(&[
+        "--socket",
+        "/s",
+        "--threshold-ms",
+        "100",
+        "--allow-cross-namespace-agents",
+        "--strict-namespace-check",
+    ])) {
+        Err(ConfigError::MutuallyExclusive { a, b }) => {
+            assert_eq!(a, "--allow-cross-namespace-agents");
+            assert_eq!(b, "--strict-namespace-check");
+        }
+        other => panic!("expected MutuallyExclusive for namespace flags, got {other:?}"),
+    }
+}
+
+#[test]
 fn recovery_plus_plaintext_udp_without_accept_flag_is_rejected() {
     // H2 mitigation: plaintext UDP + recovery without per-listener flag must fail.
     let err = Config::from_args(args(&[

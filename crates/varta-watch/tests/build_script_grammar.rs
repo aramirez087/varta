@@ -187,6 +187,19 @@ strict_namespace_check = maybe
 }
 
 #[test]
+fn namespace_postures_are_mutually_exclusive() {
+    let bad = "\
+socket = /tmp/x.sock
+threshold_ms = 5000
+allow_cross_namespace_agents = true
+strict_namespace_check = true
+";
+    let err = parse_kv(bad).expect_err("conflicting namespace postures must error");
+    assert!(err.contains("allow_cross_namespace_agents"), "got: {err}");
+    assert!(err.contains("strict_namespace_check"), "got: {err}");
+}
+
+#[test]
 fn invalid_clock_source_is_rejected() {
     let bad = "\
 socket = /tmp/x.sock

@@ -423,7 +423,7 @@ fn record_ingress_event(
     // startup error. The default behaviour is to drop the beat and
     // refuse recovery (already enforced inside `Observer`); strict
     // mode escalates to daemon exit so the operator notices.
-    if cfg.strict_namespace_check && !cfg.allow_cross_namespace_agents {
+    if cfg.strict_namespace_check {
         if let Event::NamespaceConflict { claimed_pid, .. } = ev {
             #[cfg(not(feature = "compile-time-config"))]
             varta_error!(

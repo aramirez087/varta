@@ -87,6 +87,12 @@ impl super::types::Config {
                 reason: "multiple recovery command sources configured",
             });
         }
+        if self.allow_cross_namespace_agents && self.strict_namespace_check {
+            return Err(ConfigError::CompileTimeConfigInvalid {
+                reason:
+                    "allow_cross_namespace_agents and strict_namespace_check are mutually exclusive",
+            });
+        }
         for entry in &self.recovery_env {
             super::validate::validate_recovery_env_entry(entry)?;
         }
@@ -361,6 +367,21 @@ mod tests {
         assert!(matches!(
             cfg.validate_runtime(),
             Err(ConfigError::BadRecoveryEnv(raw)) if raw == "MISSING_SEPARATOR"
+        ));
+    }
+
+    #[test]
+    fn validate_runtime_rejects_conflicting_namespace_postures() {
+        let mut cfg = valid_config();
+        cfg.allow_cross_namespace_agents = true;
+        cfg.strict_namespace_check = true;
+
+        assert!(matches!(
+            cfg.validate_runtime(),
+            Err(ConfigError::CompileTimeConfigInvalid {
+                reason:
+                    "allow_cross_namespace_agents and strict_namespace_check are mutually exclusive"
+            })
         ));
     }
 

@@ -499,6 +499,14 @@ fn validate_cross_field(parsed: &ParsedConfig) -> Result<(), String> {
     if has_recovery_exec && has_recovery_file {
         return Err("recovery_exec_cmd and recovery_exec_file are mutually exclusive".to_string());
     }
+    if bool_key(parsed, "allow_cross_namespace_agents")?
+        && bool_key(parsed, "strict_namespace_check")?
+    {
+        return Err(
+            "allow_cross_namespace_agents and strict_namespace_check are mutually exclusive"
+                .to_string(),
+        );
+    }
     if bool_key(parsed, "recovery_capture_stdio")? && !has_recovery {
         return Err(
             "recovery_capture_stdio requires recovery_exec_cmd or recovery_exec_file".to_string(),
