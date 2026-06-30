@@ -1,6 +1,7 @@
 package varta
 
 import (
+	"errors"
 	"fmt"
 	"math"
 	"os"
@@ -24,6 +25,7 @@ type Varta struct {
 	transport          transport.BeatTransport
 	buf                [vlp.FrameBytes]byte
 	startMono          time.Time
+	closed             bool
 	nonce              uint64
 	consecutiveDropped uint32
 	reconnectAfter     uint32
@@ -94,6 +96,11 @@ func (v *Varta) Beat(status Status, payload uint32) BeatOutcome {
 	if !isAgentStatus(status) {
 		v.consecutiveDropped = 0
 		return BeatOutcomeFailed(BeatError{Errno: 0, Kind: "InvalidInput"})
+	}
+
+	if v.closed {
+		v.consecutiveDropped = 0
+		return BeatOutcomeFailed(BeatError{Errno: 0, Kind: "Closed"})
 	}
 
 	pid := os.Getpid()
@@ -185,6 +192,9 @@ func (v *Varta) commitSentFrame(nonce uint64, timestamp uint64, wrapped bool) {
 func (v *Varta) Reconnect() error {
 	v.mu.Lock()
 	defer v.mu.Unlock()
+	if v.closed {
+		return errClosed
+	}
 	if err := v.transport.Reconnect(); err != nil {
 		return err
 	}
@@ -222,6 +232,11 @@ func (v *Varta) ForkRecoveries() uint64 {
 func (v *Varta) Close() error {
 	v.mu.Lock()
 	defer v.mu.Unlock()
+	if v.closed {
+		return nil
+	}
+	v.closed = true
+	v.consecutiveDropped = 0
 	return v.transport.Close()
 }
 
@@ -253,6 +268,8 @@ func saturatingAdd32(x, delta uint32) uint32 {
 }
 
 var nonceWrapOnce sync.Once
+
+var errClosed = errors.New("varta: agent is closed")
 
 func warnNonceWrapOnce() {
 	nonceWrapOnce.Do(func() {

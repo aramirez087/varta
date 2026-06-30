@@ -18,6 +18,14 @@ workspace and follows [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **Closed agents now fail with the canonical `Failed(Closed)` outcome and do
+  not reopen transport state.** The JVM client already guarded `beat()` after
+  `close()`, but returned a human sentence instead of the stable `Closed`
+  error kind; explicit `reconnect()` could also reopen a transport after the
+  agent-level closed flag was set. `close()` remains idempotent, `beat()` now
+  fails closed before PID/fork/reconnect/send work, and `reconnect()` is
+  rejected once closed.
+
 - **`beat(null, payload)` now returns `Failed(InvalidInput)` instead of
   throwing `NullPointerException`.** The JVM client documents `beat()` as
   non-throwing, and `null` is the only invalid status value Java callers can

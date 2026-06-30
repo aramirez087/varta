@@ -34,6 +34,14 @@ governed independently — see `book/src/spec/vlp.md` in the workspace.
 
 ### Fixed
 
+- **`Beat()` after `Close()` now returns `Failed(Closed)` without touching the
+  transport.** The Go agent previously closed only the transport; UDS/UDP
+  transports nil their socket on close, so a later `Beat()` could panic while
+  sending through a nil connection, or run fork/reconnect side effects on an
+  already-closed agent. `Close()` is now idempotent at the agent layer,
+  `Beat()` fails closed before PID/fork/reconnect/send work, and explicit
+  `Reconnect()` is rejected once the agent is closed.
+
 - **Short successful sends are no longer committed as delivered beats.** The
   agent now requires transports to report the full 32-byte logical frame before
   returning `Sent`; a positive short send, or secure UDP's `io.ErrShortWrite`

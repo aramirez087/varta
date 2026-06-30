@@ -1,15 +1,40 @@
 package health.varta;
 
+import health.varta.transport.BeatTransport;
 import org.junit.jupiter.api.Test;
 
+import java.io.IOException;
 import java.net.DatagramPacket;
 import java.net.DatagramSocket;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
+import java.nio.ByteBuffer;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 class VartaAgentTest {
+    private static final class CountingTransport implements BeatTransport {
+        int sends = 0;
+        int reconnects = 0;
+        int closes = 0;
+
+        @Override
+        public int send(ByteBuffer frame) {
+            sends++;
+            return Varta.FRAME_BYTES;
+        }
+
+        @Override
+        public void reconnect() throws IOException {
+            reconnects++;
+        }
+
+        @Override
+        public void close() {
+            closes++;
+        }
+    }
 
     @Test
     void beat_over_udp_round_trips_to_recorder() throws Exception {
@@ -66,14 +91,22 @@ class VartaAgentTest {
     }
 
     @Test
-    void close_is_idempotent() throws Exception {
-        try (DatagramSocket rec = new DatagramSocket(new InetSocketAddress("127.0.0.1", 0))) {
-            Varta agent = Varta.connectUdp(
-                new InetSocketAddress(InetAddress.getLoopbackAddress(), rec.getLocalPort()));
-            agent.close();
-            agent.close();
-            // Beat after close returns Failed, never throws.
-            assertThat(agent.beat(Status.OK)).isInstanceOf(BeatOutcome.Failed.class);
-        }
+    void close_is_idempotent_and_closed_beat_has_no_transport_side_effects() {
+        CountingTransport transport = new CountingTransport();
+        Varta agent = Varta.__forTest(transport);
+        agent.__setConnectPidForTest(-1);
+
+        agent.close();
+        agent.close();
+
+        assertThatThrownBy(agent::reconnect)
+            .isInstanceOf(IllegalStateException.class)
+            .hasMessage("Varta.reconnect: Closed");
+        assertThat(agent.beat(Status.OK))
+            .isInstanceOfSatisfying(BeatOutcome.Failed.class,
+                failed -> assertThat(failed.error().kind()).isEqualTo("Closed"));
+        assertThat(transport.sends).isZero();
+        assertThat(transport.reconnects).isZero();
+        assertThat(transport.closes).isEqualTo(1);
     }
 }

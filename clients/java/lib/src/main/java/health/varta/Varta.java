@@ -123,7 +123,8 @@ public final class Varta implements AutoCloseable {
         }
         synchronized (lock) {
             if (closed) {
-                return BeatOutcome.failed(new BeatError(0, "Varta agent is closed"));
+                consecutiveDropped = 0;
+                return BeatOutcome.failed(new BeatError(0, "Closed"));
             }
 
             // 1) Fork-safety: PID changed → reconnect, reset session state.
@@ -268,6 +269,9 @@ public final class Varta implements AutoCloseable {
     /** Reopen the underlying transport. Throws {@link IllegalStateException} on I/O failure. */
     public void reconnect() {
         synchronized (lock) {
+            if (closed) {
+                throw new IllegalStateException("Varta.reconnect: Closed");
+            }
             try {
                 transport.reconnect();
                 connectPid = currentPid();
@@ -313,6 +317,7 @@ public final class Varta implements AutoCloseable {
         synchronized (lock) {
             if (closed) return;
             closed = true;
+            consecutiveDropped = 0;
             transport.close();
         }
     }
