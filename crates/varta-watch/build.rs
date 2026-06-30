@@ -363,18 +363,15 @@ pub fn parse_kv(input: &str) -> Result<ParsedConfig, String> {
         }
         // Keep `1000` in sync with config::types::MAX_READ_TIMEOUT_MS
         // (= POLL_STAGE_ABORT_MS / 2; build.rs cannot import crate consts). A
-        // baked read_timeout above the ceiling passes the build but is rejected
-        // at startup by Config::validate_runtime (ReadTimeoutTooLarge), so the
-        // sealed Class-A image never starts. This static cap mirrors the most
-        // permissive runtime ceiling; a configured --self-watchdog-secs lowers
-        // it further at runtime (validate_runtime still catches that sub-case).
-        if n > 1000 {
-            return Err(
-                "read_timeout_ms must be <= 1000 (one idle UDS recv must stay below the \
-                 Poll-stage self-watchdog abort; a configured self_watchdog_secs lowers this \
-                 further at runtime; omit the key for the 100 ms default)"
-                    .into(),
-            );
+        // configured self_watchdog_secs can lower the active runtime ceiling;
+        // mirror that cross-field check here so a sealed Class-A image cannot
+        // build successfully and then fail Config::validate_runtime at startup.
+        let max_read_timeout_ms = max_read_timeout_ms_for_build(&out)?;
+        if n > max_read_timeout_ms {
+            return Err(format!(
+                "read_timeout_ms must be <= {max_read_timeout_ms} (one idle UDS recv must stay \
+                 below the active self-watchdog budget; omit the key for the 100 ms default)"
+            ));
         }
     }
     if let Some(v) = out.singletons.get("eviction_scan_window") {
@@ -490,6 +487,18 @@ fn bool_key(parsed: &ParsedConfig, key: &str) -> Result<bool, String> {
         Some(v) => Err(format!("{key}: expected true or false, got {v:?}")),
         None => Ok(false),
     }
+}
+
+fn max_read_timeout_ms_for_build(parsed: &ParsedConfig) -> Result<u64, String> {
+    let static_cap = 1000u64;
+    let Some(v) = parsed.singletons.get("self_watchdog_secs") else {
+        return Ok(static_cap);
+    };
+    let secs: u64 = v
+        .parse()
+        .map_err(|_| format!("self_watchdog_secs: not a valid u64: {v:?}"))?;
+    let half_deadline_ms = u128::from(secs) * 1000 / 2;
+    Ok(half_deadline_ms.min(u128::from(static_cap)) as u64)
 }
 
 fn validate_cross_field(parsed: &ParsedConfig) -> Result<(), String> {

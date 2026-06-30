@@ -285,6 +285,31 @@ read_timeout_ms = 1000
 }
 
 #[test]
+fn read_timeout_ms_respects_self_watchdog_ceiling() {
+    let bad = "\
+socket = /tmp/x.sock
+threshold_ms = 5000
+self_watchdog_secs = 1
+read_timeout_ms = 501
+";
+    let err = parse_kv(bad)
+        .expect_err("read_timeout_ms above half the baked self-watchdog window must error");
+    assert!(err.contains("read_timeout_ms"), "got: {err}");
+    assert!(err.contains("500"), "got: {err}");
+}
+
+#[test]
+fn read_timeout_ms_at_self_watchdog_ceiling_is_accepted() {
+    let cfg = "\
+socket = /tmp/x.sock
+threshold_ms = 5000
+self_watchdog_secs = 1
+read_timeout_ms = 500
+";
+    parse_kv(cfg).expect("read_timeout_ms at the active self-watchdog ceiling should parse");
+}
+
+#[test]
 fn uds_rcvbuf_bytes_above_setsockopt_int_max_is_rejected() {
     let bad = "\
 socket = /tmp/x.sock
