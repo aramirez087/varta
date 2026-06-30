@@ -67,7 +67,8 @@ pub struct CompleteRecord {
     pub stdout_len: u32,
     /// Number of bytes captured from child stderr (0 when capture disabled).
     pub stderr_len: u32,
-    /// True iff capture was enabled and either stream hit its byte cap.
+    /// True iff capture was enabled and setup failed, a stream hit its byte
+    /// cap, or post-exit capture draining was abandoned after the grace window.
     pub truncated: bool,
 }
 

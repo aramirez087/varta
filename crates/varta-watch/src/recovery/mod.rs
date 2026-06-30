@@ -1025,7 +1025,7 @@ impl Recovery {
                         Ok(Some(status)) => {
                             entry.completed_status = Some(status);
                             entry.completed_at = Some(Instant::now());
-                            if Self::capture_drained(entry) {
+                            if Self::capture_ready_to_complete(entry) {
                                 Some(OrphanTerminal::Complete)
                             } else {
                                 None
@@ -1037,7 +1037,7 @@ impl Recovery {
                         }
                         Err(error) => Some(OrphanTerminal::ReapFailed(error)),
                     }
-                } else if Self::capture_drained(entry) {
+                } else if Self::capture_ready_to_complete(entry) {
                     Some(OrphanTerminal::Complete)
                 } else {
                     None

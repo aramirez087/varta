@@ -18,10 +18,12 @@ pub(super) const CAPTURE_DRAIN_BYTES_PER_TICK: usize = 4096;
 /// recovery command that backgrounds a grandchild inheriting the capture pipe
 /// write-end pins the slot forever: the child has exited (`completed_status`
 /// set) but the read-end never reaches EOF, and below the cap `truncated`
-/// never trips, so [`Self::capture_drained`] would otherwise never return true.
-/// Past this window the slot is reclaimed with whatever was captured; capture
-/// is best-effort and bounded, so dropping a wedged tail is preferable to an
-/// unbounded leak that permanently disables recovery for the pid.
+/// never trips, so [`Self::capture_ready_to_complete`] would otherwise never
+/// return true.
+/// Past this window the slot is reclaimed with whatever was captured and the
+/// completion audit record is marked `truncated`; capture is best-effort and
+/// bounded, so dropping a wedged tail is preferable to an unbounded leak that
+/// permanently disables recovery for the pid.
 pub(super) const POST_EXIT_CAPTURE_DRAIN_GRACE: Duration = Duration::from_secs(5);
 
 impl Recovery {
@@ -66,7 +68,7 @@ impl Recovery {
             }
             if let Some(error) = reap_error {
                 Step::ReapFailed { child_pid, error }
-            } else if Self::capture_drained(entry_mut) {
+            } else if Self::capture_ready_to_complete(entry_mut) {
                 Step::Complete { child_pid }
             } else {
                 Step::Pending
@@ -216,10 +218,16 @@ impl Recovery {
         }
     }
 
-    pub(super) fn capture_drained(entry: &Outstanding) -> bool {
-        entry.truncated
-            || (entry.stdout_handle.is_none() && entry.stderr_handle.is_none())
-            || matches!(entry.completed_at, Some(t) if t.elapsed() >= POST_EXIT_CAPTURE_DRAIN_GRACE)
+    pub(super) fn capture_ready_to_complete(entry: &mut Outstanding) -> bool {
+        if matches!(entry.completed_at, Some(t) if t.elapsed() >= POST_EXIT_CAPTURE_DRAIN_GRACE) {
+            if entry.stdout_handle.is_some() || entry.stderr_handle.is_some() {
+                entry.truncated = true;
+                Self::close_capture_handles(entry);
+            }
+            return true;
+        }
+
+        entry.truncated || (entry.stdout_handle.is_none() && entry.stderr_handle.is_none())
     }
 
     fn close_capture_handles(entry: &mut Outstanding) {

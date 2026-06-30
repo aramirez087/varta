@@ -916,14 +916,20 @@ fn capture_truncates_at_per_child_cap() {
 /// grandchild inheriting the capture pipe write-end must not pin its
 /// outstanding slot forever. The immediate child is reaped (`completed_status`
 /// set), but the read-end never reaches EOF (the grandchild holds the
-/// write-end) and stays below the cap (never `truncated`), so the two original
-/// `capture_drained` terminal conditions are never met. The post-exit grace
-/// is the only thing that reclaims the slot; without it, `on_stall` returns
-/// `Debounced` for this pid forever and the leak can starve other pids.
+/// write-end) and stays below the cap (never `truncated` before the grace),
+/// so the two original capture-complete conditions are never met. The
+/// post-exit grace is the only thing that reclaims the slot; without it,
+/// `on_stall` returns `Debounced` for this pid forever and the leak can starve
+/// other pids.
 #[test]
 #[cfg_attr(miri, ignore)]
 fn exited_child_with_open_inherited_pipe_is_reclaimed_after_grace() {
     const PID: u32 = 991;
+
+    let dir = audit_tmpdir("post-exit-pipe");
+    let path = dir.join("audit.log");
+    let (sink, _) = audit::RecoveryAuditLog::create(&path, audit::AuditConfig::default())
+        .expect("create audit");
 
     let mut rec = Recovery::with_mode(
         RecoveryMode::Exec {
@@ -935,7 +941,8 @@ fn exited_child_with_open_inherited_pipe_is_reclaimed_after_grace() {
         },
         Duration::ZERO,
     )
-    .with_capture(8192);
+    .with_capture(8192)
+    .with_audit_sink(Some(sink));
 
     match rec.on_stall(PID, BeatOrigin::KernelAttested, false, None, 0) {
         RecoveryOutcome::Spawned { .. } => {}
@@ -981,6 +988,19 @@ fn exited_child_with_open_inherited_pipe_is_reclaimed_after_grace() {
         !rec.outstanding.contains(PID),
         "outstanding slot must be freed after the grace-driven reap"
     );
+    drop(rec);
+
+    let body = std::fs::read_to_string(&path).expect("read audit");
+    let complete = body
+        .lines()
+        .find(|l| l.contains("\tcomplete\t991\t"))
+        .expect("complete line");
+    let cols: Vec<&str> = complete.split('\t').collect();
+    assert_eq!(
+        cols[12], "true",
+        "grace-driven capture abandonment must be audit-visible as truncated: {complete}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
