@@ -128,6 +128,34 @@ fn timeout_builder_clamps_untrusted_values() {
 }
 
 #[test]
+fn recovery_env_builder_invalid_entry_fails_transactionally() {
+    let mode = RecoveryMode::Exec {
+        program: "true".to_string(),
+        args: vec![],
+    };
+    let mut rec = Recovery::with_mode(mode, Duration::from_secs(60))
+        .with_recovery_env(vec!["MISSING_SEPARATOR".to_string()]);
+
+    match rec.on_stall(42, BeatOrigin::KernelAttested, false, None, 0) {
+        RecoveryOutcome::SpawnFailed(e) => {
+            assert_eq!(e.kind(), std::io::ErrorKind::InvalidInput);
+            assert!(e.to_string().contains("MISSING_SEPARATOR"));
+        }
+        other => panic!("expected invalid recovery env to fail spawn, got {other:?}"),
+    }
+    assert!(
+        !rec.outstanding.contains(42),
+        "failed env validation must release the outstanding reservation"
+    );
+
+    rec = rec.with_recovery_env(vec!["RECOVERY_OK=1".to_string()]);
+    match rec.on_stall(42, BeatOrigin::KernelAttested, false, None, 0) {
+        RecoveryOutcome::Spawned { .. } => {}
+        other => panic!("failed env validation must not commit debounce state, got {other:?}"),
+    }
+}
+
+#[test]
 fn exec_mode_spawns_command_via_execvp() {
     let mut rec = Recovery::with_mode(
         RecoveryMode::Exec {

@@ -172,7 +172,13 @@ impl Recovery {
                     .chain(args.iter().map(|a| a.replace("{pid}", &pid_str)))
                     .collect();
                 let mut cmd = Command::new(&substituted[0]);
-                env::apply_env(&mut cmd, self.recovery_inherit_env, &self.recovery_env);
+                if let Err(e) =
+                    env::apply_env(&mut cmd, self.recovery_inherit_env, &self.recovery_env)
+                {
+                    self.outstanding.release_reservation(reservation);
+                    self.record_refused_audit(pid, observer_ns, AUDIT_REASON_SPAWN_FAILED);
+                    return RecoveryOutcome::SpawnFailed(e);
+                }
                 for arg in &substituted[1..] {
                     cmd.arg(arg);
                 }

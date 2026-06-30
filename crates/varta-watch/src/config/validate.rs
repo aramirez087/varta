@@ -73,10 +73,7 @@ pub fn parse_exec_cmd(cmd: &str) -> std::io::Result<(String, Vec<String>)> {
 /// NUL at spawn time. The parser rejects those shapes up front so recovery
 /// does not fail only after an agent has already stalled.
 pub(super) fn validate_recovery_env_entry(raw: &str) -> Result<(), ConfigError> {
-    let Some((key, value)) = raw.split_once('=') else {
-        return Err(ConfigError::BadRecoveryEnv(raw.to_string()));
-    };
-    if key.is_empty() || key.contains('\0') || value.contains('\0') {
+    if !crate::recovery::is_valid_recovery_env_entry(raw) {
         return Err(ConfigError::BadRecoveryEnv(raw.to_string()));
     }
     Ok(())

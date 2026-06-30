@@ -40,6 +40,11 @@ mod runner;
 use debounce::LastFiredTable;
 use runner::{KillForReclaim, Outstanding};
 
+/// Return whether a recovery child environment override is valid `KEY=VALUE`.
+pub(crate) fn is_valid_recovery_env_entry(raw: &str) -> bool {
+    env::is_valid_entry(raw)
+}
+
 /// Maximum number of outstanding pids visited per [`Recovery::try_reap_into`] call.
 ///
 /// Bounds the `waitpid(2, WNOHANG)` + optional `kill(2)` syscall budget to at
@@ -790,6 +795,8 @@ impl Recovery {
     /// Set explicit environment variables for child processes.
     ///
     /// Each entry is in `KEY=VALUE` format.
+    /// Invalid entries fail closed as [`RecoveryOutcome::SpawnFailed`] before
+    /// the child process is spawned.
     pub fn with_recovery_env(mut self, env: Vec<String>) -> Self {
         self.recovery_env = env;
         self
