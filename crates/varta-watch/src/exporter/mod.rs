@@ -352,8 +352,10 @@ const PROM_IP_STATE_SWEEP_INTERVAL: Duration = Duration::from_secs(10);
 #[derive(Clone, Copy, Debug)]
 struct PromIpState {
     /// Tokens available (fractional, scaled by 1000 to avoid floats).
-    /// Each accepted connection consumes 1000 milli-tokens.
-    tokens_milli: u32,
+    /// Each accepted connection consumes 1000 milli-tokens. This is wider
+    /// than the configured token count because `rate_burst` accepts `u32`
+    /// whole tokens and the internal scale factor must not lower that cap.
+    tokens_milli: u64,
     /// Wall-clock instant at which `tokens_milli` was last refilled.
     last_refill: Instant,
     /// Most recent connection from this IP — used for stale eviction.

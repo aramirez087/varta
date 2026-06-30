@@ -40,8 +40,8 @@ impl super::PromExporter {
         if self.rate_burst == 0 || self.rate_per_sec == 0 {
             return true;
         }
-        let cap_milli: u32 = self.rate_burst.saturating_mul(1000);
-        let refill_per_ms: u32 = self.rate_per_sec; // 1000 milli-tokens / 1000 ms
+        let cap_milli: u64 = u64::from(self.rate_burst).saturating_mul(1000);
+        let refill_per_ms: u64 = u64::from(self.rate_per_sec); // 1000 milli-tokens / 1000 ms
 
         // Periodic stale sweep — cheap when the table is sparse, bounded
         // by MAX_PROM_IP_STATES iterations when it isn't.
@@ -52,10 +52,11 @@ impl super::PromExporter {
 
         match self.ip_state.get_mut(ip) {
             Some(st) => {
-                let elapsed_ms = now.duration_since(st.last_refill).as_millis() as u64;
+                let elapsed_ms = u64::try_from(now.duration_since(st.last_refill).as_millis())
+                    .unwrap_or(u64::MAX);
                 if elapsed_ms > 0 {
-                    let add_milli =
-                        (elapsed_ms as u128 * refill_per_ms as u128).min(u32::MAX as u128) as u32;
+                    let add_milli = (u128::from(elapsed_ms) * u128::from(refill_per_ms))
+                        .min(u128::from(cap_milli)) as u64;
                     st.tokens_milli = st.tokens_milli.saturating_add(add_milli).min(cap_milli);
                     st.last_refill = now;
                 }

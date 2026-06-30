@@ -799,6 +799,37 @@ fn allow_ip_denies_after_burst_and_records_rate_limit() {
     assert!(prom.allow_ip(ip, t1));
 }
 
+/// Regression: configured bursts are whole-token `u32` values, while the
+/// internal bucket stores milli-tokens. Large accepted burst values must not
+/// silently saturate the effective bucket below the configured capacity.
+#[test]
+fn allow_ip_honors_large_u32_burst_without_millitoken_saturation() {
+    let large_burst = u32::MAX / 1000 + 2;
+    let mut prom = PromExporter::bind_with_rate_limit(
+        "127.0.0.1:0".parse().unwrap(),
+        make_token(),
+        /* rate_per_sec */ 1,
+        large_burst,
+    )
+    .expect("bind");
+
+    let ip: std::net::IpAddr = "127.0.0.1".parse().unwrap();
+    let t0 = Instant::now();
+
+    assert!(prom.allow_ip(ip, t0));
+    let state = prom
+        .ip_state
+        .get_mut(ip)
+        .expect("state recorded for first accepted scrape");
+    assert_eq!(
+        state.tokens_milli,
+        u64::from(large_burst)
+            .saturating_mul(1000)
+            .saturating_sub(1000),
+        "bucket capacity must honor the full configured u32 burst"
+    );
+}
+
 /// `allow_ip` with `rate_burst = 0` must always allow — this is the
 /// "no rate limit" escape hatch.  The IP-state map must stay empty.
 #[test]
