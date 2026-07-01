@@ -13,9 +13,10 @@ use std::time::Instant;
 
 #[cfg(feature = "prometheus-exporter")]
 use super::{
-    drop_reason_index, DropReason, ServeOutcome, MAX_PROM_IP_STATES, PROM_IP_STATE_SWEEP_INTERVAL,
-    PROM_IP_STATE_TTL, PROM_MAX_CONNECTIONS_PER_SERVE, PROM_MAX_DRAIN_PER_SERVE,
-    PROM_MIN_SCRAPE_INTERVAL, PROM_READ_DEADLINE, PROM_REQUEST_CAP, PROM_WRITE_TIMEOUT,
+    drop_reason_index, DropReason, ServeOutcome, MAX_PROM_IP_STATES, PROM_DRAIN_PHASE_CAP,
+    PROM_IP_STATE_SWEEP_INTERVAL, PROM_IP_STATE_TTL, PROM_MAX_CONNECTIONS_PER_SERVE,
+    PROM_MAX_DRAIN_PER_SERVE, PROM_MIN_SCRAPE_INTERVAL, PROM_READ_DEADLINE, PROM_REQUEST_CAP,
+    PROM_SERVE_PHASE_CAP, PROM_WRITE_TIMEOUT,
 };
 
 #[cfg(feature = "prometheus-exporter")]
@@ -122,7 +123,7 @@ impl super::PromExporter {
     /// drains cleanly; returns the first non-`WouldBlock` error otherwise.
     ///
     /// Service budget per call is bounded by two limits (whichever hits
-    /// first): a 100 ms wall-clock deadline and
+    /// first): the configured scrape budget capped at 100 ms and
     /// [`PROM_MAX_CONNECTIONS_PER_SERVE`] accepted connections. Both
     /// exist to prevent a storm of slow scrapers from starving the
     /// observer poll loop (stall detection, I/O polling, reaping).
@@ -137,7 +138,12 @@ impl super::PromExporter {
         let mut render_fresh = self
             .last_scrape
             .map_or(true, |last| last.elapsed() >= PROM_MIN_SCRAPE_INTERVAL);
-        let serve_deadline = Instant::now() + std::time::Duration::from_millis(100);
+        let started = Instant::now();
+        let structural_budget = PROM_SERVE_PHASE_CAP + PROM_DRAIN_PHASE_CAP;
+        let hard_budget = self.scrape_budget.min(structural_budget);
+        let serve_budget = hard_budget.min(PROM_SERVE_PHASE_CAP);
+        let serve_deadline = started + serve_budget;
+        let hard_deadline = started + hard_budget;
         let mut served = 0;
         let mut served_fresh = false;
         let result = loop {
@@ -162,7 +168,7 @@ impl super::PromExporter {
                         drop(stream);
                         continue;
                     }
-                    match self.serve_one(stream, render_fresh) {
+                    match self.serve_one(stream, render_fresh, serve_deadline) {
                         ServeOutcome::ServedFresh => {
                             served_fresh = true;
                             // `last_scrape` is committed after the batch, so
@@ -193,7 +199,7 @@ impl super::PromExporter {
         }
         let mut drained = 0;
         while drained < PROM_MAX_DRAIN_PER_SERVE {
-            if Instant::now() >= serve_deadline + std::time::Duration::from_millis(100) {
+            if Instant::now() >= hard_deadline {
                 break;
             }
             match self.listener.accept() {
@@ -216,7 +222,12 @@ impl super::PromExporter {
         result
     }
 
-    fn serve_one(&mut self, mut stream: TcpStream, render_fresh: bool) -> ServeOutcome {
+    fn serve_one(
+        &mut self,
+        mut stream: TcpStream,
+        render_fresh: bool,
+        batch_deadline: Instant,
+    ) -> ServeOutcome {
         // Linux accept4(2) with SOCK_CLOEXEC does *not* propagate O_NONBLOCK
         // to the accepted socket — the man page is explicit on this.  Set it
         // unconditionally so the deadline loops below are the actual latency
@@ -230,7 +241,7 @@ impl super::PromExporter {
         if stream.set_nonblocking(true).is_err() {
             return ServeOutcome::Rejected;
         }
-        let deadline = Instant::now() + PROM_READ_DEADLINE;
+        let deadline = earlier_deadline(Instant::now() + PROM_READ_DEADLINE, batch_deadline);
         // PROM_REQUEST_CAP bytes covers the widest real-world request: a
         // Prometheus request line + Authorization header + verbose user-agent /
         // Accept / Accept-Encoding headers can exceed 512 bytes on some
@@ -281,7 +292,8 @@ impl super::PromExporter {
 
         if total < 4 || buf[..4] != *b"GET " {
             let response = b"HTTP/1.0 405 Method Not Allowed\r\nAllow: GET\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
-            let cleanup_deadline = Instant::now() + PROM_WRITE_TIMEOUT;
+            let cleanup_deadline =
+                earlier_deadline(Instant::now() + PROM_WRITE_TIMEOUT, batch_deadline);
             let _ = write_all_nonblocking(&mut stream, response, cleanup_deadline);
             drain_read_to_would_block(&mut stream, cleanup_deadline);
             let _ = stream.shutdown(Shutdown::Write);
@@ -301,7 +313,8 @@ impl super::PromExporter {
         if !authorized {
             self.prom_auth_failures_total = self.prom_auth_failures_total.saturating_add(1);
             let response = b"HTTP/1.0 401 Unauthorized\r\nWWW-Authenticate: Bearer realm=\"varta\"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
-            let cleanup_deadline = Instant::now() + PROM_WRITE_TIMEOUT;
+            let cleanup_deadline =
+                earlier_deadline(Instant::now() + PROM_WRITE_TIMEOUT, batch_deadline);
             let _ = write_all_nonblocking(&mut stream, response, cleanup_deadline);
             drain_read_to_would_block(&mut stream, cleanup_deadline);
             let _ = stream.shutdown(Shutdown::Write);
@@ -309,24 +322,46 @@ impl super::PromExporter {
         }
 
         if render_fresh {
+            if Instant::now() >= batch_deadline {
+                return ServeOutcome::Rejected;
+            }
             self.render_body();
         }
+        if Instant::now() >= batch_deadline {
+            return ServeOutcome::Rejected;
+        }
         let body_len = self.body_buf.len();
-        let write_deadline = Instant::now() + PROM_WRITE_TIMEOUT;
+        let write_deadline = earlier_deadline(Instant::now() + PROM_WRITE_TIMEOUT, batch_deadline);
         // Write headers and body in two parts to avoid allocating a
         // combined response String.
-        let _ = write_headers_with_len(&mut stream, body_len, write_deadline);
-        let _ = write_all_nonblocking(&mut stream, self.body_buf.as_bytes(), write_deadline);
+        let response_written = match write_headers_with_len(&mut stream, body_len, write_deadline) {
+            Ok(true) => {
+                write_all_nonblocking(&mut stream, self.body_buf.as_bytes(), write_deadline)
+                    .unwrap_or(false)
+            }
+            Ok(false) | Err(_) => false,
+        };
         drain_read_to_would_block(&mut stream, write_deadline);
         let _ = stream.shutdown(Shutdown::Write);
         // An authorized client was served. `render_fresh` decides whether the
         // body it received was freshly rendered (advances `last_scrape`) or
         // came from the cache (counts as a skipped scrape).
-        if render_fresh {
+        if !response_written {
+            ServeOutcome::Rejected
+        } else if render_fresh {
             ServeOutcome::ServedFresh
         } else {
             ServeOutcome::ServedCached
         }
+    }
+}
+
+#[cfg(feature = "prometheus-exporter")]
+fn earlier_deadline(left: Instant, right: Instant) -> Instant {
+    if left <= right {
+        left
+    } else {
+        right
     }
 }
 
@@ -338,7 +373,7 @@ pub(super) fn write_headers_with_len(
     stream: &mut TcpStream,
     body_len: usize,
     deadline: Instant,
-) -> io::Result<()> {
+) -> io::Result<bool> {
     let mut buf = [0u8; 128];
     let prefix = b"HTTP/1.0 200 OK\r\nContent-Type: text/plain; version=0.0.4\r\nContent-Length: ";
     let suffix = b"\r\nConnection: close\r\n\r\n";
@@ -384,9 +419,9 @@ fn write_usize(buf: &mut [u8], mut n: usize) -> usize {
 #[cfg(feature = "prometheus-exporter")]
 const MAX_WRITE_YIELDS: usize = 10;
 
-/// Non-blocking `write_all` with a wall-clock deadline. Returns `Ok(())`
-/// whether the full buffer was written or the deadline expired; the caller
-/// is responsible for deciding whether a short write is an error.
+/// Non-blocking `write_all` with a wall-clock deadline. Returns `Ok(true)`
+/// when the full buffer was written and `Ok(false)` when the deadline,
+/// zero-write, or yield budget stopped the write early.
 ///
 /// On `WouldBlock` the loop yields the thread to the OS scheduler rather
 /// than busy-spinning.  To prevent a persistently-full TCP send buffer from
@@ -400,7 +435,7 @@ pub(super) fn write_all_nonblocking(
     stream: &mut TcpStream,
     buf: &[u8],
     deadline: Instant,
-) -> io::Result<()> {
+) -> io::Result<bool> {
     let mut written = 0;
     let mut yields = 0;
     while written < buf.len() {
@@ -421,7 +456,7 @@ pub(super) fn write_all_nonblocking(
             Err(e) => return Err(e),
         }
     }
-    Ok(())
+    Ok(written == buf.len())
 }
 
 /// Drain a bounded amount of unread data from the peer's send buffer so that

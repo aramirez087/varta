@@ -154,7 +154,7 @@ zero), so `by (label)` queries and `absent()` rules are safe day-one.
 | `varta_prom_auth_failures_total`                    | counter   |          | Bearer-token rejections.                                                          |
 | `varta_prom_connections_dropped_total`              | counter   | `reason` | Connections closed before response. `reason ∈ {drain, rate_limit, ip_table_full}`. |
 | `varta_prom_ip_state_probe_exhausted_total`         | counter   |          | Per-IP rate-limit table hash probe exhausted.                                     |
-| `varta_scrape_budget_exhausted_total`               | counter   |          | Budget exhaustion during a poll tick (advisory).                                  |
+| `varta_scrape_budget_exhausted_total`               | counter   |          | Serve connection or deadline budget exhausted during a poll tick.                  |
 
 ### Secure-UDP (4 metrics)
 

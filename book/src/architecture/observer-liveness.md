@@ -327,8 +327,9 @@ beat-path slowness:
   serve_pending — unchanged contract.
 - **`varta_observer_serve_pending_seconds`** — wall time for the
   `serve_pending` phase alone. Same bucket boundaries as
-  `iteration_seconds` so the two are coherent. Configurable soft budget
-  via `--scrape-budget-ms` (default 250 ms); overruns increment
+  `iteration_seconds` so the two are coherent. Configurable budget via
+  `--scrape-budget-ms` (default 250 ms); values below the built-in
+  structural cap also bound live scrape work, and overruns increment
   `varta_observer_scrape_budget_exceeded_total`.
 - **`varta_observer_iteration_budget_exceeded_total`** — iterations
   exceeding `--iteration-budget-ms` (default 250 ms). Includes

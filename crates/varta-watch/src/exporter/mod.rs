@@ -207,11 +207,18 @@ const PROM_READ_DEADLINE: Duration = Duration::from_millis(10);
 /// Per-connection write timeout for the metrics response body.
 #[cfg(feature = "prometheus-exporter")]
 const PROM_WRITE_TIMEOUT: Duration = Duration::from_millis(50);
+/// Structural serve-phase cap for one [`PromExporter::serve_pending`] call.
+#[cfg(feature = "prometheus-exporter")]
+const PROM_SERVE_PHASE_CAP: Duration = Duration::from_millis(100);
+/// Structural drain-phase cap after serving has stopped for one
+/// [`PromExporter::serve_pending`] call.
+#[cfg(feature = "prometheus-exporter")]
+const PROM_DRAIN_PHASE_CAP: Duration = Duration::from_millis(100);
 /// Maximum connections accepted per [`PromExporter::serve_pending`] call.
 /// Caps the amount of work done before returning control to the observer
-/// loop so that stall detection, I/O polling, and reaping are not starved
-/// under a storm of slow scrapers. The 100 ms serve deadline still applies
-/// as an additional guard.
+/// loop so that stall detection, I/O polling, and reaping are not starved under
+/// a storm of slow scrapers. The serve-phase deadline still applies as an
+/// additional guard.
 #[cfg(feature = "prometheus-exporter")]
 const PROM_MAX_CONNECTIONS_PER_SERVE: usize = 8;
 /// Slack above tracker capacity for per-pid metric rows.
@@ -288,15 +295,17 @@ pub const STAGE_LABELS: [&str; 6] = [
 /// `--self-watchdog-secs` (see `book/src/architecture/observer-liveness.md`).
 pub const DEFAULT_ITERATION_BUDGET: Duration = Duration::from_millis(250);
 
-/// Default soft budget for a single `serve_pending` call. Overruns increment
-/// `varta_observer_scrape_budget_exceeded_total`. This is the *scrape-only*
-/// component of the total iteration time; separating it from
-/// [`DEFAULT_ITERATION_BUDGET`] lets operators alert on scrape-storm
-/// pressure independently of beat-path slowness.
+/// Default budget for a single `serve_pending` call. Overruns increment
+/// `varta_observer_scrape_budget_exceeded_total`. Values lower than the
+/// built-in structural cap also bound live `/metrics` work. This is the
+/// *scrape-only* component of the total iteration time; separating it from
+/// [`DEFAULT_ITERATION_BUDGET`] lets operators alert on scrape-storm pressure
+/// independently of beat-path slowness.
 ///
 /// Mirrors [`DEFAULT_ITERATION_BUDGET`] (250 ms) because `serve_pending`'s
 /// own structural cap is `100 ms serve + 100 ms drain = 200 ms`; a 250 ms
-/// budget gives a small headroom for I/O scheduling jitter before firing.
+/// budget preserves the structural cap while giving a small headroom for I/O
+/// scheduling jitter before firing.
 pub const DEFAULT_SCRAPE_BUDGET: Duration = Duration::from_millis(250);
 /// Cap on how many bytes [`PromExporter::serve_pending`] reads from a
 /// single request before responding (we discard the request line/headers).
@@ -730,7 +739,7 @@ pub struct PromExporter {
     /// `varta_observer_serve_pending_seconds_count`.
     serve_pending_count_total: u64,
     /// Times a single `serve_pending` exceeded [`Self::scrape_budget`].
-    /// Exposed as `varta_observer_scrape_budget_exceeded_total`. Advisory.
+    /// Exposed as `varta_observer_scrape_budget_exceeded_total`.
     scrape_budget_exceeded_total: u64,
     /// Per-stage iteration timing histograms. Row index is `IterStage as
     /// usize`; column index is the [`ITERATION_BUCKET_BOUNDS_S`] slot (with
@@ -778,7 +787,8 @@ pub struct PromExporter {
     /// values are emitted unconditionally — even at zero — so
     /// `absent()` alert rules stay green from the first scrape.
     audit_ring_watermark_total: [u64; 2],
-    /// Soft per-call budget for `serve_pending`. Configurable via
+    /// Per-call budget for `serve_pending`. Values below the built-in
+    /// structural cap also bound live scrape work. Configurable via
     /// `--scrape-budget-ms`; defaults to [`DEFAULT_SCRAPE_BUDGET`].
     scrape_budget: Duration,
     /// Per-source-IP token bucket state.  Bounded by
@@ -1353,7 +1363,7 @@ impl PromExporter {
         self
     }
 
-    /// Override the soft per-call `serve_pending` budget. Builder-style.
+    /// Override the per-call `serve_pending` budget. Builder-style.
     pub fn with_scrape_budget(mut self, budget: Duration) -> Self {
         self.scrape_budget = budget;
         self

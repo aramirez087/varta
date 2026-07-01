@@ -120,7 +120,7 @@ strict_namespace_check = true
 | `max_beat_rate` | u32 | none | Per-pid beats/sec cap. |
 | `clock_source` | enum | `monotonic` | `monotonic` or `boottime` (Linux only). |
 | `iteration_budget_ms` | u64 | `250` | Per-iteration soft budget. Range [50, 60000]. |
-| `scrape_budget_ms` | u64 | `250` | Per-serve_pending soft budget. Range [50, 60000]. |
+| `scrape_budget_ms` | u64 | `250` | Per-serve_pending budget; values below the built-in structural cap also bound live scrape work. Range [50, 60000]. |
 | `shutdown_after_secs` | u64 | none | Self-terminate after this uptime. |
 | `shutdown_grace_ms` | u64 | `5000` | Drop blocking time during shutdown. Range [100, 60000]. |
 | `self_watchdog_secs` | u64 | none | Self-watchdog deadline (auto-enables under systemd). |

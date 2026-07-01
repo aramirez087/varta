@@ -784,7 +784,7 @@ impl super::PromExporter {
             self.serve_pending_count_total
         );
         self.body_buf.push_str(
-            "# HELP varta_observer_scrape_budget_exceeded_total serve_pending calls that exceeded the soft --scrape-budget-ms.\n",
+            "# HELP varta_observer_scrape_budget_exceeded_total serve_pending calls that exceeded --scrape-budget-ms.\n",
         );
         self.body_buf
             .push_str("# TYPE varta_observer_scrape_budget_exceeded_total counter\n");

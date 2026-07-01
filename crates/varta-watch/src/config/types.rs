@@ -213,10 +213,10 @@ pub const MIN_ITERATION_BUDGET_MS: u64 = 50;
 /// abort the daemon, so the metric ceases to be a useful early signal.
 pub const MAX_ITERATION_BUDGET_MS: u64 = 60_000;
 
-/// Minimum accepted value for `--scrape-budget-ms`.  Below this the budget
-/// overlaps the structural cap of `serve_pending` itself (100 ms serve +
-/// 100 ms drain = 200 ms worst case), so it would fire spuriously.  Bounds
-/// chosen on the same logic as `--iteration-budget-ms`.
+/// Minimum accepted value for `--scrape-budget-ms`.  Below this the budget is
+/// too close to ordinary scheduler jitter and would shed queued scrapes before
+/// the poll loop has a useful chance to serve them.  Bounds chosen on the same
+/// noise-floor logic as `--iteration-budget-ms`.
 pub const MIN_SCRAPE_BUDGET_MS: u64 = 50;
 
 /// Maximum accepted value for `--scrape-budget-ms`.  Above this the
@@ -503,10 +503,10 @@ pub struct Config {
     /// `--iteration-budget-ms`; defaults to
     /// [`crate::exporter::DEFAULT_ITERATION_BUDGET`].
     pub iteration_budget: Duration,
-    /// Soft per-call budget for `PromExporter::serve_pending`.  Calls
-    /// exceeding this increment
-    /// `varta_observer_scrape_budget_exceeded_total` and are visible in
-    /// the `varta_observer_serve_pending_seconds` histogram.  Lets
+    /// Per-call budget for `PromExporter::serve_pending`.  Values below the
+    /// built-in structural cap also bound live `/metrics` work; calls exceeding
+    /// this increment `varta_observer_scrape_budget_exceeded_total` and are
+    /// visible in the `varta_observer_serve_pending_seconds` histogram.  Lets
     /// operators alert on scrape-storm pressure separately from beat-path
     /// slowness.  Set by `--scrape-budget-ms`; defaults to
     /// [`crate::exporter::DEFAULT_SCRAPE_BUDGET`].

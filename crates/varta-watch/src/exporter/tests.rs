@@ -286,6 +286,61 @@ fn queued_authorized_scrapes_share_one_fresh_render() {
 }
 
 #[test]
+fn serve_pending_honors_configured_scrape_budget_before_accepting() {
+    let mut prom = PromExporter::bind("127.0.0.1:0".parse().unwrap(), make_token())
+        .expect("bind")
+        .with_scrape_budget(Duration::ZERO);
+    let addr = prom.local_addr().expect("local_addr");
+
+    let queued = authorized_get_stream(addr);
+    std::thread::sleep(Duration::from_millis(30));
+
+    prom.serve_pending().expect("serve_pending");
+
+    assert_eq!(
+        prom.scrape_budget_exhausted_total, 1,
+        "a zero configured scrape budget should exhaust before accepting work"
+    );
+    assert!(
+        prom.last_scrape.is_none(),
+        "budget-exhausted serve_pending must not advance scrape freshness"
+    );
+    assert!(
+        prom.body_buf.is_empty(),
+        "budget-exhausted serve_pending must not render a metrics body"
+    );
+    drop(queued);
+}
+
+#[test]
+fn serve_pending_applies_configured_scrape_budget_to_accepted_connection() {
+    let mut prom = PromExporter::bind("127.0.0.1:0".parse().unwrap(), make_token())
+        .expect("bind")
+        .with_scrape_budget(Duration::from_millis(1));
+    let addr = prom.local_addr().expect("local_addr");
+
+    let mut slow = TcpStream::connect(addr).expect("connect");
+    slow.write_all(b"G").expect("write partial request");
+    std::thread::sleep(Duration::from_millis(30));
+
+    prom.serve_pending().expect("serve_pending");
+
+    assert_eq!(
+        prom.scrape_budget_exhausted_total, 1,
+        "an accepted but incomplete request must not outlive the configured scrape budget"
+    );
+    assert!(
+        prom.last_scrape.is_none(),
+        "budget-expired accepted request must not advance scrape freshness"
+    );
+    assert!(
+        prom.body_buf.is_empty(),
+        "budget-expired accepted request must not render a metrics body"
+    );
+    drop(slow);
+}
+
+#[test]
 fn metrics_rejects_wrong_token() {
     let mut prom = PromExporter::bind("127.0.0.1:0".parse().unwrap(), make_token()).expect("bind");
     let addr = prom.local_addr().expect("local_addr");

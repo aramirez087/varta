@@ -370,9 +370,11 @@ OPTIONAL:
                                      Range [50, 60000].  See
                                      book/src/architecture/observer-liveness.md
                                      for the worst-case derivation.
-    --scrape-budget-ms <MS>        Soft per-call budget for serve_pending
+    --scrape-budget-ms <MS>        Per-call budget for serve_pending
                                      (the /metrics serving phase of one
-                                     poll iteration). Overruns increment
+                                     poll iteration). Values below the built-in
+                                     structural cap bound live scrape work.
+                                     Overruns increment
                                      varta_observer_scrape_budget_exceeded_total
                                      and are visible in
                                      varta_observer_serve_pending_seconds.

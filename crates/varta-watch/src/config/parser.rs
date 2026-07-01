@@ -733,10 +733,10 @@ impl Config {
         };
 
         // --scrape-budget-ms — same bounds story as --iteration-budget-ms:
-        // reject the noise-floor case (overlaps serve_pending's own 200 ms
-        // structural cap) and the never-fires case (overlaps the self-
-        // watchdog).  The two budgets are independent: scrape-storm alarms
-        // fire on scrape_budget; beat-path alarms fire on iteration_budget.
+        // reject the noise-floor case (too close to scheduler jitter to be a
+        // useful serve cap) and the never-fires case (overlaps the self-
+        // watchdog). The two budgets are independent: scrape-storm alarms fire
+        // on scrape_budget; beat-path alarms fire on iteration_budget.
         let scrape_budget = match scrape_budget_ms {
             Some(ms) => {
                 if !(MIN_SCRAPE_BUDGET_MS..=MAX_SCRAPE_BUDGET_MS).contains(&ms) {
