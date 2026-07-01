@@ -478,7 +478,15 @@ impl Recovery {
     }
 
     /// Bound the outstanding-child table to `capacity` slots.
+    ///
+    /// This is a setup-time builder. Once recovery has spawned children, the
+    /// existing table owns the `Child` handles that [`Drop`] must kill/reap, so
+    /// a later call preserves that table rather than dropping live children.
     pub fn with_outstanding_capacity(mut self, capacity: usize) -> Self {
+        if self.outstanding.len() != 0 {
+            return self;
+        }
+
         let cap = capacity
             .clamp(1, crate::tracker::MAX_CAPACITY)
             .max(self.reaping_orphans.len());

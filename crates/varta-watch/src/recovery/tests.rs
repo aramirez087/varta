@@ -39,6 +39,42 @@ fn capacity_builders_cap_untrusted_values() {
 }
 
 #[test]
+#[cfg_attr(miri, ignore)]
+fn outstanding_capacity_builder_preserves_live_children() {
+    const PID: u32 = 77_001;
+
+    let mut rec = Recovery::with_mode(
+        RecoveryMode::Exec {
+            program: "sleep".to_string(),
+            args: vec!["30".to_string()],
+        },
+        Duration::from_secs(60),
+    );
+
+    let child_pid = match rec.on_stall(PID, BeatOrigin::KernelAttested, false, Some(1), 0) {
+        RecoveryOutcome::Spawned { child_pid } => child_pid,
+        other => panic!("expected live recovery child, got {other:?}"),
+    };
+
+    rec = rec.with_outstanding_capacity(1);
+    let still_tracked = rec.outstanding.contains(PID);
+    if !still_tracked {
+        // Negative-control cleanup: pre-fix the builder dropped the only
+        // `Child` handle, so `Recovery::drop` could no longer kill it.
+        let _ = std::process::Command::new("kill")
+            .arg("-KILL")
+            .arg(child_pid.to_string())
+            .status();
+    }
+    drop(rec);
+
+    assert!(
+        still_tracked,
+        "changing capacity after spawn must not drop the outstanding child handle"
+    );
+}
+
+#[test]
 fn try_reap_into_clears_and_reuses_caller_buffer_for_pending_outcomes() {
     let mut rec = Recovery::new_exec("true".to_string(), vec![], Duration::ZERO);
     rec.pending_outcomes
