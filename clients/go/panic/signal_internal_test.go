@@ -3,6 +3,9 @@ package panic
 import (
 	"math"
 	"net"
+	"os"
+	"path/filepath"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -10,6 +13,8 @@ import (
 
 	"github.com/aramirez087/Varta/clients/go/internal/vlp"
 )
+
+var panicUDSCounter atomic.Uint64
 
 func TestClaimTerminalTimestampIsStrictAcrossClockResetAndCollision(t *testing.T) {
 	var last atomic.Uint64
@@ -110,5 +115,111 @@ func TestSecureEmitterConcurrentEmitUsesUniqueNonces(t *testing.T) {
 			t.Fatalf("NONCE REUSE: %x seen twice across %d concurrent emits", nonce, n)
 		}
 		seen[nonce] = true
+	}
+}
+
+// Regression: repeated InstallSignalHandler* calls replaced activeEmitter but
+// left the retired socket open. A stale emitter retained inside an in-flight
+// goroutine could still write a terminal frame to the old observer, and long
+// running processes that reinstalled the hook leaked one descriptor per
+// replacement. Replacement now atomically retires the old emitter and closes
+// its socket.
+func TestRepeatedInstallClosesRetiredUDSEmitter(t *testing.T) {
+	if previous := activeEmitter.Swap(nil); previous != nil && previous.close != nil {
+		previous.close()
+	}
+	t.Cleanup(func() {
+		if current := activeEmitter.Swap(nil); current != nil && current.close != nil {
+			current.close()
+		}
+	})
+
+	firstPath := shortUnixgramPath(t, "first")
+	secondPath := shortUnixgramPath(t, "second")
+	firstListener := listenUnixgram(t, firstPath)
+	defer firstListener.Close()
+	secondListener := listenUnixgram(t, secondPath)
+	defer secondListener.Close()
+
+	if err := InstallSignalHandlerUDS(firstPath); err != nil {
+		t.Fatalf("first install: %v", err)
+	}
+	retired := activeEmitter.Load()
+	if retired == nil {
+		t.Fatal("first emitter not published")
+	}
+
+	if err := InstallSignalHandlerUDS(secondPath); err != nil {
+		t.Fatalf("second install: %v", err)
+	}
+	current := activeEmitter.Load()
+	if current == nil {
+		t.Fatal("second emitter not published")
+	}
+	if current == retired {
+		t.Fatal("second install reused the retired emitter pointer")
+	}
+
+	retired.emit()
+	assertNoUnixgram(t, firstListener, "retired emitter wrote to first listener")
+
+	current.emit()
+	assertCriticalUnixgram(t, secondListener)
+}
+
+func listenUnixgram(t *testing.T, path string) *net.UnixConn {
+	t.Helper()
+	addr, err := net.ResolveUnixAddr("unixgram", path)
+	if err != nil {
+		t.Fatalf("resolve unixgram %s: %v", path, err)
+	}
+	conn, err := net.ListenUnixgram("unixgram", addr)
+	if err != nil {
+		t.Fatalf("listen unixgram %s: %v", path, err)
+	}
+	return conn
+}
+
+func shortUnixgramPath(t *testing.T, name string) string {
+	t.Helper()
+	count := panicUDSCounter.Add(1)
+	path := filepath.Join(
+		"/tmp",
+		"varta-go-panic-"+strconv.Itoa(os.Getpid())+"-"+strconv.FormatUint(count, 10)+"-"+name+".sock",
+	)
+	t.Cleanup(func() { _ = os.Remove(path) })
+	return path
+}
+
+func assertNoUnixgram(t *testing.T, conn *net.UnixConn, msg string) {
+	t.Helper()
+	_ = conn.SetReadDeadline(time.Now().Add(75 * time.Millisecond))
+	var buf [128]byte
+	n, _, err := conn.ReadFromUnix(buf[:])
+	if err == nil {
+		t.Fatalf("%s: received %d bytes", msg, n)
+	}
+	if ne, ok := err.(net.Error); !ok || !ne.Timeout() {
+		t.Fatalf("read stale listener: got %v, want timeout", err)
+	}
+}
+
+func assertCriticalUnixgram(t *testing.T, conn *net.UnixConn) {
+	t.Helper()
+	_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	var buf [128]byte
+	n, _, err := conn.ReadFromUnix(buf[:])
+	if err != nil {
+		t.Fatalf("read current listener: %v", err)
+	}
+	frame, err := vlp.Decode(buf[:n])
+	if err != nil {
+		t.Fatalf("decode current terminal frame: %v", err)
+	}
+	if frame.Status != vlp.StatusCritical {
+		t.Fatalf("status = %d, want critical", frame.Status)
+	}
+	if frame.Nonce != vlp.NonceTerminal {
+		t.Fatalf("nonce = %x, want terminal", frame.Nonce)
 	}
 }

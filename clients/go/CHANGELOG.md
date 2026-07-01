@@ -34,6 +34,12 @@ governed independently — see `book/src/spec/vlp.md` in the workspace.
 
 ### Fixed
 
+- Repeated `panic.InstallSignalHandlerUDS/UDP/SecureUDP` calls now close the
+  retired emitter socket when publishing the replacement. Previously every
+  reinstall leaked one descriptor, and a stale in-flight emitter could still
+  write a terminal frame to the old observer after the latest handler had been
+  installed.
+
 - `Reconnect()` now clears the consecutive-dropped counter. A manual reconnect
   after a dropped beat starts a fresh `SetReconnectAfter` window instead of
   letting the next drop immediately reconnect and retry again.

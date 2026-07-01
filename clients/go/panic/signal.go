@@ -36,8 +36,9 @@ func (e *PanicInstallError) Unwrap() error { return e.Err }
 // Run defer/recover wrapper — both write a Critical+NonceTerminal
 // frame to a socket that was bound at install time.
 type emitter struct {
-	emit func()
-	desc string
+	emit  func()
+	close func()
+	desc  string
 }
 
 // activeEmitter is the most-recently-installed emitter. The Run
@@ -103,11 +104,16 @@ func buildCriticalFrame() ([vlp.FrameBytes]byte, bool) {
 	return frame, ok
 }
 
-// installSignals wires the signal goroutine after the emitter has
-// been published. On first signal, emit + re-raise.
-func installSignals() {
+// installEmitter publishes the new emitter, retires the previous socket, and
+// wires the signal goroutine once. On first signal, emit + re-raise.
+func installEmitter(em *emitter) {
 	installSerial.Lock()
 	defer installSerial.Unlock()
+
+	if previous := activeEmitter.Swap(em); previous != nil && previous.close != nil {
+		previous.close()
+	}
+
 	if installed.Load() {
 		return
 	}
@@ -193,10 +199,12 @@ func InstallSignalHandlerUDS(path string) error {
 			}
 			_, _ = conn.Write(frame[:])
 		},
+		close: func() {
+			_ = conn.Close()
+		},
 		desc: "uds:" + path,
 	}
-	activeEmitter.Store(em)
-	installSignals()
+	installEmitter(em)
 	return nil
 }
 
@@ -214,10 +222,12 @@ func InstallSignalHandlerUDP(host string, port int) error {
 			}
 			_, _ = conn.Write(frame[:])
 		},
+		close: func() {
+			_ = conn.Close()
+		},
 		desc: fmt.Sprintf("udp:%s:%d", host, port),
 	}
-	activeEmitter.Store(em)
-	installSignals()
+	installEmitter(em)
 	return nil
 }
 
@@ -282,10 +292,12 @@ func InstallSignalHandlerSecureUDP(host string, port int, key []byte) error {
 			state.counter++
 			_, _ = conn.Write(wire[:])
 		},
+		close: func() {
+			_ = conn.Close()
+		},
 		desc: fmt.Sprintf("secure-udp:%s:%d", host, port),
 	}
-	activeEmitter.Store(em)
-	installSignals()
+	installEmitter(em)
 	return nil
 }
 
