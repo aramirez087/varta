@@ -426,10 +426,9 @@ mod tests {
     #[cfg(target_os = "macos")]
     use std::sync::Mutex;
 
-    /// Serializes macOS syscall tests that sample `/dev/fd`. Cargo runs lib tests
-    /// in parallel; another test opening a transient fd between before/after
-    /// samples produces a spurious +1. Zero-dep alternative to the `serial_test`
-    /// crate. The Linux SCM_RIGHTS test uses readlink-target counting instead.
+    /// Serializes macOS syscall tests that sample `/dev/fd`. The SCM_RIGHTS
+    /// leak test counts only fds for its own target file, but serialization
+    /// still keeps the RLIMIT_NOFILE raise local to one test at a time.
     #[cfg(target_os = "macos")]
     static FD_INVENTORY_TEST_LOCK: Mutex<()> = Mutex::new(());
 
@@ -862,23 +861,41 @@ mod tests {
         };
         unsafe { setrlimit(RLIMIT_NOFILE, &new) };
 
-        fn open_fd_count() -> usize {
-            std::fs::read_dir("/dev/fd").expect("read /dev/fd").count()
+        fn count_fds_with_readlink_target(target: &std::path::Path) -> usize {
+            std::fs::read_dir("/dev/fd")
+                .expect("read /dev/fd")
+                .filter_map(|e| e.ok())
+                .filter_map(|e| {
+                    let fd: i32 = e.file_name().to_string_lossy().parse().ok()?;
+                    let link = std::fs::read_link(format!("/dev/fd/{fd}")).ok()?;
+                    (link == target).then_some(())
+                })
+                .count()
         }
 
         let path =
             std::env::temp_dir().join(format!("varta-scmrights-macos-{}.sock", std::process::id()));
         let _ = std::fs::remove_file(&path);
+        let passed_path = std::env::temp_dir().join(format!(
+            "varta-scmrights-macos-passed-{}.tmp",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&passed_path);
 
         let observer = UnixDatagram::bind(&path).expect("bind observer");
         enable_credential_passing(observer.as_raw_fd()).expect("enable credential passing");
         let sender = UnixDatagram::unbound().expect("sender socket");
         sender.connect(&path).expect("connect sender");
 
-        // NFDS duplicate handles of /dev/null; the sender's copies are closed
-        // after send so only the observer's recvmsg-installed duplicates are
-        // leak candidates.
-        let base = std::fs::File::open("/dev/null").expect("open /dev/null");
+        // NFDS duplicate handles of a test-owned file; the sender's copies
+        // are closed after send so only the observer's recvmsg-installed
+        // duplicates are leak candidates. Counting this exact readlink target
+        // avoids false positives from unrelated parallel tests opening sockets
+        // or pipes.
+        let base = std::fs::File::create(&passed_path).expect("create passed fd target");
+        let passed_target = passed_path
+            .canonicalize()
+            .expect("canonicalize passed fd target");
         let dups: Vec<i32> = (0..NFDS)
             .map(|_| unsafe { dup(base.as_raw_fd()) })
             .collect();
@@ -926,9 +943,11 @@ mod tests {
             unsafe { close(*d) };
         }
 
-        let before = open_fd_count();
+        let before = count_fds_with_readlink_target(&passed_target);
         let result = recv_authenticated(observer.as_raw_fd());
-        let after = eventually_open_fd_count_at_most(before, open_fd_count);
+        let after = eventually_open_fd_count_at_most(before, || {
+            count_fds_with_readlink_target(&passed_target)
+        });
 
         match result {
             RecvResult::Authenticated { data, origin, .. } => {
@@ -943,5 +962,6 @@ mod tests {
         );
 
         let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&passed_path);
     }
 }

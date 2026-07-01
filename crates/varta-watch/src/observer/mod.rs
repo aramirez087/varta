@@ -31,6 +31,15 @@ pub(crate) enum RateLimitReason {
 
 pub(crate) const RATE_LIMIT_N: usize = 2;
 
+fn saturating_listener_count_sum<F>(listeners: &mut [Box<dyn BeatListener>], mut drain: F) -> u64
+where
+    F: FnMut(&mut dyn BeatListener) -> u64,
+{
+    listeners.iter_mut().fold(0, |total, listener| {
+        total.saturating_add(drain(listener.as_mut()))
+    })
+}
+
 /// Forward-jump sentinel: a single poll-tick advance exceeding this threshold
 /// is counted as an anomalous forward jump (sleep/wake, VM live migration,
 /// hypervisor pause). 5 s is far above worst-case poll-tick latency on a
@@ -1191,10 +1200,7 @@ impl Observer {
     /// Drain and reset the AEAD decryption failure counter across all
     /// listeners.
     pub fn drain_decrypt_failures(&mut self) -> u64 {
-        self.listeners
-            .iter_mut()
-            .map(|l| l.drain_decrypt_failures())
-            .sum()
+        saturating_listener_count_sum(&mut self.listeners, |l| l.drain_decrypt_failures())
     }
 
     /// Drain and reset the replay-refused counter across all listeners.
@@ -1202,23 +1208,17 @@ impl Observer {
     /// timestamp did not advance past the recorded replay high-water mark —
     /// replay refusals, distinct from AEAD decrypt failures.
     pub fn drain_replay_refused(&mut self) -> u64 {
-        self.listeners
-            .iter_mut()
-            .map(|l| l.drain_replay_refused())
-            .sum()
+        saturating_listener_count_sum(&mut self.listeners, |l| l.drain_replay_refused())
     }
 
     /// Drain and reset the truncated-datagram counter across all listeners.
     pub fn drain_truncated(&mut self) -> u64 {
-        self.listeners.iter_mut().map(|l| l.drain_truncated()).sum()
+        saturating_listener_count_sum(&mut self.listeners, |l| l.drain_truncated())
     }
 
     /// Drain and reset the sender-state-full counter across all listeners.
     pub fn drain_sender_state_full(&mut self) -> u64 {
-        self.listeners
-            .iter_mut()
-            .map(|l| l.drain_sender_state_full())
-            .sum()
+        saturating_listener_count_sum(&mut self.listeners, |l| l.drain_sender_state_full())
     }
 
     /// Drain and reset the AEAD-decryption-attempt counter across all
@@ -1227,10 +1227,7 @@ impl Observer {
     /// the secure-UDP listener — every loaded key is tried per frame to
     /// remove the key-rotation timing side-channel.
     pub fn drain_aead_attempts(&mut self) -> u64 {
-        self.listeners
-            .iter_mut()
-            .map(|l| l.drain_aead_attempts())
-            .sum()
+        saturating_listener_count_sum(&mut self.listeners, |l| l.drain_aead_attempts())
     }
 
     /// Drain and reset the parent-directory fsync failure counter for UDS

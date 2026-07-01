@@ -35,6 +35,11 @@ pub fn drain_bind_dir_fsync_failures() -> u64 {
     DIR_FSYNC_FAILED.swap(0, Ordering::Relaxed)
 }
 
+#[inline]
+pub(crate) fn saturating_ingress_counter_inc(counter: &mut u64) {
+    *counter = counter.saturating_add(1);
+}
+
 extern "C" {
     fn umask(mode: u32) -> u32;
 }
@@ -575,7 +580,7 @@ impl BeatListener for UdsListener {
         // is irrelevant here.
         match peer_cred::recv_authenticated(self.sock.as_raw_fd()) {
             RecvResult::ShortRead => {
-                self.truncated_count = self.truncated_count.wrapping_add(1);
+                saturating_ingress_counter_inc(&mut self.truncated_count);
                 RecvResult::ShortRead
             }
             other => other,
@@ -853,6 +858,15 @@ mod tests {
         // SAFETY: listener unit tests use private, per-test paths and do not
         // create concurrent filesystem objects during this bind window.
         unsafe { super::PreThreadAttestation::new_unchecked() }
+    }
+
+    #[test]
+    fn ingress_counter_increment_saturates_at_u64_max() {
+        let mut count = u64::MAX;
+
+        super::saturating_ingress_counter_inc(&mut count);
+
+        assert_eq!(count, u64::MAX);
     }
 
     #[test]
@@ -1173,7 +1187,7 @@ mod udp_impl {
                         };
                     }
                     Ok(_) => {
-                        self.truncated_count = self.truncated_count.wrapping_add(1);
+                        super::saturating_ingress_counter_inc(&mut self.truncated_count);
                         // Match the observer's one-datagram poll contract:
                         // malformed UDP traffic must not keep this listener
                         // draining indefinitely inside one poll iteration.
@@ -1244,6 +1258,37 @@ mod udp_impl {
             }
 
             assert_eq!(listener.drain_truncated(), 1);
+        }
+
+        #[test]
+        fn truncated_counter_saturates_at_u64_max() {
+            let mut listener =
+                UdpListener::bind("127.0.0.1:0".parse().unwrap()).expect("bind listener");
+            listener.truncated_count = u64::MAX;
+            let target = listener.sock.local_addr().expect("listener local addr");
+            let sender = UdpSocket::bind("127.0.0.1:0").expect("sender bind");
+
+            let overlong = [0xEEu8; VLP_FRAME_RECV_CAP];
+            sender.send_to(&overlong, target).expect("send overlong");
+
+            let deadline = Instant::now() + Duration::from_millis(500);
+            loop {
+                match listener.recv(0) {
+                    RecvResult::WouldBlock if Instant::now() < deadline => {
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                    RecvResult::ShortRead => break,
+                    RecvResult::Authenticated { .. } => {
+                        panic!("overlong datagram must be rejected")
+                    }
+                    RecvResult::WouldBlock => panic!("listener did not receive test datagram"),
+                    RecvResult::CtrlTruncated(e) | RecvResult::IoError { error: e, .. } => {
+                        panic!("unexpected receive error: {}", e.into_io_error())
+                    }
+                }
+            }
+
+            assert_eq!(listener.drain_truncated(), u64::MAX);
         }
     }
 }

@@ -642,6 +642,90 @@ fn send_wire(target: SocketAddr, wire: &[u8]) {
     sender.send_to(wire, target).expect("send_to");
 }
 
+fn recv_until_consumed(listener: &mut SecureUdpListener) -> RecvResult {
+    let deadline = Instant::now() + Duration::from_millis(500);
+    loop {
+        let result = listener.recv(0);
+        if listener.last_recv_consumed() {
+            return result;
+        }
+        assert!(
+            matches!(result, RecvResult::WouldBlock),
+            "unconsumed listener result should be idle"
+        );
+        assert!(
+            Instant::now() < deadline,
+            "listener did not consume the queued test datagram"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
+#[test]
+fn truncated_counter_saturates_at_u64_max() {
+    let key_bytes = [0x24u8; 32];
+    let mut listener = bind_with_keys(vec![Key::from_bytes(key_bytes)]);
+    listener.truncated_count = u64::MAX;
+    let target = listener.test_local_addr();
+    let short = [0xEEu8; SECURE_FRAME_LEN - 1];
+
+    send_wire(target, &short);
+
+    assert!(
+        matches!(recv_until_consumed(&mut listener), RecvResult::ShortRead),
+        "wrong-size datagram must be reported as short-read"
+    );
+    assert_eq!(listener.drain_truncated(), u64::MAX);
+}
+
+#[test]
+fn decrypt_failure_counter_saturates_at_u64_max() {
+    let key_bytes = [0x77u8; 32];
+    let mut listener = bind_with_keys(vec![Key::from_bytes(key_bytes)]);
+    listener.decrypt_failures = u64::MAX;
+    let target = listener.test_local_addr();
+
+    let stranger = Key::from_bytes([0xFFu8; 32]);
+    let plaintext = [0xBBu8; 32];
+    let wire = build_shared_frame(&stranger, test_iv(), 1, &plaintext);
+
+    send_wire(target, &wire);
+
+    assert!(
+        matches!(recv_until_consumed(&mut listener), RecvResult::WouldBlock),
+        "AEAD-invalid datagram is consumed without producing an observer event"
+    );
+    assert_eq!(listener.drain_decrypt_failures(), u64::MAX);
+}
+
+#[test]
+fn replay_refused_counter_saturates_at_u64_max() {
+    let key_bytes = [0x5Au8; 32];
+    let mut listener = bind_with_keys(vec![Key::from_bytes(key_bytes)]);
+    let target = listener.test_local_addr();
+
+    let mut plaintext = [0u8; 32];
+    Frame::new(Status::Ok, 12_345, 777, 1, 0).encode(&mut plaintext);
+    let wire = build_shared_frame(&Key::from_bytes(key_bytes), test_iv(), 9, &plaintext);
+
+    send_wire(target, &wire);
+    match recv_one(&mut listener) {
+        RecvResult::Authenticated { data, .. } => {
+            assert_eq!(data, plaintext, "first ciphertext should authenticate");
+        }
+        _ => panic!("expected first frame to authenticate"),
+    }
+
+    listener.replay_refused = u64::MAX;
+    send_wire(target, &wire);
+
+    assert!(
+        matches!(recv_until_consumed(&mut listener), RecvResult::WouldBlock),
+        "replayed ciphertext is consumed and rejected"
+    );
+    assert_eq!(listener.drain_replay_refused(), u64::MAX);
+}
+
 #[test]
 fn overlong_shared_prefix_is_truncated_before_decrypt() {
     let key_bytes = [0x24u8; 32];

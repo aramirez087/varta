@@ -488,6 +488,85 @@ impl BeatListener for ScriptedListener {
     }
 }
 
+struct CountingListener {
+    decrypt_failures: u64,
+    replay_refused: u64,
+    truncated: u64,
+    sender_state_full: u64,
+    aead_attempts: u64,
+}
+
+impl CountingListener {
+    fn with_all(count: u64) -> Self {
+        Self {
+            decrypt_failures: count,
+            replay_refused: count,
+            truncated: count,
+            sender_state_full: count,
+            aead_attempts: count,
+        }
+    }
+}
+
+impl BeatListener for CountingListener {
+    fn recv(&mut self, _now_ns: u64) -> RecvResult {
+        RecvResult::WouldBlock
+    }
+
+    fn drain_decrypt_failures(&mut self) -> u64 {
+        let n = self.decrypt_failures;
+        self.decrypt_failures = 0;
+        n
+    }
+
+    fn drain_replay_refused(&mut self) -> u64 {
+        let n = self.replay_refused;
+        self.replay_refused = 0;
+        n
+    }
+
+    fn drain_truncated(&mut self) -> u64 {
+        let n = self.truncated;
+        self.truncated = 0;
+        n
+    }
+
+    fn drain_sender_state_full(&mut self) -> u64 {
+        let n = self.sender_state_full;
+        self.sender_state_full = 0;
+        n
+    }
+
+    fn drain_aead_attempts(&mut self) -> u64 {
+        let n = self.aead_attempts;
+        self.aead_attempts = 0;
+        n
+    }
+}
+
+#[test]
+fn listener_counter_drains_saturate_across_listeners() {
+    let mut obs = Observer::new(
+        Duration::from_secs(1),
+        64,
+        EvictionPolicy::Strict,
+        DEFAULT_EVICTION_SCAN_WINDOW,
+        None,
+        0,
+        0,
+        ClockSource::Monotonic,
+    )
+    .expect("Observer::new should succeed");
+    obs.add_listener(Box::new(CountingListener::with_all(u64::MAX)));
+    obs.add_listener(Box::new(CountingListener::with_all(1)));
+
+    assert_eq!(obs.drain_decrypt_failures(), u64::MAX);
+    assert_eq!(obs.drain_replay_refused(), u64::MAX);
+    assert_eq!(obs.drain_truncated(), u64::MAX);
+    assert_eq!(obs.drain_sender_state_full(), u64::MAX);
+    assert_eq!(obs.drain_aead_attempts(), u64::MAX);
+}
+
 #[test]
 fn linux_effective_origin_requires_namespace_for_unpinned_kernel_authority() {
     assert_eq!(

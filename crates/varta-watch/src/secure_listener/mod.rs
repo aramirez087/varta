@@ -45,7 +45,7 @@ use std::time::{Duration, Instant};
 use varta_vlp::crypto::{self, Key, NONCE_BYTES, SECURE_FRAME_MASTER_BYTES, TAG_BYTES};
 use varta_vlp::{Frame, NONCE_TERMINAL};
 
-use crate::listener::{BeatListener, TransportTrust};
+use crate::listener::{saturating_ingress_counter_inc, BeatListener, TransportTrust};
 use crate::peer_cred::{BeatOrigin, RecvResult};
 use crate::probe_table::{BoundedIndex, Hash32};
 
@@ -848,7 +848,7 @@ impl BeatListener for SecureUdpListener {
                     (iv_random, iv_counter, ciphertext, tag, decrypted)
                 }
                 _ => {
-                    self.truncated_count = self.truncated_count.wrapping_add(1);
+                    saturating_ingress_counter_inc(&mut self.truncated_count);
                     return RecvResult::ShortRead;
                 }
             };
@@ -858,7 +858,7 @@ impl BeatListener for SecureUdpListener {
             let _ = (ciphertext, tag);
 
             let Some(plaintext) = decrypted else {
-                self.decrypt_failures = self.decrypt_failures.wrapping_add(1);
+                saturating_ingress_counter_inc(&mut self.decrypt_failures);
                 // One bad datagram is one poll unit. Do not privately drain
                 // the socket here: a sustained unauthenticated flood must not
                 // pin the observer inside this listener and starve maintenance.
@@ -933,7 +933,7 @@ impl BeatListener for SecureUdpListener {
                     // high-water mark: this is a replay refusal, not a decrypt
                     // failure. Count it on its own metric so operators do not
                     // read a captured-frame replay as a crypto failure.
-                    self.replay_refused = self.replay_refused.wrapping_add(1);
+                    saturating_ingress_counter_inc(&mut self.replay_refused);
                 } else {
                     self.sender_state_full = self.sender_state_full.saturating_add(1);
                 }
