@@ -354,6 +354,26 @@ impl ScriptedListener {
         Self { results }
     }
 
+    fn with_status_origin_peer_frames(
+        frames: &[(u32, Status, u64, u64, u32, BeatOrigin, u32)],
+    ) -> Self {
+        let mut results = VecDeque::new();
+        for &(pid, status, timestamp, nonce, payload, origin, peer_pid) in frames {
+            let frame = Frame::new(status, pid, timestamp, nonce, payload);
+            let mut data = [0u8; 32];
+            frame.encode(&mut data);
+            results.push_back(RecvResult::Authenticated {
+                peer_pid,
+                peer_uid: 0,
+                peer_pid_ns_inode: None,
+                peer_pidfd: None,
+                origin,
+                data,
+            });
+        }
+        Self { results }
+    }
+
     /// A regular beat (`nonce 1`, `Ok`) immediately followed by the pid's
     /// terminal dying-gasp (`NONCE_TERMINAL`, decode-enforced `Critical`),
     /// both kernel-attested. The two frames are microseconds apart, so the
@@ -1120,6 +1140,78 @@ fn terminal_gasp_bypasses_global_limiter_once_for_tracked_kernel_agent() {
         obs.drain_global_rate_limited(),
         1,
         "the repeated terminal frame should pay the exhausted global bucket"
+    );
+}
+
+#[test]
+fn rejected_terminal_frames_pay_global_limiter_after_bypass_probe() {
+    let pid = std::process::id();
+    let mut obs = Observer::new(
+        Duration::from_secs(60),
+        64,
+        EvictionPolicy::Strict,
+        DEFAULT_EVICTION_SCAN_WINDOW,
+        None,
+        1,
+        2,
+        ClockSource::Monotonic,
+    )
+    .expect("Observer::new should succeed");
+
+    obs.add_listener(Box::new(ScriptedListener::with_status_origin_peer_frames(
+        &[
+            (pid, Status::Ok, 1, 1, 100, BeatOrigin::KernelAttested, pid),
+            (
+                pid,
+                Status::Critical,
+                2,
+                NONCE_TERMINAL,
+                0xDEAD,
+                BeatOrigin::SocketModeOnly,
+                pid,
+            ),
+            (
+                pid,
+                Status::Critical,
+                3,
+                NONCE_TERMINAL,
+                0xBEEF,
+                BeatOrigin::SocketModeOnly,
+                pid,
+            ),
+        ],
+    )));
+
+    let first = obs.poll();
+    assert!(
+        matches!(first, Some(Event::Beat { pid: got_pid, .. }) if got_pid == pid),
+        "regular kernel-attested beat should consume the first global token, got {first:?}"
+    );
+
+    let second = obs.poll();
+    assert!(
+        matches!(
+            second,
+            Some(Event::OriginConflict {
+                claimed_pid: got_pid,
+                observed_origin: BeatOrigin::SocketModeOnly,
+                slot_origin: BeatOrigin::KernelAttested,
+                ..
+            }) if got_pid == pid
+        ),
+        "the first rejected terminal frame may use the remaining global token, got {second:?}"
+    );
+    assert_eq!(obs.drain_global_rate_limited(), 0);
+
+    let third = obs.poll();
+    assert!(
+        third.is_none(),
+        "a repeated rejected terminal frame must not receive the dying-gasp global bypass, got {third:?}"
+    );
+    assert_eq!(
+        obs.drain_global_rate_limited(),
+        1,
+        "rejected terminal frames must spend global admission once the bypass probe fails"
     );
 }
 

@@ -700,8 +700,12 @@ impl Observer {
                             // erase a dying agent's only Critical signal, but
                             // untracked / UDP terminal traffic and repeated
                             // terminal frames still pay the global bucket.
-                            if !terminal_global_bypass && !self.try_admit_global(now_ns) {
-                                continue;
+                            let mut global_admitted = false;
+                            if !terminal_global_bypass {
+                                if !self.try_admit_global(now_ns) {
+                                    continue;
+                                }
+                                global_admitted = true;
                             }
                             // Resolve the peer's PID-namespace inode now —
                             // only AFTER the global rate limiter has admitted
@@ -763,6 +767,9 @@ impl Observer {
                             let cross_ns =
                                 cross_namespace_refused(observer_ns_inode, peer_pid_ns_inode);
                             if cross_ns && !self.allow_cross_namespace {
+                                if !global_admitted && !self.try_admit_global(now_ns) {
+                                    continue;
+                                }
                                 self.cross_namespace_drops =
                                     self.cross_namespace_drops.saturating_add(1);
                                 if first_event.is_none() {
@@ -797,6 +804,9 @@ impl Observer {
                                     }
                                 }
                                 Update::OriginConflict => {
+                                    if !global_admitted && !self.try_admit_global(now_ns) {
+                                        continue;
+                                    }
                                     if first_event.is_none() {
                                         first_event = Some(Event::OriginConflict {
                                             claimed_pid: frame.pid,
@@ -807,6 +817,9 @@ impl Observer {
                                     }
                                 }
                                 Update::NamespaceConflict => {
+                                    if !global_admitted && !self.try_admit_global(now_ns) {
+                                        continue;
+                                    }
                                     if first_event.is_none() {
                                         first_event = Some(Event::NamespaceConflict {
                                             claimed_pid: frame.pid,
