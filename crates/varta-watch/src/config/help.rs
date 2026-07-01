@@ -210,10 +210,10 @@ OPTIONAL:
                                      /dev/watchdog) and kick it once per
                                      poll iteration. On clean shutdown the
                                      magic-close byte 'V' is written to
-                                     disarm the watchdog. On supported Linux
-                                     builds, startup verifies the watchdog
-                                     ioctl API and enforces a >=30 s timeout
-                                     floor.
+                                     disarm watchdogs that support it. On
+                                     supported Linux builds, startup verifies
+                                     the watchdog ioctl API, close semantics,
+                                     and a >=30 s timeout floor.
     --prom-rate-limit-per-sec <N>  Per-source-IP refill rate for the
                                      /metrics endpoint token bucket
                                      (default 5).  Scrapes from any single

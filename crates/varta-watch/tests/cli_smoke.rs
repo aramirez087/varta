@@ -815,7 +815,7 @@ fn cli_hw_watchdog_rejects_character_device_without_watchdog_ioctl() {
         "/dev/null must not pass Linux watchdog ioctl validation"
     );
     assert!(
-        String::from_utf8_lossy(&out.stderr).contains("WDIOC_GETTIMEOUT failed"),
+        String::from_utf8_lossy(&out.stderr).contains("WDIOC_GETSUPPORT failed"),
         "startup error must name the missing watchdog ioctl; stderr: {}",
         String::from_utf8_lossy(&out.stderr)
     );

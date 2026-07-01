@@ -135,11 +135,14 @@ accepting writes while providing no watchdog protection.
 
 On Linux builds with a pinned watchdog ioctl ABI (x86_64, aarch64, and
 riscv64 today), `varta-watch` also verifies that the descriptor implements the
-standard watchdog ioctl API. It reads `WDIOC_GETTIMEOUT`, and if the current
-timeout is below 30 s it requests 30 s with `WDIOC_SETTIMEOUT`. Startup fails
-if the device is not a watchdog, the timeout cannot be read, the kernel clamps
-the timeout below the 30 s floor, or the Linux target's ioctl encoding has not
-yet been pinned.
+standard watchdog ioctl API and has crash-close semantics. It reads
+`WDIOC_GETSUPPORT` and accepts the device only when it advertises
+`WDIOF_MAGICCLOSE` or sysfs reports `nowayout=1` for the same character
+device. It then reads `WDIOC_GETTIMEOUT`, and if the current timeout is below
+30 s it requests 30 s with `WDIOC_SETTIMEOUT`. Startup fails if the device is
+not a watchdog, close behavior cannot be proven safe, the timeout cannot be
+read, the kernel clamps the timeout below the 30 s floor, or the Linux
+target's ioctl encoding has not yet been pinned.
 
 **Magic close:** on a clean shutdown (SIGTERM/SIGINT followed by graceful exit)
 `varta-watch` writes the magic byte `'V'` to disarm the watchdog before
@@ -147,7 +150,9 @@ exiting.  A crash or hang leaves the watchdog armed; the kernel reboots after
 its timeout. If startup validation rejects a device after opening it,
 `varta-watch` also best-effort writes `'V'` before returning the startup error
 so a clean configuration failure does not leave an already-opened watchdog
-running.
+running. On Linux `nowayout=1` devices the kernel deliberately overrules magic
+close; `varta-watch` accepts that mode because crash/hang protection is
+stronger, but a clean service stop cannot disarm the hardware watchdog.
 
 The `/dev/watchdog` device is typically root-owned (mode 0600).  Run
 `varta-watch` as root or grant the `CAP_SYS_ADMIN` capability, or use a
