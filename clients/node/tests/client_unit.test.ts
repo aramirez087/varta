@@ -51,6 +51,21 @@ class CountingTransport implements BeatTransport {
   }
 }
 
+class DropTwiceTransport implements BeatTransport {
+  remaining = 2;
+  reconnects = 0;
+  send(_buf: Buffer): void {
+    if (this.remaining > 0) {
+      this.remaining -= 1;
+      throw errnoErr("EAGAIN", 11);
+    }
+  }
+  reconnect(): void {
+    this.reconnects += 1;
+  }
+  close(): void {}
+}
+
 function errnoErr(code: string, errno: number): NodeJS.ErrnoException {
   const e = new Error(`mock ${code}`) as NodeJS.ErrnoException;
   e.code = code;
@@ -259,6 +274,25 @@ test("failed reconnect rearms consecutiveDropped window", () => {
   // Only after another full window should reconnect be attempted again.
   assert.equal(agent.beat(Status.Ok).kind, "dropped");
   assert.equal(transport.reconnects, 2);
+});
+
+test("explicit reconnect resets consecutiveDropped window", () => {
+  const transport = new DropTwiceTransport();
+  const agent = Varta.fromTransport(transport);
+  agent.setReconnectAfter(2);
+
+  assert.equal(agent.beat(Status.Ok).kind, "dropped");
+  assert.equal(transport.reconnects, 0);
+
+  agent.reconnect();
+  assert.equal(transport.reconnects, 1);
+
+  assert.equal(agent.beat(Status.Ok).kind, "dropped");
+  assert.equal(
+    transport.reconnects,
+    1,
+    "first drop after explicit reconnect must not immediately auto-reconnect",
+  );
 });
 
 test("__setNonceForTest at NONCE_TERMINAL - 1 triggers wrap to 0", async () => {

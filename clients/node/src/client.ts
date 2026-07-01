@@ -246,6 +246,7 @@ export class Varta {
   reconnect(): void {
     this.transport.reconnect();
     this.connectPid = process.pid;
+    this.consecutiveDropped = 0;
   }
 
   setReconnectAfter(n: number | null): void {

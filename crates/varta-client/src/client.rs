@@ -701,6 +701,7 @@ impl<T: BeatTransport> Varta<T> {
         self.transport.reconnect()?;
         self.connect_pid = std::process::id();
         self.connect_fork_epoch = fork_epoch::current();
+        self.consecutive_dropped = 0;
         Ok(())
     }
 
@@ -1170,6 +1171,34 @@ mod tests {
             "the retry after reconnect must send the same pending frame"
         );
         assert_eq!(&agent.transport.accepted_nonces[..1], &[1]);
+    }
+
+    #[test]
+    fn explicit_reconnect_resets_consecutive_dropped_window() {
+        let mut agent = varta_with_transport(ScriptedTransport::new(&[
+            SendStep::WouldBlock,
+            SendStep::WouldBlock,
+            SendStep::Sent,
+        ]));
+        agent.set_reconnect_after(2);
+
+        assert!(matches!(agent.beat(Status::Ok, 0), BeatOutcome::Dropped(_)));
+        assert_eq!(agent.consecutive_dropped, 1);
+        assert_eq!(agent.transport.reconnects, 0);
+
+        agent.reconnect().expect("explicit reconnect succeeds");
+        assert_eq!(agent.transport.reconnects, 1);
+        assert_eq!(
+            agent.consecutive_dropped, 0,
+            "explicit reconnect must clear the stale dropped-beat window"
+        );
+
+        assert!(matches!(agent.beat(Status::Ok, 0), BeatOutcome::Dropped(_)));
+        assert_eq!(agent.consecutive_dropped, 1);
+        assert_eq!(
+            agent.transport.reconnects, 1,
+            "first drop after explicit reconnect must not immediately auto-reconnect"
+        );
     }
 
     #[test]

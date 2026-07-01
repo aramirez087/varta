@@ -30,6 +30,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Manual reconnect now clears stale auto-reconnect drop windows in Rust, Go,
+  Python, and Node clients.** After one dropped beat, an operator calling
+  `reconnect()` expected the channel state to be fresh; the next dropped beat
+  should start a new `set_reconnect_after` window, not immediately trigger
+  another reconnect and retry. Java and .NET already reset this counter; the
+  remaining clients now match.
 - **Go, Python, Java, and .NET secure-UDP no longer reuse or overflow terminal
   AEAD nonce state at double exhaustion (bug-539).** The earlier
   commit-on-success fixes covered the ordinary counter-wrap beat, but the final

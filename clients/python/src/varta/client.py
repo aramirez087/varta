@@ -400,6 +400,7 @@ class Varta:
         self._transport.reconnect()
         self._connect_pid = os.getpid()
         self._connect_fork_epoch = _fork_epoch.current()
+        self._consecutive_dropped = 0
 
     def set_reconnect_after(self, n: Optional[int]) -> None:
         """Auto-reconnect after ``n`` consecutive ``Dropped`` outcomes.

@@ -43,8 +43,9 @@ func (t *shortWriteErr) Close() error               { return nil }
 
 // countingDrop drops the first n sends, then succeeds; Reconnect succeeds.
 type countingDrop struct {
-	remaining int
-	sends     int
+	remaining  int
+	sends      int
+	reconnects int
 }
 
 func (t *countingDrop) Send(buf []byte) (int, error) {
@@ -55,8 +56,11 @@ func (t *countingDrop) Send(buf []byte) (int, error) {
 	}
 	return len(buf), nil
 }
-func (t *countingDrop) Reconnect() error { return nil }
-func (t *countingDrop) Close() error     { return nil }
+func (t *countingDrop) Reconnect() error {
+	t.reconnects++
+	return nil
+}
+func (t *countingDrop) Close() error { return nil }
 
 func TestDroppedBeatDoesNotCommitNonceOrTimestamp(t *testing.T) {
 	v := newVarta(&alwaysDrop{})
@@ -150,6 +154,36 @@ func TestReconnectRetryCommitsNonceOnlyOnSuccessfulRetry(t *testing.T) {
 	}
 	if tr.sends != 3 {
 		t.Fatalf("sends = %d, want 3 (2 drops + 1 retry)", tr.sends)
+	}
+}
+
+func TestExplicitReconnectResetsConsecutiveDroppedWindow(t *testing.T) {
+	tr := &countingDrop{remaining: 2}
+	v := newVarta(tr)
+	v.SetReconnectAfter(2)
+	if out := v.Beat(StatusOK, 0); !out.IsDropped() {
+		t.Fatalf("beat 1: want Dropped, got %s", out.String())
+	}
+	if v.consecutiveDropped != 1 {
+		t.Fatalf("beat 1: consecutiveDropped = %d, want 1", v.consecutiveDropped)
+	}
+	if err := v.Reconnect(); err != nil {
+		t.Fatalf("explicit Reconnect() error = %v", err)
+	}
+	if tr.reconnects != 1 {
+		t.Fatalf("explicit reconnects = %d, want 1", tr.reconnects)
+	}
+	if v.consecutiveDropped != 0 {
+		t.Fatalf("explicit Reconnect() left consecutiveDropped = %d, want 0", v.consecutiveDropped)
+	}
+	if out := v.Beat(StatusOK, 0); !out.IsDropped() {
+		t.Fatalf("beat 2: want Dropped after reset window, got %s", out.String())
+	}
+	if tr.reconnects != 1 {
+		t.Fatalf("beat 2: reconnects = %d, want 1 (no immediate auto-reconnect)", tr.reconnects)
+	}
+	if v.consecutiveDropped != 1 {
+		t.Fatalf("beat 2: consecutiveDropped = %d, want 1", v.consecutiveDropped)
 	}
 }
 

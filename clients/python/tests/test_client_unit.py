@@ -563,6 +563,24 @@ def test_auto_reconnect_after_threshold() -> None:
     assert transport.send_calls == 3  # 2 drops + 1 retry send
 
 
+def test_explicit_reconnect_resets_consecutive_dropped_window() -> None:
+    transport = _CountingTransport(drop_count=2)
+    agent = Varta(transport)
+    agent.set_reconnect_after(2)
+
+    assert agent.beat(Status.OK).is_dropped
+    assert agent._consecutive_dropped == 1
+    assert transport.reconnect_calls == 0
+
+    agent.reconnect()
+    assert transport.reconnect_calls == 1
+    assert agent._consecutive_dropped == 0
+
+    assert agent.beat(Status.OK).is_dropped
+    assert transport.reconnect_calls == 1
+    assert agent._consecutive_dropped == 1
+
+
 def test_set_reconnect_after_zero_disables() -> None:
     transport = _CountingTransport(drop_count=10)
     agent = Varta(transport)

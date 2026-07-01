@@ -34,6 +34,10 @@ governed independently — see `book/src/spec/vlp.md` in the workspace.
 
 ### Fixed
 
+- `Reconnect()` now clears the consecutive-dropped counter. A manual reconnect
+  after a dropped beat starts a fresh `SetReconnectAfter` window instead of
+  letting the next drop immediately reconnect and retry again.
+
 - **`Beat()` after `Close()` now returns `Failed(Closed)` without touching the
   transport.** The Go agent previously closed only the transport; UDS/UDP
   transports nil their socket on close, so a later `Beat()` could panic while

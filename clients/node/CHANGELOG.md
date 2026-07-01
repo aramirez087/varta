@@ -26,6 +26,10 @@ governed independently — see `book/src/spec/vlp.md` in the workspace.
 
 ### Fixed
 
+- `reconnect()` now clears the consecutive-dropped counter. A manual reconnect
+  after a dropped beat starts a fresh `setReconnectAfter` window instead of
+  letting the next drop immediately reconnect and retry again.
+
 - `Varta.beat()` after `close()` now returns `{ kind: "failed",
   error.kind: "Closed" }` without touching the transport. This matches the
   Rust/Python/Java/.NET outcome contract and prevents shutdown races from

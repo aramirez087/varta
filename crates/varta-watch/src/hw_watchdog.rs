@@ -262,26 +262,11 @@ mod linux_watchdog {
         target_arch = "riscv64"
     ))]
     #[repr(C)]
-    #[derive(Clone, Copy)]
+    #[derive(Clone, Copy, Default)]
     struct WatchdogInfo {
         options: u32,
         firmware_version: u32,
         identity: [u8; 32],
-    }
-
-    #[cfg(any(
-        target_arch = "x86_64",
-        target_arch = "aarch64",
-        target_arch = "riscv64"
-    ))]
-    impl Default for WatchdogInfo {
-        fn default() -> Self {
-            Self {
-                options: 0,
-                firmware_version: 0,
-                identity: [0u8; 32],
-            }
-        }
     }
 
     // Linux watchdog UAPI:

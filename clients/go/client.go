@@ -199,6 +199,7 @@ func (v *Varta) Reconnect() error {
 		return err
 	}
 	v.connectPID = os.Getpid()
+	v.consecutiveDropped = 0
 	return nil
 }
 
