@@ -18,6 +18,15 @@ workspace and follows [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **JVM panic-handler installs now replace the active `SignalHandler.run`
+  emitter.** Reinstalling a shutdown or signal panic handler previously kept the
+  first emitter active because installation used first-writer-wins
+  `compareAndSet(null, emitter)`. A rolling reconfiguration could therefore
+  emit terminal beats to the old observer, and closing the stale handle could
+  leave `run()` with no active emitter at all. New installs now close and
+  restore the previous Varta registration before publishing the new one; stale
+  handles are idempotent no-ops and cannot clear a newer registration.
+
 - **Closed agents now fail with the canonical `Failed(Closed)` outcome and do
   not reopen transport state.** The JVM client already guarded `beat()` after
   `close()`, but returned a human sentence instead of the stable `Closed`

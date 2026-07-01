@@ -17,7 +17,6 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
-import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Consumer;
 
 /**
@@ -31,7 +30,8 @@ import java.util.function.Consumer;
  */
 public final class SignalHandler {
     private static final List<String> POSIX_SIGNALS = List.of("TERM", "INT", "HUP", "QUIT");
-    private static final AtomicReference<Emitter> ACTIVE = new AtomicReference<>();
+    private static final Object INSTALL_LOCK = new Object();
+    private static Registration active;
 
     private SignalHandler() {}
 
@@ -72,8 +72,9 @@ public final class SignalHandler {
         try {
             action.run();
         } catch (Throwable t) {
-            Emitter active = ACTIVE.get();
-            if (active != null) active.emitBestEffort();
+            synchronized (INSTALL_LOCK) {
+                if (active != null) active.emitBestEffort();
+            }
             throw t;
         }
     }
@@ -83,14 +84,11 @@ public final class SignalHandler {
     private static AutoCloseable installShutdownHook(TransportOpener opener) {
         BeatTransport tx = openOrFail(opener);
         Emitter emitter = new Emitter(tx);
-        ACTIVE.compareAndSet(null, emitter);
         Thread hook = new Thread(emitter::emitBestEffort, "varta-shutdown-hook");
-        Runtime.getRuntime().addShutdownHook(hook);
-        return () -> {
-            try { Runtime.getRuntime().removeShutdownHook(hook); } catch (IllegalStateException ignored) {}
-            ACTIVE.compareAndSet(emitter, null);
-            emitter.close();
-        };
+        Registration registration = new Registration(emitter, () ->
+            Runtime.getRuntime().removeShutdownHook(hook));
+        return activateRegistration(registration, () ->
+            Runtime.getRuntime().addShutdownHook(hook));
     }
 
     private static AutoCloseable installSignalHandler(TransportOpener opener) {
@@ -100,31 +98,87 @@ public final class SignalHandler {
         }
         BeatTransport tx = openOrFail(opener);
         Emitter emitter = new Emitter(tx);
-        ACTIVE.compareAndSet(null, emitter);
 
         Map<String, sun.misc.SignalHandler> previous = new HashMap<>();
-        for (String name : POSIX_SIGNALS) {
+        Registration registration = new Registration(emitter, () -> {
+            for (var e : previous.entrySet()) {
+                sun.misc.Signal.handle(new sun.misc.Signal(e.getKey()), e.getValue());
+            }
+        });
+        return activateRegistration(registration, () -> {
+            for (String name : POSIX_SIGNALS) {
+                try {
+                    sun.misc.Signal sig = new sun.misc.Signal(name);
+                    // The lambda looks up `previous.get(name)` at FIRE time (by then
+                    // the map is fully populated), so it can chain to the handler
+                    // that was installed before ours.
+                    sun.misc.SignalHandler prev = sun.misc.Signal.handle(sig, signal ->
+                        onTerminatingSignal(signal, previous.get(name), emitter, SignalHandler::reRaiseSignal));
+                    previous.put(name, prev);
+                } catch (IllegalArgumentException ignored) {
+                    // signal not supported on this OS — skip silently
+                }
+            }
+        });
+    }
+
+    private static AutoCloseable activateRegistration(Registration registration, Runnable install) {
+        synchronized (INSTALL_LOCK) {
+            Registration previous = active;
+            active = null;
+            if (previous != null) {
+                previous.closeForReplacement();
+            }
+
             try {
-                sun.misc.Signal sig = new sun.misc.Signal(name);
-                // The lambda looks up `previous.get(name)` at FIRE time (by then
-                // the map is fully populated), so it can chain to the handler
-                // that was installed before ours.
-                sun.misc.SignalHandler prev = sun.misc.Signal.handle(sig, signal ->
-                    onTerminatingSignal(signal, previous.get(name), emitter, SignalHandler::reRaiseSignal));
-                previous.put(name, prev);
-            } catch (IllegalArgumentException ignored) {
-                // signal not supported on this OS — skip silently
+                install.run();
+                active = registration;
+                return registration;
+            } catch (RuntimeException | Error e) {
+                registration.closeForReplacement();
+                throw e;
             }
         }
-        return () -> {
-            for (var e : previous.entrySet()) {
+    }
+
+    private static final class Registration implements AutoCloseable {
+        private final Emitter emitter;
+        private final Runnable restore;
+        private boolean closed;
+
+        Registration(Emitter emitter, Runnable restore) {
+            this.emitter = emitter;
+            this.restore = restore;
+        }
+
+        @Override
+        public void close() {
+            close(false);
+        }
+
+        void emitBestEffort() {
+            emitter.emitBestEffort();
+        }
+
+        void closeForReplacement() {
+            close(true);
+        }
+
+        private void close(boolean replacement) {
+            synchronized (INSTALL_LOCK) {
+                if (closed) return;
+                closed = true;
+                if (!replacement && active == this) {
+                    active = null;
+                }
                 try {
-                    sun.misc.Signal.handle(new sun.misc.Signal(e.getKey()), e.getValue());
-                } catch (Throwable ignored) {}
+                    restore.run();
+                } catch (Throwable ignored) {
+                } finally {
+                    emitter.close();
+                }
             }
-            ACTIVE.compareAndSet(emitter, null);
-            emitter.close();
-        };
+        }
     }
 
     /**

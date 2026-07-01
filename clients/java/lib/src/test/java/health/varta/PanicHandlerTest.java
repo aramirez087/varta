@@ -7,8 +7,10 @@ import java.net.DatagramPacket;
 import java.net.DatagramSocket;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
+import java.net.SocketTimeoutException;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 class PanicHandlerTest {
 
@@ -59,6 +61,45 @@ class PanicHandlerTest {
                 assertThat(Long.compareUnsigned(secondTimestamp, firstTimestamp))
                     .as("terminal timestamp must advance so the observer does not reject a later panic as replay")
                     .isGreaterThan(0);
+            }
+        }
+    }
+
+    @Test
+    void latest_shutdown_hook_installation_remains_active_after_stale_handle_close() throws Exception {
+        try (DatagramSocket first = new DatagramSocket(new InetSocketAddress("127.0.0.1", 0));
+             DatagramSocket second = new DatagramSocket(new InetSocketAddress("127.0.0.1", 0))) {
+            InetSocketAddress firstAddr =
+                new InetSocketAddress(InetAddress.getLoopbackAddress(), first.getLocalPort());
+            InetSocketAddress secondAddr =
+                new InetSocketAddress(InetAddress.getLoopbackAddress(), second.getLocalPort());
+
+            AutoCloseable firstHook = SignalHandler.installShutdownHookUdp(firstAddr);
+            AutoCloseable secondHook = SignalHandler.installShutdownHookUdp(secondAddr);
+            try {
+                firstHook.close();
+
+                try {
+                    SignalHandler.run(() -> { throw new IllegalStateException("latest"); });
+                } catch (IllegalStateException expected) {
+                    assertThat(expected).hasMessageContaining("latest");
+                }
+
+                second.setSoTimeout(2000);
+                DatagramPacket pkt = new DatagramPacket(new byte[64], 64);
+                second.receive(pkt);
+                assertThat(pkt.getLength()).isEqualTo(Varta.FRAME_BYTES);
+                Frame frame = Frame.decode(java.util.Arrays.copyOf(pkt.getData(), pkt.getLength()));
+                assertThat(frame.status()).isEqualTo(Status.CRITICAL);
+                assertThat(frame.nonce()).isEqualTo(Varta.NONCE_TERMINAL);
+
+                first.setSoTimeout(250);
+                DatagramPacket stale = new DatagramPacket(new byte[64], 64);
+                assertThatThrownBy(() -> first.receive(stale))
+                    .isInstanceOf(SocketTimeoutException.class);
+            } finally {
+                secondHook.close();
+                firstHook.close();
             }
         }
     }
