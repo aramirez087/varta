@@ -12,6 +12,7 @@ taxonomy — is preserved.
 
 from __future__ import annotations
 
+import errno
 import os
 import sys
 import time
@@ -162,6 +163,10 @@ def _write_zero_outcome() -> BeatOutcome:
 
 def _closed_outcome() -> BeatOutcome:
     return BeatOutcome.failed(BeatError(BeatError.UNKNOWN_ERRNO, "Closed"))
+
+
+def _closed_reconnect_error() -> OSError:
+    return OSError(errno.EBADF, "Varta.reconnect: Closed")
 
 
 def _errno_name(code: Optional[int]) -> str:
@@ -397,6 +402,9 @@ class Varta:
         reconnect issued from a forked child cannot leave stale ancestor
         identity behind that would re-trigger fork recovery on the next beat.
         """
+        if self._closed:
+            self._consecutive_dropped = 0
+            raise _closed_reconnect_error()
         self._transport.reconnect()
         self._connect_pid = os.getpid()
         self._connect_fork_epoch = _fork_epoch.current()
@@ -428,6 +436,7 @@ class Varta:
         if self._closed:
             return
         self._closed = True
+        self._consecutive_dropped = 0
         self._transport.close()
 
     def __enter__(self) -> "Varta":

@@ -250,6 +250,11 @@ public sealed class Varta : IDisposable
     {
         lock (_lock)
         {
+            if (_disposed)
+            {
+                _consecutiveDropped = 0;
+                throw new ObjectDisposedException(nameof(Varta));
+            }
             _transport.Reconnect();
             _connectPid = Environment.ProcessId;
             _consecutiveDropped = 0;
@@ -297,6 +302,7 @@ public sealed class Varta : IDisposable
         {
             if (_disposed) return;
             _disposed = true;
+            _consecutiveDropped = 0;
             _transport.Dispose();
         }
     }

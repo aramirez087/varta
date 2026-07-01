@@ -30,6 +30,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Python, Node, and .NET agents no longer reconnect after shutdown.** Public
+  `reconnect()` calls on a closed/disposed agent now fail before touching the
+  transport, so a shutdown race cannot reopen UDS/UDP sockets or refresh
+  secure-UDP session state after the handle has been closed. Rust has no
+  explicit close surface, and Go/Java already guarded this path.
 - **Manual reconnect now clears stale auto-reconnect drop windows in Rust, Go,
   Python, and Node clients.** After one dropped beat, an operator calling
   `reconnect()` expected the channel state to be fresh; the next dropped beat

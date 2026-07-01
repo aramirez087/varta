@@ -13,6 +13,10 @@ here. Versioning is independent of the Rust workspace and follows
   outcome path before any transport send, preserving the documented
   never-throws contract during shutdown races.
 
+- **`Reconnect()` after `Dispose()` now throws before touching the transport.**
+  A disposed agent can no longer reopen a socket or refresh secure-UDP session
+  state after shutdown; closed `Beat()` calls still return `Failed(Closed)`.
+
 - **Short successful sends are no longer committed as delivered beats.** The
   agent now requires transports to report the full 32-byte logical frame before
   returning `Sent`; any short return surfaces as `Failed(WriteZero)` and leaves

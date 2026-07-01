@@ -190,6 +190,20 @@ test("beat after close returns failed Closed without transport side effects", ()
   assert.equal(transport.reconnects, 0);
 });
 
+test("reconnect after close throws without transport side effects", () => {
+  const transport = new CountingTransport();
+  const agent = Varta.fromTransport(transport);
+  agent.setReconnectAfter(1);
+  agent.__setConnectPidForTest(process.pid + 1);
+
+  agent.close();
+  assert.throws(() => agent.reconnect(), /Varta\.reconnect: Closed/);
+
+  assert.equal(transport.closes, 1);
+  assert.equal(transport.sends, 0);
+  assert.equal(transport.reconnects, 0);
+});
+
 test("beat against a closed listener does not throw", async () => {
   // The connected-mode UDP transport may surface ICMP `port unreachable`
   // as `DropReason.NoObserver` (Linux) or stay silent (macOS, where

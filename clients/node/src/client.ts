@@ -58,6 +58,13 @@ function warnNonceWrapping(): void {
   }
 }
 
+function closedReconnectError(): NodeJS.ErrnoException {
+  const err = new Error("Varta.reconnect: Closed") as NodeJS.ErrnoException;
+  err.code = "EBADF";
+  err.errno = 9;
+  return err;
+}
+
 // `process.hrtime.bigint()` is monotonic and unaffected by NTP slew.
 // We expose this through a tiny indirection so unit tests can clamp the
 // clock without touching the global.
@@ -244,6 +251,10 @@ export class Varta {
   }
 
   reconnect(): void {
+    if (this.closed) {
+      this.consecutiveDropped = 0;
+      throw closedReconnectError();
+    }
     this.transport.reconnect();
     this.connectPid = process.pid;
     this.consecutiveDropped = 0;
@@ -269,6 +280,7 @@ export class Varta {
   close(): void {
     if (this.closed) return;
     this.closed = true;
+    this.consecutiveDropped = 0;
     this.transport.close();
   }
 

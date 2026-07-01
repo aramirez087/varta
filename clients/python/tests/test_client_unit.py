@@ -161,6 +161,24 @@ def test_beat_after_close_returns_failed_without_sending() -> None:
     assert transport.reconnect_calls == 0
 
 
+def test_reconnect_after_close_fails_without_transport_side_effects() -> None:
+    transport = _SimpleSendTransport()
+    agent = Varta(transport)
+    agent.set_reconnect_after(1)
+    agent._set_connect_pid_for_test(os.getpid() + 1)
+    agent._consecutive_dropped = 7
+
+    agent.close()
+    with pytest.raises(OSError) as excinfo:
+        agent.reconnect()
+
+    assert excinfo.value.errno == errno.EBADF
+    assert "Closed" in str(excinfo.value)
+    assert agent._consecutive_dropped == 0
+    assert transport.send_calls == 0
+    assert transport.reconnect_calls == 0
+
+
 def test_consecutive_beats_increment_nonce(
     bound_uds_listener: Tuple[socket.socket, Path],
 ) -> None:

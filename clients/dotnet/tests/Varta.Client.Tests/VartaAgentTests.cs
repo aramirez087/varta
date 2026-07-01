@@ -35,6 +35,7 @@ public class VartaAgentTests
     {
         public int Sends;
         public int Reconnects;
+        public int Closes;
 
         public int Send(ReadOnlySpan<byte> frame32)
         {
@@ -47,7 +48,10 @@ public class VartaAgentTests
             Reconnects++;
         }
 
-        public void Dispose() { }
+        public void Dispose()
+        {
+            Closes++;
+        }
     }
 
     private sealed class ThrowingTransport : IBeatTransport
@@ -349,6 +353,23 @@ public class VartaAgentTests
         Assert.Equal("Closed", outcome.Error.Kind);
         Assert.Equal(0, transport.Sends);
         Assert.Equal(0, transport.Reconnects);
+        Assert.Equal(1, transport.Closes);
+    }
+
+    [Fact]
+    public void Reconnect_AfterDispose_ThrowsWithoutTransportSideEffects()
+    {
+        var transport = new CountingTransport();
+        using var agent = global::Varta.Varta.FromTransportForTest(transport);
+        agent.SetReconnectAfter(1);
+        agent.SetConnectPidForTest(Environment.ProcessId + 1);
+
+        agent.Dispose();
+        Assert.Throws<ObjectDisposedException>(() => agent.Reconnect());
+
+        Assert.Equal(0, transport.Sends);
+        Assert.Equal(0, transport.Reconnects);
+        Assert.Equal(1, transport.Closes);
     }
 
     [Fact]

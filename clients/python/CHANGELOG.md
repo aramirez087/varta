@@ -12,6 +12,10 @@ governed independently — see `book/src/spec/vlp.md` in the workspace.
   after a dropped beat starts a fresh `set_reconnect_after` window instead of
   letting the next drop immediately reconnect and retry again.
 
+- `reconnect()` after `close()` now fails before touching the transport. A
+  closed agent can no longer reopen a socket or refresh secure-UDP session
+  state after shutdown; closed `beat()` calls still return `failed(Closed)`.
+
 - **`Varta.beat()` now returns `failed(Closed)` after `close()` instead of
   raising an internal assertion.** The agent records a closed state and refuses
   later beats before touching the transport, preserving the outcome-based
