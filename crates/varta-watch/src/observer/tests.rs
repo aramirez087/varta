@@ -488,6 +488,30 @@ impl BeatListener for ScriptedListener {
     }
 }
 
+fn seed_recovered_after_terminal(obs: &mut Observer, pid: u32, origin: BeatOrigin, now_ns: u64) {
+    let first = Frame::new(Status::Ok, pid, 1, 1, 0x100);
+    assert_eq!(
+        obs.tracker
+            .record(&first, now_ns - 2, obs.threshold_ns, origin, None),
+        Update::Inserted
+    );
+
+    let terminal = Frame::new(Status::Critical, pid, 2, NONCE_TERMINAL, 0x200);
+    assert_eq!(
+        obs.tracker
+            .record(&terminal, now_ns - 1, obs.threshold_ns, origin, None),
+        Update::Refreshed
+    );
+
+    let recovered = Frame::new(Status::Ok, pid, 3, 2, 0x300);
+    assert_eq!(
+        obs.tracker
+            .record(&recovered, now_ns, obs.threshold_ns, origin, None),
+        Update::Refreshed
+    );
+    assert_eq!(obs.tracker.last_observed_nonce_of(pid), Some(2));
+}
+
 struct CountingListener {
     decrypt_failures: u64,
     replay_refused: u64,
@@ -1361,6 +1385,94 @@ fn repeated_terminal_gasp_pays_per_pid_rate_limiter() {
         obs.drain_per_pid_rate_limited(),
         1,
         "repeated terminal frames should pay the per-pid limiter"
+    );
+}
+
+#[test]
+fn stale_terminal_after_recovery_pays_per_pid_rate_limiter() {
+    let pid = 10;
+    let now_ns = 10_000_000_000;
+    let mut obs = Observer::new(
+        Duration::from_secs(60),
+        64,
+        EvictionPolicy::Strict,
+        DEFAULT_EVICTION_SCAN_WINDOW,
+        Some(1),
+        0,
+        0,
+        ClockSource::Monotonic,
+    )
+    .expect("Observer::new should succeed");
+    seed_recovered_after_terminal(&mut obs, pid, BeatOrigin::SocketModeOnly, now_ns);
+    obs.last_now_ns = now_ns;
+
+    obs.add_listener(Box::new(ScriptedListener::with_status_origin_peer_frames(
+        &[(
+            pid,
+            Status::Critical,
+            2,
+            NONCE_TERMINAL,
+            0xBEEF,
+            BeatOrigin::SocketModeOnly,
+            0,
+        )],
+    )));
+
+    let got = obs.poll();
+    assert!(
+        got.is_none(),
+        "stale terminal replay after recovery should be dropped, got {got:?}"
+    );
+    assert_eq!(
+        obs.drain_per_pid_rate_limited(),
+        1,
+        "stale terminal replays after recovery are ordinary same-pid pressure"
+    );
+}
+
+#[test]
+fn stale_terminal_after_recovery_pays_global_rate_limiter() {
+    let pid = std::process::id();
+    let now_ns = 10_000_000_000;
+    let mut obs = Observer::new(
+        Duration::from_secs(60),
+        64,
+        EvictionPolicy::Strict,
+        DEFAULT_EVICTION_SCAN_WINDOW,
+        None,
+        1,
+        1,
+        ClockSource::Monotonic,
+    )
+    .expect("Observer::new should succeed");
+    seed_recovered_after_terminal(&mut obs, pid, BeatOrigin::SocketModeOnly, now_ns);
+    obs.last_now_ns = now_ns;
+    assert!(
+        obs.global_rl.try_consume(now_ns),
+        "drain the single global token before polling the stale terminal replay"
+    );
+
+    obs.add_listener(Box::new(ScriptedListener::with_status_origin_peer_frames(
+        &[(
+            pid,
+            Status::Critical,
+            2,
+            NONCE_TERMINAL,
+            0xBEEF,
+            BeatOrigin::SocketModeOnly,
+            pid,
+        )],
+    )));
+
+    let got = obs.poll();
+    assert!(
+        got.is_none(),
+        "stale terminal replay after recovery should be globally shed, got {got:?}"
+    );
+    assert_eq!(
+        obs.drain_global_rate_limited(),
+        1,
+        "stale terminal replays must not receive the dying-gasp global bypass"
     );
 }
 

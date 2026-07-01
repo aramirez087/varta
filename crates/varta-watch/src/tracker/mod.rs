@@ -1028,6 +1028,27 @@ impl Tracker {
             .map(|s| s.last_observed_nonce)
     }
 
+    /// Return whether a terminal panic frame with `timestamp` would advance the
+    /// tracked terminal high-water mark for `pid`.
+    ///
+    /// Used by the observer before granting the terminal-frame rate-limit
+    /// bypass. A recovered process can emit regular beats after a terminal
+    /// frame; an old terminal replay after that regular beat still has
+    /// `last_observed_nonce != NONCE_TERMINAL`, but the tracker would reject it
+    /// as stale. Such frames are not dying gasps and must pay the normal
+    /// limiters.
+    pub fn terminal_timestamp_would_advance(&self, pid: u32, timestamp: u64) -> bool {
+        self.pid_to_index
+            .get(pid)
+            .and_then(|idx| self.entries.get(idx))
+            .filter(|s| s.used)
+            .map(|s| match s.last_terminal_timestamp {
+                Some(last) => timestamp > last,
+                None => true,
+            })
+            .unwrap_or(false)
+    }
+
     /// Return the pinned transport origin of a tracked pid, if present.
     /// Used by the observer to populate `Event::OriginConflict::slot_origin`
     /// before calling `record` (which may produce the conflict).

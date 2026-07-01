@@ -602,7 +602,11 @@ impl Observer {
                             // below must still pay the global bucket unless it
                             // is the one protected dying-gasp edge.
                             let is_terminal = frame.nonce == NONCE_TERMINAL;
-                            let terminal_after_regular = is_terminal
+                            let terminal_would_advance = is_terminal
+                                && self
+                                    .tracker
+                                    .terminal_timestamp_would_advance(frame.pid, frame.timestamp);
+                            let terminal_after_regular = terminal_would_advance
                                 && matches!(
                                     self.tracker.last_observed_nonce_of(frame.pid),
                                     Some(nonce) if nonce != NONCE_TERMINAL
