@@ -40,6 +40,19 @@ pub(crate) fn saturating_ingress_counter_inc(counter: &mut u64) {
     *counter = counter.saturating_add(1);
 }
 
+fn validate_read_timeout(read_timeout: Duration) -> io::Result<()> {
+    if read_timeout < Duration::from_millis(crate::config::MIN_READ_TIMEOUT_MS) {
+        return Err(io::Error::new(
+            ErrorKind::InvalidInput,
+            format!(
+                "UDS read timeout must be at least {} ms",
+                crate::config::MIN_READ_TIMEOUT_MS
+            ),
+        ));
+    }
+    Ok(())
+}
+
 extern "C" {
     fn umask(mode: u32) -> u32;
 }
@@ -428,6 +441,7 @@ impl UdsListener {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let path = path.as_ref();
+        validate_read_timeout(read_timeout)?;
         let owned_path: PathBuf = path.to_path_buf();
         validate_socket_parent(path)?;
         let effective_socket_mode = socket_mode & 0o777;
@@ -1002,6 +1016,27 @@ mod tests {
 
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755))
             .expect("restore temp socket dir mode");
+        let _ = std::fs::remove_dir(&dir);
+    }
+
+    #[test]
+    fn uds_bind_rejects_zero_read_timeout_before_creating_socket() {
+        let (dir, path) = short_temp_socket_path_with_mode("rt0", 0o755);
+        let _bind_guard = BIND_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let err = match super::UdsListener::bind(&path, 0o600, Duration::ZERO, 0, &pre_thread()) {
+            Ok(listener) => {
+                drop(listener);
+                panic!("bind must reject a zero read timeout")
+            }
+            Err(err) => err,
+        };
+
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(
+            !path.exists(),
+            "read-timeout validation must run before UnixDatagram::bind creates a socket file"
+        );
+
         let _ = std::fs::remove_dir(&dir);
     }
 

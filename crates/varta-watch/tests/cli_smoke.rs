@@ -17,8 +17,12 @@
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::atomic::{AtomicU32, Ordering};
+#[cfg(any(feature = "secure-udp", feature = "unsafe-plaintext-udp"))]
+use std::sync::{Mutex, MutexGuard};
 
 static UDS_COUNTER: AtomicU32 = AtomicU32::new(0);
+#[cfg(any(feature = "secure-udp", feature = "unsafe-plaintext-udp"))]
+static UDP_PORT_LOCK: Mutex<()> = Mutex::new(());
 
 fn unique_uds_path(tag: &str) -> UdsPath {
     let pid = std::process::id();
@@ -46,12 +50,35 @@ impl Drop for UdsPath {
 }
 
 #[cfg(any(feature = "secure-udp", feature = "unsafe-plaintext-udp"))]
-fn unused_udp_port() -> u16 {
-    std::net::UdpSocket::bind("127.0.0.1:0")
+struct ReservedUdpPort {
+    port: String,
+    _guard: MutexGuard<'static, ()>,
+}
+
+#[cfg(any(feature = "secure-udp", feature = "unsafe-plaintext-udp"))]
+impl ReservedUdpPort {
+    fn as_str(&self) -> &str {
+        self.port.as_str()
+    }
+}
+
+#[cfg(any(feature = "secure-udp", feature = "unsafe-plaintext-udp"))]
+fn unused_udp_port() -> ReservedUdpPort {
+    // The child process must bind the chosen port before another parallel
+    // smoke test asks the OS for a fresh ephemeral port.
+    let guard = UDP_PORT_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let port = std::net::UdpSocket::bind("127.0.0.1:0")
         .expect("bind ephemeral UDP port")
         .local_addr()
         .expect("read ephemeral UDP local_addr")
         .port()
+        .to_string();
+    ReservedUdpPort {
+        port,
+        _guard: guard,
+    }
 }
 
 #[cfg_attr(miri, ignore)] // JUSTIFY: miri cannot model process spawning (Command::new)
@@ -183,7 +210,7 @@ fn cli_parses_socket_mode() {
 #[test]
 fn cli_plaintext_udp_without_accept_flag_is_rejected() {
     let path = unique_uds_path("plaintext-no-accept");
-    let port = unused_udp_port().to_string();
+    let port = unused_udp_port();
 
     let out = Command::new(env!("CARGO_BIN_EXE_varta-watch"))
         .args([
@@ -194,7 +221,7 @@ fn cli_plaintext_udp_without_accept_flag_is_rejected() {
             "--udp-bind-addr",
             "127.0.0.1",
             "--udp-port",
-            &port,
+            port.as_str(),
             "--shutdown-after-secs",
             "0",
         ])
@@ -220,7 +247,7 @@ fn cli_plaintext_udp_without_accept_flag_is_rejected() {
 #[test]
 fn cli_plaintext_udp_with_accept_flag_starts() {
     let path = unique_uds_path("plaintext-accept");
-    let port = unused_udp_port().to_string();
+    let port = unused_udp_port();
 
     let out = Command::new(env!("CARGO_BIN_EXE_varta-watch"))
         .args([
@@ -231,7 +258,7 @@ fn cli_plaintext_udp_with_accept_flag_starts() {
             "--udp-bind-addr",
             "127.0.0.1",
             "--udp-port",
-            &port,
+            port.as_str(),
             "--i-accept-plaintext-udp",
             "--shutdown-after-secs",
             "0",
@@ -383,7 +410,7 @@ fn cli_secure_udp_binds_single_listener_for_udp_port() {
     use std::os::unix::fs::PermissionsExt;
 
     let path = unique_uds_path("secure-udp");
-    let port = unused_udp_port().to_string();
+    let port = unused_udp_port();
     let key = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
 
     // The observer enforces mode 0600 on the key file; write it with the
@@ -414,7 +441,7 @@ fn cli_secure_udp_binds_single_listener_for_udp_port() {
             "--udp-bind-addr",
             "127.0.0.1",
             "--udp-port",
-            &port,
+            port.as_str(),
             "--key-file",
             key_path.to_str().expect("utf-8 key path"),
             "--shutdown-after-secs",
@@ -438,7 +465,7 @@ fn cli_secure_udp_binds_single_listener_for_udp_port() {
 #[test]
 fn cli_accepted_key_file_only_binds_secure_udp_without_plaintext_ack() {
     let path = unique_uds_path("accepted-only-secure-udp");
-    let port = unused_udp_port().to_string();
+    let port = unused_udp_port();
     let key = "1111111111111111111111111111111111111111111111111111111111111111";
     let key_path = write_secret_file("accepted-only-secure-udp", key, 0o600);
     let _g = scopeguard(key_path.parent().unwrap());
@@ -452,7 +479,7 @@ fn cli_accepted_key_file_only_binds_secure_udp_without_plaintext_ack() {
             "--udp-bind-addr",
             "127.0.0.1",
             "--udp-port",
-            &port,
+            port.as_str(),
             "--accepted-key-file",
             key_path.to_str().expect("utf-8 key path"),
             "--shutdown-after-secs",
@@ -543,7 +570,7 @@ fn write_secret_file(tag: &str, content: &str, mode: u32) -> std::path::PathBuf 
 #[test]
 fn cli_key_file_with_world_readable_mode_is_rejected() {
     let socket = unique_uds_path("key-file-perm");
-    let port = unused_udp_port().to_string();
+    let port = unused_udp_port();
     let key = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
     // 0o644 leaves group+other readable — the validator must refuse.
     let key_path = write_secret_file("key-0644", key, 0o644);
@@ -556,7 +583,7 @@ fn cli_key_file_with_world_readable_mode_is_rejected() {
             "--udp-bind-addr",
             "127.0.0.1",
             "--udp-port",
-            &port,
+            port.as_str(),
             "--key-file",
             key_path.to_str().expect("utf-8 key path"),
         ])
@@ -844,7 +871,7 @@ fn scopeguard(path: &std::path::Path) -> impl Drop + '_ {
 #[test]
 fn cli_secure_udp_non_loopback_without_accept_flag_is_rejected() {
     let socket = unique_uds_path("h4-noaccept");
-    let port = unused_udp_port().to_string();
+    let port = unused_udp_port();
     let key = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
     let key_path = write_secret_file("h4-noaccept", key, 0o600);
     let _g = scopeguard(key_path.parent().unwrap());
@@ -858,7 +885,7 @@ fn cli_secure_udp_non_loopback_without_accept_flag_is_rejected() {
             "--udp-bind-addr",
             "0.0.0.0",
             "--udp-port",
-            &port,
+            port.as_str(),
             "--key-file",
             key_path.to_str().expect("utf-8 key path"),
             "--shutdown-after-secs",
@@ -886,7 +913,7 @@ fn cli_secure_udp_non_loopback_without_accept_flag_is_rejected() {
 #[test]
 fn cli_secure_udp_non_loopback_with_accept_flag_starts_and_warns() {
     let socket = unique_uds_path("h4-accept");
-    let port = unused_udp_port().to_string();
+    let port = unused_udp_port();
     let key = "111213141516171819202122232425262728293031323334353637383940414243";
     // 64 hex chars exactly; trim if longer.
     let key = &key[..64];
@@ -902,7 +929,7 @@ fn cli_secure_udp_non_loopback_with_accept_flag_starts_and_warns() {
             "--udp-bind-addr",
             "0.0.0.0",
             "--udp-port",
-            &port,
+            port.as_str(),
             "--key-file",
             key_path.to_str().expect("utf-8 key path"),
             "--i-accept-secure-udp-non-loopback",
@@ -933,7 +960,7 @@ fn cli_secure_udp_defaults_to_loopback_without_bind_addr() {
     // 127.0.0.1 without requiring the accept flag.  Startup must succeed
     // and NOT emit the non-loopback warning.
     let socket = unique_uds_path("h4-default");
-    let port = unused_udp_port().to_string();
+    let port = unused_udp_port();
     let key = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef";
     let key_path = write_secret_file("h4-default", key, 0o600);
     let _g = scopeguard(key_path.parent().unwrap());
@@ -945,7 +972,7 @@ fn cli_secure_udp_defaults_to_loopback_without_bind_addr() {
             "--threshold-ms",
             "100",
             "--udp-port",
-            &port,
+            port.as_str(),
             "--key-file",
             key_path.to_str().expect("utf-8 key path"),
             "--shutdown-after-secs",

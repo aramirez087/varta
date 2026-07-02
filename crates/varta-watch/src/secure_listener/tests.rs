@@ -239,6 +239,29 @@ fn session_restart_gap_within_configured_threshold_still_rejects() {
 }
 
 #[test]
+fn session_restart_gap_builder_clamps_below_config_floor() {
+    let min = Duration::from_millis(crate::config::MIN_THRESHOLD_MS);
+    let mut listener = SecureUdpListener::bind("127.0.0.1:0".parse().unwrap(), vec![test_key()])
+        .expect("bind should succeed")
+        .with_session_restart_gap(Duration::ZERO);
+    let identity = test_identity();
+    let t0 = Instant::now();
+    let t0_ns = 1_000_000_000u64;
+
+    assert!(listener.try_record_replay_state_at(t0, t0_ns, identity, test_iv(), 100, 5_000, 5_000));
+    assert!(
+        !listener.try_record_replay_state_at(t0, t0_ns, identity, test_iv2(), 0, 1, 9_999),
+        "a zero builder input must not admit an immediate non-advancing replay"
+    );
+
+    let after_min_ns = t0_ns + (min + Duration::from_millis(1)).as_nanos() as u64;
+    assert!(
+        listener.try_record_replay_state_at(t0, after_min_ns, identity, test_iv2(), 0, 1, 9_999),
+        "the clamped floor should still admit a recycled session once the minimum gap passes"
+    );
+}
+
+#[test]
 fn terminal_panic_nonce_does_not_poison_regular_rotation() {
     let mut listener = new_listener();
     let identity = test_identity();

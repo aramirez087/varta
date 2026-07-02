@@ -410,9 +410,10 @@ impl SecureUdpListener {
     /// built to eliminate). Plumbing the real threshold collapses that window
     /// to zero. Values above the default simply make the listener admit a
     /// recycle no earlier than the tracker would reset it, which is also
-    /// correct.
+    /// correct. Direct library callers below the config floor are clamped to
+    /// that floor because this builder cannot return `Result`.
     pub fn with_session_restart_gap(mut self, gap: Duration) -> Self {
-        self.session_restart_gap = gap;
+        self.session_restart_gap = gap.max(Duration::from_millis(crate::config::MIN_THRESHOLD_MS));
         self
     }
 

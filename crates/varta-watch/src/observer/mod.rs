@@ -94,6 +94,19 @@ fn origin_repair_bypasses_per_pid(incoming: BeatOrigin, pinned: BeatOrigin) -> b
     true
 }
 
+fn threshold_ns_from_duration(threshold: Duration) -> io::Result<u64> {
+    if threshold < Duration::from_millis(crate::config::MIN_THRESHOLD_MS) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "observer threshold must be at least {} ms",
+                crate::config::MIN_THRESHOLD_MS
+            ),
+        ));
+    }
+    Ok(threshold.as_nanos().min(u64::MAX as u128) as u64)
+}
+
 /// Global per-observer token bucket — one shared across all senders.
 ///
 /// Guards against per-pid rotation attacks where an attacker cycles through
@@ -413,7 +426,7 @@ impl Observer {
         clock_source: ClockSource,
     ) -> io::Result<Self> {
         let tracker_capacity = tracker_capacity.min(crate::tracker::MAX_CAPACITY);
-        let threshold_ns = threshold.as_nanos().min(u64::MAX as u128) as u64;
+        let threshold_ns = threshold_ns_from_duration(threshold)?;
         let rate_limit_interval_ns = max_beat_rate.and_then(|rps| {
             if rps == 0 {
                 None
@@ -506,6 +519,7 @@ impl Observer {
         clock_source: ClockSource,
         pre_thread: &PreThreadAttestation,
     ) -> io::Result<Self> {
+        threshold_ns_from_duration(threshold)?;
         let listener = UdsListener::bind(
             path,
             socket_mode,

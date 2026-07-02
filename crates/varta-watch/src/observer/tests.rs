@@ -50,6 +50,25 @@ fn new_caps_untrusted_tracker_capacity_before_auxiliary_allocations() {
 }
 
 #[test]
+fn new_rejects_threshold_below_config_floor() {
+    let err = match Observer::new(
+        Duration::ZERO,
+        64,
+        EvictionPolicy::Strict,
+        DEFAULT_EVICTION_SCAN_WINDOW,
+        None,
+        0,
+        0,
+        ClockSource::Monotonic,
+    ) {
+        Ok(_) => panic!("Observer::new must reject a zero threshold"),
+        Err(err) => err,
+    };
+
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+}
+
+#[test]
 #[allow(unsafe_code)]
 fn drop_unlinks_bound_socket() {
     // SAFETY: unit-test runner may be multi-threaded; the umask window is
@@ -1480,7 +1499,7 @@ fn stale_terminal_after_recovery_pays_global_rate_limiter() {
 #[test]
 fn first_contact_without_generation_is_recovery_ineligible() {
     let mut obs = Observer::new(
-        Duration::ZERO,
+        Duration::from_millis(crate::config::MIN_THRESHOLD_MS),
         64,
         EvictionPolicy::Strict,
         DEFAULT_EVICTION_SCAN_WINDOW,
