@@ -134,6 +134,29 @@ fn shutdown_grace_builder_clamps_untrusted_values() {
 }
 
 #[test]
+fn capture_builder_clamps_untrusted_values() {
+    let mode = RecoveryMode::Exec {
+        program: "true".to_string(),
+        args: vec![],
+    };
+
+    let rec = Recovery::with_mode(mode.clone(), Duration::ZERO).with_capture(0);
+    assert_eq!(
+        rec.capture_cap,
+        crate::config::MIN_RECOVERY_CAPTURE_BYTES,
+        "with_capture(0) must keep capture enabled instead of silently disabling it"
+    );
+
+    let accepted = crate::config::MIN_RECOVERY_CAPTURE_BYTES.saturating_add(1);
+    let rec = Recovery::with_mode(mode.clone(), Duration::ZERO).with_capture(accepted);
+    assert_eq!(rec.capture_cap, accepted);
+
+    let rec = Recovery::with_mode(mode, Duration::ZERO)
+        .with_capture(crate::config::MAX_RECOVERY_CAPTURE_BYTES + 1);
+    assert_eq!(rec.capture_cap, crate::config::MAX_RECOVERY_CAPTURE_BYTES);
+}
+
+#[test]
 fn timeout_builder_clamps_untrusted_values() {
     let mode = RecoveryMode::Exec {
         program: "true".to_string(),

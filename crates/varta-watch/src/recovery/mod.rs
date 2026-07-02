@@ -782,7 +782,10 @@ impl Recovery {
 
     /// Enable bounded stdout/stderr capture for child processes.
     pub fn with_capture(mut self, cap: u32) -> Self {
-        self.capture_cap = cap;
+        self.capture_cap = cap.clamp(
+            crate::config::MIN_RECOVERY_CAPTURE_BYTES,
+            crate::config::MAX_RECOVERY_CAPTURE_BYTES,
+        );
         self
     }
 
