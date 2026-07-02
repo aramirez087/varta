@@ -81,6 +81,42 @@ def test_install_excepthook_uds_chains_previous_hook(
     sys.excepthook = saved
 
 
+def test_reinstall_retires_previous_excepthook_emitter(
+    tmp_uds_path: Path, saved_excepthook
+) -> None:
+    first_path = tmp_uds_path
+    second_path = tmp_uds_path.with_name("varta-second.sock")
+    first = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+    second = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+    first.bind(os.fspath(first_path))
+    second.bind(os.fspath(second_path))
+    try:
+        install_excepthook_uds(os.fspath(first_path))
+        install_excepthook_uds(os.fspath(second_path))
+
+        try:
+            raise RuntimeError("latest")
+        except RuntimeError:
+            sys.excepthook(*sys.exc_info())
+
+        data, _ = second.recvfrom(64)
+        frame = decode(data)
+        assert frame.status is Status.CRITICAL
+        assert frame.nonce == NONCE_TERMINAL
+
+        first.settimeout(0.1)
+        with pytest.raises(socket.timeout):
+            first.recvfrom(64)
+    finally:
+        first.close()
+        second.close()
+        for path in (first_path, second_path):
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                pass
+
+
 def test_install_excepthook_uds_raises_socket_bind_on_missing_path(
     tmp_uds_path: Path,
 ) -> None:

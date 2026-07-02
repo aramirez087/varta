@@ -75,6 +75,8 @@ public sealed class PanicInstallException : Exception
 public static class SignalHandler
 {
     private static Emitter? s_activeEmitter;
+    private static readonly object s_installLock = new();
+    private static CompositeDisposable? s_activeRegistration;
     // Terminal timestamps are replay-ordering state for the whole PID, so
     // emitter replacement and coarse clock samples must share one high-water.
     private static readonly long s_terminalClockEpoch = Stopwatch.GetTimestamp();
@@ -201,15 +203,41 @@ public static class SignalHandler
 
     private static CompositeDisposable InstallEmitter(Emitter emitter)
     {
-        Volatile.Write(ref s_activeEmitter, emitter);
-        var regs = new[]
+        IDisposable?[] regs = new IDisposable?[4];
+        int regCount = 0;
+        try
         {
-            PosixSignalRegistration.Create(PosixSignal.SIGTERM, _ => emitter.Emit()),
-            PosixSignalRegistration.Create(PosixSignal.SIGINT,  _ => emitter.Emit()),
-            PosixSignalRegistration.Create(PosixSignal.SIGQUIT, _ => emitter.Emit()),
-            PosixSignalRegistration.Create(PosixSignal.SIGHUP,  _ => emitter.Emit()),
-        };
-        return new CompositeDisposable(regs, emitter);
+            regs[regCount++] = PosixSignalRegistration.Create(PosixSignal.SIGTERM, _ => EmitActive());
+            regs[regCount++] = PosixSignalRegistration.Create(PosixSignal.SIGINT,  _ => EmitActive());
+            regs[regCount++] = PosixSignalRegistration.Create(PosixSignal.SIGQUIT, _ => EmitActive());
+            regs[regCount++] = PosixSignalRegistration.Create(PosixSignal.SIGHUP,  _ => EmitActive());
+        }
+        catch
+        {
+            for (int i = 0; i < regCount; i++)
+            {
+                try { regs[i]?.Dispose(); } catch { /* best-effort */ }
+            }
+            emitter.Dispose();
+            throw;
+        }
+
+        var registration = new CompositeDisposable(
+            new[] { regs[0]!, regs[1]!, regs[2]!, regs[3]! },
+            emitter);
+        lock (s_installLock)
+        {
+            var previous = s_activeRegistration;
+            Volatile.Write(ref s_activeEmitter, emitter);
+            s_activeRegistration = registration;
+            previous?.CloseForReplacement();
+            return registration;
+        }
+    }
+
+    private static void EmitActive()
+    {
+        Volatile.Read(ref s_activeEmitter)?.Emit();
     }
 
     private static Socket BuildUdp(string host, int port)
@@ -361,17 +389,40 @@ public static class SignalHandler
     {
         private readonly IDisposable[] _items;
         private readonly Emitter _emitter;
+        private bool _closed;
+
         public CompositeDisposable(IDisposable[] items, Emitter emitter)
         {
             _items = items;
             _emitter = emitter;
         }
+
         public void Dispose()
         {
-            foreach (var it in _items) { try { it.Dispose(); } catch { /* best-effort */ } }
-            try { _emitter.Dispose(); } catch { /* best-effort */ }
-            // Drop our reference if we were the active emitter.
-            Interlocked.CompareExchange(ref s_activeEmitter, null, _emitter);
+            Close(replacement: false);
+        }
+
+        internal void CloseForReplacement()
+        {
+            Close(replacement: true);
+        }
+
+        private void Close(bool replacement)
+        {
+            lock (s_installLock)
+            {
+                if (_closed) return;
+                _closed = true;
+
+                if (!replacement && ReferenceEquals(s_activeRegistration, this))
+                {
+                    s_activeRegistration = null;
+                    Interlocked.CompareExchange(ref s_activeEmitter, null, _emitter);
+                }
+
+                foreach (var it in _items) { try { it.Dispose(); } catch { /* best-effort */ } }
+                try { _emitter.Dispose(); } catch { /* best-effort */ }
+            }
         }
     }
 }

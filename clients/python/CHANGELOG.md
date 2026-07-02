@@ -8,6 +8,11 @@ governed independently — see `book/src/spec/vlp.md` in the workspace.
 
 ### Fixed
 
+- Panic hook reinstalls now replace the active Varta emitter instead of
+  chaining retired emitters. A later uncaught exception no longer sends stale
+  terminal beats to old observers, and the retired socket is closed on
+  replacement.
+
 - `reconnect()` now clears the consecutive-dropped counter. A manual reconnect
   after a dropped beat starts a fresh `set_reconnect_after` window instead of
   letting the next drop immediately reconnect and retry again.

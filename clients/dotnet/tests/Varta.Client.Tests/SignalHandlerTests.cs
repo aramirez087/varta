@@ -72,6 +72,40 @@ public class SignalHandlerTests
             SignalHandler.Run(() => throw new InvalidOperationException("boom")));
     }
 
+    [Fact]
+    public void RepeatedInstall_RetiresPreviousEmitterAndKeepsLatestActive()
+    {
+        using var firstRecv = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
+        using var secondRecv = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
+        firstRecv.Bind(new IPEndPoint(IPAddress.Loopback, 0));
+        secondRecv.Bind(new IPEndPoint(IPAddress.Loopback, 0));
+        firstRecv.ReceiveTimeout = 250;
+        secondRecv.ReceiveTimeout = 2000;
+
+        int firstPort = ((IPEndPoint)firstRecv.LocalEndPoint!).Port;
+        int secondPort = ((IPEndPoint)secondRecv.LocalEndPoint!).Port;
+
+        using var firstRegistration = SignalHandler.InstallUdp("127.0.0.1", firstPort);
+        object firstEmitter = GetActiveEmitter()!;
+
+        using var secondRegistration = SignalHandler.InstallUdp("127.0.0.1", secondPort);
+        object secondEmitter = GetActiveEmitter()!;
+        Assert.NotSame(firstEmitter, secondEmitter);
+
+        InvokeEmitter(firstEmitter);
+        byte[] firstBuf = new byte[Frame.Bytes];
+        Assert.False(TryReceiveDatagram(firstRecv, firstBuf, out _));
+
+        InvokeEmitter(secondEmitter);
+        byte[] secondBuf = new byte[Frame.Bytes];
+        Assert.True(TryReceiveDatagram(secondRecv, secondBuf, out int n));
+        Assert.Equal(Frame.Bytes, n);
+
+        var frame = Frame.Decode(secondBuf);
+        Assert.Equal(Status.Critical, frame.Status);
+        Assert.Equal(Frame.NonceTerminal, frame.Nonce);
+    }
+
     /// The secure panic emitter must DERIVE its 8-byte IV prefix from the
     /// install-time salt plus the per-fire (pid, timestamp) that are sealed in
     /// the authenticated plaintext — never a raw stored IV. Decrypting the wire
@@ -123,5 +157,28 @@ public class SignalHandlerTests
         var field = typeof(SignalHandler).GetField("s_activeEmitter",
             BindingFlags.NonPublic | BindingFlags.Static)!;
         return field.GetValue(null);
+    }
+
+    private static void InvokeEmitter(object emitter)
+    {
+        var emitMethod = emitter.GetType().GetMethod("Emit",
+            BindingFlags.Instance | BindingFlags.Public)!;
+        emitMethod.Invoke(emitter, null);
+    }
+
+    private static bool TryReceiveDatagram(Socket socket, byte[] buffer, out int bytesRead)
+    {
+        try
+        {
+            bytesRead = socket.Receive(buffer);
+            return true;
+        }
+        catch (SocketException ex) when (
+            ex.SocketErrorCode == SocketError.TimedOut ||
+            ex.SocketErrorCode == SocketError.WouldBlock)
+        {
+            bytesRead = 0;
+            return false;
+        }
     }
 }

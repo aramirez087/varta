@@ -51,13 +51,18 @@ _TIMESTAMP_INVALID = 0xFFFFFFFFFFFFFFFF
 _TERMINAL_CLOCK_EPOCH_NS = time.monotonic_ns()
 _last_terminal_timestamp = 0
 _terminal_timestamp_lock = threading.Lock()
+_excepthook_lock = threading.Lock()
+_previous_excepthook: Optional[Callable[..., None]] = None
+_active_emit: Optional[Callable[[], None]] = None
+_active_close: Optional[Callable[[], None]] = None
 
 
 def _reset_terminal_timestamp_lock_after_fork() -> None:
-    global _terminal_timestamp_lock
+    global _terminal_timestamp_lock, _excepthook_lock
 
     # A child cannot release a lock held by a vanished parent thread.
     _terminal_timestamp_lock = threading.Lock()
+    _excepthook_lock = threading.Lock()
 
 
 _register_at_fork = getattr(os, "register_at_fork", None)
@@ -127,18 +132,37 @@ def _build_critical_frame(payload: int = 0) -> Optional[bytes]:
     return None if meta is None else meta[0]
 
 
-def _chain_excepthook(emit: Callable[[], None]) -> None:
-    prev = sys.excepthook
+def _varta_excepthook(exc_type, exc_value, exc_tb):  # type: ignore[no-untyped-def]
+    with _excepthook_lock:
+        emit = _active_emit
+        prev = _previous_excepthook
 
-    def hook(exc_type, exc_value, exc_tb):  # type: ignore[no-untyped-def]
+    if emit is not None:
         try:
             emit()
         except Exception:  # pragma: no cover - hook must not propagate
             pass
-        if prev is not None:
-            prev(exc_type, exc_value, exc_tb)
+    if prev is not None:
+        prev(exc_type, exc_value, exc_tb)
 
-    sys.excepthook = hook
+
+def _install_excepthook(emit: Callable[[], None], close: Callable[[], None]) -> None:
+    global _previous_excepthook, _active_emit, _active_close
+
+    old_close: Optional[Callable[[], None]]
+    with _excepthook_lock:
+        old_close = _active_close
+        _active_emit = emit
+        _active_close = close
+        if sys.excepthook is not _varta_excepthook:
+            _previous_excepthook = sys.excepthook
+            sys.excepthook = _varta_excepthook
+
+    if old_close is not None:
+        try:
+            old_close()
+        except OSError:
+            pass
 
 
 def install_excepthook_uds(
@@ -171,7 +195,7 @@ def install_excepthook_uds(
         except OSError:
             pass
 
-    _chain_excepthook(emit)
+    _install_excepthook(emit, sock.close)
     if faulthandler_signals:
         faulthandler.enable(file=sock.fileno(), all_threads=True)
 
@@ -199,7 +223,7 @@ def install_excepthook_udp(
         except OSError:
             pass
 
-    _chain_excepthook(emit)
+    _install_excepthook(emit, sock.close)
     if faulthandler_signals:
         faulthandler.enable(file=sock.fileno(), all_threads=True)
 
@@ -271,4 +295,4 @@ def install_excepthook_secure_udp(addr: Address, key: bytes) -> None:
         except Exception:  # pragma: no cover - hook must not propagate
             pass
 
-    _chain_excepthook(emit)
+    _install_excepthook(emit, sock.close)

@@ -8,6 +8,11 @@ here. Versioning is independent of the Rust workspace and follows
 
 ### Fixed
 
+- Panic signal-handler reinstalls now retire the previous registration and
+  dispatch through the current emitter. A later signal can no longer write a
+  stale terminal beat to an old observer, and the retired socket is closed on
+  replacement.
+
 - **`Beat()` now returns `Failed(Closed)` after `Dispose()` instead of throwing
   `ObjectDisposedException`.** The disposed state is handled inside the normal
   outcome path before any transport send, preserving the documented
