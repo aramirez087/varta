@@ -1514,20 +1514,31 @@ fn first_contact_without_generation_is_recovery_ineligible() {
     obs.add_listener(Box::new(ScriptedListener::with_frame(pid, 1, 0xCAFE)));
 
     let beat = obs.poll();
+    let beat_observer_ns = match beat {
+        Some(Event::Beat {
+            pid: got_pid,
+            payload: 0xCAFE,
+            origin: BeatOrigin::SocketModeOnly,
+            observer_ns,
+            ..
+        }) if got_pid == pid => observer_ns,
+        other => {
+            panic!(
+                "first-contact Linux UDS beat with no start-time generation must stay \
+                 observable but recovery-ineligible, got {other:?}"
+            );
+        }
+    };
     assert!(
-        matches!(
-            beat,
-            Some(Event::Beat {
-                pid: got_pid,
-                payload: 0xCAFE,
-                origin: BeatOrigin::SocketModeOnly,
-                ..
-            }) if got_pid == pid
-        ),
-        "first-contact Linux UDS beat with no start-time generation must stay \
-         observable but recovery-ineligible, got {beat:?}"
+        obs.poll_pending().is_none(),
+        "the stall threshold must not fire before synthetic time advances"
     );
 
+    let _ = obs.apply_raw_clock_test(beat_observer_ns.saturating_add(obs.threshold_ns));
+    assert!(
+        obs.poll().is_none(),
+        "empty poll should only drain the now-stalled slot into the pending queue"
+    );
     let stall = obs.poll_pending();
     assert!(
         matches!(
