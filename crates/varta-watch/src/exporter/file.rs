@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 
 use varta_vlp::Status;
 
+use crate::config::MIN_EXPORT_FILE_MAX_BYTES;
 use crate::observer::Event;
 
 /// Sink for an [`Event`] stream.
@@ -122,7 +123,8 @@ impl FileExporter {
     /// in a [`BufWriter`].
     ///
     /// `max_bytes` is the optional size limit after which the file is
-    /// rotated.
+    /// rotated. When set, it must be at least
+    /// [`MIN_EXPORT_FILE_MAX_BYTES`]; use `None` for an unbounded file.
     ///
     /// `sync_every` is the number of records between forced `fdatasync(2)`
     /// calls. `0` disables per-record durability — the BufWriter is only
@@ -135,12 +137,26 @@ impl FileExporter {
         max_bytes: Option<u64>,
         sync_every: u32,
     ) -> io::Result<Self> {
-        let file = open_or_create_export_file(path.as_ref())?;
+        validate_export_max_bytes(max_bytes)?;
+        Self::create_unchecked(path.as_ref(), max_bytes, sync_every)
+    }
+
+    #[cfg(test)]
+    fn create_unchecked_for_test(
+        path: impl AsRef<Path>,
+        max_bytes: Option<u64>,
+        sync_every: u32,
+    ) -> io::Result<Self> {
+        Self::create_unchecked(path.as_ref(), max_bytes, sync_every)
+    }
+
+    fn create_unchecked(path: &Path, max_bytes: Option<u64>, sync_every: u32) -> io::Result<Self> {
+        let file = open_or_create_export_file(path)?;
         let bytes_written = file.metadata()?.len();
         let mut exporter = FileExporter {
             sink: BufWriter::new(file),
             pending_err: None,
-            path: path.as_ref().to_path_buf(),
+            path: path.to_path_buf(),
             max_bytes,
             bytes_written,
             sync_every,
@@ -391,6 +407,22 @@ impl FileExporter {
         destination_guard.disarm();
         Ok(())
     }
+}
+
+fn validate_export_max_bytes(max_bytes: Option<u64>) -> io::Result<()> {
+    let Some(max_bytes) = max_bytes else {
+        return Ok(());
+    };
+    if max_bytes >= MIN_EXPORT_FILE_MAX_BYTES {
+        return Ok(());
+    }
+    Err(io::Error::new(
+        io::ErrorKind::InvalidInput,
+        format!(
+            "export file max_bytes must be >= {MIN_EXPORT_FILE_MAX_BYTES} bytes; \
+             omit max_bytes to disable rotation"
+        ),
+    ))
 }
 
 fn is_cross_device_error(e: &io::Error) -> bool {
@@ -1018,9 +1050,24 @@ mod tests {
     }
 
     #[test]
+    fn create_rejects_tiny_max_bytes_without_creating_file() {
+        let (dir, path) = rotation_reopen_fixture("tiny-max-bytes");
+        let err = match FileExporter::create(&path, Some(MIN_EXPORT_FILE_MAX_BYTES - 1), 0) {
+            Ok(_) => panic!("create must reject tiny max_bytes"),
+            Err(e) => e,
+        };
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert!(
+            !path.exists(),
+            "invalid max_bytes must be rejected before creating the export file"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn record_reports_rotation_reopen_failure() {
         let (dir, path) = rotation_reopen_fixture("record-rotation-error");
-        let mut fe = FileExporter::create(&path, Some(1), 0).unwrap();
+        let mut fe = FileExporter::create_unchecked_for_test(&path, Some(1), 0).unwrap();
 
         std::fs::remove_file(&path).unwrap();
         std::fs::remove_dir(&dir).unwrap();
@@ -1046,7 +1093,7 @@ mod tests {
         // records. The reopen-pending latch must retry ONLY the reopen, leaving
         // `.1` in place.
         let (dir, path) = rotation_reopen_fixture("reopen-no-loss");
-        let mut fe = FileExporter::create(&path, Some(1), 0).unwrap();
+        let mut fe = FileExporter::create_unchecked_for_test(&path, Some(1), 0).unwrap();
 
         // Emulate rename-succeeds-but-create-fails for every reopen.
         fe.reopen_must_fail = true;
@@ -1106,7 +1153,7 @@ mod tests {
         // NOT advance on a reopen failure.
         let (dir, path) = rotation_reopen_fixture("reopen-fail-fsync");
         // max_bytes = 1 => the first record rotates; the reopen then fails.
-        let mut fe = FileExporter::create(&path, Some(1), 0).unwrap();
+        let mut fe = FileExporter::create_unchecked_for_test(&path, Some(1), 0).unwrap();
         let before = fe.dir_fsyncs;
 
         fe.reopen_must_fail = true;
@@ -1133,7 +1180,7 @@ mod tests {
     #[test]
     fn successful_record_does_not_clear_latched_rotation_error() {
         let (dir, path) = rotation_reopen_fixture("record-latched-error");
-        let mut fe = FileExporter::create(&path, Some(1), 0).unwrap();
+        let mut fe = FileExporter::create_unchecked_for_test(&path, Some(1), 0).unwrap();
 
         std::fs::remove_file(&path).unwrap();
         std::fs::remove_dir(&dir).unwrap();
@@ -1165,7 +1212,7 @@ mod tests {
     #[test]
     fn record_eviction_pid_reports_rotation_reopen_failure() {
         let (dir, path) = rotation_reopen_fixture("eviction-rotation-error");
-        let mut fe = FileExporter::create(&path, Some(1), 0).unwrap();
+        let mut fe = FileExporter::create_unchecked_for_test(&path, Some(1), 0).unwrap();
 
         std::fs::remove_file(&path).unwrap();
         std::fs::remove_dir(&dir).unwrap();
@@ -1192,7 +1239,8 @@ mod tests {
         let (dir, path) = rotation_reopen_fixture("rotation-dir-fsync");
         // sync_every = 1 => durability opt-in; max_bytes = 1 => every record
         // rotates. create() already fsynced the parent for the live dirent.
-        let mut fe = FileExporter::create(&path, Some(1), 1).expect("create exporter");
+        let mut fe =
+            FileExporter::create_unchecked_for_test(&path, Some(1), 1).expect("create exporter");
         assert_eq!(
             fe.dir_fsyncs, 1,
             "create() must fsync the parent dir once for the live dirent"

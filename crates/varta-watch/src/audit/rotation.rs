@@ -1949,7 +1949,7 @@ mod tests {
         // rotation FSM to span multiple ticks — the only window the bug lives in.
         let mut c = cfg(Some(120), 1);
         c.rotation_budget = Duration::from_micros(1);
-        let (mut log, _) = RecoveryAuditLog::create(&path, c).expect("create");
+        let (mut log, _) = RecoveryAuditLog::create_unchecked_for_test(&path, c).expect("create");
 
         let spawn = |pid: u32| crate::audit::SpawnRecord {
             wallclock_ms: 1,

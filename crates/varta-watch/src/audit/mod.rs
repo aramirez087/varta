@@ -43,6 +43,8 @@ use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use crate::config::MIN_RECOVERY_AUDIT_MAX_BYTES;
+
 /// Maximum number of recent `fdatasync(2)` durations buffered for export.
 pub const AUDIT_FSYNC_HISTORY_CAP: usize = FSYNC_HISTORY_CAP;
 
@@ -135,11 +137,26 @@ pub struct CreateWarnings {
 
 impl RecoveryAuditLog {
     /// Open `path` in append mode, creating it (and writing the header)
-    /// if necessary. The file is opened with mode 0600 on create.
+    /// if necessary. The file is opened with mode 0600 on create. When
+    /// `cfg.max_bytes` is set, it must be at least
+    /// [`MIN_RECOVERY_AUDIT_MAX_BYTES`]; use `None` for an unbounded file.
     pub fn create(path: impl AsRef<Path>, cfg: AuditConfig) -> io::Result<(Self, CreateWarnings)> {
+        validate_audit_max_bytes(cfg.max_bytes)?;
+        Self::create_unchecked(path.as_ref(), cfg)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn create_unchecked_for_test(
+        path: impl AsRef<Path>,
+        cfg: AuditConfig,
+    ) -> io::Result<(Self, CreateWarnings)> {
+        Self::create_unchecked(path.as_ref(), cfg)
+    }
+
+    fn create_unchecked(path: &Path, cfg: AuditConfig) -> io::Result<(Self, CreateWarnings)> {
         use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 
-        let path_buf = path.as_ref().to_path_buf();
+        let path_buf = path.to_path_buf();
 
         let mut warnings = CreateWarnings::default();
         if !chain_enabled() {
@@ -443,6 +460,22 @@ impl RecoveryAuditLog {
     }
 }
 
+fn validate_audit_max_bytes(max_bytes: Option<u64>) -> io::Result<()> {
+    let Some(max_bytes) = max_bytes else {
+        return Ok(());
+    };
+    if max_bytes >= MIN_RECOVERY_AUDIT_MAX_BYTES {
+        return Ok(());
+    }
+    Err(io::Error::new(
+        io::ErrorKind::InvalidInput,
+        format!(
+            "recovery audit max_bytes must be >= {MIN_RECOVERY_AUDIT_MAX_BYTES} bytes; \
+             omit max_bytes to disable rotation"
+        ),
+    ))
+}
+
 impl Drop for RecoveryAuditLog {
     fn drop(&mut self) {
         while let Some(line) = self.pending_lines.pop_front() {
@@ -685,7 +718,8 @@ mod tests {
     fn rotation_engages_at_max_bytes_with_chain_continuity() {
         let dir = tmpdir("rot");
         let path = dir.join("audit.log");
-        let (mut log, _) = RecoveryAuditLog::create(&path, cfg(Some(160), 1)).expect("create");
+        let (mut log, _) =
+            RecoveryAuditLog::create_unchecked_for_test(&path, cfg(Some(160), 1)).expect("create");
         for i in 0..8u32 {
             log.record_spawn(&SpawnRecord {
                 wallclock_ms: i as u64,
@@ -737,7 +771,8 @@ mod tests {
         // (ring empty at rotation), so it never exercised this path.
         let dir = tmpdir("rot-ring");
         let path = dir.join("audit.log");
-        let (mut log, _) = RecoveryAuditLog::create(&path, cfg(Some(160), 1)).expect("create");
+        let (mut log, _) =
+            RecoveryAuditLog::create_unchecked_for_test(&path, cfg(Some(160), 1)).expect("create");
 
         // Phase 1: emit + fully flush enough records to cross max_bytes,
         // which arms `needs_rotation`. The ring is empty after this flush.
@@ -895,6 +930,23 @@ mod tests {
             Err(e) => e,
         };
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn create_rejects_tiny_max_bytes_without_creating_file() {
+        let dir = tmpdir("tiny-max-bytes");
+        let path = dir.join("audit.log");
+        let err =
+            match RecoveryAuditLog::create(&path, cfg(Some(MIN_RECOVERY_AUDIT_MAX_BYTES - 1), 1)) {
+                Ok(_) => panic!("create must reject tiny max_bytes"),
+                Err(e) => e,
+            };
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert!(
+            !path.exists(),
+            "invalid max_bytes must be rejected before creating the audit file"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

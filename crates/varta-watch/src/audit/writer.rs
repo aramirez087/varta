@@ -950,7 +950,7 @@ mod tests {
         };
         let _ = cfg.rotation_budget;
         cfg.rotation_budget = Duration::from_micros(1);
-        let (mut log, _) = RecoveryAuditLog::create(&path, cfg).expect("create");
+        let (mut log, _) = RecoveryAuditLog::create_unchecked_for_test(&path, cfg).expect("create");
         for i in 0..8u32 {
             log.record_spawn(&dummy_spawn(i));
         }
