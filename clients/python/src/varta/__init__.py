@@ -34,7 +34,7 @@ from .client import (
     classify_send_error as classify_send_error,
 )
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 __all__ = [
     "__version__",

@@ -605,7 +605,7 @@ dependencies = [
 
 [[package]]
 name = "varta-client"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "varta-vlp",
 ]
@@ -622,7 +622,7 @@ dependencies = [
 
 [[package]]
 name = "varta-vlp"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "chacha20poly1305",
  "hkdf",
@@ -632,7 +632,7 @@ dependencies = [
 
 [[package]]
 name = "varta-watch"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "varta-vlp",
 ]

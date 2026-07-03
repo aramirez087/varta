@@ -15,7 +15,7 @@ public surface.
 ```kotlin
 // build.gradle.kts
 dependencies {
-    implementation("health.varta:varta-client:0.1.0")
+    implementation("health.varta:varta-client:0.2.0")
     // UDS transport requires a SOCK_DGRAM AF_UNIX provider.
     // junixsocket is the recommended default (no shipping JDK provides
     // SOCK_DGRAM AF_UNIX in-box, as of JDK 22).
@@ -28,7 +28,7 @@ dependencies {
 <dependency>
   <groupId>health.varta</groupId>
   <artifactId>varta-client</artifactId>
-  <version>0.1.0</version>
+  <version>0.2.0</version>
 </dependency>
 <dependency>
   <groupId>com.kohlschutter.junixsocket</groupId>

@@ -2,7 +2,7 @@
 
 [![Maven Central](https://img.shields.io/maven-central/v/health.varta/varta-client.svg)](https://central.sonatype.com/artifact/health.varta/varta-client)
 
-The JVM client (`implementation("health.varta:varta-client:0.1.0")`) is a
+The JVM client (`implementation("health.varta:varta-client:0.2.0")`) is a
 first-class peer of the Rust `varta-client` crate. It tracks the same
 wire-format contract, passes the same `tools/vlp-test-vectors.json`
 conformance suite, and interoperates with the same `varta-watch`
@@ -13,7 +13,7 @@ observer binary.
 ```kotlin
 // build.gradle.kts
 dependencies {
-    implementation("health.varta:varta-client:0.1.0")
+    implementation("health.varta:varta-client:0.2.0")
     // UDS transport requires a SOCK_DGRAM AF_UNIX provider.
     runtimeOnly("com.kohlschutter.junixsocket:junixsocket-core:2.10.1")
 }

@@ -68,7 +68,7 @@ docker run -d --name varta-watch \
   -v /run/varta:/run/varta \
   -v /etc/varta/prom.token:/etc/varta/prom.token:ro \
   -p 127.0.0.1:9100:9100 \
-  ghcr.io/aramirez087/varta-watch:0.2.0 \
+  ghcr.io/aramirez087/varta-watch:0.3.0 \
   --socket=/run/varta/varta.sock \
   --prom-addr=0.0.0.0:9100 \
   --prom-token-file=/etc/varta/prom.token \
@@ -78,7 +78,7 @@ docker run -d --name varta-watch \
 Verify the image before pulling it into production:
 
 ```bash
-cosign verify ghcr.io/aramirez087/varta-watch:0.2.0 \
+cosign verify ghcr.io/aramirez087/varta-watch:0.3.0 \
   --certificate-identity-regexp '^https://github.com/aramirez087/Varta' \
   --certificate-oidc-issuer 'https://token.actions.githubusercontent.com'
 ```
@@ -97,7 +97,7 @@ the chart's default render.
 # Helm (recommended)
 helm install varta-watch \
   oci://ghcr.io/aramirez087/charts/varta-watch \
-  --version 0.1.0 \
+  --version 0.2.0 \
   --namespace varta --create-namespace \
   --set prometheusToken.token=$(openssl rand -hex 32)
 

@@ -115,10 +115,10 @@ policy](../architecture/recovery-async-spawn.md#recovery-child-environment-polic
 
 These are additive — adopt at your own pace:
 
-- [ ] **Container image** — `ghcr.io/aramirez087/varta-watch:0.2.0`,
+- [ ] **Container image** — `ghcr.io/aramirez087/varta-watch:0.3.0`,
       cosign-signed with keyless OIDC, SLSA L3 provenance.
 - [ ] **Helm chart** —
-      `oci://ghcr.io/aramirez087/charts/varta-watch --version 0.1.0`
+      `oci://ghcr.io/aramirez087/charts/varta-watch --version 0.2.0`
       (the chart version is independent of the app version).
 - [ ] **`curl | sh` installer** — `https://varta.sh/install.sh`.
 - [ ] **`cargo binstall varta-watch`**.

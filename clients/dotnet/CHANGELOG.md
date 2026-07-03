@@ -6,6 +6,8 @@ here. Versioning is independent of the Rust workspace and follows
 
 ## [Unreleased]
 
+## [0.2.0] — 2026-07-03
+
 ### Fixed
 
 - Panic signal-handler reinstalls now retire the previous registration and

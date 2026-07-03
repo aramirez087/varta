@@ -102,7 +102,7 @@ Replayable [asciinema cast](docs/marketing/varta-demo.cast).
 | Go       | `go get github.com/aramirez087/Varta/clients/go`    | Beta   | [`clients/go/`](clients/go/)                   |
 | Node.js  | `npm install @varta-health/client`                  | Beta   | [`clients/node/`](clients/node/)               |
 | .NET     | `dotnet add package Varta.Client`                   | Beta   | [`clients/dotnet/`](clients/dotnet/)           |
-| JVM      | `implementation("health.varta:varta-client:0.1.0")` | Beta   | [`clients/java/`](clients/java/)               |
+| JVM      | `implementation("health.varta:varta-client:0.2.0")` | Beta   | [`clients/java/`](clients/java/)               |
 
 The wire protocol (`VLP v0.2`) is governed by
 [`book/src/spec/`](book/src/spec/) and the cross-language conformance
@@ -122,10 +122,10 @@ signed by the same release workflow.
 | Audience            | One-paste install                                                                                                            |
 | ------------------- | ---------------------------------------------------------------------------------------------------------------------------- |
 | Bare metal / VM     | `curl -fsSL https://varta.sh/install.sh \| sh`                                                                               |
-| Docker host         | `docker run … ghcr.io/aramirez087/varta-watch:0.2.0 …`                                                                       |
-| Kubernetes (Helm)   | `helm install varta-watch oci://ghcr.io/aramirez087/charts/varta-watch --version 0.1.0 -n varta --create-namespace`          |
+| Docker host         | `docker run … ghcr.io/aramirez087/varta-watch:0.3.0 …`                                                                       |
+| Kubernetes (Helm)   | `helm install varta-watch oci://ghcr.io/aramirez087/charts/varta-watch --version 0.2.0 -n varta --create-namespace`          |
 | Rust developer      | `cargo binstall varta-watch`                                                                                                 |
-| Security reviewer   | `cosign verify ghcr.io/aramirez087/varta-watch:0.2.0 --certificate-oidc-issuer https://token.actions.githubusercontent.com …` |
+| Security reviewer   | `cosign verify ghcr.io/aramirez087/varta-watch:0.3.0 --certificate-oidc-issuer https://token.actions.githubusercontent.com …` |
 
 Full operator guide: [`book/src/operations/install.md`](book/src/operations/install.md).
 

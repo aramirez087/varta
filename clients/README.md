@@ -12,7 +12,7 @@ gets its own subdirectory with independent semver, packaging, and CI.
 | Go       | `go get github.com/aramirez087/Varta/clients/go`       | Beta   | [`go/`](go/)       |
 | Node.js  | `npm install @varta-health/client`                     | Beta   | [`node/`](node/)   |
 | .NET     | `dotnet add package Varta.Client`                      | Beta   | [`dotnet/`](dotnet/) |
-| JVM      | `implementation("health.varta:varta-client:0.1.0")`    | Beta   | [`java/`](java/)   |
+| JVM      | `implementation("health.varta:varta-client:0.2.0")`    | Beta   | [`java/`](java/)   |
 
 ## Stability model
 
@@ -22,7 +22,7 @@ There are two independent stability contracts:
    [`book/src/spec/`](../book/src/spec/). Any change requires a version
    byte bump and is a breaking change across every client.
 2. **Client API** — semver per client, tracked in each client's
-   `CHANGELOG.md`. The Python client at 0.1.0 may change its public
+   `CHANGELOG.md`. The Python client at 0.2.0 may change its public
    surface without breaking the wire.
 
 ## Reference verifiers vs. clients

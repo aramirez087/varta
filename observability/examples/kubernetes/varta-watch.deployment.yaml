@@ -83,7 +83,7 @@ spec:
           type: RuntimeDefault
       containers:
         - name: varta-watch
-          image: ghcr.io/aramirez087/varta-watch:0.2.0
+          image: ghcr.io/aramirez087/varta-watch:0.3.0
           imagePullPolicy: IfNotPresent
           args:
             # The argv parser is whitespace-separated only ("--flag value");

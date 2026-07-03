@@ -9,8 +9,8 @@ regardless of how you fetch it.
 | Audience            | One-paste install                                                                                                            |
 | ------------------- | ---------------------------------------------------------------------------------------------------------------------------- |
 | Bare metal / VM     | `curl -fsSL https://varta.sh/install.sh \| sh`                                                                               |
-| Docker host         | `docker run … ghcr.io/aramirez087/varta-watch:0.2.0 …`                                                                       |
-| Kubernetes (Helm)   | `helm install varta-watch oci://ghcr.io/aramirez087/charts/varta-watch --version 0.1.0 …`                                    |
+| Docker host         | `docker run … ghcr.io/aramirez087/varta-watch:0.3.0 …`                                                                       |
+| Kubernetes (Helm)   | `helm install varta-watch oci://ghcr.io/aramirez087/charts/varta-watch --version 0.2.0 …`                                    |
 | Rust developer      | `cargo binstall varta-watch`                                                                                                 |
 | Source build        | `cargo install --path crates/varta-watch --features prometheus-exporter`                                                     |
 
@@ -31,7 +31,7 @@ Knobs (env vars):
 
 | Var            | Default            | Effect                                                       |
 | -------------- | ------------------ | ------------------------------------------------------------ |
-| `VERSION`      | latest release     | Pin to a specific tag, e.g. `VERSION=v0.2.0`                 |
+| `VERSION`      | latest release     | Pin to a specific tag, e.g. `VERSION=v0.3.0`                 |
 | `INSTALL_DIR`  | `/usr/local/bin`   | Target directory for the binary                              |
 | `ASSUME_YES`   | `0`                | `1` skips interactive prompts (required when piping curl)    |
 | `VERIFY_COSIGN`| `0`                | `1` requires `cosign` on `$PATH` and fails if absent          |
@@ -69,7 +69,7 @@ docker run -d --name varta-watch \
   -v /run/varta:/run/varta \
   -v /etc/varta/prom.token:/etc/varta/prom.token:ro \
   -p 127.0.0.1:9100:9100 \
-  ghcr.io/aramirez087/varta-watch:0.2.0 \
+  ghcr.io/aramirez087/varta-watch:0.3.0 \
   --socket=/run/varta/varta.sock \
   --prom-addr=0.0.0.0:9100 \
   --prom-token-file=/etc/varta/prom.token \
@@ -79,7 +79,7 @@ docker run -d --name varta-watch \
 Verify the image before pulling in production:
 
 ```sh
-cosign verify ghcr.io/aramirez087/varta-watch:0.2.0 \
+cosign verify ghcr.io/aramirez087/varta-watch:0.3.0 \
   --certificate-identity-regexp '^https://github.com/aramirez087/Varta' \
   --certificate-oidc-issuer 'https://token.actions.githubusercontent.com'
 ```
@@ -91,7 +91,7 @@ See [Container Image](container.md) for the full reference.
 ```sh
 helm install varta-watch \
   oci://ghcr.io/aramirez087/charts/varta-watch \
-  --version 0.1.0 \
+  --version 0.2.0 \
   --create-namespace \
   --namespace varta \
   --set prometheusToken.token=$(openssl rand -hex 32)

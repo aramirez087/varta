@@ -6,6 +6,8 @@ governed independently — see `book/src/spec/vlp.md` in the workspace.
 
 ## [Unreleased]
 
+## [0.2.0] — 2026-07-03
+
 ### Fixed
 
 - Panic hook reinstalls now replace the active Varta emitter instead of

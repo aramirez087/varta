@@ -6,6 +6,8 @@ governed independently — see `book/src/spec/vlp.md` in the workspace.
 
 ## [Unreleased]
 
+## [0.2.0] — 2026-07-03
+
 ### Security
 
 - **Secure-UDP reconnects before terminal AEAD nonce exhaustion.** At

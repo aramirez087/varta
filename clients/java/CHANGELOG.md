@@ -6,6 +6,8 @@ workspace and follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.2.0] — 2026-07-03
+
 ### Security
 
 - **Secure-UDP reconnects before terminal AEAD nonce exhaustion.** The JVM

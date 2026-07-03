@@ -37,7 +37,7 @@ docker run -d --name varta-watch \
   -v /run/varta:/run/varta \
   -v /etc/varta/prom.token:/etc/varta/prom.token:ro \
   -p 127.0.0.1:9100:9100 \
-  ghcr.io/aramirez087/varta-watch:0.2.0 \
+  ghcr.io/aramirez087/varta-watch:0.3.0 \
   --socket=/run/varta/varta.sock \
   --prom-addr=0.0.0.0:9100 \
   --prom-token-file=/etc/varta/prom.token \
@@ -51,7 +51,7 @@ unless-stopped` brings the container back up.
 ## Verifying the image
 
 ```sh
-cosign verify ghcr.io/aramirez087/varta-watch:0.2.0 \
+cosign verify ghcr.io/aramirez087/varta-watch:0.3.0 \
   --certificate-identity-regexp '^https://github.com/aramirez087/Varta' \
   --certificate-oidc-issuer 'https://token.actions.githubusercontent.com'
 ```
@@ -59,7 +59,7 @@ cosign verify ghcr.io/aramirez087/varta-watch:0.2.0 \
 CycloneDX SBOM is attached via `cosign attest --type cyclonedx`:
 
 ```sh
-cosign verify-attestation ghcr.io/aramirez087/varta-watch:0.2.0 \
+cosign verify-attestation ghcr.io/aramirez087/varta-watch:0.3.0 \
   --type cyclonedx \
   --certificate-identity-regexp '^https://github.com/aramirez087/Varta' \
   --certificate-oidc-issuer 'https://token.actions.githubusercontent.com' \
@@ -70,7 +70,7 @@ SLSA L3 build provenance is registered with GitHub:
 
 ```sh
 gh attestation verify --repo aramirez087/Varta \
-  oci://ghcr.io/aramirez087/varta-watch:0.2.0
+  oci://ghcr.io/aramirez087/varta-watch:0.3.0
 ```
 
 ## Image labels

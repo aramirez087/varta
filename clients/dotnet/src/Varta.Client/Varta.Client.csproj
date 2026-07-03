@@ -7,7 +7,7 @@
 
     <!-- Package metadata -->
     <PackageId>Varta.Client</PackageId>
-    <Version>0.1.0</Version>
+    <Version>0.2.0</Version>
     <Authors>Varta authors</Authors>
     <Description>Zero-overhead health protocol client for distributed local agents (Varta VLP v0.2). Emits 32-byte heartbeats over Unix domain sockets, plaintext UDP, or ChaCha20-Poly1305 secure UDP.</Description>
     <PackageProjectUrl>https://varta.sh</PackageProjectUrl>
