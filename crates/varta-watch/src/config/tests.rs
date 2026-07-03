@@ -1690,6 +1690,42 @@ fn load_secure_keys_preserves_primary_then_accepted_order() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+#[cfg(feature = "secure-udp")]
+#[test]
+fn load_secure_keys_rejects_too_many_shared_keys() {
+    use std::fmt::Write as _;
+
+    let dir = mk_tmpdir("too-many-accepted");
+    let accepted = dir.join("accepted.keys");
+    let mut content = String::new();
+    for i in 0..=super::types::MAX_SECURE_SHARED_KEYS {
+        writeln!(&mut content, "{:064x}", i + 1).expect("write key line");
+    }
+    write_mode(&accepted, content.as_bytes(), 0o600);
+
+    let cfg = Config::from_args(args(&[
+        "--socket",
+        "/s",
+        "--threshold-ms",
+        "100",
+        "--udp-port",
+        "9000",
+        "--accepted-key-file",
+        accepted.to_str().expect("utf8 path"),
+    ]))
+    .expect("parse");
+    let err = cfg
+        .load_secure_keys()
+        .expect_err("accepted key file must be capped");
+
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    assert!(
+        err.to_string().contains("too many shared secure-UDP keys"),
+        "unexpected error: {err}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 // ----- validate_secret_file tests (M2: TOCTOU hardening) -----
 
 /// Mint a unique tempdir under `$TMPDIR` for a single test. Tests cannot

@@ -165,7 +165,8 @@ OPTIONAL:
                                      secure-udp at build time).
     --accepted-key-file <PATH>     Path to a file with one hex key per line
                                      for zero-downtime rotation (requires
-                                     --features secure-udp).
+                                     --features secure-udp). The total
+                                     shared-key set is capped at 8 keys.
     --master-key-file <PATH>       Path to a file containing a 64-hex-char
                                      master key for per-agent key derivation
                                      (requires --features secure-udp).

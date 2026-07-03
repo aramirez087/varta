@@ -132,6 +132,17 @@ pub const DEFAULT_GLOBAL_BEAT_RATE: u32 = 5_000;
 #[cfg(not(feature = "compile-time-config"))]
 pub const DEFAULT_GLOBAL_BEAT_BURST: u32 = 10_000;
 
+/// Maximum number of shared secure-UDP keys loaded from `--key-file` plus
+/// `--accepted-key-file`.
+///
+/// The secure listener intentionally trials every shared key on every
+/// encrypted datagram so key-rotation position is not exposed as a timing
+/// signal. That makes the key count a poll-loop work bound, not just a config
+/// convenience. Eight keys covers primary plus staged rotation and rollback
+/// windows; deployments that need per-agent isolation should use
+/// `--master-key-file` instead of loading one shared key per agent.
+pub const MAX_SECURE_SHARED_KEYS: usize = 8;
+
 /// Default receive-buffer size requested via `SO_RCVBUF` on the observer
 /// UDS.  1 MiB ≈ 32 768 × 32 B frames ≈ 6 s of full-burst headroom at the
 /// default global rate.  Linux doubles the value then clamps to
@@ -368,7 +379,9 @@ pub struct Config {
     /// (requires `--features secure-udp`).
     pub secure_key_file: Option<PathBuf>,
     /// Path to a file with one hex key per line for zero-downtime key
-    /// rotation (requires `--features secure-udp`).
+    /// rotation (requires `--features secure-udp`). Combined with
+    /// [`Self::secure_key_file`], the shared-key set is capped at
+    /// [`MAX_SECURE_SHARED_KEYS`].
     pub accepted_key_file: Option<PathBuf>,
     /// Path to a file containing a 64-character hex master key for
     /// per-agent key derivation (requires `--features secure-udp`).

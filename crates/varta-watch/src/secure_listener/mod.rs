@@ -310,6 +310,19 @@ fn new_sender_state_store() -> (
 }
 
 impl SecureUdpListener {
+    fn validate_shared_key_count(keys_len: usize) -> io::Result<()> {
+        if keys_len > crate::config::MAX_SECURE_SHARED_KEYS {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "SecureUdpListener supports at most {} shared keys; got {keys_len}",
+                    crate::config::MAX_SECURE_SHARED_KEYS
+                ),
+            ));
+        }
+        Ok(())
+    }
+
     /// Bind a non-blocking UDP socket on `addr` and prepare AEAD decryption
     /// with the given key(s).
     ///
@@ -327,6 +340,7 @@ impl SecureUdpListener {
                 "SecureUdpListener requires at least one key",
             ));
         }
+        Self::validate_shared_key_count(keys.len())?;
         let sock = UdpSocket::bind(addr)?;
         sock.set_nonblocking(true)?;
         let (sender_slab, sender_free_list, sender_index) = new_sender_state_store();
@@ -363,6 +377,7 @@ impl SecureUdpListener {
     /// in `iv_random[0..4]` is verified against the decrypted frame's `pid`
     /// field to prevent PID spoofing at the transport layer.
     pub fn bind_with_master(addr: SocketAddr, keys: Vec<Key>, master_key: Key) -> io::Result<Self> {
+        Self::validate_shared_key_count(keys.len())?;
         let sock = UdpSocket::bind(addr)?;
         sock.set_nonblocking(true)?;
         let (sender_slab, sender_free_list, sender_index) = new_sender_state_store();

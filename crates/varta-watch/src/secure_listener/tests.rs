@@ -428,6 +428,34 @@ fn bind_requires_at_least_one_key() {
 }
 
 #[test]
+fn bind_rejects_too_many_shared_keys_before_listening() {
+    let keys: Vec<Key> = (0..=crate::config::MAX_SECURE_SHARED_KEYS)
+        .map(|i| Key::from_bytes([i as u8; 32]))
+        .collect();
+    let err = match SecureUdpListener::bind("127.0.0.1:0".parse().unwrap(), keys) {
+        Err(err) => err,
+        Ok(_) => panic!("oversized shared-key set must fail before bind"),
+    };
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+}
+
+#[test]
+fn bind_with_master_rejects_too_many_shared_keys() {
+    let keys: Vec<Key> = (0..=crate::config::MAX_SECURE_SHARED_KEYS)
+        .map(|i| Key::from_bytes([i as u8; 32]))
+        .collect();
+    let err = match SecureUdpListener::bind_with_master(
+        "127.0.0.1:0".parse().unwrap(),
+        keys,
+        Key::from_bytes([0xff; 32]),
+    ) {
+        Err(err) => err,
+        Ok(_) => panic!("master-key listener must still cap shared-key trials"),
+    };
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+}
+
+#[test]
 fn new_sender_accepted_and_inserted() {
     let mut listener = new_listener();
     let identity = test_identity();

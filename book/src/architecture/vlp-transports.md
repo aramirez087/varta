@@ -130,6 +130,11 @@ varta-watch --socket /tmp/varta.sock --threshold-ms 500 \
             --udp-port 9000 --master-key-file /tmp/varta-master.key
 ```
 
+The combined shared-key set from `--key-file` and `--accepted-key-file`
+is capped at 8 keys. The observer trials every shared key on every secure-UDP
+datagram to avoid leaking the active rotation slot through response timing, so
+the cap is also a poll-loop work bound.
+
 ## Feature flags
 
 | Crate | Flag | Effect |

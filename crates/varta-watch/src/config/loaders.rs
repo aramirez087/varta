@@ -1,12 +1,17 @@
 use super::types::Config;
 #[cfg(feature = "secure-udp")]
+use super::types::MAX_SECURE_SHARED_KEYS;
+#[cfg(feature = "secure-udp")]
 use super::validate::read_secret_file;
 use super::validate::validate_recovery_file;
 #[cfg(feature = "prometheus-exporter")]
 use super::validate::validate_secret_file;
 
 #[cfg(feature = "secure-udp")]
-fn load_key_file(path: &std::path::Path) -> std::io::Result<Vec<varta_vlp::crypto::Key>> {
+fn load_key_file(
+    path: &std::path::Path,
+    max_keys: usize,
+) -> std::io::Result<Vec<varta_vlp::crypto::Key>> {
     use std::io;
     use varta_vlp::crypto::Key;
 
@@ -16,6 +21,15 @@ fn load_key_file(path: &std::path::Path) -> std::io::Result<Vec<varta_vlp::crypt
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
             continue;
+        }
+        if keys.len() >= max_keys {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "{}: too many shared secure-UDP keys (at most {MAX_SECURE_SHARED_KEYS} total)",
+                    path.display()
+                ),
+            ));
         }
         let key = Key::from_hex(line).map_err(|e| {
             io::Error::new(
@@ -107,7 +121,9 @@ impl Config {
     /// Returns `Ok(None)` when neither shared-key file is set. `--key-file`
     /// must contain exactly one key. `--accepted-key-file` may contain one or
     /// more additional keys and is loaded even when a master key, rather than
-    /// a primary shared key, is configured.
+    /// a primary shared key, is configured. The combined shared-key set is
+    /// capped at [`MAX_SECURE_SHARED_KEYS`] because every encrypted datagram
+    /// trials every shared key on the observer poll loop.
     ///
     /// # Errors
     ///
@@ -122,7 +138,7 @@ impl Config {
         let mut keys = Vec::new();
 
         if let Some(ref path) = self.secure_key_file {
-            let mut primary_keys = load_key_file(path)?;
+            let mut primary_keys = load_key_file(path, MAX_SECURE_SHARED_KEYS)?;
             if primary_keys.len() > 1 {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -142,7 +158,7 @@ impl Config {
         }
 
         if let Some(ref path) = self.accepted_key_file {
-            let accepted = load_key_file(path)?;
+            let accepted = load_key_file(path, MAX_SECURE_SHARED_KEYS.saturating_sub(keys.len()))?;
             if accepted.is_empty() {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
