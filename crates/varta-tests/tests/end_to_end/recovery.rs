@@ -7,6 +7,8 @@ use super::{
 use std::time::Duration;
 use varta_client::{BeatOutcome, Status, Varta};
 
+const FAST_RECOVERY_DEBOUNCE_MS: &str = "1";
+
 /// Spawns `varta-watch` with `--recovery-exec`, drives beats, induces a
 /// stall, and asserts the recovery exec command fired (created a marker file
 /// with the agent PID in its name).
@@ -290,7 +292,7 @@ pub(super) fn recovery_timeout_kill_after() {
         "--recovery-exec",
         script.to_str().unwrap(),
         "--recovery-debounce-ms",
-        "0", // no debounce so stall triggers immediately
+        FAST_RECOVERY_DEBOUNCE_MS, // fastest legal debounce; first stall still triggers immediately
         "--recovery-timeout-ms",
         "300",
         "--prom-addr",
@@ -403,7 +405,7 @@ pub(super) fn recovery_env_isolation() {
         "--recovery-exec",
         script1.to_str().unwrap(),
         "--recovery-debounce-ms",
-        "0",
+        FAST_RECOVERY_DEBOUNCE_MS,
         "--recovery-env",
         "VARTA_E2E_ENV=works",
         "--prom-addr",
@@ -455,7 +457,7 @@ pub(super) fn recovery_env_isolation() {
         "--recovery-exec",
         script2.to_str().unwrap(),
         "--recovery-debounce-ms",
-        "0",
+        FAST_RECOVERY_DEBOUNCE_MS,
         "--prom-addr",
         "127.0.0.1:0",
         "--shutdown-after-secs",
@@ -509,7 +511,7 @@ pub(super) fn recovery_env_isolation() {
         "--recovery-exec",
         script3.to_str().unwrap(),
         "--recovery-debounce-ms",
-        "0",
+        FAST_RECOVERY_DEBOUNCE_MS,
         "--recovery-inherit-env",
         "--prom-addr",
         "127.0.0.1:0",
