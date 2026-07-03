@@ -307,6 +307,25 @@ pub const DEFAULT_ITERATION_BUDGET: Duration = Duration::from_millis(250);
 /// budget preserves the structural cap while giving a small headroom for I/O
 /// scheduling jitter before firing.
 pub const DEFAULT_SCRAPE_BUDGET: Duration = Duration::from_millis(250);
+
+#[cfg(feature = "prometheus-exporter")]
+fn normalize_iteration_budget(budget: Duration) -> Duration {
+    budget
+        .max(Duration::from_millis(
+            crate::config::MIN_ITERATION_BUDGET_MS,
+        ))
+        .min(Duration::from_millis(
+            crate::config::MAX_ITERATION_BUDGET_MS,
+        ))
+}
+
+#[cfg(feature = "prometheus-exporter")]
+fn normalize_scrape_budget(budget: Duration) -> Duration {
+    budget
+        .max(Duration::from_millis(crate::config::MIN_SCRAPE_BUDGET_MS))
+        .min(Duration::from_millis(crate::config::MAX_SCRAPE_BUDGET_MS))
+}
+
 /// Cap on how many bytes [`PromExporter::serve_pending`] reads from a
 /// single request before responding (we discard the request line/headers).
 #[cfg(feature = "prometheus-exporter")]
@@ -1356,15 +1375,28 @@ impl PromExporter {
         self.last_loop_system = SystemTime::now();
     }
 
-    /// Override the soft per-iteration budget. Builder-style: returns
-    /// `self` so the binary can chain `.bind(...).with_iteration_budget(...)`.
+    /// Override the soft per-iteration budget.
+    ///
+    /// Values outside the same range accepted by `--iteration-budget-ms` are
+    /// clamped so direct library callers cannot accidentally make the overrun
+    /// metric fire on every tick or never fire at all.
     pub fn with_iteration_budget(mut self, budget: Duration) -> Self {
-        self.iteration_budget = budget;
+        self.iteration_budget = normalize_iteration_budget(budget);
         self
     }
 
-    /// Override the per-call `serve_pending` budget. Builder-style.
+    /// Override the per-call `serve_pending` budget.
+    ///
+    /// Values outside the same range accepted by `--scrape-budget-ms` are
+    /// clamped so direct library callers cannot starve the metrics endpoint
+    /// with a zero budget or make scrape-budget alerts unreachable.
     pub fn with_scrape_budget(mut self, budget: Duration) -> Self {
+        self.scrape_budget = normalize_scrape_budget(budget);
+        self
+    }
+
+    #[cfg(test)]
+    fn with_scrape_budget_unchecked_for_test(mut self, budget: Duration) -> Self {
         self.scrape_budget = budget;
         self
     }

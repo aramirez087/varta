@@ -289,7 +289,7 @@ fn queued_authorized_scrapes_share_one_fresh_render() {
 fn serve_pending_honors_configured_scrape_budget_before_accepting() {
     let mut prom = PromExporter::bind("127.0.0.1:0".parse().unwrap(), make_token())
         .expect("bind")
-        .with_scrape_budget(Duration::ZERO);
+        .with_scrape_budget_unchecked_for_test(Duration::ZERO);
     let addr = prom.local_addr().expect("local_addr");
 
     let queued = authorized_get_stream(addr);
@@ -316,7 +316,7 @@ fn serve_pending_honors_configured_scrape_budget_before_accepting() {
 fn serve_pending_applies_configured_scrape_budget_to_accepted_connection() {
     let mut prom = PromExporter::bind("127.0.0.1:0".parse().unwrap(), make_token())
         .expect("bind")
-        .with_scrape_budget(Duration::from_millis(1));
+        .with_scrape_budget_unchecked_for_test(Duration::from_millis(1));
     let addr = prom.local_addr().expect("local_addr");
 
     let mut slow = TcpStream::connect(addr).expect("connect");
@@ -338,6 +338,28 @@ fn serve_pending_applies_configured_scrape_budget_to_accepted_connection() {
         "budget-expired accepted request must not render a metrics body"
     );
     drop(slow);
+}
+
+#[test]
+fn public_budget_builders_clamp_to_config_bounds() {
+    let min_iteration = Duration::from_millis(crate::config::MIN_ITERATION_BUDGET_MS);
+    let max_iteration = Duration::from_millis(crate::config::MAX_ITERATION_BUDGET_MS);
+    let min_scrape = Duration::from_millis(crate::config::MIN_SCRAPE_BUDGET_MS);
+    let max_scrape = Duration::from_millis(crate::config::MAX_SCRAPE_BUDGET_MS);
+
+    let prom = PromExporter::bind("127.0.0.1:0".parse().unwrap(), make_token())
+        .expect("bind")
+        .with_iteration_budget(Duration::ZERO)
+        .with_scrape_budget(Duration::ZERO);
+    assert_eq!(prom.iteration_budget, min_iteration);
+    assert_eq!(prom.scrape_budget, min_scrape);
+
+    let prom = PromExporter::bind("127.0.0.1:0".parse().unwrap(), make_token())
+        .expect("bind")
+        .with_iteration_budget(max_iteration + Duration::from_millis(1))
+        .with_scrape_budget(max_scrape + Duration::from_millis(1));
+    assert_eq!(prom.iteration_budget, max_iteration);
+    assert_eq!(prom.scrape_budget, max_scrape);
 }
 
 #[test]

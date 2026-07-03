@@ -217,14 +217,15 @@ fn prom_exporter_serve_pending_histogram_records_observed_durations() {
 
 #[test]
 fn prom_exporter_scrape_budget_exceeded_increments_when_observation_exceeds_budget() {
+    let scrape_budget = Duration::from_millis(varta_watch::config::MIN_SCRAPE_BUDGET_MS);
     let mut prom = PromExporter::bind("127.0.0.1:0".parse().unwrap(), make_token())
         .expect("bind")
-        .with_scrape_budget(Duration::from_millis(10));
+        .with_scrape_budget(scrape_budget);
     let addr = prom.local_addr().expect("local_addr");
     // One in-budget, two over-budget.
-    prom.record_serve_pending_duration(Duration::from_millis(1));
-    prom.record_serve_pending_duration(Duration::from_millis(20));
-    prom.record_serve_pending_duration(Duration::from_millis(50));
+    prom.record_serve_pending_duration(scrape_budget / 2);
+    prom.record_serve_pending_duration(scrape_budget + Duration::from_millis(1));
+    prom.record_serve_pending_duration(scrape_budget + Duration::from_millis(20));
     let body = http_get(&mut prom, addr, "/metrics");
     assert!(
         body.contains("varta_observer_scrape_budget_exceeded_total 2"),
