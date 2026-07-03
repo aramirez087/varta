@@ -351,6 +351,17 @@ recovery_timeout_ms = 0
 }
 
 #[test]
+fn recovery_debounce_ms_zero_is_rejected() {
+    let bad = "\
+socket = /tmp/x.sock
+threshold_ms = 5000
+recovery_debounce_ms = 0
+";
+    let err = parse_kv(bad).expect_err("recovery_debounce_ms=0 must error");
+    assert!(err.contains("recovery_debounce_ms"), "got: {err}");
+}
+
+#[test]
 fn recovery_audit_max_bytes_below_minimum_is_rejected() {
     let bad = "\
 socket = /tmp/x.sock

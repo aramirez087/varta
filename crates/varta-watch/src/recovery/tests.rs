@@ -157,6 +157,25 @@ fn capture_builder_clamps_untrusted_values() {
 }
 
 #[test]
+fn debounce_builder_clamps_untrusted_values() {
+    let mode = RecoveryMode::Exec {
+        program: "true".to_string(),
+        args: vec![],
+    };
+    let min = Duration::from_millis(crate::config::MIN_RECOVERY_DEBOUNCE_MS);
+
+    let rec = Recovery::with_mode(mode.clone(), Duration::ZERO);
+    assert_eq!(
+        rec.debounce, min,
+        "zero debounce must not disable the recovery debounce ledger"
+    );
+
+    let accepted = min + Duration::from_millis(1);
+    let rec = Recovery::with_mode(mode, accepted);
+    assert_eq!(rec.debounce, accepted);
+}
+
+#[test]
 fn timeout_builder_clamps_untrusted_values() {
     let mode = RecoveryMode::Exec {
         program: "true".to_string(),

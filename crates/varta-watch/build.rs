@@ -295,6 +295,23 @@ pub fn parse_kv(input: &str) -> Result<ParsedConfig, String> {
             );
         }
     }
+    if let Some(v) = out.singletons.get("recovery_debounce_ms") {
+        // Keep `1` in sync with config::types::MIN_RECOVERY_DEBOUNCE_MS
+        // (build.rs cannot import crate consts). A baked `0` prunes the
+        // debounce ledger immediately and can respawn recovery for the same
+        // still-silent pid on every evaluation; omit the key for the 1000 ms
+        // default.
+        let n: u64 = v
+            .parse()
+            .map_err(|_| format!("recovery_debounce_ms: not a valid u64: {v:?}"))?;
+        if n < 1 {
+            return Err(
+                "recovery_debounce_ms must be >= 1 (0 disables recovery debounce; omit the key \
+                 for the default)"
+                    .into(),
+            );
+        }
+    }
     if let Some(v) = out.singletons.get("recovery_timeout_ms") {
         // Keep `100` in sync with config::types::MIN_RECOVERY_TIMEOUT_MS
         // (build.rs cannot import crate consts). A baked `0` (or any value below

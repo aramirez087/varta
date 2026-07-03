@@ -10,6 +10,13 @@ use crate::tracker::EvictionPolicy;
 /// without an explicit `--recovery-debounce-ms`.
 pub const DEFAULT_RECOVERY_DEBOUNCE_MS: u64 = 1000;
 
+/// Minimum accepted `--recovery-debounce-ms`.
+///
+/// A zero debounce prunes the debounce ledger immediately and lets a
+/// still-silent pid spawn a fresh recovery as fast as a quick child can exit.
+/// Omit the flag for the safe default; do not use `0` as a disable switch.
+pub const MIN_RECOVERY_DEBOUNCE_MS: u64 = 1;
+
 /// Default UDS file permissions created at bind time (octal 0600 —
 /// owner-only read and write). Tightens the blast radius so only the owning
 /// UID can speak to the observer socket.
@@ -694,6 +701,16 @@ pub enum ConfigError {
         /// The minimum allowed value, in milliseconds.
         min: u64,
     },
+    /// `--recovery-debounce-ms` was below [`MIN_RECOVERY_DEBOUNCE_MS`].
+    /// A zero debounce prunes the debounce ledger immediately and permits a
+    /// fast recovery child to be respawned for the same still-silent pid on
+    /// every stall evaluation; use the default instead of `0`.
+    RecoveryDebounceTooLow {
+        /// The value that was provided, in milliseconds.
+        value: u64,
+        /// The minimum allowed value, in milliseconds.
+        min: u64,
+    },
     /// `--recovery-audit-max-bytes` was below [`MIN_RECOVERY_AUDIT_MAX_BYTES`].
     /// A tiny cap arms per-record rotation that shreds the Class C audit trail
     /// to the last few records with no tamper-evidence signal; the unbounded
@@ -943,6 +960,12 @@ impl core::fmt::Display for ConfigError {
                  (0 kills every still-running recovery child on the first reap tick, \
                  neutering recovery; omit the flag for the never-kill default)"
             ),
+            ConfigError::RecoveryDebounceTooLow { value, min } => write!(
+                f,
+                "--recovery-debounce-ms: {value} is below the minimum {min} ms \
+                 (0 disables the debounce ledger and can respawn recovery for the \
+                 same still-silent pid on every evaluation; omit the flag for the default)"
+            ),
             ConfigError::RecoveryAuditMaxBytesTooLow { value, min } => write!(
                 f,
                 "--recovery-audit-max-bytes: {value} is below the minimum {min} bytes \
@@ -1124,6 +1147,10 @@ impl core::fmt::Display for ConfigError {
             ConfigError::RecoveryTimeoutTooLow { value, min } => write!(
                 f,
                 "recovery timeout below minimum: {value} ms < {min} ms ({REF})"
+            ),
+            ConfigError::RecoveryDebounceTooLow { value, min } => write!(
+                f,
+                "recovery debounce below minimum: {value} ms < {min} ms ({REF})"
             ),
             ConfigError::RecoveryAuditMaxBytesTooLow { value, min } => write!(
                 f,

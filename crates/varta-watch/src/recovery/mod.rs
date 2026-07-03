@@ -431,7 +431,14 @@ impl Recovery {
     ///
     /// The [`Drop`] grace defaults to [`crate::config::DEFAULT_SHUTDOWN_GRACE_MS`].
     /// Use [`Self::with_shutdown_grace`] to override.
+    ///
+    /// `debounce` values below [`crate::config::MIN_RECOVERY_DEBOUNCE_MS`] are
+    /// clamped to that floor; a zero debounce would let a quick recovery child
+    /// respawn for the same still-silent pid on every stall evaluation.
     pub fn with_timeout(mode: RecoveryMode, debounce: Duration, timeout: Option<Duration>) -> Self {
+        let debounce = debounce.max(Duration::from_millis(
+            crate::config::MIN_RECOVERY_DEBOUNCE_MS,
+        ));
         let timeout = timeout.map(|timeout| {
             timeout.max(Duration::from_millis(
                 crate::config::MIN_RECOVERY_TIMEOUT_MS,

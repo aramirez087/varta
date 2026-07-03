@@ -41,8 +41,8 @@ impl super::types::Config {
             MAX_ITERATION_BUDGET_MS, MAX_RECOVERY_CAPTURE_BYTES, MAX_SCRAPE_BUDGET_MS,
             MAX_SHUTDOWN_GRACE_MS, MAX_UDS_RCVBUF_BYTES, MIN_EXPORT_FILE_MAX_BYTES,
             MIN_ITERATION_BUDGET_MS, MIN_READ_TIMEOUT_MS, MIN_RECOVERY_AUDIT_MAX_BYTES,
-            MIN_RECOVERY_CAPTURE_BYTES, MIN_RECOVERY_TIMEOUT_MS, MIN_SCRAPE_BUDGET_MS,
-            MIN_SELF_WATCHDOG_SECS, MIN_SHUTDOWN_GRACE_MS, MIN_THRESHOLD_MS,
+            MIN_RECOVERY_CAPTURE_BYTES, MIN_RECOVERY_DEBOUNCE_MS, MIN_RECOVERY_TIMEOUT_MS,
+            MIN_SCRAPE_BUDGET_MS, MIN_SELF_WATCHDOG_SECS, MIN_SHUTDOWN_GRACE_MS, MIN_THRESHOLD_MS,
         };
 
         if self.threshold < std::time::Duration::from_millis(MIN_THRESHOLD_MS) {
@@ -98,6 +98,13 @@ impl super::types::Config {
         }
         if self.recovery_capture_stdio && !has_recovery {
             return Err(ConfigError::RecoveryCaptureRequiresRecovery);
+        }
+        let recovery_debounce_ms = duration_ms_saturating(self.recovery_debounce);
+        if recovery_debounce_ms < MIN_RECOVERY_DEBOUNCE_MS {
+            return Err(ConfigError::RecoveryDebounceTooLow {
+                value: recovery_debounce_ms,
+                min: MIN_RECOVERY_DEBOUNCE_MS,
+            });
         }
 
         if !(MIN_ITERATION_BUDGET_MS..=MAX_ITERATION_BUDGET_MS)
@@ -459,6 +466,17 @@ mod tests {
         assert!(matches!(
             cfg.validate_runtime(),
             Err(ConfigError::RecoveryTimeoutTooLow { value: 0, min: 100 })
+        ));
+    }
+
+    #[test]
+    fn validate_runtime_rejects_recovery_debounce_zero() {
+        let mut cfg = valid_config();
+        cfg.recovery_debounce = Duration::ZERO;
+
+        assert!(matches!(
+            cfg.validate_runtime(),
+            Err(ConfigError::RecoveryDebounceTooLow { value: 0, min: 1 })
         ));
     }
 

@@ -33,8 +33,8 @@ use super::types::{
     MAX_AUDIT_ROTATION_BUDGET_MS, MAX_ITERATION_BUDGET_MS, MAX_RECOVERY_CAPTURE_BYTES,
     MAX_SCRAPE_BUDGET_MS, MAX_SHUTDOWN_GRACE_MS, MAX_UDS_RCVBUF_BYTES, MIN_EXPORT_FILE_MAX_BYTES,
     MIN_ITERATION_BUDGET_MS, MIN_READ_TIMEOUT_MS, MIN_RECOVERY_AUDIT_MAX_BYTES,
-    MIN_RECOVERY_CAPTURE_BYTES, MIN_RECOVERY_TIMEOUT_MS, MIN_SCRAPE_BUDGET_MS,
-    MIN_SELF_WATCHDOG_SECS, MIN_SHUTDOWN_GRACE_MS, MIN_THRESHOLD_MS,
+    MIN_RECOVERY_CAPTURE_BYTES, MIN_RECOVERY_DEBOUNCE_MS, MIN_RECOVERY_TIMEOUT_MS,
+    MIN_SCRAPE_BUDGET_MS, MIN_SELF_WATCHDOG_SECS, MIN_SHUTDOWN_GRACE_MS, MIN_THRESHOLD_MS,
 };
 #[cfg(not(feature = "compile-time-config"))]
 use super::validate::validate_recovery_env_entry;
@@ -634,8 +634,15 @@ impl Config {
             });
         }
 
-        let recovery_debounce =
-            Duration::from_millis(recovery_debounce_ms.unwrap_or(DEFAULT_RECOVERY_DEBOUNCE_MS));
+        let recovery_debounce_ms_resolved =
+            recovery_debounce_ms.unwrap_or(DEFAULT_RECOVERY_DEBOUNCE_MS);
+        if recovery_debounce_ms_resolved < MIN_RECOVERY_DEBOUNCE_MS {
+            return Err(ConfigError::RecoveryDebounceTooLow {
+                value: recovery_debounce_ms_resolved,
+                min: MIN_RECOVERY_DEBOUNCE_MS,
+            });
+        }
+        let recovery_debounce = Duration::from_millis(recovery_debounce_ms_resolved);
 
         let recovery_capture_bytes_resolved =
             recovery_capture_bytes.unwrap_or(DEFAULT_RECOVERY_CAPTURE_BYTES);

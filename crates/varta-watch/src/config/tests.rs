@@ -505,6 +505,39 @@ fn recovery_timeout_below_minimum_is_rejected() {
     );
 }
 
+#[test]
+fn recovery_debounce_zero_is_rejected() {
+    match Config::from_args(args(&[
+        "--socket",
+        "/s",
+        "--threshold-ms",
+        "100",
+        "--recovery-debounce-ms",
+        "0",
+    ])) {
+        Err(ConfigError::RecoveryDebounceTooLow { value, min }) => {
+            assert_eq!(value, 0);
+            assert_eq!(min, super::types::MIN_RECOVERY_DEBOUNCE_MS);
+        }
+        other => panic!("expected RecoveryDebounceTooLow, got {other:?}"),
+    }
+
+    let min_s = super::types::MIN_RECOVERY_DEBOUNCE_MS.to_string();
+    let cfg = Config::from_args(args(&[
+        "--socket",
+        "/s",
+        "--threshold-ms",
+        "100",
+        "--recovery-debounce-ms",
+        &min_s,
+    ]))
+    .expect("floor value must parse");
+    assert_eq!(
+        cfg.recovery_debounce,
+        Duration::from_millis(super::types::MIN_RECOVERY_DEBOUNCE_MS)
+    );
+}
+
 /// `--recovery-audit-max-bytes` below the floor must be rejected: a tiny cap
 /// arms per-record rotation that shreds the IEC 62304 Class C audit trail to
 /// the last few records while the hash chain stays linear — no tamper signal.
