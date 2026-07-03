@@ -795,7 +795,7 @@ pub enum ConfigError {
         max: u32,
     },
     /// `--tracker-capacity` was outside the accepted range
-    /// (`[1, crate::tracker::MAX_CAPACITY]`).
+    /// (`[crate::tracker::MIN_CAPACITY, crate::tracker::MAX_CAPACITY]`).
     TrackerCapacityOutOfRange {
         /// The value provided.
         value: usize,

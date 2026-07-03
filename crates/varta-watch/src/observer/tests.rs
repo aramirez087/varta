@@ -1,7 +1,7 @@
 use super::*;
 use crate::listener::BeatListener;
 use crate::peer_cred::{BeatOrigin, RecvResult};
-use crate::tracker::{DEFAULT_EVICTION_SCAN_WINDOW, MAX_CAPACITY};
+use crate::tracker::{DEFAULT_EVICTION_SCAN_WINDOW, MAX_CAPACITY, MIN_CAPACITY};
 use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -47,6 +47,23 @@ fn new_caps_untrusted_tracker_capacity_before_auxiliary_allocations() {
     .expect("observer construction should cap capacity before allocation");
 
     assert_eq!(obs.stall_queue.capacity(), MAX_CAPACITY);
+}
+
+#[test]
+fn new_clamps_zero_tracker_capacity_before_auxiliary_allocations() {
+    let obs = Observer::new(
+        Duration::from_secs(1),
+        0,
+        EvictionPolicy::Strict,
+        DEFAULT_EVICTION_SCAN_WINDOW,
+        None,
+        0,
+        0,
+        ClockSource::Monotonic,
+    )
+    .expect("observer construction should normalize zero capacity before allocation");
+
+    assert_eq!(obs.stall_queue.capacity(), MIN_CAPACITY);
 }
 
 #[test]

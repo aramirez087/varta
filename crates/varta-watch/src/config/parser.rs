@@ -20,7 +20,7 @@ use crate::tracker::EvictionPolicy;
 #[cfg(not(feature = "compile-time-config"))]
 use crate::tracker::{
     DEFAULT_CAPACITY, DEFAULT_EVICTION_SCAN_WINDOW, MAX_CAPACITY, MAX_EVICTION_SCAN_WINDOW,
-    MIN_EVICTION_SCAN_WINDOW,
+    MIN_CAPACITY, MIN_EVICTION_SCAN_WINDOW,
 };
 
 #[cfg(not(feature = "compile-time-config"))]
@@ -766,10 +766,10 @@ impl Config {
         };
         let tracker_capacity_resolved = match tracker_capacity {
             Some(v) => {
-                if !(1..=MAX_CAPACITY).contains(&v) {
+                if !(MIN_CAPACITY..=MAX_CAPACITY).contains(&v) {
                     return Err(ConfigError::TrackerCapacityOutOfRange {
                         value: v,
-                        min: 1,
+                        min: MIN_CAPACITY,
                         max: MAX_CAPACITY,
                     });
                 }

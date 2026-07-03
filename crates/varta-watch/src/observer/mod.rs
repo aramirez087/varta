@@ -425,7 +425,7 @@ impl Observer {
         global_beat_burst: u32,
         clock_source: ClockSource,
     ) -> io::Result<Self> {
-        let tracker_capacity = tracker_capacity.min(crate::tracker::MAX_CAPACITY);
+        let tracker_capacity = crate::tracker::normalize_capacity(tracker_capacity);
         let threshold_ns = threshold_ns_from_duration(threshold)?;
         let rate_limit_interval_ns = max_beat_rate.and_then(|rps| {
             if rps == 0 {

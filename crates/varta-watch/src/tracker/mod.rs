@@ -23,10 +23,25 @@ use crate::peer_cred::BeatOrigin;
 /// v0.2.0 raises this from 64 to 256. Override via `--tracker-capacity`.
 pub const DEFAULT_CAPACITY: usize = 256;
 
+/// Minimum viable tracker capacity.
+///
+/// A zero-capacity tracker cannot admit even its first pid, so every beat from
+/// a direct library caller would be reported as [`Update::CapacityExceeded`].
+pub const MIN_CAPACITY: usize = 1;
+
 /// Hard upper bound for `--tracker-capacity`. The tracker uses a linear scan
 /// over active slots; at capacities exceeding this value the scan becomes a
 /// latency spike risk in the observer poll loop.
 pub const MAX_CAPACITY: usize = 4096;
+
+/// Normalize an untrusted tracker capacity into the public constructor range.
+///
+/// Config parsing rejects values outside this range; public library
+/// constructors clamp as defense in depth so they cannot construct a tracker
+/// that silently drops every new pid.
+pub fn normalize_capacity(capacity: usize) -> usize {
+    capacity.clamp(MIN_CAPACITY, MAX_CAPACITY)
+}
 
 /// Multiplier applied to the stall threshold when choosing eviction victims.
 ///
@@ -435,7 +450,7 @@ impl Tracker {
         eviction_policy: EvictionPolicy,
         eviction_scan_window: usize,
     ) -> Self {
-        let cap = capacity.min(MAX_CAPACITY);
+        let cap = normalize_capacity(capacity);
         let window = eviction_scan_window.clamp(MIN_EVICTION_SCAN_WINDOW, MAX_EVICTION_SCAN_WINDOW);
         Tracker {
             entries: Vec::with_capacity(cap),

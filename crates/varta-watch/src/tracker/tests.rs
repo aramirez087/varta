@@ -1,7 +1,7 @@
 use super::pid_index::{PidIndex, ProbeExhausted};
 use super::{
     EvictionPolicy, StallFreshness, Tracker, Update, DEFAULT_EVICTION_SCAN_WINDOW,
-    EVICTION_MULTIPLIER, MAX_CAPACITY,
+    EVICTION_MULTIPLIER, MAX_CAPACITY, MIN_CAPACITY,
 };
 use crate::peer_cred::BeatOrigin;
 use varta_vlp::{Frame, Status, NONCE_TERMINAL};
@@ -14,6 +14,27 @@ fn frame(pid: u32, nonce: u64) -> Frame {
 /// behaviour. Picked as `KernelAttested` so existing tests continue to
 /// represent the common UDS path.
 const ORIGIN: BeatOrigin = BeatOrigin::KernelAttested;
+
+#[test]
+fn zero_capacity_normalizes_to_one_pid() {
+    let mut t = Tracker::new(0, EvictionPolicy::Strict, DEFAULT_EVICTION_SCAN_WINDOW);
+    let now_ns = 1_000;
+    let threshold_ns = 100;
+
+    assert_eq!(
+        t.record(&frame(1, 1), now_ns, threshold_ns, ORIGIN, None),
+        Update::Inserted,
+        "the first pid must be admitted after capacity normalization"
+    );
+    assert_eq!(t.len(), MIN_CAPACITY);
+
+    assert_eq!(
+        t.record(&frame(2, 1), now_ns, threshold_ns, ORIGIN, None),
+        Update::CapacityExceeded,
+        "strict capacity-one tracker must still refuse a second live pid"
+    );
+    assert_eq!(t.len(), MIN_CAPACITY);
+}
 
 /// Fill capacity entirely; never trigger a stall. find_evictable_slot
 /// must return None without scanning any slot (Strict policy).

@@ -163,10 +163,12 @@ impl super::types::Config {
                 platform: std::env::consts::OS,
             });
         }
-        if !(1..=crate::tracker::MAX_CAPACITY).contains(&self.tracker_capacity) {
+        if !(crate::tracker::MIN_CAPACITY..=crate::tracker::MAX_CAPACITY)
+            .contains(&self.tracker_capacity)
+        {
             return Err(ConfigError::TrackerCapacityOutOfRange {
                 value: self.tracker_capacity,
-                min: 1,
+                min: crate::tracker::MIN_CAPACITY,
                 max: crate::tracker::MAX_CAPACITY,
             });
         }
