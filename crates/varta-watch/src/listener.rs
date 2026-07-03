@@ -25,6 +25,12 @@ static DIR_FSYNC_FAILED: AtomicU64 = AtomicU64::new(0);
 #[cfg(test)]
 static UDS_BIND_TEST_LOCK: Mutex<()> = Mutex::new(());
 
+#[cfg(test)]
+thread_local! {
+    #[allow(clippy::missing_const_for_thread_local)] // `const { ... }` would break the Rust 1.70 MSRV lane.
+    static FINISH_BIND_FAIL_AFTER_IDENTITY: std::cell::Cell<bool> = std::cell::Cell::new(false);
+}
+
 /// Drain and reset the parent-directory fsync failure counter.
 ///
 /// Returns the number of `fsync_parent_dir` calls that failed since the last
@@ -534,6 +540,18 @@ impl UdsListener {
         uds_rcvbuf_bytes: u32,
         expected_mode: u32,
     ) -> io::Result<Self> {
+        let identity = bound_socket_identity(&path)?;
+        let mut bound_socket = BoundSocketGuard::new(path.clone(), identity);
+        validate_bound_socket_identity(&path, expected_mode, identity)?;
+
+        #[cfg(test)]
+        if take_finish_bind_failure_after_identity_for_test() {
+            return Err(io::Error::new(
+                ErrorKind::Other,
+                "injected post-bind UDS listener setup failure",
+            ));
+        }
+
         // The observer's round-robin `poll()` is contractually non-blocking:
         // it pulls at most one datagram per listener per call and must never
         // wait on an idle socket (`book/.../observer-liveness.md`, p99 ≤ 5 ms).
@@ -554,8 +572,6 @@ impl UdsListener {
         sock.set_read_timeout(Some(read_timeout))?;
         let raw_fd = sock.as_raw_fd();
         peer_cred::enable_credential_passing(raw_fd)?;
-
-        let identity = bound_socket_identity(&path, expected_mode)?;
         let bound_dev = identity.dev;
         let bound_ino = identity.ino;
 
@@ -577,6 +593,7 @@ impl UdsListener {
             0
         };
 
+        bound_socket.disarm();
         Ok(UdsListener {
             sock,
             path,
@@ -610,15 +627,13 @@ impl BeatListener for UdsListener {
 
 impl Drop for UdsListener {
     fn drop(&mut self) {
-        use std::os::unix::fs::{FileTypeExt, MetadataExt};
-        if let Ok(meta) = std::fs::symlink_metadata(&self.path) {
-            if meta.file_type().is_socket()
-                && meta.dev() == self.bound_dev
-                && meta.ino() == self.bound_ino
-            {
-                let _ = std::fs::remove_file(&self.path);
-            }
-        }
+        remove_socket_if_identity_matches(
+            &self.path,
+            SocketIdentity {
+                dev: self.bound_dev,
+                ino: self.bound_ino,
+            },
+        );
     }
 }
 
@@ -677,6 +692,49 @@ fn set_rcvbuf(fd: i32, bytes: u32) -> io::Result<u32> {
 struct SocketIdentity {
     dev: u64,
     ino: u64,
+}
+
+struct BoundSocketGuard {
+    path: PathBuf,
+    identity: SocketIdentity,
+    armed: bool,
+}
+
+impl BoundSocketGuard {
+    fn new(path: PathBuf, identity: SocketIdentity) -> Self {
+        Self {
+            path,
+            identity,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for BoundSocketGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+
+        remove_socket_if_identity_matches(&self.path, self.identity);
+    }
+}
+
+fn remove_socket_if_identity_matches(path: &Path, identity: SocketIdentity) {
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+
+    if let Ok(meta) = std::fs::symlink_metadata(path) {
+        let matches_identity = meta.file_type().is_socket()
+            && meta.dev() == identity.dev
+            && meta.ino() == identity.ino;
+        if matches_identity {
+            let _ = std::fs::remove_file(path);
+        }
+    }
 }
 
 enum PathOccupant {
@@ -782,8 +840,8 @@ fn trusted_socket_parent_symlink_metadata(
     ))
 }
 
-fn bound_socket_identity(path: &Path, expected_mode: u32) -> io::Result<SocketIdentity> {
-    use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
+fn bound_socket_identity(path: &Path) -> io::Result<SocketIdentity> {
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
 
     let meta = std::fs::symlink_metadata(path)?;
     if !meta.file_type().is_socket() {
@@ -795,6 +853,33 @@ fn bound_socket_identity(path: &Path, expected_mode: u32) -> io::Result<SocketId
             ),
         ));
     }
+    Ok(SocketIdentity {
+        dev: meta.dev(),
+        ino: meta.ino(),
+    })
+}
+
+fn validate_bound_socket_identity(
+    path: &Path,
+    expected_mode: u32,
+    expected_identity: SocketIdentity,
+) -> io::Result<()> {
+    use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
+
+    let meta = std::fs::symlink_metadata(path)?;
+    if !meta.file_type().is_socket()
+        || meta.dev() != expected_identity.dev
+        || meta.ino() != expected_identity.ino
+    {
+        return Err(io::Error::new(
+            ErrorKind::AddrInUse,
+            format!(
+                "observer socket path {} was replaced before bind completed",
+                path.display()
+            ),
+        ));
+    }
+
     let actual_mode = meta.permissions().mode() & 0o777;
     if actual_mode != expected_mode {
         return Err(io::Error::new(
@@ -805,9 +890,25 @@ fn bound_socket_identity(path: &Path, expected_mode: u32) -> io::Result<SocketId
             ),
         ));
     }
-    Ok(SocketIdentity {
-        dev: meta.dev(),
-        ino: meta.ino(),
+    Ok(())
+}
+
+#[cfg(test)]
+fn inject_finish_bind_failure_after_identity_for_test() {
+    FINISH_BIND_FAIL_AFTER_IDENTITY.with(|flag| flag.set(true));
+}
+
+#[cfg(test)]
+fn clear_finish_bind_failure_after_identity_for_test() {
+    FINISH_BIND_FAIL_AFTER_IDENTITY.with(|flag| flag.set(false));
+}
+
+#[cfg(test)]
+fn take_finish_bind_failure_after_identity_for_test() -> bool {
+    FINISH_BIND_FAIL_AFTER_IDENTITY.with(|flag| {
+        let fail = flag.get();
+        flag.set(false);
+        fail
     })
 }
 
@@ -1035,6 +1136,37 @@ mod tests {
         assert!(
             !path.exists(),
             "read-timeout validation must run before UnixDatagram::bind creates a socket file"
+        );
+
+        let _ = std::fs::remove_dir(&dir);
+    }
+
+    #[test]
+    fn uds_bind_removes_created_socket_after_post_bind_setup_failure() {
+        let (dir, path) = short_temp_socket_path_with_mode("fb", 0o755);
+        let _bind_guard = BIND_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        super::inject_finish_bind_failure_after_identity_for_test();
+        let result =
+            super::UdsListener::bind(&path, 0o600, Duration::from_millis(100), 0, &pre_thread());
+        super::clear_finish_bind_failure_after_identity_for_test();
+        let err = match result {
+            Ok(listener) => {
+                drop(listener);
+                panic!("bind must surface the injected post-bind setup failure")
+            }
+            Err(err) => err,
+        };
+
+        assert_eq!(err.kind(), ErrorKind::Other);
+        assert!(
+            err.to_string()
+                .contains("injected post-bind UDS listener setup failure"),
+            "error should identify the injected setup failure: {err}"
+        );
+        assert!(
+            !path.exists(),
+            "post-bind setup failure must remove the socket file created by bind"
         );
 
         let _ = std::fs::remove_dir(&dir);
