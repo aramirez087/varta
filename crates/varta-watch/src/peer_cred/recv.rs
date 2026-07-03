@@ -509,8 +509,9 @@ mod tests {
         }
 
         /// Count open fds whose `/proc/self/fd/<n>` target matches `target`.
-        /// Unlike a raw fd-table length, this stays stable when unrelated
-        /// parallel lib tests open transient pipes or sockets.
+        /// Unlike a raw fd-table length or `/dev/null` count, this stays
+        /// stable when unrelated parallel lib tests open or close transient
+        /// descriptors.
         fn count_fds_with_readlink_target(target: &std::path::Path) -> usize {
             std::fs::read_dir("/proc/self/fd")
                 .expect("read /proc/self/fd")
@@ -526,6 +527,9 @@ mod tests {
         let path =
             std::env::temp_dir().join(format!("varta-scmrights-{}.sock", std::process::id()));
         let _ = std::fs::remove_file(&path);
+        let passed_path =
+            std::env::temp_dir().join(format!("varta-scmrights-passed-{}.tmp", std::process::id()));
+        let _ = std::fs::remove_file(&passed_path);
 
         let observer = UnixDatagram::bind(&path).expect("bind observer");
         enable_credential_passing(observer.as_raw_fd()).expect("enable credential passing");
@@ -536,7 +540,10 @@ mod tests {
         // The fd whose recvmsg-installed duplicate must be reclaimed. We keep
         // `passed` open for the whole test; only its duplicate in the observer
         // is the leak candidate.
-        let passed = std::fs::File::open("/dev/null").expect("open /dev/null");
+        let passed = std::fs::File::create(&passed_path).expect("create passed fd target");
+        let passed_target = passed_path
+            .canonicalize()
+            .expect("canonicalize passed fd target");
 
         let mut beat = [0u8; super::VLP_FRAME_LEN];
         let mut iov = plat::Iovec {
@@ -575,8 +582,7 @@ mod tests {
             "sendmsg should send the beat"
         );
 
-        let dev_null = std::path::Path::new("/dev/null");
-        let before = count_fds_with_readlink_target(dev_null);
+        let before = count_fds_with_readlink_target(&passed_target);
         let result = recv_authenticated(observer.as_raw_fd());
 
         // Consume `result` by value before measuring: on Linux 6.5+ the kernel
@@ -599,17 +605,18 @@ mod tests {
             }
             _ => panic!("expected an authenticated beat"),
         };
-        let after = count_fds_with_readlink_target(dev_null);
+        let after = count_fds_with_readlink_target(&passed_target);
 
         assert_eq!(data, beat, "beat payload should survive intact");
         assert_ne!(peer_pid, 0, "in-process send is kernel-attested");
         assert_eq!(
             after, before,
-            "observer leaked a peer-injected SCM_RIGHTS duplicate of /dev/null \
+            "observer leaked a peer-injected SCM_RIGHTS duplicate of the test fd \
              (before={before}, after={after})"
         );
 
         let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&passed_path);
     }
 
     /// Regression: peer-triggered ancillary truncation must not allocate before
