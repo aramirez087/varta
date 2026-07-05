@@ -123,7 +123,8 @@ impl super::PromExporter {
     /// drains cleanly; returns the first non-`WouldBlock` error otherwise.
     ///
     /// Service budget per call is bounded by two limits (whichever hits
-    /// first): the configured scrape budget capped at 100 ms and
+    /// first): the serve slice of the configured scrape budget (three
+    /// quarters of it, capped at 100 ms) and
     /// [`PROM_MAX_CONNECTIONS_PER_SERVE`] accepted connections. Both
     /// exist to prevent a storm of slow scrapers from starving the
     /// observer poll loop (stall detection, I/O polling, reaping).
@@ -141,7 +142,18 @@ impl super::PromExporter {
         let started = Instant::now();
         let structural_budget = PROM_SERVE_PHASE_CAP + PROM_DRAIN_PHASE_CAP;
         let hard_budget = self.scrape_budget.min(structural_budget);
-        let serve_budget = hard_budget.min(PROM_SERVE_PHASE_CAP);
+        // The drain phase must keep a non-empty slice of the hard budget.
+        // Capping the serve slice at the hard budget alone made
+        // `serve_deadline == hard_deadline` for any scrape budget at or
+        // below PROM_SERVE_PHASE_CAP; a deadline-bound serve phase then hit
+        // the drain loop's deadline check immediately and the anti-flood
+        // drain never ran — precisely when a connection flood needed it.
+        // A quarter of the hard budget is reserved for draining; the total
+        // never exceeds the configured scrape budget.
+        let drain_reserve = (hard_budget / 4).min(PROM_DRAIN_PHASE_CAP);
+        let serve_budget = hard_budget
+            .saturating_sub(drain_reserve)
+            .min(PROM_SERVE_PHASE_CAP);
         let serve_deadline = started + serve_budget;
         let hard_deadline = started + hard_budget;
         let mut served = 0;

@@ -340,6 +340,55 @@ fn serve_pending_applies_configured_scrape_budget_to_accepted_connection() {
     drop(slow);
 }
 
+/// Regression test: with `--scrape-budget-ms` at or below the 100 ms
+/// serve-phase cap (the legal range starts at [`MIN_SCRAPE_BUDGET_MS`] =
+/// 50 ms), `serve_budget` used to equal `hard_budget`, so once the serve
+/// phase exhausted its deadline the drain phase's first deadline check
+/// fired immediately and the anti-flood drain accepted **zero**
+/// connections — the accept-queue relief was silently disabled for
+/// exactly the operators who tightened the budget, and exactly when a
+/// connection flood needed it.
+///
+/// Setup: idle connections (connected, nothing sent) each pin `serve_one`
+/// to its 10 ms read deadline, so the serve phase is deadline-bound with
+/// connections still queued behind it. The drain phase must then accept
+/// and close at least one of the queued remainder within the same
+/// `serve_pending` call.
+#[test]
+fn scrape_budget_at_serve_phase_cap_still_runs_drain_phase() {
+    // Per-IP rate limiting off (burst 0) so every queued loopback
+    // connection reaches serve/drain accounting deterministically.
+    let mut prom =
+        PromExporter::bind_with_rate_limit("127.0.0.1:0".parse().unwrap(), make_token(), 0, 0)
+            .expect("bind")
+            .with_scrape_budget(Duration::from_millis(crate::config::MIN_SCRAPE_BUDGET_MS));
+    let addr = prom.local_addr().expect("local_addr");
+
+    // More idle connections than the serve phase can drain: each costs a
+    // full 10 ms PROM_READ_DEADLINE, so a 50 ms budget deadline-exits the
+    // serve phase after at most ~5 of them, leaving the rest queued.
+    let queued: Vec<TcpStream> = (0..12)
+        .map(|_| TcpStream::connect(addr).expect("connect idle"))
+        .collect();
+    std::thread::sleep(Duration::from_millis(50));
+
+    prom.serve_pending().expect("serve_pending");
+
+    assert_eq!(
+        prom.scrape_budget_exhausted_total, 1,
+        "idle connections must exhaust the serve phase by deadline"
+    );
+    let drain_idx = drop_reason_index(DropReason::Drain);
+    assert!(
+        prom.connections_dropped_total[drain_idx] > 0,
+        "after a deadline-bound serve phase the anti-flood drain must still \
+         accept-and-close queued connections at the minimum legal scrape \
+         budget; drained = {}",
+        prom.connections_dropped_total[drain_idx]
+    );
+    drop(queued);
+}
+
 #[test]
 fn public_budget_builders_clamp_to_config_bounds() {
     let min_iteration = Duration::from_millis(crate::config::MIN_ITERATION_BUDGET_MS);
