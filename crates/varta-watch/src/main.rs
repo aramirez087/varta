@@ -1172,6 +1172,12 @@ fn run(cfg: Config) -> std::io::Result<()> {
         // cheap Debounced/Refused outcomes never consume this budget. The
         // remainder stays queued (the stall_queue cursor resumes next tick).
         let mut spawns_this_tick = 0usize;
+        // Set only when a real scheduler budget leaves queued stalls for a
+        // later tick. The normal first-pass queue is not a deferral boundary:
+        // its enqueue path already performed the safe generation check, and
+        // treating it as deferred would suppress recovery forever on
+        // credential-attested platforms without Linux start-time tokens.
+        let mut recovery_budget_deferred_stalls = false;
         // Per-tick stall *evaluation* budget: even a non-spawning outcome costs
         // an O(tracker_capacity) debounce-ledger scan in on_stall plus a
         // /proc/<pid>/stat freshness read, so a mass non-spawning batch (a
@@ -1183,7 +1189,7 @@ fn run(cfg: Config) -> std::io::Result<()> {
         // spawn budget. See recovery::RECOVERY_STALL_EVAL_MAX_PER_TICK.
         let mut evals_this_tick = 0usize;
         while evals_this_tick < varta_watch::recovery::RECOVERY_STALL_EVAL_MAX_PER_TICK {
-            let Some(ev) = observer.poll_pending() else {
+            let Some((ev, requires_freshness_check)) = observer.poll_pending_for_recovery() else {
                 break;
             };
             evals_this_tick += 1;
@@ -1206,65 +1212,60 @@ fn run(cfg: Config) -> std::io::Result<()> {
             } = &ev
             {
                 if let Some(rec) = recovery.as_mut() {
-                    // Freshness re-check before firing. This stall may have
-                    // sat queued across ticks: a mass simultaneous stall
-                    // queues more events than RECOVERY_SPAWN_MAX_PER_TICK can
-                    // fire in one DrainPending stage, deferring the remainder.
-                    // Two things can invalidate a queued stall inside that
-                    // window — the agent resuming beating (slot clears
-                    // `stall_emitted`), or the OS recycling the stalled PID to
-                    // a different process (slot stays latched but its pinned
-                    // start-time generation no longer matches the live process,
-                    // mirroring drain_stalled_slots' enqueue-time check). Firing
-                    // in either case would kill/restart an innocent process.
-                    // Skip — O(1) plus at most one /proc start-time read on the
-                    // cold fire path, and it consumes no spawn budget (no fork).
-                    // See observer::stall_freshness.
-                    match observer.stall_freshness(*pid, *generation) {
-                        StallFreshness::Warranted => {}
-                        StallFreshness::AgentResumed => {
-                            let outcome = RecoveryOutcome::SkippedAgentResumed { pid: *pid };
-                            rec.record_deferred_skip_audit(&outcome, *observer_ns);
-                            #[cfg(feature = "prometheus-exporter")]
-                            if let Some(pe) = prom_export.as_mut() {
-                                pe.record_recovery_outcome(&outcome, None);
-                            }
-                            varta_info_pid!(
-                                *pid,
-                                "recovery for pid {pid} SKIPPED: agent resumed \
+                    // Only stalls actually held back by the scheduler's
+                    // per-tick budget need the fire-time check. The initial
+                    // pass was validated at enqueue time; on platforms that
+                    // attest PID but expose no start-time generation, applying
+                    // this to that pass would withhold every recovery rather
+                    // than only the recycle-risking deferred ones.
+                    if requires_freshness_check {
+                        match observer.stall_freshness(*pid, *generation) {
+                            StallFreshness::Warranted => {}
+                            StallFreshness::AgentResumed => {
+                                let outcome = RecoveryOutcome::SkippedAgentResumed { pid: *pid };
+                                rec.record_deferred_skip_audit(&outcome, *observer_ns);
+                                #[cfg(feature = "prometheus-exporter")]
+                                if let Some(pe) = prom_export.as_mut() {
+                                    pe.record_recovery_outcome(&outcome, None);
+                                }
+                                varta_info_pid!(
+                                    *pid,
+                                    "recovery for pid {pid} SKIPPED: agent resumed \
                                  beating before its deferred stall fired"
-                            );
-                            continue;
-                        }
-                        StallFreshness::PidRecycled => {
-                            let outcome = RecoveryOutcome::SkippedPidRecycled { pid: *pid };
-                            rec.record_deferred_skip_audit(&outcome, *observer_ns);
-                            #[cfg(feature = "prometheus-exporter")]
-                            if let Some(pe) = prom_export.as_mut() {
-                                pe.record_recovery_outcome(&outcome, None);
+                                );
+                                continue;
                             }
-                            varta_info_pid!(
-                                *pid,
-                                "recovery for pid {pid} SKIPPED: PID recycled to a \
+                            StallFreshness::PidRecycled => {
+                                let outcome = RecoveryOutcome::SkippedPidRecycled { pid: *pid };
+                                rec.record_deferred_skip_audit(&outcome, *observer_ns);
+                                #[cfg(feature = "prometheus-exporter")]
+                                if let Some(pe) = prom_export.as_mut() {
+                                    pe.record_recovery_outcome(&outcome, None);
+                                }
+                                varta_info_pid!(
+                                    *pid,
+                                    "recovery for pid {pid} SKIPPED: PID recycled to a \
                                  different process before its deferred stall fired"
-                            );
-                            continue;
-                        }
-                        StallFreshness::UnverifiableGeneration => {
-                            let outcome = RecoveryOutcome::SkippedStallUnverifiable { pid: *pid };
-                            rec.record_deferred_skip_audit(&outcome, *observer_ns);
-                            #[cfg(feature = "prometheus-exporter")]
-                            if let Some(pe) = prom_export.as_mut() {
-                                pe.record_recovery_outcome(&outcome, None);
+                                );
+                                continue;
                             }
-                            varta_info_pid!(
-                                *pid,
-                                "recovery for pid {pid} SKIPPED: kernel-attested stall \
+                            StallFreshness::UnverifiableGeneration => {
+                                let outcome =
+                                    RecoveryOutcome::SkippedStallUnverifiable { pid: *pid };
+                                rec.record_deferred_skip_audit(&outcome, *observer_ns);
+                                #[cfg(feature = "prometheus-exporter")]
+                                if let Some(pe) = prom_export.as_mut() {
+                                    pe.record_recovery_outcome(&outcome, None);
+                                }
+                                varta_info_pid!(
+                                    *pid,
+                                    "recovery for pid {pid} SKIPPED: kernel-attested stall \
                                  cannot prove start-time generation at fire time, so a PID \
                                  recycle in the deferral window cannot be ruled out; \
                                  refusing recovery to avoid targeting a recycled bystander"
-                            );
-                            continue;
+                                );
+                                continue;
+                            }
                         }
                     }
                     // Cross-namespace agent: the slot's pinned PID-namespace
@@ -1421,11 +1422,24 @@ fn run(cfg: Config) -> std::io::Result<()> {
                             if let Some(pe) = prom_export.as_mut() {
                                 pe.record_recovery_spawn_budget_exceeded(1);
                             }
+                            recovery_budget_deferred_stalls = true;
                             break;
                         }
                     }
                 }
             }
+        }
+
+        // The spawn-cap branch above breaks directly; the evaluation cap exits
+        // via the loop condition. Either way, only the still-queued tail has
+        // crossed a real deferral boundary and must receive the fire-time
+        // PID-freshness check on a later tick.
+        if recovery.is_some()
+            && observer.has_pending_stalls()
+            && (recovery_budget_deferred_stalls
+                || evals_this_tick >= varta_watch::recovery::RECOVERY_STALL_EVAL_MAX_PER_TICK)
+        {
+            observer.defer_remaining_stalls_for_recovery();
         }
 
         // Record drain_pending stage, then reset timer for the poll phase.

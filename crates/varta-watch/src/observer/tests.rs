@@ -1,7 +1,7 @@
 use super::*;
 use crate::listener::BeatListener;
 use crate::peer_cred::{BeatOrigin, RecvResult};
-use crate::tracker::{DEFAULT_EVICTION_SCAN_WINDOW, MAX_CAPACITY, MIN_CAPACITY};
+use crate::tracker::{StallFreshness, DEFAULT_EVICTION_SCAN_WINDOW, MAX_CAPACITY, MIN_CAPACITY};
 use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -1787,6 +1787,68 @@ fn predrain_loop_observes_all_buffered_resumes_before_deferred_stalls_fire() {
             "buffered resume for pid {pid} must flip its deferred stall stale"
         );
     }
+}
+
+#[test]
+fn recovery_freshness_marks_only_budget_deferred_stalls() {
+    let mut obs = Observer::new(
+        Duration::from_millis(crate::config::MIN_THRESHOLD_MS),
+        64,
+        EvictionPolicy::Strict,
+        DEFAULT_EVICTION_SCAN_WINDOW,
+        None,
+        0,
+        0,
+        ClockSource::Monotonic,
+    )
+    .expect("Observer::new should succeed");
+
+    const PIDS: [u32; 2] = [71, 72];
+    obs.add_listener(Box::new(ScriptedListener::with_origin_frames(&[
+        (PIDS[0], 1, 0, BeatOrigin::KernelAttested),
+        (PIDS[1], 1, 0, BeatOrigin::KernelAttested),
+    ])));
+
+    let mut last_beat_ns = 0;
+    for _ in PIDS {
+        let event = obs.poll();
+        match event {
+            Some(Event::Beat { observer_ns, .. }) => last_beat_ns = observer_ns,
+            other => panic!("initial beat should be observed, got {other:?}"),
+        }
+    }
+
+    let threshold_ns = Duration::from_millis(crate::config::MIN_THRESHOLD_MS)
+        .as_nanos()
+        .min(u64::MAX as u128) as u64;
+    let _ = obs.apply_raw_clock_test(last_beat_ns.saturating_add(threshold_ns));
+    assert!(
+        obs.poll().is_none(),
+        "threshold crossing should queue stalls"
+    );
+    assert_eq!(
+        obs.stall_freshness(PIDS[0], None),
+        StallFreshness::UnverifiableGeneration,
+        "this first stall would be wrongly withheld if ordinary queueing were treated as deferral"
+    );
+
+    let (first, first_requires_freshness) =
+        obs.poll_pending_for_recovery().expect("first queued stall");
+    assert!(matches!(first, Event::Stall { pid, .. } if pid == PIDS[0]));
+    assert!(
+        !first_requires_freshness,
+        "the first recovery pass is not budget-deferred"
+    );
+
+    obs.defer_remaining_stalls_for_recovery();
+    let (second, second_requires_freshness) = obs
+        .poll_pending_for_recovery()
+        .expect("budget-deferred queued stall");
+    assert!(matches!(second, Event::Stall { pid, .. } if pid == PIDS[1]));
+    assert!(
+        second_requires_freshness,
+        "only the tail held by the scheduler budget must be re-validated"
+    );
 }
 
 #[test]

@@ -315,6 +315,15 @@ pub struct Observer {
     clock: Clock,
     stall_queue: Vec<Option<Event>>,
     stall_cursor: usize,
+    /// First queued stall that was held back by a per-tick recovery budget.
+    ///
+    /// The enqueue path already verifies a kernel-attested PID's generation
+    /// before latching its initial stall. Applying the stricter fire-time
+    /// check to every queue entry would therefore turn platforms without
+    /// Linux `/proc/<pid>/stat` generation tokens into a permanent
+    /// no-recovery state, even for their normal first recovery attempt. The
+    /// sentinel `usize::MAX` means no queued stall crossed that boundary.
+    stall_deferred_from: usize,
     /// Next index to start polling from for fair round-robin across listeners.
     next_listener_start: usize,
     /// Whether the most recent [`Observer::poll`] dequeued at least one
@@ -445,6 +454,7 @@ impl Observer {
             clock,
             stall_queue: Vec::with_capacity(tracker_capacity),
             stall_cursor: 0,
+            stall_deferred_from: usize::MAX,
             next_listener_start: 0,
             last_poll_consumed: false,
             rate_limit_interval_ns,
@@ -931,6 +941,28 @@ impl Observer {
         None
     }
 
+    /// Return the next queued stall together with whether recovery must
+    /// re-validate its PID freshness before firing.
+    ///
+    /// This is primarily for the companion daemon's recovery scheduler;
+    /// library consumers that do not run recovery can keep using
+    /// [`Self::poll_pending`] and receive the same event stream.
+    pub fn poll_pending_for_recovery(&mut self) -> Option<(Event, bool)> {
+        let queue_index = self.stall_cursor;
+        let event = self.poll_pending()?;
+        Some((event, queue_index >= self.stall_deferred_from))
+    }
+
+    /// Mark the still-queued stalls as deferred by the recovery scheduler.
+    ///
+    /// This stores an index instead of walking every remaining event, keeping
+    /// a mass-stall budget exhaustion O(1).
+    pub fn defer_remaining_stalls_for_recovery(&mut self) {
+        if self.stall_cursor < self.stall_queue.len() {
+            self.stall_deferred_from = self.stall_deferred_from.min(self.stall_cursor);
+        }
+    }
+
     /// Whether the stall queue has unconsumed [`Event::Stall`] entries.
     pub fn has_pending_stalls(&self) -> bool {
         self.stall_cursor < self.stall_queue.len()
@@ -1030,6 +1062,7 @@ impl Observer {
         let now_ns = self.now_ns();
         self.stall_queue.clear();
         self.stall_cursor = 0;
+        self.stall_deferred_from = usize::MAX;
         self.tracker.drain_stalled_slots(
             now_ns,
             self.threshold_ns,
